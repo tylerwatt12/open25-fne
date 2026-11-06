@@ -1,0 +1,117 @@
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -2932,8 +2932,12 @@
+     if (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateSrcId(srcId)) {
+         LogWarning(LOG_RF, P25_TSDU_STR ", %s denial, RID rejection, srcId = %u", iosp->toString().c_str(), srcId);
+         ::ActivityLog("P25", true, "group affiliation request from %u to %s %u denied", srcId, "TG ", dstId);
+-        iosp->setResponse(ResponseCode::REFUSED);
+-        noNet = true;
++        // AABD-B 6.7.2.1(b): an invalid WUID receives DENY_RSP,
++        // not AFF_REFUSED (which describes an invalid system group).
++        if (m_p25->m_affiliations->groupUnaff(srcId) && m_p25->m_network != nullptr)
++            m_p25->m_network->announceGroupAffiliationRemoval(srcId);
++        writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_REQ_UNIT_NOT_VALID, TSBKO::IOSP_GRP_AFF);
++        return ResponseCode::REFUSED;
+     }
+ 
+     // register the RID if the MFID is $90 (this is typically DVRS, and DVRS won't unit register so we'll do it for them)
+@@ -2960,8 +2964,10 @@
+     if (!m_p25->m_affiliations->isUnitReg(srcId) && m_verifyReg) {
+         LogWarning(LOG_RF, P25_TSDU_STR ", %s denial, RID not registered, srcId = %u", iosp->toString().c_str(), srcId);
+         ::ActivityLog("P25", true, "group affiliation request from %u to %s %u denied", srcId, "TG ", dstId);
+-        iosp->setResponse(ResponseCode::REFUSED);
+-        noNet = true;
++        if (m_p25->m_affiliations->groupUnaff(srcId) && m_p25->m_network != nullptr)
++            m_p25->m_network->announceGroupAffiliationRemoval(srcId);
++        writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_REQ_UNIT_NOT_VALID, TSBKO::IOSP_GRP_AFF);
++        return ResponseCode::REFUSED;
+     }
+ 
+     // validate the talkgroup ID
+--- a/tests/p25/ZeroCapacity_Tests.cpp
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -616,4 +616,34 @@
+         if (needsRegistration)
+             REQUIRE(replies.back()->getLCO() == TSBKO::OSP_U_REG_CMD);
+     }
++}
++
++
++// AABC-E 6.1.9.1 / Figure 6.1.9-1, PDF108 / printed89:
++// literal abbreviated affiliation request, System1, group101, 24-bit source.
++// AABD-B 6.7.2.1(b), PDF62 / printed57 requires DENY_RSP for invalid WUID.
++TEST_CASE("invalid working unit identities receive affiliation service denials instead of group refusals", "[p25][zero-capacity][affiliation-denial]") {
++    ControllerFixture fixture(false,false,true);
++    std::array<uint8_t,3U> source{{0x00U,0x03U,0xE9U}}; //1001, enabled but not registered.
++    SECTION("enabled unregistered unit") {}
++    SECTION("disabled unit") { source[2]=0xEBU; } //1003
++    SECTION("unknown unit") { source[2]=0xECU; } //1004
++    SECTION("null working address") { source={{0x00U,0x00U,0x00U}}; }
++    SECTION("all-unit reserved address") { source={{0xFFU,0xFFU,0xFFU}}; }
++    ControllerFixture::RawBlock request{{0xA8U,0x00U,0x00U,0x00U,0x01U,0x00U,0x65U,
++        source[0],source[1],source[2],0x00U,0x00U}};
++    edac::CRC::addCCITT162(request.data(),request.size());
++    REQUIRE(fixture.receiveRaw(request));
++    auto replies=fixture.drain(); REQUIRE(replies.size()==2U); //Existing demandUnitRegForRefusedAff policy.
++    const auto* wire=replies.front()->getDecodedRaw(); REQUIRE(wire!=nullptr);
++    REQUIRE((wire[0]&0x3fU)==0x27U); //DENY_RSP, not GRP_AFF_RSP0x28.
++    REQUIRE(wire[1]==0x00U); REQUIRE((wire[2]&0x3fU)==0x28U); //denied service.
++    REQUIRE(wire[3]==0x10U); //Chosen Requesting Unit Not Valid reason.
++    REQUIRE(wire[7]==source[0]); REQUIRE(wire[8]==source[1]); REQUIRE(wire[9]==source[2]);
++    const auto* registration=replies.back()->getDecodedRaw(); REQUIRE(registration!=nullptr);
++    REQUIRE((registration[0]&0x3fU)==0x2DU);
++    REQUIRE(registration[4]==source[0]); REQUIRE(registration[5]==source[1]); REQUIRE(registration[6]==source[2]);
++    REQUIRE(fixture.controller->affiliations()->grpAffSize()==0U);
++    REQUIRE(fixture.controller->affiliations()->grantSize()==0U);
++    REQUIRE(fixture.channels.rfChDataSize()==0U);
+ }
+--- a/tests/p25/SubscriberAccess_Tests.cpp
++++ b/tests/p25/SubscriberAccess_Tests.cpp
+@@ -173,14 +173,14 @@
+         REQUIRE_FALSE(cc.controller->affiliations()->isUnitReg(source));
+         REQUIRE_FALSE(cc.controller->affiliations()->isGroupAff(source,TG));
+         REQUIRE(cc.controller->affiliations()->grantSize()==0U);
+-        auto replies=cc.responses(); unsigned denied=0U;
++        auto replies=cc.responses(); unsigned denied=0U; bool affiliationDenied=false;
+         for (auto& reply:replies) {
+             const auto opcode=reply[0]&0x3fU;
+-            if (opcode==TSBKO::OSP_DENY_RSP) { REQUIRE(reply[3]==ReasonCode::DENY_REQ_UNIT_NOT_VALID); ++denied; }
++            if (opcode==0x27U) { REQUIRE(reply[3]==0x10U); if ((reply[2]&0x3fU)==0x28U) affiliationDenied=true; ++denied; }
+             if (opcode==TSBKO::IOSP_U_REG) { REQUIRE(((reply[2]>>4U)&3U)==ResponseCode::REFUSED); ++denied; }
+-            if (opcode==TSBKO::IOSP_GRP_AFF) { REQUIRE((reply[2]&3U)==ResponseCode::REFUSED); ++denied; }
++            REQUIRE(opcode!=0x28U); // Invalid WUID must not receive AFF_REFUSED.
+         }
+-        REQUIRE(denied==3U);
++        REQUIRE(denied==3U); REQUIRE(affiliationDenied);
+         Fixture vc(false); vc.apply(false,{},false,{});
+         REQUIRE(vc.voice(DUID::HDU,source)); vc.drainVoice();
+         REQUIRE_FALSE(vc.voice(DUID::LDU1,source)); REQUIRE(vc.drainVoice()==0U);
+@@ -288,18 +288,25 @@
+     Fixture f(true); f.apply(false,{},false,{});
+     REQUIRE(f.signal(0x28U,(uint64_t(1U)<<40U)|(uint64_t(1002U)<<24U)|RID));
+     REQUIRE(f.controller->affiliations()->isGroupAff(RID,1002U)); f.responses();
++    bool invalidUnit=false;
+     uint8_t response=0x02U; // AFF_DENY, AABC-E 6.2.8.1, PDF165 / printed146.
+     SECTION("new group denied by per-radio policy") { f.apply(true,{},false,{}); }
+     SECTION("new group disabled") { f.groups.addEntry(TG,1U,false); }
+-    SECTION("unit refused") { f.radios.addEntry(RID,false,"Disabled subscriber"); response=0x03U; }
++    SECTION("invalid unit receives service denial") { f.radios.addEntry(RID,false,"Disabled subscriber"); invalidUnit=true; }
+     f.signal(0x28U,(uint64_t(1U)<<40U)|(uint64_t(TG)<<24U)|RID);
+     REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,1002U));
+     REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,TG));
+     REQUIRE(f.controller->affiliations()->grpAffSize()==0U);
+     REQUIRE(f.controller->affiliations()->isUnitReg(RID));
+     bool found=false;
+-    for (const auto& reply:f.responses()) if ((reply[0]&0x3fU)==0x28U) {
+-        REQUIRE((reply[2]&3U)==response); found=true;
++    for (const auto& reply:f.responses()) {
++        const uint8_t opcode=reply[0]&0x3fU;
++        if (invalidUnit) {
++            REQUIRE(opcode!=0x28U);
++            if (opcode==0x27U) { REQUIRE((reply[2]&0x3fU)==0x28U); REQUIRE(reply[3]==0x10U); found=true; }
++        } else if (opcode==0x28U) {
++            REQUIRE((reply[2]&3U)==response); found=true;
++        }
+     }
+     REQUIRE(found);
+ }

@@ -1,0 +1,332 @@
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -300,6 +300,9 @@
+         void setZoneConnected(bool connected) { m_zoneConnected.store(connected); }
+         bool zoneConnected() const { return m_zoneConnected.load(); }
+         bool externalNetworkAvailable() const { return !m_managedSite || m_zoneConnected.load(); }
++        // Media terminates at the Site-local FNE. Zone authority controls the
++        // wide-area advertisement and application routing, not this local path.
++        bool localMediaAvailable() const { return !m_managedSite || m_network != nullptr; }
+ 
+     private:
+ #if defined(CATCH2_TEST_COMPILATION)
+@@ -334,7 +337,9 @@
+ 
+         bool m_authoritative;
+         bool m_managedSite = false;
+-        bool m_externalWasRunning = false;
++        std::set<uint32_t> m_dispatchSubscribers;
++        bool dispatchRFInterest(uint32_t destination) const;
++        bool m_localMediaWasRunning = false;
+         std::atomic<bool> m_zoneConnected{false};
+         bool m_supervisor;
+ 
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -337,6 +337,15 @@
+     yaml::Node p25Protocol = conf["protocols"]["p25"];
+     m_managedSite = p25Protocol["managedSite"].as<bool>(false);
+     m_zoneConnected.store(false);
++    m_dispatchSubscribers.clear();
++    auto dispatchSubscribers = p25Protocol["dispatchSubscribers"];
++    if (dispatchSubscribers.isSequence()) {
++        for (size_t i = 0U; i < dispatchSubscribers.size(); ++i) {
++            const uint32_t id = dispatchSubscribers[i].as<uint32_t>(0U);
++            if (id > 0U && id < 0xFFFFFCU) m_dispatchSubscribers.insert(id);
++        }
++    }
++
+ 
+     // Digital BSI is independent of the Ham Morse scheduler.
+     m_control->m_ctrlStationId = systemConf["bsi"]["enable"].as<bool>(false);
+@@ -1030,16 +1039,16 @@
+     if (m_network != nullptr) {
+         processNetwork();
+ 
+-        const bool connected = m_network->getStatus() == network::NET_STAT_RUNNING && externalNetworkAvailable();
+-        m_siteData.setNetActive(connected);
+-        if (connected && !m_externalWasRunning && m_authoritative && m_enableControl) {
++        const bool mediaConnected = m_network->getStatus() == network::NET_STAT_RUNNING && localMediaAvailable();
++        m_siteData.setNetActive(mediaConnected && externalNetworkAvailable());
++        if (mediaConnected && !m_localMediaWasRunning && m_authoritative && m_enableControl) {
+             // Rebuild FNE interest immediately after restart/reconnect, using
+             // only registrations/affiliations actually accepted at this site.
+             const auto affiliations = m_affiliations->grpAffTable();
+             m_network->announceAffiliationUpdate(affiliations);
+             m_control->writeAdjSSNetwork();
+         }
+-        m_externalWasRunning = connected;
++        m_localMediaWasRunning = mediaConnected;
+ 
+         lc::TDULC::setSiteData(m_siteData);
+         lc::TSBK::setSiteData(m_siteData);
+@@ -1163,7 +1172,7 @@
+         p25::data::LowSpeedData lsd = p25::data::LowSpeedData();
+ 
+         uint8_t controlByte = 0x00U;
+-        if (m_network != nullptr && externalNetworkAvailable()) m_network->writeP25TDU(lc, lsd);
++        if (m_network != nullptr && localMediaAvailable()) m_network->writeP25TDU(lc, lsd);
+ 
+         m_rfCallTermDstId = 0U;
+         m_rfCallTermSrcId = 0U;
+@@ -1602,7 +1611,7 @@
+     if (!buffer) buffer = m_network->readP25(ret, length);
+     if (!ret)
+         return;
+-    if (!externalNetworkAvailable()) { m_pendingSiteFrames.clear(); return; }
++    if (!localMediaAvailable()) { m_pendingSiteFrames.clear(); return; }
+     if (length < 24U)
+         return;
+     if (buffer == nullptr) {
+--- a/src/host/p25/Control.Dispatch.cpp
++++ b/src/host/p25/Control.Dispatch.cpp
+@@ -72,9 +72,23 @@
+     return result;
+ }
+ 
++// Physical subscriber kinds are provisioned by the Site service. A console or
++// mobile login can never become RF demand merely by using its own numeric ID.
++bool Control::dispatchRFInterest(uint32_t destination) const
++{
++    if (m_affiliations == nullptr) return false;
++    const auto affiliations = m_affiliations->grpAffTable();
++    for (const auto& entry : affiliations) {
++        if (entry.second != destination || m_dispatchSubscribers.count(entry.first) == 0U) continue;
++        const auto radio = m_ridLookup->find(entry.first);
++        if (!radio.radioDefault() && radio.radioEnabled()) return true;
++    }
++    return false;
++}
++
+ bool Control::dispatchReady(bool admitNew) const
+ {
+-    return externalNetworkAvailable() && m_dispatchEnabled && !m_dispatchClosing.load() && m_authoritative && m_supervisor &&
++    return localMediaAvailable() && m_dispatchEnabled && !m_dispatchClosing.load() && m_authoritative && m_supervisor &&
+         m_enableControl && m_dedicatedControl && m_duplex && m_ccRunning && !m_ccHalted &&
+         !identificationActive() && (!admitNew || !identificationUnavailable()) && m_modem != nullptr && !m_modem->hasError() &&
+         !m_modem->hasLockout() && m_modem->statusGeneration() != 0U &&
+@@ -116,7 +130,7 @@
+             m_dispatchLease.channelNo, m_dispatchLease.epoch);
+         if (!owned) endDispatch("lost");
+         else if (Clock::now() >= m_dispatchExpires) endDispatch("expired");
+-        else if (!dispatchReady(false)) endDispatch("unavailable");
++        else if (!dispatchReady(false) || !dispatchRFInterest(m_dispatchLease.dstId)) endDispatch("unavailable");
+     }
+     std::shared_ptr<DispatchOperation> operation;
+     {
+@@ -179,7 +193,7 @@
+             endDispatch("released");
+             auto result = m_dispatchHistory.at(request.leaseId); result.accepted = true; return result;
+         }
+-        if (!dispatchReady(false)) { endDispatch("unavailable"); rejected.message = "dispatch owner unavailable"; return rejected; }
++        if (!dispatchReady(false) || !dispatchRFInterest(request.dstId)) { endDispatch("unavailable"); rejected.message = "dispatch owner or physical RF interest unavailable"; return rejected; }
+         const auto lease = m_dispatchLease;
+         std::string permitToken;
+         ::lookups::VoiceChData channel;
+@@ -203,7 +217,7 @@
+                     response["permitToken"].is<std::string>() && response["permitToken"].get<std::string>() == permitToken);
+             }, channel.address(), channel.port(), true);
+         auto guard = m_affiliations->lockGrants();
+-        if (!replied || !accepted->load() || !dispatchReady(false) || Clock::now() >= m_dispatchExpires ||
++        if (!replied || !accepted->load() || !dispatchReady(false) || !dispatchRFInterest(lease.dstId) || Clock::now() >= m_dispatchExpires ||
+             Clock::now() >= operation->deadline || operation->phase.load() == DispatchOperation::Cancelled ||
+             !m_affiliations->ownsGrant(lease.dstId, lease.srcId, lease.channelNo, lease.epoch)) {
+             endDispatch("lost"); rejected.message = "voice permit renewal not accepted"; return rejected;
+@@ -235,6 +249,7 @@
+     if (radio.radioDefault() || !radio.radioEnabled() || group.isInvalid() || !group.config().active() ||
+         !acl::AccessControl::validateSrcId(request.srcId) || !acl::AccessControl::validateTGId(request.dstId))
+         return reject(403, "radio or talkgroup is not enabled in the native allow lists");
++    if (!dispatchRFInterest(request.dstId)) return reject(409, "no affiliated physical subscriber requires RF");
+     if (!m_dispatchLease.leaseId.empty()) return reject(409, "another dispatch lease is active");
+     {
+         auto guard = m_affiliations->lockGrants();
+@@ -246,7 +261,7 @@
+     // Reserve only when the request still owns its pre-commit phase. The stock
+     // allocator requires a positive, token-matched VC reply before this hook.
+     const bool granted = m_control->writeRF_TSDU_Grant(request.srcId, request.dstId, 4U, true, true, false, 0U, [&] {
+-        if (!dispatchReady() || Clock::now() >= operation->deadline) return false;
++        if (!dispatchReady() || !dispatchRFInterest(request.dstId) || Clock::now() >= operation->deadline) return false;
+         int executing = DispatchOperation::Executing;
+         return operation->phase.compare_exchange_strong(executing, DispatchOperation::Committed);
+     });
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -355,7 +355,7 @@
+             }
+ 
+             // send network grant demand TDU
+-            if (m_p25->m_network != nullptr && m_p25->externalNetworkAvailable()) {
++            if (m_p25->m_network != nullptr && m_p25->localMediaAvailable()) {
+                 if (!m_p25->m_dedicatedControl && m_p25->m_convNetGrantDemand) {
+                     uint8_t controlByte = network::NET_CTRL_GRANT_DEMAND;                   // Grant Demand Flag
+                     if (encrypted)
+@@ -1463,7 +1463,7 @@
+ {
+     assert(data != nullptr);
+ 
+-    if (m_p25->m_network == nullptr || !m_p25->externalNetworkAvailable())
++    if (m_p25->m_network == nullptr || !m_p25->localMediaAvailable())
+         return;
+ 
+     if (m_p25->m_rfTimeout.isRunning() && m_p25->m_rfTimeout.hasExpired())
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -1353,7 +1353,7 @@
+     assert(tsbk != nullptr);
+     assert(data != nullptr);
+ 
+-    if (m_p25->m_network == nullptr || !m_p25->externalNetworkAvailable())
++    if (m_p25->m_network == nullptr || !m_p25->localMediaAvailable())
+         return;
+ 
+     if (m_p25->m_rfTimeout.isRunning() && m_p25->m_rfTimeout.hasExpired())
+@@ -1376,7 +1376,7 @@
+ {
+     assert(data != nullptr);
+ 
+-    if (m_p25->m_network == nullptr || !m_p25->externalNetworkAvailable())
++    if (m_p25->m_network == nullptr || !m_p25->localMediaAvailable())
+         return;
+ 
+     if (m_p25->m_rfTimeout.isRunning() && m_p25->m_rfTimeout.hasExpired())
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -44,6 +44,7 @@
+     static void expire(Control& value) { for (auto& frame : value.m_pendingSiteFrames) frame.received -= std::chrono::seconds(1); }
+     static void expireNetwork(Control& value) { value.m_networkWatchdog.clock(1501U); }
+     static void managed(Control& value) { value.m_managedSite = true; value.setZoneConnected(false); }
++    static bool netActive(Control& value) { return value.m_siteData.netActive(); }
+ };
+ struct CapacityPermitTestAccess {
+     static void startOldCallHang(Control& value) { value.m_rfTGHang.start(); }
+@@ -1450,12 +1451,34 @@
+     for (const auto& frame:cc.drain()) REQUIRE(frame->getLCO()==TSBKO::OSP_DENY_RSP);
+ }
+ 
+-TEST_CASE("Zone outage keeps local RF voice while blocking external encoded media", "[p25][multisite][site-trunking]") {
++TEST_CASE("Site-local media recovery rebuilds accepted affiliations during Zone loss", "[p25][multisite][site-trunking][local-media]") {
++    SiteNetwork net; ControllerFixture cc(true,false,false,false,true,&net);
++    MultiSiteTestAccess::managed(*cc.controller);
++    cc.controller->affiliations()->unitReg(TARGET); cc.controller->affiliations()->groupAff(TARGET,GROUP);
++    cc.controller->clock(); REQUIRE(net.snapshots.size()==1U); REQUIRE(net.snapshots.back().at(TARGET)==GROUP);
++    REQUIRE_FALSE(MultiSiteTestAccess::netActive(*cc.controller));
++    net.running(false); cc.controller->clock(); REQUIRE(net.snapshots.size()==1U);
++    net.running(true); cc.controller->clock(); REQUIRE(net.snapshots.size()==2U); REQUIRE(net.snapshots.back().at(TARGET)==GROUP);
++    REQUIRE_FALSE(MultiSiteTestAccess::netActive(*cc.controller)); REQUIRE_FALSE(cc.controller->zoneConnected());
++}
++
++TEST_CASE("Zone outage keeps RF and Site-local encoded media without wide-area authority", "[p25][multisite][site-trunking]") {
+     SiteNetwork net; ControllerFixture voice(true,false,false,false,false,&net); voice.voiceMode(false); voice.permitVoice("aaa:1");
+     MultiSiteTestAccess::managed(*voice.controller);
+     REQUIRE(voice.voiceFrame(DUID::HDU)); REQUIRE(voice.voiceFrame(DUID::LDU1)); REQUIRE(voice.voiceFrame(DUID::LDU2));
+-    REQUIRE(net.outgoing.empty()); REQUIRE_FALSE(voice.drainVoice().empty());
++    REQUIRE_FALSE(net.outgoing.empty()); REQUIRE_FALSE(voice.drainVoice().empty());
+     REQUIRE(MultiSiteTestAccess::permitted(*voice.controller));
++    REQUIRE_FALSE(voice.controller->externalNetworkAvailable());
++    REQUIRE(voice.controller->localMediaAvailable());
++    // A separately permitted local console stream is still usable. This does
++    // not establish Zone routing authority or create an RF affiliation.
++    SiteNetwork local; ControllerFixture listener(true,false,false,false,false,&local);
++    listener.voiceMode(false); listener.permitVoice("bbb:1");
++    MultiSiteTestAccess::managed(*listener.controller);
++    local.incoming.push_back(local.encoded(DUID::LDU1)); MultiSiteTestAccess::process(*listener.controller);
++    local.incoming.push_back(local.encoded(DUID::LDU2)); MultiSiteTestAccess::process(*listener.controller);
++    REQUIRE_FALSE(listener.drainVoice().empty());
++    REQUIRE_FALSE(listener.controller->externalNetworkAvailable());
+     voice.controller->setZoneConnected(true);
+     REQUIRE(voice.voiceFrame(DUID::LDU1)); REQUIRE_FALSE(net.outgoing.empty());
+ }
+--- a/tests/p25/DispatchGrant_Tests.cpp
++++ b/tests/p25/DispatchGrant_Tests.cpp
+@@ -16,6 +16,7 @@
+     static void run(Control& c) { c.clockDispatch(); }
+     static void expire(Control& c) { c.m_dispatchExpires = std::chrono::steady_clock::now() - std::chrono::milliseconds(1); }
+     static void disable(Control& c) { c.m_dispatchEnabled = false; }
++    static void managed(Control& c) { c.m_managedSite = true; c.setZoneConnected(false); }
+ };
+ }
+ namespace {
+@@ -50,6 +51,12 @@
+         response = parsed.get<json::object>(); json::object ignored; callback(response, ignored); return true;
+     }
+ };
++class LocalNetwork : public network::Network {
++public:
++    LocalNetwork() : Network("127.0.0.1", 49991U, 0U, 100101001U, "offline", true, false,
++        false, true, false, false, false, false, false, false, false, false) { m_status = network::NET_STAT_RUNNING; }
++    void running(bool active) { m_status = active ? network::NET_STAT_RUNNING : network::NET_STAT_WAITING_CONNECT; }
++};
+ struct Fixture {
+     ::lookups::ChannelLookup channels;
+     ::lookups::RadioIdLookup radios{"", 0U, true};
+@@ -58,6 +65,7 @@
+     ::lookups::RSSIInterpolator rssi;
+     ReadyModem modem;
+     DispatchRPC rpc;
++    LocalNetwork network;
+     network::NetRPC* old = g_RPC;
+     std::unique_ptr<p25::Control> control;
+     Fixture() {
+@@ -65,13 +73,15 @@
+         radios.addEntry(RID, true, "Dispatch"); radios.addEntry(10001U, true, "Subscriber");
+         radios.addEntry(10003U, false, "Denied"); groups.addEntry(TG, 1U, true); groups.addEntry(TG2, 1U, true);
+         channels.setRFChData(VC, ::lookups::VoiceChData(2U, VC, "127.0.0.1", 48993U, "offline-test")); channels.addRFCh(VC);
+-        control = std::make_unique<p25::Control>(true, 0x293U, 1U, 16384U, &modem, nullptr, 120U, 1U, true,
++        control = std::make_unique<p25::Control>(true, 0x293U, 1U, 16384U, &modem, &network, 120U, 1U, true,
+             &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
+         yaml::Node config;
+         REQUIRE(yaml::Parse(config, std::string(R"(
+ protocols:
+     p25:
+         dispatchEnable: true
++        dispatchSubscribers:
++            - 10001
+         verifyReg: true
+         verifyAff: true
+         tduPreambleCount: 0
+@@ -88,6 +98,7 @@
+ )")));
+         control->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 1U, false);
+         control->setSupervisor(true); control->setCCRunning(true);
++        control->affiliations()->unitReg(10001U); control->affiliations()->groupAff(10001U,TG);
+     }
+     ~Fixture() { control.reset(); g_RPC = old; }
+     p25::DispatchRequest request(p25::DispatchAction action = p25::DispatchAction::Grant, const std::string& lease = LEASE) {
+@@ -222,3 +233,37 @@
+     REQUIRE(f.control->tryBeginIdentification());
+     REQUIRE(f.control->identificationActive());
+ }
++
++TEST_CASE("managed Site-local dispatch survives Zone loss but requires its local media master", "[dispatch-grant][site-trunking][local-media]") {
++    Fixture f; p25::DispatchGrantTestAccess::managed(*f.control);
++    REQUIRE_FALSE(f.control->externalNetworkAvailable()); REQUIRE(f.control->localMediaAvailable());
++    const auto grant=f.run(f.request()); REQUIRE(grant.accepted); REQUIRE(grant.issued);
++    REQUIRE(f.rpc.permits==1U); REQUIRE_FALSE(f.control->zoneConnected());
++    auto release=f.request(p25::DispatchAction::Release); release.epoch=grant.epoch; REQUIRE(f.run(release).accepted);
++    f.network.running(false);
++    const auto unavailable=f.run(f.request(p25::DispatchAction::Grant,LEASE2));
++    REQUIRE_FALSE(unavailable.accepted); REQUIRE_FALSE(unavailable.issued);
++}
++
++TEST_CASE("dispatch without physical interest neither reserves nor emits RF", "[dispatch-grant][rf-interest]") {
++    for (const bool consoleOnly : {false, true}) {
++        Fixture f; f.control->affiliations()->groupUnaff(10001U);
++        if (consoleOnly) { f.control->affiliations()->unitReg(RID); f.control->affiliations()->groupAff(RID,TG); }
++        const auto result=f.run(f.request());
++        REQUIRE_FALSE(result.accepted); REQUIRE_FALSE(result.issued);
++        REQUIRE(f.rpc.permits==0U); REQUIRE(f.drain()==0U);
++        REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
++    }
++}
++TEST_CASE("last physical affiliation disappearing during permit rejects commit", "[dispatch-grant][rf-interest]") {
++    Fixture f; f.rpc.beforeReply=[&] { f.control->affiliations()->groupUnaff(10001U); };
++    const auto result=f.run(f.request()); REQUIRE_FALSE(result.accepted); REQUIRE_FALSE(result.issued);
++    REQUIRE(f.drain()==0U); REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
++}
++TEST_CASE("dispatch renewal releases its resource after physical RF interest ends", "[dispatch-grant][rf-interest]") {
++    Fixture f; const auto granted=f.run(f.request()); REQUIRE(granted.accepted); f.drain();
++    f.control->affiliations()->groupUnaff(10001U);
++    auto renew=f.request(p25::DispatchAction::Renew); renew.epoch=granted.epoch;
++    REQUIRE_FALSE(f.run(renew).accepted); REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
++    REQUIRE(f.rpc.clears==1U); REQUIRE(f.drain()==0U);
++}

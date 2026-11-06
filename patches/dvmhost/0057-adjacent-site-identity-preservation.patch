@@ -1,0 +1,231 @@
+diff --git a/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h b/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h
+--- a/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h
++++ b/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h
+@@ -63,6 +63,8 @@
+ 
+             public:
+                 // Adjacent Site Data
++                /** Neighbor Location Registration Area, not the transmitting Site LRA. */
++                DECLARE_PROPERTY(uint8_t, adjLra, AdjSiteLRA);
+                 /**
+                  * @brief Adjacent site CFVA flags.
+                  */
+diff --git a/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.cpp b/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.cpp
+--- a/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.cpp
++++ b/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.cpp
+@@ -24,6 +24,7 @@
+ /* Initializes a new instance of the OSP_ADJ_STS_BCAST class. */
+ 
+ OSP_ADJ_STS_BCAST::OSP_ADJ_STS_BCAST() : TSBK(),
++    m_adjLra(0U),
+     m_adjCFVA(CFVA::FAILURE),
+     m_adjSysId(0U),
+     m_adjRfssId(0U),
+@@ -50,6 +51,8 @@
+ 
+     ulong64_t tsbkValue = TSBK::toValue(tsbk);
+ 
++    m_adjLra = (uint8_t)((tsbkValue >> 56) & 0xFFU);
++    m_adjCFVA = (uint8_t)((tsbkValue >> 52) & 0xFU);
+     m_adjSysId = (uint32_t)((tsbkValue >> 40) & 0xFFFU);                            // Site System ID
+     m_adjRfssId = (uint8_t)((tsbkValue >> 32) & 0xFFU);                             // Site RFSS ID
+     m_adjSiteId = (uint8_t)((tsbkValue >> 24) & 0xFFU);                             // Site ID
+@@ -68,9 +71,9 @@
+ 
+     ulong64_t tsbkValue = 0U;
+ 
+-    tsbkValue = s_siteData.lra();                                                   // Location Registration Area
+-    tsbkValue = (tsbkValue << 4) + m_adjCFVA;                                       // CFVA
+-    tsbkValue = (tsbkValue << 12) + s_siteData.sysId();                             // System ID
++    tsbkValue = m_adjLra;                                                   // Location Registration Area
++    tsbkValue = (tsbkValue << 4) + (m_adjCFVA & 0xFU);                                       // CFVA
++    tsbkValue = (tsbkValue << 12) + (m_adjSysId & 0xFFFU);                             // System ID
+     tsbkValue = (tsbkValue << 8) + m_adjRfssId;                                     // RF Sub-System ID
+     tsbkValue = (tsbkValue << 8) + m_adjSiteId;                                     // Site ID
+     tsbkValue = (tsbkValue << 4) + m_adjChannelId;                                  // Channel ID
+@@ -98,6 +101,7 @@
+ {
+     TSBK::copy(data);
+ 
++    m_adjLra = data.m_adjLra;
+     m_adjCFVA = data.m_adjCFVA;
+     m_adjSysId = data.m_adjSysId;
+     m_adjRfssId = data.m_adjRfssId;
+diff --git a/src/common/p25/SiteData.h b/src/common/p25/SiteData.h
+--- a/src/common/p25/SiteData.h
++++ b/src/common/p25/SiteData.h
+@@ -35,6 +35,7 @@
+          */
+         SiteData() :
+             m_lra(0U),
++            m_adjCFVA(0U),
+             m_netId(defines::WACN_STD_DEFAULT),
+             m_sysId(defines::SID_STD_DEFAULT),
+             m_rfssId(1U),
+@@ -64,6 +65,7 @@
+          */
+         SiteData(uint32_t netId, uint32_t sysId, uint8_t rfssId, uint8_t siteId, uint8_t lra, uint8_t channelId, uint32_t channelNo, uint8_t serviceClass, int8_t lto) :
+             m_lra(0U),
++            m_adjCFVA(0U),
+             m_netId(defines::WACN_STD_DEFAULT),
+             m_sysId(defines::SID_STD_DEFAULT),
+             m_rfssId(1U),
+@@ -157,7 +159,7 @@
+          * @param channelNo Channel Number.
+          * @param serviceClass Service class.
+          */
+-        void setAdjSite(uint32_t sysId, uint8_t rfssId, uint8_t siteId, uint8_t channelId, uint32_t channelNo, uint8_t serviceClass)
++        void setAdjSite(uint8_t lra, uint8_t cfva, uint32_t sysId, uint8_t rfssId, uint8_t siteId, uint8_t channelId, uint32_t channelNo, uint8_t serviceClass)
+         {
+             // sysId clamping
+             sysId = P25Utils::sysId(sysId);
+@@ -180,7 +182,8 @@
+                 channelNo = 4095U;
+             }
+ 
+-            m_lra = 0U;
++            m_lra = lra;
++            m_adjCFVA = cfva & 0xFU;
+ 
+             m_netId = 0U;
+             m_sysId = sysId;
+@@ -209,6 +212,7 @@
+         {
+             if (this != &data) {
+                 m_lra = data.m_lra;
++                m_adjCFVA = data.m_adjCFVA;
+ 
+                 m_netId = data.m_netId;
+                 m_sysId = data.m_sysId;
+@@ -240,6 +244,7 @@
+          * @brief P25 location resource area.
+          */
+         DECLARE_RO_PROPERTY_PLAIN(uint8_t, lra);
++        DECLARE_RO_PROPERTY_PLAIN(uint8_t, adjCFVA);
+         /**
+          * @brief P25 network ID.
+          */
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -950,7 +950,7 @@
+                                 osp->getAdjSiteSysId(), osp->getAdjSiteRFSSId(), osp->getAdjSiteId(), osp->getAdjSiteChnId(), osp->getAdjSiteChnNo(), osp->getAdjSiteSvcClass());
+                         }
+ 
+-                        site.setAdjSite(osp->getAdjSiteSysId(), osp->getAdjSiteRFSSId(), osp->getAdjSiteId(), osp->getAdjSiteChnId(), osp->getAdjSiteChnNo(), osp->getAdjSiteSvcClass());
++                        site.setAdjSite(osp->getAdjSiteLRA(), osp->getAdjSiteCFVA(), osp->getAdjSiteSysId(), osp->getAdjSiteRFSSId(), osp->getAdjSiteId(), osp->getAdjSiteChnId(), osp->getAdjSiteChnNo(), osp->getAdjSiteSvcClass());
+ 
+                         m_adjSiteTable[site.siteId()] = site;
+                         m_adjSiteUpdateCnt[site.siteId()] = ADJ_SITE_UPDATE_CNT;
+@@ -972,7 +972,7 @@
+                                 osp->getAdjSiteSysId(), osp->getAdjSiteRFSSId(), osp->getAdjSiteId(), osp->getAdjSiteChnId(), osp->getAdjSiteChnNo(), osp->getAdjSiteSvcClass());
+                         }
+ 
+-                        site.setAdjSite(osp->getAdjSiteSysId(), osp->getAdjSiteRFSSId(), osp->getAdjSiteId(), osp->getAdjSiteChnId(), osp->getAdjSiteChnNo(), osp->getAdjSiteSvcClass());
++                        site.setAdjSite(osp->getAdjSiteLRA(), osp->getAdjSiteCFVA(), osp->getAdjSiteSysId(), osp->getAdjSiteRFSSId(), osp->getAdjSiteId(), osp->getAdjSiteChnId(), osp->getAdjSiteChnNo(), osp->getAdjSiteSvcClass());
+ 
+                         m_sccbTable[site.rfssId()] = site;
+                         m_sccbUpdateCnt[site.rfssId()] = ADJ_SITE_UPDATE_CNT;
+@@ -1248,6 +1248,7 @@
+ 
+     if (m_p25->m_network != nullptr) {
+         uint8_t cfva = CFVA::VALID;
++        if (m_p25->m_siteData.netActive()) cfva |= CFVA::NETWORK;
+         if (m_p25->m_enableControl && !m_p25->m_dedicatedControl) {
+             cfva |= CFVA::CONV;
+         }
+@@ -1255,6 +1256,7 @@
+         // transmit adjacent site broadcast
+         std::unique_ptr<OSP_ADJ_STS_BCAST> osp = std::make_unique<OSP_ADJ_STS_BCAST>();
+         osp->setSrcId(WUID_FNE);
++        osp->setAdjSiteLRA(m_p25->m_siteData.lra());
+         osp->setAdjSiteCFVA(cfva);
+         osp->setAdjSiteSysId(m_p25->m_siteData.sysId());
+         osp->setAdjSiteRFSSId(m_p25->m_siteData.rfssId());
+@@ -2401,7 +2403,7 @@
+                             site.siteId() == m_p25->m_siteData.siteId() && site.sysId() == m_p25->m_siteData.sysId())
+                             continue;
+ 
+-                        uint8_t cfva = CFVA::NETWORK;
++                        uint8_t cfva = site.adjCFVA() & (CFVA::CONV | CFVA::NETWORK);
+                         if (m_adjSiteUpdateCnt[site.siteId()] == 0U) {
+                             cfva |= CFVA::FAILURE;
+                         }
+@@ -2410,6 +2412,7 @@
+                         }
+ 
+                         // transmit adjacent site broadcast
++                        osp->setAdjSiteLRA(site.lra());
+                         osp->setAdjSiteCFVA(cfva);
+                         osp->setAdjSiteSysId(site.sysId());
+                         osp->setAdjSiteRFSSId(site.rfssId());
+diff --git a/tests/p25/NeighborIdentity_Tests.cpp b/tests/p25/NeighborIdentity_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/NeighborIdentity_Tests.cpp
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Source-derived literal layout: TIA-102.AABC-E (April 2019), 6.2.2.1,
++// Figure 6.2.2-1, PDF154/printed135, p25_89a3b878eee70a14.
++// Body fields are independently specified below. CRC96BA was calculated with
++// Python binascii.crc_hqx(body, 0) ^ 0xFFFF, outside the native implementation.
++#include "common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h"
++#include "common/p25/SiteData.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++
++using namespace p25;
++using namespace p25::lc;
++using namespace p25::lc::tsbk;
++
++TEST_CASE("Adjacent Site identity belongs to the neighbor", "[p25][neighbor-identity]") {
++    const std::array<uint8_t, 12> wire{0xBC,0x00,0xA5,0x3A,0xBC,0x02,0x11,0x53,0x45,0x7F,0x96,0xBA};
++    struct RestoreSite { SiteData previous; ~RestoreSite() { TSBK::setSiteData(previous); } } restore{TSBK::getSiteData()};
++    TSBK::setSiteData(SiteData(1U,0x123U,1U,1U,0x22U,1U,1U,0U,0));
++    OSP_ADJ_STS_BCAST received;
++    REQUIRE(received.decode(wire.data(), true));
++    REQUIRE(received.getAdjSiteLRA() == 0xA5U);
++    REQUIRE(received.getAdjSiteCFVA() == 3U);
++    REQUIRE(received.getAdjSiteSysId() == 0xABCU);
++    REQUIRE(received.getAdjSiteRFSSId() == 2U);
++    REQUIRE(received.getAdjSiteId() == 0x11U);
++    REQUIRE(received.getAdjSiteChnId() == 5U);
++    REQUIRE(received.getAdjSiteChnNo() == 0x345U);
++    REQUIRE(received.getAdjSiteSvcClass() == 0x7FU);
++    std::array<uint8_t,12> result{};
++    received.encode(result.data(), true, true);
++    REQUIRE(result == wire);
++    SiteData cached;
++    cached.setAdjSite(received.getAdjSiteLRA(),received.getAdjSiteCFVA(),received.getAdjSiteSysId(),received.getAdjSiteRFSSId(),received.getAdjSiteId(),received.getAdjSiteChnId(),received.getAdjSiteChnNo(),received.getAdjSiteSvcClass());
++    SiteData copied;
++    copied = cached;
++    REQUIRE(copied.lra() == 0xA5U);
++    REQUIRE(copied.adjCFVA() == 3U);
++    REQUIRE(copied.sysId() == 0xABCU);
++    OSP_ADJ_STS_BCAST broadcast;
++    broadcast.setLastBlock(true);
++    broadcast.setAdjSiteLRA(copied.lra());
++    broadcast.setAdjSiteCFVA(copied.adjCFVA());
++    broadcast.setAdjSiteSysId(copied.sysId());
++    broadcast.setAdjSiteRFSSId(copied.rfssId());
++    broadcast.setAdjSiteId(copied.siteId());
++    broadcast.setAdjSiteChnId(copied.channelId());
++    broadcast.setAdjSiteChnNo(copied.channelNo());
++    broadcast.setAdjSiteSvcClass(copied.serviceClass());
++    broadcast.encode(result.data(), true, true);
++    REQUIRE(result == wire);
++    for (unsigned lra = 0; lra < 256; ++lra) {
++        for (unsigned flags = 0; flags < 16; ++flags) {
++            broadcast.setAdjSiteLRA(lra);
++            broadcast.setAdjSiteCFVA(flags);
++            broadcast.encode(result.data(), true, true);
++            REQUIRE(result[2] == lra);
++            REQUIRE((result[3] >> 4) == flags);
++            REQUIRE((result[3] & 15U) == 0xAU);
++            OSP_ADJ_STS_BCAST decoded;
++            REQUIRE(decoded.decode(result.data(), true));
++            REQUIRE(decoded.getAdjSiteLRA() == lra);
++            REQUIRE(decoded.getAdjSiteCFVA() == flags);
++        }
++    }
++}

@@ -1,0 +1,290 @@
+diff --git a/src/bridge/HostBridge.Opaque.cpp b/src/bridge/HostBridge.Opaque.cpp
+--- a/src/bridge/HostBridge.Opaque.cpp
++++ b/src/bridge/HostBridge.Opaque.cpp
+@@ -30,6 +30,7 @@
+     write32(packet+12,src);write32(packet+16,dst);write64(packet+24,++m_opaqueRxSequence);
+     std::memcpy(packet+32,m_opaqueRxToken,16);
+     if (supportedSecure(m_opaqueRxAlgorithm)) std::memcpy(packet+48,m_opaqueRxMI,9);
++    packet[57]=m_opaqueRxMFId;
+     write16(packet+58,end?0:11);
+     if (!end) std::memcpy(packet+packetHeader,imbe,11);
+     sockaddr_storage address;uint32_t addressLength;
+@@ -54,9 +55,29 @@
+         m_networkWatchdog.stop();m_network->resetP25();return;
+     }
+     if ((duid!=DUID::LDU1 && duid!=DUID::LDU2) || length<178) return;
++    const uint8_t manufacturer=buffer[15]; // DVM/FNE header, not a DFSI voice byte.
++    if (manufacturer>1) return; // Proprietary LC requires a separately implemented profile.
+     uint32_t stream=m_network->getP25StreamId();
++    if (stream==m_rxStreamId && m_callInProgress && manufacturer!=m_opaqueRxMFId) return;
++    lc::LC control;control.setLCO(LCO::GROUP);control.setSrcId(src);control.setDstId(dst);
++    control.setMFId(manufacturer);
++    data::LowSpeedData lsd;
++    dfsi::LC dfsiLC(control,lsd);
++    uint8_t words[9][11]{};
++    const uint8_t first=duid==DUID::LDU1?DFSIFrameType::LDU1_VOICE1:DFSIFrameType::LDU2_VOICE10;
++    for (unsigned i=0;i<9;i++) {
++        if (length<dfsiOffsets[i]+dfsiLengths[i] || buffer[dfsiOffsets[i]]!=first+i) return;
++        dfsiLC.setFrameType(static_cast<DFSIFrameType::E>(first+i));
++        if (duid==DUID::LDU1) dfsiLC.decodeLDU1(buffer+dfsiOffsets[i],words[i]);
++        else dfsiLC.decodeLDU2(buffer+dfsiOffsets[i],words[i]);
++    }
++    // LDU1 repeats MFID in its LC; LDU2 carries ESS only and retains the
++    // accepted stream value supplied above. Never replace it with a default.
++    if (dfsiLC.control()->getMFId()!=manufacturer) return;
++    // Malformed/mismatched LC must not replace an accepted stream identity.
+     if (stream!=m_rxStreamId || !m_callInProgress) {
+         m_opaqueRxSequence=0;m_opaqueRxAlgorithm=0;m_opaqueRxKey=0;
++        m_opaqueRxMFId=manufacturer;
+         std::memset(m_opaqueRxMI,0,9);std::memset(m_opaqueRxToken,0,16);
+         uint64_t now=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+         write64(m_opaqueRxToken,now);write32(m_opaqueRxToken+8,stream);write32(m_opaqueRxToken+12,src);
+@@ -69,17 +90,6 @@
+         m_opaqueRxAlgorithm=buffer[181];m_opaqueRxKey=GET_UINT16(buffer,182);
+         std::memcpy(m_opaqueRxMI,buffer+184,9);
+     }
+-    lc::LC control;control.setLCO(LCO::GROUP);control.setSrcId(src);control.setDstId(dst);
+-    data::LowSpeedData lsd;
+-    dfsi::LC dfsiLC(control,lsd);
+-    uint8_t words[9][11]{};
+-    const uint8_t first=duid==DUID::LDU1?DFSIFrameType::LDU1_VOICE1:DFSIFrameType::LDU2_VOICE10;
+-    for (unsigned i=0;i<9;i++) {
+-        if (length<dfsiOffsets[i]+dfsiLengths[i] || buffer[dfsiOffsets[i]]!=first+i) return;
+-        dfsiLC.setFrameType(static_cast<DFSIFrameType::E>(first+i));
+-        if (duid==DUID::LDU1) dfsiLC.decodeLDU1(buffer+dfsiOffsets[i],words[i]);
+-        else dfsiLC.decodeLDU2(buffer+dfsiOffsets[i],words[i]);
+-    }
+     const bool known=(m_opaqueRxAlgorithm==0x80 && m_opaqueRxKey==0) || supportedSecure(m_opaqueRxAlgorithm);
+     if (known) for (unsigned i=0;i<9;i++) writeOpaqueP25(src,dst,words[i],uint8_t(i+(duid==DUID::LDU2?9:0)),false);
+     // The LDU2 encryption sync applies to the NEXT superframe, never the nine
+@@ -96,10 +106,10 @@
+     using namespace p25::defines;
+     if (length<packetHeader || std::memcmp(packet,"DV25",4) || packet[4]!=16 || packet[5] || length!=packetHeader+read16(packet+58)) return;
+     uint32_t src=read32(packet+12),dst=read32(packet+16);uint16_t flags=read16(packet+10),key=read16(packet+8);
+-    uint64_t sequence=read64(packet+24);uint8_t algorithm=packet[6],index=packet[7];
+-    if (!src || src>0xfffffb || dst!=m_dstId || (flags&~1U)) return;
++    uint64_t sequence=read64(packet+24);uint8_t algorithm=packet[6],index=packet[7],manufacturer=packet[57];
++    if (!src || src>0xfffffb || dst!=m_dstId || (flags&~1U) || manufacturer>1) return;
+     if (flags&1) {
+-        if (length==packetHeader && m_trafficFromUDP && std::memcmp(packet+32,m_opaqueTxToken,16)==0) callEnd(src,dst);
++        if (length==packetHeader && m_trafficFromUDP && manufacturer==m_opaqueTxMFId && std::memcmp(packet+32,m_opaqueTxToken,16)==0) callEnd(src,dst);
+         return;
+     }
+     if (length!=packetHeader+11 || !sequence || index>17 || !((algorithm==0x80 && key==0)||supportedSecure(algorithm))) return;
+@@ -109,9 +119,10 @@
+         if (m_trafficFromUDP) callEnd(m_udpSrcId,m_dstId);
+         m_callInProgress=false;m_networkWatchdog.stop();m_rxStreamId=0;m_opaqueRxSequence=0;
+         m_p25N=0;m_opaqueTxSequence=0;m_opaqueTxAlgorithm=algorithm;m_opaqueTxKey=key;
++        m_opaqueTxMFId=manufacturer;
+         std::memcpy(m_opaqueTxToken,packet+32,16);
+     }
+-    if (sequence<=m_opaqueTxSequence || algorithm!=m_opaqueTxAlgorithm || key!=m_opaqueTxKey) return;
++    if (sequence<=m_opaqueTxSequence || algorithm!=m_opaqueTxAlgorithm || key!=m_opaqueTxKey || manufacturer!=m_opaqueTxMFId) return;
+     if (index!=m_p25N) {
+         // A partial LDU is discarded on a network gap. Rejoin on a complete
+         // LDU boundary; never fill encrypted gaps with clear silence.
+@@ -124,6 +135,7 @@
+     m_udpInactivity.received();m_udpDropTime.start();
+     if (index==8 || index==17) {
+         lc::LC control;control.setLCO(LCO::GROUP);control.setGroup(true);control.setPriority(4);
++        control.setMFId(m_opaqueTxMFId);
+         control.setSrcId(src);control.setDstId(dst);control.setAlgId(algorithm);control.setKId(key);control.setEncrypted(algorithm!=0x80);
+         uint8_t mi[9]{};if (algorithm!=0x80) std::memcpy(mi,packet+48,9);
+         if (index==17 && algorithm!=0x80) {
+diff --git a/src/bridge/HostBridge.P25.cpp b/src/bridge/HostBridge.P25.cpp
+--- a/src/bridge/HostBridge.P25.cpp
++++ b/src/bridge/HostBridge.P25.cpp
+@@ -675,6 +675,7 @@
+         srcId = m_srcId;
+ 
+     lc::LC lc = lc::LC();
++    lc.setMFId(m_voiceMFId);
+     lc.setLCO(LCO::GROUP);
+     lc.setGroup(true);
+     lc.setPriority(4U);
+diff --git a/src/bridge/HostBridge.cpp b/src/bridge/HostBridge.cpp
+--- a/src/bridge/HostBridge.cpp
++++ b/src/bridge/HostBridge.cpp
+@@ -1043,6 +1043,12 @@
+     m_udpAudio = systemConf["udpAudio"].as<bool>(false);
+     m_udpMetadata = systemConf["udpMetadata"].as<bool>(false);
+     m_opaqueP25 = systemConf["opaqueP25"].as<bool>(false);
++    const uint32_t voiceMFId = systemConf["voiceMfid"].as<uint32_t>(0U);
++    if (voiceMFId > 1U) {
++        LogError(LOG_HOST, "Standard group voice MFID must be 0 or 1.");
++        return false;
++    }
++    m_voiceMFId = uint8_t(voiceMFId);
+     m_udpSendPort = (uint16_t)systemConf["udpSendPort"].as<uint32_t>(34001);
+     m_udpSendAddress = systemConf["udpSendAddress"].as<std::string>();
+     m_udpReceivePort = (uint16_t)systemConf["udpReceivePort"].as<uint32_t>(34001);
+diff --git a/src/bridge/HostBridge.h b/src/bridge/HostBridge.h
+--- a/src/bridge/HostBridge.h
++++ b/src/bridge/HostBridge.h
+@@ -221,9 +221,11 @@
+     bool m_udpAudio;
+     bool m_udpMetadata;
+     bool m_opaqueP25 = false;
++    uint8_t m_voiceMFId = 0;
+     uint8_t m_opaqueRxToken[16]{}, m_opaqueTxToken[16]{}, m_opaqueRxMI[9]{};
+     uint64_t m_opaqueRxSequence = 0, m_opaqueTxSequence = 0;
+     uint8_t m_opaqueRxAlgorithm = 0, m_opaqueTxAlgorithm = 0;
++    uint8_t m_opaqueRxMFId = 0, m_opaqueTxMFId = 0;
+     uint16_t m_opaqueRxKey = 0, m_opaqueTxKey = 0;
+     uint16_t m_udpSendPort;
+     std::string m_udpSendAddress;
+diff --git a/src/bridge/PacketCodec.cpp b/src/bridge/PacketCodec.cpp
+--- a/src/bridge/PacketCodec.cpp
++++ b/src/bridge/PacketCodec.cpp
+@@ -117,7 +117,7 @@
+     std::unique_ptr<vocoder::MBEDecoder> decoder;
+     std::array<uint8_t,9> mi{};
+     uint64_t encodedSequence = 0, decodedSequence = 0, superframe = 0;
+-    uint8_t algorithm = Clear;
++    uint8_t algorithm = Clear, manufacturer = 0;
+     uint16_t key = 0;
+     std::chrono::steady_clock::time_point seen = std::chrono::steady_clock::now();
+ };
+@@ -148,15 +148,17 @@
+     put16(response.data() + 58, 0);
+     auto reject = [&](uint8_t status) { response[5] = status; return response; };
+     if (std::memcmp(request.data(), "DV25", 4) || request[5] || (request[4] != 1 && request[4] != 2 && request[4] != 3)) return reject(1);
+-    uint8_t op = request[4], algorithm = request[6], index = request[7];
++    uint8_t op = request[4], algorithm = request[6], index = request[7], manufacturer = request[57];
+     uint16_t keyID = u16(request.data() + 8), flags = u16(request.data() + 10), size = u16(request.data() + 58);
+     uint32_t source = u32(request.data() + 12), group = u32(request.data() + 16);
+     uint64_t sequence = u64(request.data() + 24);
+-    if (request.size() != Header + size || !source || source > 0xfffffb || !group || group > 65534 || (flags & ~1U)) return reject(1);
++    if (request.size() != Header + size || !source || source > 0xfffffb || !group || group > 65534 || (flags & ~1U) || manufacturer > 1) return reject(1);
+     std::string identity(reinterpret_cast<char*>(request.data() + 32), 16);
+     identity.append(reinterpret_cast<char*>(request.data() + 12), 8);
+     if (flags & 1) {
+         if (size) return reject(1);
++        auto active = calls.find(identity);
++        if (active != calls.end() && active->second.manufacturer != manufacturer) return reject(3);
+         calls.erase(identity);
+         response[5] = 0;
+         return response;
+@@ -172,9 +174,10 @@
+     if (!calls.count(identity) && calls.size() >= 128) return reject(4);
+     Call& call = calls[identity];
+     call.seen = now;
+-    if ((call.encodedSequence || call.decodedSequence) && (call.algorithm != algorithm || call.key != keyID)) return reject(3);
++    if ((call.encodedSequence || call.decodedSequence) && (call.algorithm != algorithm || call.key != keyID || call.manufacturer != manufacturer)) return reject(3);
+     call.algorithm = algorithm;
+     call.key = keyID;
++    call.manufacturer = manufacturer;
+     uint8_t imbe[11]{};
+     if (op == 1) {
+         if (sequence <= call.encodedSequence) return reject(3);
+diff --git a/tests/p25/ScopedManufacturerID_Tests.cpp b/tests/p25/ScopedManufacturerID_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/ScopedManufacturerID_Tests.cpp
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Protocol serialization only. No network socket or modem is opened.
++#include "common/network/Network.h"
++#include "common/p25/P25Defines.h"
++#include "common/p25/lc/LC.h"
++#include "common/p25/lc/tsbk/OSP_MOT_CC_BSI.h"
++#include "common/p25/lc/tsbk/OSP_NET_STS_BCAST.h"
++#include "common/p25/dfsi/LC.h"
++#include "common/p25/dfsi/DFSIDefines.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++
++namespace {
++using namespace p25;
++using namespace p25::defines;
++class ManufacturerNetwork : public network::Network {
++public:
++    ManufacturerNetwork() : Network("127.0.0.1", 49992U, 0U, 100101002U, "unopened-mf-id-test", true, false,
++        false, true, false, false, false, false, false, false, false, false) {}
++    using network::BaseNetwork::createP25_LDU1Message;
++    using network::BaseNetwork::createP25_LDU2Message;
++};
++lc::LC voice(uint8_t manufacturer) {
++    lc::LC control;
++    control.setMFId(manufacturer); control.setLCO(LCO::GROUP); control.setGroup(true);
++    control.setSrcId(10001U); control.setDstId(1001U);
++    control.setAlgId(ALGO_AES_256); control.setKId(7U); control.setEncrypted(true);
++    const uint8_t mi[9]{1, 2, 3, 4, 5, 6, 7, 8, 0}; control.setMI(mi);
++    return control;
++}
++}
++
++TEST_CASE("standard voice manufacturer survives RF header and accepted LDU2 state", "[p25][mfid]") {
++    for (const uint8_t manufacturer : {0U, 1U}) {
++        auto control = voice(manufacturer);
++        std::array<uint8_t, P25_LDU_FRAME_LENGTH_BYTES> frame{};
++        control.encodeHDU(frame.data()); lc::LC header;
++        REQUIRE(header.decodeHDU(frame.data()));
++        REQUIRE(header.getMFId() == manufacturer);
++        REQUIRE(header.getAlgId() == ALGO_AES_256); REQUIRE(header.getKId() == 7U);
++        control.encodeLDU1(frame.data()); lc::LC accepted;
++        REQUIRE(accepted.decodeLDU1(frame.data()));
++        REQUIRE(accepted.getMFId() == manufacturer);
++        REQUIRE(accepted.getSrcId() == 10001U); REQUIRE(accepted.getDstId() == 1001U);
++        control.encodeLDU2(frame.data());
++        REQUIRE(accepted.decodeLDU2(frame.data()));
++        // ESS does not contain another MFID. It must retain the accepted LC.
++        REQUIRE(accepted.getMFId() == manufacturer);
++        REQUIRE(accepted.getAlgId() == ALGO_AES_256); REQUIRE(accepted.getKId() == 7U);
++    }
++}
++
++TEST_CASE("FNE and DFSI agree on standard voice manufacturer", "[p25][mfid]") {
++    ManufacturerNetwork network;
++    for (const uint8_t manufacturer : {0U, 1U}) {
++        auto control = voice(manufacturer); data::LowSpeedData lsd;
++        std::array<uint8_t, P25_LDU_FRAME_LENGTH_BYTES> frame{};
++        uint32_t length = 0U;
++        auto ldu1 = network.createP25_LDU1Message(length, control, lsd, frame.data(), FrameType::HDU_VALID, 0U);
++        REQUIRE(length >= 178U); REQUIRE(ldu1[15U] == manufacturer);
++        // DFSI Voice3 starts at byte60; its byte2 is the repeated LC MFID.
++        REQUIRE(ldu1[62U] == manufacturer);
++        dfsi::LC parsed(control, lsd); uint8_t imbe[11]{};
++        const unsigned offsets[9]{24, 46, 60, 77, 94, 111, 128, 145, 162};
++        for (unsigned i = 0U; i < 9U; ++i) parsed.decodeLDU1(ldu1.get() + offsets[i], imbe);
++        REQUIRE(parsed.control()->getMFId() == manufacturer);
++        auto ldu2 = network.createP25_LDU2Message(length, control, lsd, frame.data(), 0U);
++        REQUIRE(length >= 178U); REQUIRE(ldu2[15U] == manufacturer);
++        for (unsigned i = 0U; i < 9U; ++i) parsed.decodeLDU2(ldu2.get() + offsets[i], imbe);
++        REQUIRE(parsed.control()->getMFId() == manufacturer);
++        REQUIRE(parsed.control()->getAlgId() == ALGO_AES_256); REQUIRE(parsed.control()->getKId() == 7U);
++    }
++}
++
++TEST_CASE("vendor BSI and standard control messages keep their own MFIDs", "[p25][mfid]") {
++    std::array<uint8_t, 12> bytes{};
++    lc::tsbk::OSP_MOT_CC_BSI bsi;
++    bsi.encode(bytes.data(), true, true); REQUIRE(bytes[1] == 0x90U);
++    lc::tsbk::OSP_NET_STS_BCAST status;
++    status.encode(bytes.data(), true, true); REQUIRE(bytes[1] == 0U);
++}
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -375,6 +375,9 @@
+ 
+ 
+     // Digital BSI is independent of the Ham Morse scheduler.
++    const std::string bsiProfile = systemConf["bsi"]["profile"].as<std::string>("motorola");
++    if (bsiProfile != "motorola")
++        ::fatal("Unsupported P25 BSI signaling profile: %s", bsiProfile.c_str());
+     m_control->m_ctrlStationId = systemConf["bsi"]["enable"].as<bool>(false);
+ 
+     if (m_isModemDFSI) {
+diff --git a/tests/p25/TSBK_Tests.cpp b/tests/p25/TSBK_Tests.cpp
+--- a/tests/p25/TSBK_Tests.cpp
++++ b/tests/p25/TSBK_Tests.cpp
+@@ -215,7 +215,7 @@
+ 
+         // Payload is bytes 2-9 (8 bytes)
+         uint8_t expectedPayload[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
+-        ::memcpy(testTSBK, expectedPayload, 8);
++        ::memcpy(testTSBK + 2U, expectedPayload, 8);
+ 
+         edac::CRC::addCCITT162(testTSBK, P25_TSBK_LENGTH_BYTES);
+ 

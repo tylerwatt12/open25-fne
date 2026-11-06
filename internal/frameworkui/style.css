@@ -1,0 +1,24 @@
+body { margin: 1em; color: black; background: white; font: 14px Arial, Helvetica, sans-serif; }
+a { color: #0000ee; text-decoration: underline; }
+a:visited { color: #551a8b; }
+header { padding-bottom: .5em; border-bottom: 1px solid #888; }
+nav { margin: .75em 0; line-height: 1.9; }
+h1 { font-size: 1.5em; } h2 { font-size: 1.2em; margin-top: 1.5em; }
+table { border-collapse: collapse; margin: .75em 0; }
+th, td { border: 1px solid #888; padding: .35em .5em; text-align: left; vertical-align: top; }
+th { background: #eee; }
+.fields th { width: 18em; }
+input, select, textarea, button { font: inherit; }
+input:not([type=checkbox]):not([type=radio]), select { max-width: 95vw; }
+input[type=text], input[type=password] { width: 26em; }
+input[type=number] { width: 13em; }
+textarea { max-width: 90vw; }
+button { margin: .15em; }
+form { margin: .5em 0; }
+td form { display: inline; }
+.help { display: inline-block; font-weight: normal; }
+.help summary { display: inline; cursor: pointer; text-decoration: underline; }
+.help[open] { display: block; max-width: 32em; padding: .5em; border: 1px solid #888; background: white; }
+[role=alert] { font-weight: bold; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+#test-log { white-space: pre-wrap; max-height: 20em; overflow: auto; border: 1px solid #888; padding: .5em; }

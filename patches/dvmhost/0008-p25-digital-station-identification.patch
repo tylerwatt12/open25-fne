@@ -1,0 +1,260 @@
+diff --git a/src/common/p25/lc/tsbk/OSP_MOT_CC_BSI.cpp b/src/common/p25/lc/tsbk/OSP_MOT_CC_BSI.cpp
+--- a/src/common/p25/lc/tsbk/OSP_MOT_CC_BSI.cpp
++++ b/src/common/p25/lc/tsbk/OSP_MOT_CC_BSI.cpp
+@@ -49,9 +49,14 @@
+ 
+     m_mfId = MFG_MOT;
+ 
+-    tsbkValue = (s_siteCallsign[0] - 43U) & 0x3F;                                   // Character 0
+-    for (uint8_t i = 1; i < MOT_CALLSIGN_LENGTH_BYTES; i++) {
+-        tsbkValue = (tsbkValue << 6) + ((s_siteCallsign[i] - 43U) & 0x3F);          // Character 1 - 7
++    // Zero denotes an unused character in the six-bit station identifier.
++    // ASCII space is not in that alphabet: subtracting 43 from it would turn
++    // padding into a visible backtick at a receiver.
++    for (uint8_t i = 0U; i < MOT_CALLSIGN_LENGTH_BYTES; i++) {
++        const uint8_t character = s_siteCallsign[i];
++        const uint8_t code = character == 0U || character == ' ' ? 0U :
++            (character - 43U) & 0x3FU;
++        tsbkValue = (tsbkValue << 6) + code;
+     }
+     tsbkValue = (tsbkValue << 4) + s_siteData.channelId();                          // Channel ID
+     tsbkValue = (tsbkValue << 12) + s_siteData.channelNo();                         // Channel Number
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -1308,6 +1308,7 @@
+     m_adjSiteUpdateInterval(ADJ_SITE_TIMER_TIMEOUT),
+     m_microslotCount(0U),
+     m_ctrlTimeDateAnn(false),
++    m_ctrlStationId(false),
+     m_ctrlTSDUMBF(true),
+     m_disableGrantSrcIdCheck(false),
+     m_redundantImmediate(true),
+@@ -1897,7 +1898,7 @@
+ 
+     // should we insert the BSI bursts?
+     bool bsi = (frameCnt % 127U) == 0U;
+-    if (bsi && n > 4U) {
++    if (m_ctrlStationId && bsi && n > 4U) {
+         queueRF_TSBK_Ctrl(TSBKO::OSP_MOT_CC_BSI);
+     }
+ 
+diff --git a/src/host/p25/packet/ControlSignaling.h b/src/host/p25/packet/ControlSignaling.h
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -200,6 +200,7 @@
+             uint16_t m_microslotCount;
+ 
+             bool m_ctrlTimeDateAnn;
++            bool m_ctrlStationId;
+ 
+             bool m_ctrlTSDUMBF;
+ 
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -241,6 +241,10 @@
+     yaml::Node systemConf = conf["system"];
+     yaml::Node p25Protocol = conf["protocols"]["p25"];
+ 
++    // The one identification switch gates both modem Morse and digital
++    // Motorola control-channel station identification.
++    m_control->m_ctrlStationId = systemConf["cwId"]["enable"].as<bool>(false);
++
+     if (m_isModemDFSI) {
+         yaml::Node modemConf = systemConf["modem"];
+         yaml::Node dfsiConf = modemConf["dfsi"];
+diff --git a/tests/p25/DigitalStationId_Tests.cpp b/tests/p25/DigitalStationId_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/DigitalStationId_Tests.cpp
+@@ -0,0 +1,189 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Offline native station-ID wire tests. No hardware or network is opened. */
++#include "host/Host.h"
++#include "host/HostMain.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/lc/tsbk/OSP_MOT_CC_BSI.h"
++#include "common/Log.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <chrono>
++#include <cstdlib>
++#include <fstream>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace {
++using namespace p25;
++using namespace p25::defines;
++using namespace p25::lc;
++using namespace p25::lc::tsbk;
++using RawBlock = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++using TaggedFrame = std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES + 2U>;
++
++uint64_t payload(const RawBlock& raw) {
++    uint64_t result = 0U;
++    for (size_t i = 2U; i < 10U; ++i) result = (result << 8U) | raw[i];
++    return result;
++}
++std::string decodeCallsign(const RawBlock& raw) {
++    std::string result;
++    const uint64_t value = payload(raw);
++    for (size_t i = 0U; i < 8U; ++i) {
++        const uint8_t code = uint8_t((value >> (58U - i * 6U)) & 63U);
++        if (code != 0U) result += char(code + 43U);
++    }
++    return result;
++}
++std::string hexBytes(const uint8_t* data, size_t length) {
++    static const char* digits = "0123456789ABCDEF";
++    std::string result;
++    for (size_t i = 0U; i < length; ++i) {
++        result += digits[data[i] >> 4U]; result += digits[data[i] & 15U];
++    }
++    return result;
++}
++struct QueuedStationId { RawBlock raw; TaggedFrame frame; };
++
++// The real scheduler also emits IDEN_UP; give it a real bounded bandplan
++// rather than an empty table (which is not a valid running CC configuration).
++class StationIdBandplan : public ::lookups::IdenTableLookup {
++public:
++    StationIdBandplan() : IdenTableLookup("", 0U) {
++        m_table[2U] = ::lookups::IdenTable(2U, 443437500U, 12.5F, 5.0F, 12.5F);
++    }
++};
++
++struct StationIdFixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, false};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, false};
++    StationIdBandplan identities;
++    ::lookups::RSSIInterpolator rssi;
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "offline-test", false};
++    network::NetRPC* previousRPC = g_RPC;
++    std::array<uint8_t, 4U> gitHash{{0x43U, 0x5FU, 0xF4U, 0x5BU}};
++    uint8_t* previousGitHash = g_gitHashBytes;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U,
++        true, true, false, false, false, false};
++    std::unique_ptr<Control> controller;
++    explicit StationIdFixture(bool enabled, const std::string& callsign) {
++        g_logDisplayLevel = 0U; g_RPC = &rpc;
++        // HostMain initializes this before real control scheduling. The full
++        // scheduler also emits a Git-hash burst beside BSI at frame zero.
++        g_gitHashBytes = gitHash.data();
++        controller = std::make_unique<Control>(true, 0x293U, 1U, 16384U,
++            &modem, nullptr, 120U, 1U, true, &channels, &radios, &groups,
++            &identities, &rssi, false, false, false, false, false);
++        yaml::Node config;
++        REQUIRE(yaml::Parse(config, std::string(R"(
++protocols:
++    p25:
++        tduPreambleCount: 0
++        sndcpSupport: false
++        control:
++            enable: true
++            dedicated: true
++            disableTSDUMBF: true
++            redundantImmediate: false
++system:
++    cwId:
++        enable: )") + (enabled ? "true" : "false") + R"(
++    config:
++        controlCh:
++            notifyEnable: false
++)"));
++        controller->setOptions(config, false, callsign, ::lookups::VoiceChData(),
++            1U, 1U, 1U, 1U, 2U, 1U, false);
++        controller->setCCRunning(true);
++        controller->clock();
++    }
++    ~StationIdFixture() {
++        controller.reset(); g_RPC = previousRPC; g_gitHashBytes = previousGitHash;
++    }
++    std::vector<QueuedStationId> schedule() {
++        std::vector<QueuedStationId> ids;
++        // Tick the actual Control scheduler through its first nine sequences.
++        // The small real interval avoids exposing private scheduler state or
++        // replacing its configured flags with values supplied by a test double.
++        for (unsigned tick = 0U; tick < 10U; ++tick) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(20));
++            controller->clock();
++            TaggedFrame frame{};
++            uint32_t length;
++            while ((length = controller->getFrame(frame.data())) != 0U) {
++                REQUIRE(length == frame.size());
++                std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{};
++                P25Utils::decode(frame.data() + 2U, coded.data(), 114U, 318U);
++                RawBlock raw{}; edac::Trellis trellis;
++                REQUIRE(trellis.decode12(coded.data(), raw.data()));
++                REQUIRE(edac::CRC::checkCCITT162(raw.data(), raw.size()));
++                if (raw[1U] == MFG_MOT && (raw[0U] & 63U) == TSBKO::OSP_MOT_CC_BSI)
++                    ids.push_back({raw, frame});
++            }
++        }
++        REQUIRE(controller->affiliations()->grantSize() == 0U);
++        REQUIRE(channels.rfChDataSize() == 0U);
++        REQUIRE(channels.rfChSize() == 0U);
++        return ids;
++    }
++};
++}
++
++TEST_CASE("Digital Motorola station ID zero-fills unused callsign characters", "[p25][digital-station-id]") {
++    SiteData site(1U, 1U, 1U, 1U, 0U, 2U, 1U, 0U, 0);
++    TSBK::setSiteData(site);
++    for (const std::string& callsign : {std::string("N0TEST"), std::string("W1AW")}) {
++        TSBK::setCallsign(callsign);
++        OSP_MOT_CC_BSI identifier;
++        identifier.setLastBlock(true);
++        RawBlock raw{}; identifier.encode(raw.data(), true, true);
++        REQUIRE(raw[0U] == (0x80U | TSBKO::OSP_MOT_CC_BSI));
++        REQUIRE(raw[1U] == MFG_MOT);
++        REQUIRE(edac::CRC::checkCCITT162(raw.data(), raw.size()));
++        REQUIRE(decodeCallsign(raw) == callsign);
++        REQUIRE(((payload(raw) >> 12U) & 15U) == 2U);
++        REQUIRE((payload(raw) & 4095U) == 1U);
++        for (size_t i = callsign.size(); i < 8U; ++i)
++            REQUIRE(((payload(raw) >> (58U - i * 6U)) & 63U) == 0U);
++        if (callsign == "N0TEST")
++            REQUIRE(hexBytes(raw.data() + 2U, 8U) == "8C5A5AA290002001");
++    }
++}
++
++TEST_CASE("The one CW master switch gates native digital station-ID broadcasts", "[p25][digital-station-id]") {
++    for (const std::string& ignoredCallsign : {std::string(""), std::string("N0TEST")}) {
++        StationIdFixture disabled(false, ignoredCallsign);
++        REQUIRE(disabled.schedule().empty());
++    }
++    StationIdFixture enabled(true, "N0TEST");
++    const auto frames = enabled.schedule();
++    REQUIRE_FALSE(frames.empty());
++    for (const auto& identifier : frames) {
++        REQUIRE(decodeCallsign(identifier.raw) == "N0TEST");
++        REQUIRE(((payload(identifier.raw) >> 12U) & 15U) == 2U);
++        REQUIRE((payload(identifier.raw) & 4095U) == 1U);
++    }
++    // Keep this new actual native output separate from the frozen M1 fixtures.
++    if (const char* path = std::getenv("DVM_DIGITAL_STATION_ID_EXPORT")) {
++        std::ofstream output(path, std::ios::trunc);
++        REQUIRE(output.good());
++        const auto& identifier = frames.front();
++        output << "{\n  \"schema\": \"dvm-digital-station-id-v1\",\n"
++            << "  \"callsign\": \"N0TEST\",\n  \"channel_id\": 2,\n  \"channel_number\": 1,\n"
++            << "  \"nac\": 659,\n  \"master_off_bsi_frames\": 0,\n"
++            << "  \"master_on_bsi_frames\": " << frames.size() << ",\n"
++            << "  \"raw_tsbk_hex\": \"" << hexBytes(identifier.raw.data(), identifier.raw.size()) << "\",\n"
++            << "  \"tagged_frame_hex\": \"" << hexBytes(identifier.frame.data(), identifier.frame.size()) << "\",\n"
++            << "  \"tsdu_hex\": \"" << hexBytes(identifier.frame.data() + 2U, identifier.frame.size() - 2U) << "\",\n"
++            << "  \"radio_hardware_opened\": false,\n  \"rf_transmitted\": false\n}\n";
++        REQUIRE(output.good());
++    }
++}

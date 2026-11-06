@@ -1,0 +1,228 @@
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -1725,27 +1725,27 @@
+ 
+ /* Helper to write a P25 TDU w/ link control packet. */
+ 
+-void ControlSignaling::writeRF_TDULC(lc::TDULC* lc, bool noNetwork)
++void ControlSignaling::writeRF_TDULC(lc::TDULC* lc, bool noNetwork, lc::TDULC* outboundLC)
+ {
+     uint8_t data[P25_TDULC_FRAME_LENGTH_BYTES + 2U];
+-    ::memset(data + 2U, 0x00U, P25_TDULC_FRAME_LENGTH_BYTES);
+-
+-    // generate Sync
+-    Sync::addP25Sync(data + 2U);
+-
+-    // generate NID
+-    m_p25->m_nid.encode(data + 2U, DUID::TDULC);
+-
+-    // generate TDULC Data
+-    lc->encode(data + 2U);
+-
+-    // add status bits
+-    P25Utils::addStatusBits(data + 2U, P25_TDULC_FRAME_LENGTH_BITS, false, false);
++    const auto encode = [&](lc::TDULC* value) {
++        ::memset(data + 2U, 0x00U, P25_TDULC_FRAME_LENGTH_BYTES);
++        Sync::addP25Sync(data + 2U);
++        m_p25->m_nid.encode(data + 2U, DUID::TDULC);
++        value->encode(data + 2U);
++        P25Utils::addStatusBits(data + 2U, P25_TDULC_FRAME_LENGTH_BITS, false, false);
++    };
++    encode(lc);
+ 
+     m_p25->m_rfTimeout.stop();
+ 
+     if (!noNetwork)
+         writeNetworkRF(lc, data + 2U, false);
++
++    // RFSS addressing can differ from the received/internal session target.
++    // Neither the internal LC metadata nor its encoded network payload is changed.
++    if (outboundLC != nullptr)
++        encode(outboundLC);
+ 
+     if (m_p25->m_duplex) {
+         data[0U] = modem::TAG_EOT;
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -340,7 +340,7 @@
+              * @param lc TDULC to write to the modem.
+              * @param noNetwork Flag indicating not to write the TDULC to the network.
+              */
+-            void writeRF_TDULC(lc::TDULC* lc, bool noNetwork);
++            void writeRF_TDULC(lc::TDULC* lc, bool noNetwork, lc::TDULC* outboundLC = nullptr);
+             /**
+              * @brief Helper to write a network P25 TDU w/ link control packet.
+              * @param lc TDULC to write to the modem.
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -16,6 +16,7 @@
+ #include "common/p25/lc/tsbk/OSP_GRP_VCH_GRANT_UPD.h"
+ #include "common/p25/lc/tsbk/OSP_UU_VCH_GRANT_UPD.h"
+ #include "common/p25/lc/tdulc/TDULCFactory.h"
++#include "common/p25/lc/tdulc/LC_CALL_TERM.h"
+ #include "common/p25/P25Utils.h"
+ #include "common/p25/Sync.h"
+ #include "common/Log.h"
+@@ -1122,7 +1123,15 @@
+             m_p25->m_rfTimeout.stop();
+         }
+         else {
+-            m_p25->m_control->writeRF_TDULC(receivedLC.get(), false);
++            if (m_rfLC.getGroup() && (m_p25->m_enableControl || m_p25->m_notifyCC)) {
++                // AABD-B 3.5/AABF-D 7.3.8: the outbound RFSS group termination
++                // addresses every SU. Keep the received target for internal routing.
++                lc::tdulc::LC_CALL_TERM outboundLC;
++                outboundLC.setDstId(WUID_ALL);
++                m_p25->m_control->writeRF_TDULC(receivedLC.get(), false, &outboundLC);
++            } else {
++                m_p25->m_control->writeRF_TDULC(receivedLC.get(), false);
++            }
+         }
+ 
+         if (m_p25->m_rfState == RS_RF_AUDIO) {
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -48,6 +48,7 @@
+     static bool netActive(Control& value) { return value.m_siteData.netActive(); }
+ };
+ struct CapacityPermitTestAccess {
++    static void standaloneConventional(Control& value) { value.m_notifyCC = false; }
+     static void startOldCallHang(Control& value) { value.m_rfTGHang.start(); }
+     static void advanceHang(Control& value, uint32_t ms) { value.m_rfTGHang.clock(ms); }
+     static void advanceCallTerm(Control& value, uint32_t ms) { value.m_rfVoiceCallTermTimeout.clock(ms); }
+@@ -1699,3 +1700,135 @@
+     REQUIRE(voice.controller->getRFState() == RS_RF_LISTENING);
+     REQUIRE(voice.rpc.releases == std::vector<uint32_t>{GROUP});
+ }
++
++namespace {
++class ReceivedTerminationNetwork : public SiteNetwork {
++public:
++    std::vector<uint32_t> destinations;
++    std::vector<std::array<uint8_t, 9U>> payloads;
++    bool writeP25TDULC(const LC& control, const uint8_t* frame) override {
++        destinations.push_back(control.getDstId());
++        lc::tdulc::LC_CALL_TERM decoded;
++        REQUIRE(decoded.decode(frame));
++        std::array<uint8_t, 9U> raw{};
++        std::copy(decoded.getDecodedRaw(), decoded.getDecodedRaw() + raw.size(), raw.begin());
++        payloads.push_back(raw);
++        return true;
++    }
++};
++void receivedTerminationPermit(ControllerFixture& fixture, uint32_t destination, const std::string& token) {
++    json::object request, reply;
++    setJSON<uint32_t>(request, "dstId", destination);
++    setJSON<uint32_t>(request, "srcId", SOURCE);
++    request["permitToken"].set<std::string>(token);
++    request = wireObject(request);
++    REQUIRE(fixture.rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));
++    REQUIRE(reply["status"].get<int>() == network::NetRPC::OK);
++}
++std::array<uint8_t, 9U> receivedTerminationRF(Control& controller) {
++    std::array<uint8_t, 1024U> frame{};
++    REQUIRE(controller.getFrame(frame.data()) == P25_TDULC_FRAME_LENGTH_BYTES + 2U);
++    NID nid(0x293U); REQUIRE(nid.decode(frame.data() + 2U)); REQUIRE(nid.getDUID() == DUID::TDULC);
++    lc::tdulc::LC_CALL_TERM decoded; REQUIRE(decoded.decode(frame.data() + 2U));
++    std::array<uint8_t, 9U> raw{};
++    std::copy(decoded.getDecodedRaw(), decoded.getDecodedRaw() + raw.size(), raw.begin());
++    REQUIRE(controller.getFrame(frame.data()) == 0U);
++    return raw;
++}
++}
++
++// TIA-102.AABD-B November2014 3.5 PDF26/printed21 and AABF-D April2015
++// 7.3.8 PDF24/printed13: RFSS group CALL_TERM is addressed to FFFFFF.
++// These literal octets are derived from the verified LC field diagram, not an encoder oracle.
++TEST_CASE("Received group TDULC first keeps internal TG and emits RFSS all-unit termination", "[p25][received-group-termination]") {
++    ReceivedTerminationNetwork network;
++    ControllerFixture voice(true, false, false, false, false, &network);
++    voice.voiceMode(false); receivedTerminationPermit(voice, GROUP, "ab12:751");
++    REQUIRE(voice.voiceFrame(DUID::HDU)); REQUIRE(voice.voiceFrame(DUID::LDU1)); voice.drainVoice();
++    REQUIRE(voice.voiceFrame(DUID::TDULC, GROUP));
++    const std::array<uint8_t, 9U> expectedRF{{0x4FU, 0U, 0U, 0U, 0U, 0U, 0xFFU, 0xFFU, 0xFFU}};
++    const std::array<uint8_t, 9U> expectedInternal{{0x4FU, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0x65U}};
++    REQUIRE(receivedTerminationRF(*voice.controller) == expectedRF);
++    REQUIRE(network.destinations == std::vector<uint32_t>{GROUP});
++    REQUIRE(network.payloads == std::vector<std::array<uint8_t, 9U>>{expectedInternal});
++    REQUIRE(voice.rpc.releases == std::vector<uint32_t>{GROUP});
++    REQUIRE(voice.controller->getRFState() == RS_RF_LISTENING);
++    REQUIRE_FALSE(voice.voiceFrame(DUID::TDULC, GROUP)); // Duplicate end cannot repeat or release twice.
++    REQUIRE(voice.drainVoice().empty());
++    REQUIRE(network.destinations.size() == 1U); REQUIRE(voice.rpc.releases.size() == 1U);
++}
++
++TEST_CASE("Received private TDULC first retains the individual RF and internal target", "[p25][received-group-termination]") {
++    ReceivedTerminationNetwork network;
++    ControllerFixture voice(true, false, false, false, false, &network);
++    voice.voiceMode(false); receivedTerminationPermit(voice, TARGET, "ab12:752");
++    REQUIRE(voice.voiceFrame(DUID::HDU, TARGET, false, false));
++    REQUIRE(voice.voiceFrame(DUID::LDU1, TARGET, false, false)); voice.drainVoice();
++    REQUIRE(voice.voiceFrame(DUID::TDULC, TARGET, false, false));
++    const std::array<uint8_t, 9U> expected{{0x4FU, 0U, 0U, 0U, 0U, 0U, 0U, 0x03U, 0xEAU}};
++    REQUIRE(receivedTerminationRF(*voice.controller) == expected);
++    REQUIRE(network.destinations == std::vector<uint32_t>{TARGET});
++    REQUIRE(network.payloads == std::vector<std::array<uint8_t, 9U>>{expected});
++    REQUIRE(voice.rpc.releases == std::vector<uint32_t>{TARGET});
++    REQUIRE(voice.controller->getRFState() == RS_RF_LISTENING);
++}
++
++TEST_CASE("Received termination rejects orphan wrong-target and truncated inputs before effects", "[p25][received-group-termination]") {
++    for (bool active : {false, true}) {
++        ControllerFixture voice(true, false, false, false, false);
++        voice.voiceMode(false); voice.permitVoice("ab12:753");
++        if (active) { REQUIRE(voice.voiceFrame(DUID::HDU)); REQUIRE(voice.voiceFrame(DUID::LDU1)); voice.drainVoice(); }
++        const auto state = voice.controller->getRFState();
++        for (uint32_t destination : {0U, WUID_ALL, DENIED_GROUP, TARGET}) {
++            REQUIRE_FALSE(voice.voiceFrame(DUID::TDULC, destination));
++            REQUIRE(voice.controller->getRFState() == state);
++            REQUIRE(voice.rpc.releases.empty()); REQUIRE(voice.drainVoice().empty());
++        }
++        if (!active) REQUIRE_FALSE(voice.voiceFrame(DUID::TDULC, GROUP));
++        std::array<uint8_t, P25_TDULC_FRAME_LENGTH_BYTES + 2U> malformed{};
++        for (uint32_t i = 2U; i < malformed.size(); ++i) malformed[i] = uint8_t(0xA5U ^ (73U * i));
++        Sync::addP25Sync(malformed.data() + 2U); NID malformedNID(0x293U); malformedNID.encode(malformed.data() + 2U, DUID::TDULC);
++        P25Utils::addStatusBits(malformed.data() + 2U, P25_TDULC_FRAME_LENGTH_BITS, true, false);
++        REQUIRE_FALSE(voice.controller->processFrame(malformed.data(), malformed.size()));
++        REQUIRE(voice.controller->getRFState() == state);
++        REQUIRE(voice.rpc.releases.empty()); REQUIRE(voice.drainVoice().empty());
++        std::array<uint8_t, P25_TDULC_FRAME_LENGTH_BYTES + 2U> truncated{};
++        Sync::addP25Sync(truncated.data() + 2U); NID nid(0x293U); nid.encode(truncated.data() + 2U, DUID::TDULC);
++        for (uint32_t length : {0U, 16U, P25_TDULC_FRAME_LENGTH_BYTES + 1U}) {
++            REQUIRE_FALSE(voice.controller->processFrame(truncated.data(), length));
++            REQUIRE(voice.controller->getRFState() == state);
++            REQUIRE(voice.rpc.releases.empty()); REQUIRE(voice.drainVoice().empty());
++        }
++    }
++}
++
++TEST_CASE("Standalone non-termination TDULC remains separate from call ending", "[p25][received-group-termination]") {
++    for (bool active : {false, true}) {
++        ControllerFixture voice(true, false, false, false, false);
++        voice.voiceMode(false); voice.permitVoice("ab12:754");
++        if (active) { REQUIRE(voice.voiceFrame(DUID::HDU)); REQUIRE(voice.voiceFrame(DUID::LDU1)); voice.drainVoice(); }
++        const auto state = voice.controller->getRFState();
++        REQUIRE(voice.voiceFrame(DUID::TDULC, GROUP, true));
++        std::array<uint8_t, 1024U> frame{};
++        REQUIRE(voice.controller->getFrame(frame.data()) == P25_TDULC_FRAME_LENGTH_BYTES + 2U);
++        lc::tdulc::LC_GROUP decoded; REQUIRE(decoded.decode(frame.data() + 2U));
++        REQUIRE(decoded.getLCO() == LCO::GROUP); // Existing non-termination path remains separate.
++        REQUIRE(voice.controller->getFrame(frame.data()) == 0U);
++        REQUIRE(voice.controller->getRFState() == state); REQUIRE(voice.rpc.releases.empty());
++    }
++}
++
++TEST_CASE("Received termination change is scoped to the trunking RFSS role", "[p25][received-group-termination]") {
++    ReceivedTerminationNetwork network;
++    ControllerFixture voice(true, false, false, false, false, &network);
++    voice.voiceMode(false); p25::CapacityPermitTestAccess::standaloneConventional(*voice.controller);
++    receivedTerminationPermit(voice, GROUP, "ab12:755");
++    REQUIRE(voice.voiceFrame(DUID::HDU)); REQUIRE(voice.voiceFrame(DUID::LDU1)); voice.drainVoice();
++    REQUIRE(voice.voiceFrame(DUID::TDULC, GROUP));
++    const std::array<uint8_t, 9U> prior{{0x4FU, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0x65U}};
++    REQUIRE(receivedTerminationRF(*voice.controller) == prior);
++    REQUIRE(network.destinations == std::vector<uint32_t>{GROUP});
++    REQUIRE(network.payloads == std::vector<std::array<uint8_t, 9U>>{prior});
++    REQUIRE(voice.rpc.releases.empty());
++    REQUIRE(voice.controller->getRFState() == RS_RF_LISTENING);
++}

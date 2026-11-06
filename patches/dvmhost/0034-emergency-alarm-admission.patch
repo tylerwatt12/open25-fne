@@ -1,0 +1,280 @@
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -595,11 +595,44 @@
+             case TSBKO::ISP_EMERG_ALRM_REQ:
+             {
+                 ISP_EMERG_ALRM_REQ* isp = static_cast<ISP_EMERG_ALRM_REQ*>(tsbk.get());
++                // AABD-B 11.2.1 includes successful registration in RFSS validity.
++                // Inventory admission alone does not assign a valid WUID.
++                if (!m_p25->m_affiliations->isUnitReg(srcId)) {
++                    LogWarning(LOG_RF, P25_TSDU_STR ", emergency alarm denial, invalid WUID, srcId = %u, dstId = %u", srcId, dstId);
++                    writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_REQ_UNIT_NOT_VALID, TSBKO::ISP_EMERG_ALRM_REQ);
++                    m_inbound = false; m_p25->m_rfState = prevRfState;
++                    return false;
++                }
++
++                // Local policy admits alarms only for a supported Site group.
++                // AABC-E Table2.3.16-1: 0=null, FFFF=All Group; 1..FFFE
++                // are assignable. Do not treat a wildcard ACL as provisioning.
++                const auto alarmGroup = m_p25->m_tidLookup->find(dstId);
++                uint8_t reason = 0U;
++                if (dstId == 0U || dstId > 0xFFFEU || alarmGroup.isInvalid() || !alarmGroup.config().active())
++                    reason = ReasonCode::DENY_TGT_GROUP_NOT_VALID;
++                else if (alarmGroup.config().nonPreferred() || !alarmGroup.config().subscriberAffiliationPermitted(srcId))
++                    reason = ReasonCode::DENY_TGT_GROUP_NOT_AUTH;
++
++                // A valid SU's service denial is an acknowledged transaction;
++                // it neither accepts an emergency nor changes affiliation.
++                markValidatedWUID(srcId);
++                if (reason != 0U) {
++                    LogWarning(LOG_RF, P25_TSDU_STR ", emergency alarm denial, reason = $%02X, srcId = %u, dstId = %u", reason, srcId, dstId);
++                    // An alarm is a special status indication, not a group
++                    // voice/data audience service: AABC-E 6.2.5 otherwise
++                    // requires zero additional information and AIV=0.
++                    writeRF_TSDU_Deny(srcId, WUID_FNE, reason, TSBKO::ISP_EMERG_ALRM_REQ);
++                    m_inbound = false; m_p25->m_rfState = prevRfState;
++                    return false;
++                }
++                // AABD-B 11.2.3 permits an admitted preprogrammed group before
++                // affiliation. Alarm admission is not direct-TX permission.
+                 if (isp->getEmergency()) {
+-                    if (m_verbose) {
+-                        LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, si1 = $%02X, si2 = $%02X, srcId = %u, dstId = %u",
+-                            tsbk->toString(true).c_str(), isp->getSpecialInformation1(), isp->getSpecialInformation2(), srcId, dstId);
+-                    }
++                    // Operational alarm notification must not depend on the
++                    // diagnostic verbosity switch; the Site consumes this event.
++                    LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, si1 = $%02X, si2 = $%02X, srcId = %u, dstId = %u",
++                        tsbk->toString(true).c_str(), isp->getSpecialInformation1(), isp->getSpecialInformation2(), srcId, dstId);
+ 
+                     ::ActivityLog("P25", true, "emergency alarm request from %u", srcId);
+ 
+@@ -3053,10 +3086,10 @@
+     iosp->setSrcId(srcId);
+     iosp->setService(service);
+ 
+-    if (extended) {
+-        iosp->setAIV(true);
+-        iosp->setEX(true);
+-    }
++    // AABC-E 6.2.1.1: this helper identifies only the target SU.
++    // Basic ACK has no additional source; extended ACK carries its SUID.
++    iosp->setAIV(extended);
++    iosp->setEX(extended);
+ 
+     if (m_verbose) {
+         LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, AIV = %u, EX = %u, serviceType = $%02X, srcId = %u",
+--- /dev/null
++++ b/tests/p25/EmergencyAdmission_Tests.cpp
+@@ -0,0 +1,198 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Literal alarm/ACK/DENY fixtures: AABC-E 6.1.6/Fig6.1.6-1 PDF103/p84;
++// 6.2.1.1/Fig6.2.1-1 PDF150/p131; 6.2.5/Fig6.2.5-1 PDF160/p141;
++// AnnexB PDF232/p213; Table2.3.16-1 PDF34/p15. AABD-B11.2.1-.3
++// PDF104-106/p99-101 supplies validity/preprogrammed-group behavior.
++// Existing CRC/Trellis supply framing only. No physical or socket opens.
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/network/P25SiteRouting.h"
++#include "common/p25/acl/AccessControl.h"
++#include "common/p25/Audio.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/Log.h"
++#include "common/json/json.h"
++#include <iostream>
++#include <fstream>
++#include <cstdlib>
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <sstream>
++#include <vector>
++
++namespace {
++using namespace p25;
++using namespace p25::defines;
++constexpr uint32_t RID = 10001U, OTHER = 10005U, APP = 10002U, TG = 1001U, NAC = 0x293U;
++using Block = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++std::ostringstream& nativeLog() { static std::ostringstream log; return log; }
++size_t acceptedLogs() {
++    const auto log=nativeLog().str(); size_t count=0U, at=0U;
++    while ((at=log.find("(Emergency Alarm Request)",at))!=std::string::npos) { ++count; ++at; }
++    return count;
++}
++std::string hex(const uint8_t* bytes,size_t length) {
++    static const char* digits="0123456789ABCDEF"; std::string value;
++    for(size_t i=0U;i<length;++i) { value+=digits[bytes[i]>>4U]; value+=digits[bytes[i]&15U]; }
++    return value;
++}
++::lookups::TalkgroupRuleGroupVoice policy(bool affRestricted, const std::vector<uint32_t>& aff,
++    bool txRestricted, const std::vector<uint32_t>& tx) {
++    std::ostringstream text;
++    text << "name: TEST\nsource:\n    tgid: 1001\n    slot: 1\nconfig:\n    active: true\n    subscriber_access:\n        affiliation:\n            restricted: " << (affRestricted ? "true" : "false") << "\n            radio_ids:";
++    if (aff.empty()) text << " []\n";
++    else { text << "\n"; for (auto id : aff) text << "                - " << id << "\n"; }
++    text << "        transmit:\n            restricted: " << (txRestricted ? "true" : "false") << "\n            radio_ids:";
++    if (tx.empty()) text << " []\n";
++    else { text << "\n"; for (auto id : tx) text << "                - " << id << "\n"; }
++    yaml::Node node; REQUIRE(yaml::Parse(node, text.str()));
++    return ::lookups::TalkgroupRuleGroupVoice(node);
++}
++struct Fixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, true};
++    ::lookups::TalkgroupRulesLookup groups;
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U, true, true, false, false, false, false};
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-subscriber-test", false};
++    network::NetRPC* oldRPC = g_RPC;
++    std::unique_ptr<Control> controller;
++    explicit Fixture(bool groupACL = true) : groups("",0U,groupACL) {
++        const bool cc=true; const bool physicalInventory=true;
++        g_logDisplayLevel = 0U; g_RPC = &rpc;
++        nativeLog().str(""); nativeLog().clear(); log_internal::SetInternalOutputStream(nativeLog());
++        radios.addEntry(RID, true, "Subscriber"); radios.addEntry(OTHER, false, "Disabled"); radios.addEntry(APP, true, "Console"); radios.addEntry(10006U, true, "Not physical");
++        groups.addEntry(TG, 1U, true); groups.addEntry(1002U, 1U, true);
++        controller = std::make_unique<Control>(true, NAC, 1U, 16384U, &modem, nullptr, 120U, 1U, true,
++            &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
++        yaml::Node config; std::string mode = cc ? "true" : "false";
++        const std::string inventory = physicalInventory ? "        dispatchSubscribers:\n            - 10001\n            - 10005\n" : "        dispatchSubscribers: []\n";
++        REQUIRE(yaml::Parse(config, std::string("protocols:\n    p25:\n        managedSite: true\n") + inventory + "        verifyReg: true\n        verifyAff: true\n        inhibitUnauthorized: false\n        tduPreambleCount: 0\n        control:\n            enable: " + mode + "\n            dedicated: " + mode + "\n            ackRequests: false\n            disableTSDUMBF: true\n            redundantImmediate: false\nsystem:\n    config:\n        controlCh:\n            notifyEnable: false\n"));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 25U, false);
++        controller->setDebugVerbose(false,true);
++        controller->configureIdentification(false); controller->setCCRunning(cc); controller->setZoneConnected(false);
++        controller->affiliations()->unitReg(RID);
++    }
++    ~Fixture() { controller.reset(); g_RPC = oldRPC; log_internal::SetInternalOutputStream(std::cerr); }
++    void apply(bool ar, std::vector<uint32_t> a, bool tr, std::vector<uint32_t> t) { groups.addEntry(policy(ar, a, tr, t)); }
++    bool signal(uint8_t opcode, uint64_t value, uint8_t manufacturer = 0U) {
++        Block raw{}; raw[0] = 0x80U | opcode; raw[1] = manufacturer;
++        for (unsigned i = 0U; i < 8U; ++i) raw[2U+i] = uint8_t(value >> ((7U-i)*8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES+2U> frame{}; frame[0] = modem::TAG_DATA; frame[1] = 1U;
++        Sync::addP25Sync(frame.data()+2U); NID nid(NAC); nid.encode(frame.data()+2U, DUID::TSDU);
++        std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> encoded{}; edac::Trellis trellis;
++        trellis.encode12(raw.data(), encoded.data()); P25Utils::encode(encoded.data(), frame.data()+2U, 114U, 318U);
++        P25Utils::addStatusBits(frame.data()+2U, P25_TSDU_FRAME_LENGTH_BITS, false, false);
++        return controller->processFrame(frame.data(), frame.size());
++    }
++    std::vector<Block> responses() {
++        std::array<uint8_t, 1024> frame{}; std::vector<Block> blocks;
++        while (controller->getFrame(frame.data()) != 0U) {
++            NID nid(NAC); if (!nid.decode(frame.data()+2U) || nid.getDUID()!=DUID::TSDU) continue;
++            std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{}; Block raw{}; edac::Trellis trellis;
++            P25Utils::decode(frame.data()+2U, coded.data(), 114U, 318U); REQUIRE(trellis.decode12(coded.data(), raw.data()));
++            REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); blocks.push_back(raw);
++        }
++        return blocks;
++    }
++    void age(uint32_t ms) { controller->affiliations()->clock(ms); }
++};
++}
++
++TEST_CASE("emergency alarm ACK and accepted event require a valid SU and admitted supported Site group", "[p25][emergency-admission]") {
++    struct Case { const char* name; unsigned mode; uint32_t source; uint32_t group; uint8_t reason; };
++    const Case cases[]={
++        {"supported",0U,RID,TG,0U},
++        {"preprogrammed_before_affiliation_direct_tx_denied",1U,RID,TG,0U},
++        {"unknown_group",2U,RID,1099U,0x30U},
++        {"disabled_group",3U,RID,TG,0x30U},
++        {"not_in_applied_site_groups",4U,RID,1002U,0x30U},
++        {"subscriber_admission_selected_empty",5U,RID,TG,0x31U},
++        {"site_nonpreferred",6U,RID,TG,0x31U},
++        {"unregistered",7U,RID,TG,0x10U},
++        {"disabled_subscriber",8U,RID,TG,0x10U},
++        {"unknown_subscriber",9U,19999U,TG,0x10U},
++        {"console_identity",10U,APP,TG,0x10U},
++        {"null_group",11U,RID,0U,0x30U},
++        {"all_group_even_if_bad_lookup_provisions_it",12U,RID,0xFFFFU,0x30U},
++        {"highest_assignable_group",13U,RID,0xFFFEU,0U},
++        {"lowest_assignable_group",14U,RID,1U,0U},
++        {"wildcard_acl_does_not_provision_unknown_group",15U,RID,1099U,0x30U},
++        {"diagnostic_verbose_disabled",16U,RID,TG,0U}
++    };
++    json::array observations;
++    for (const auto& c:cases) {
++        CAPTURE(c.name,c.source,c.group,c.reason);
++        Fixture f(c.mode!=15U); auto* units=f.controller->affiliations();
++        units->groupAff(RID,1002U); // Preprogrammed emergency group can differ.
++        f.age(1000U);
++        if(c.mode==1U) { f.apply(true,{RID},true,{}); REQUIRE_FALSE(acl::AccessControl::validateGroupTransmit(RID,TG)); }
++        if(c.mode==3U) f.groups.addEntry(TG,1U,false);
++        if(c.mode==4U) f.groups.eraseEntry(1002U,1U);
++        if(c.mode==5U) f.apply(true,{},false,{});
++        if(c.mode==6U) f.groups.addEntry(TG,1U,true,false,true);
++        if(c.mode==7U) units->unitDereg(RID,false);
++        if(c.mode==8U) f.radios.addEntry(RID,false,"disabled");
++        if(c.mode==12U || c.mode==13U || c.mode==14U) f.groups.addEntry(c.group,1U,true);
++        if(c.mode==16U) f.controller->setDebugVerbose(false,false);
++        nativeLog().str(""); nativeLog().clear();
++        // Literal SI1/SI2/reserved/Group/Source field positions, not encoder output.
++        const uint64_t input=0x0102000000000000ULL|(uint64_t(c.group)<<24U)|c.source;
++        const bool accepted=c.reason==0U;
++        REQUIRE(f.signal(0x27U,input)==accepted);
++        auto output=f.responses(); REQUIRE(output.size()==1U);
++        const std::array<uint8_t,7U> prefix=accepted
++            ? std::array<uint8_t,7U>{{0xA0U,0x00U,0x27U,0x00U,0x00U,0x00U,0x00U}}
++            : std::array<uint8_t,7U>{{0xA7U,0x00U,0x27U,c.reason,0x00U,0x00U,0x00U}};
++        for(size_t i=0U;i<prefix.size();++i) REQUIRE(output[0][i]==prefix[i]);
++        REQUIRE(output[0][7]==uint8_t(c.source>>16U));
++        REQUIRE(output[0][8]==uint8_t(c.source>>8U));
++        REQUIRE(output[0][9]==uint8_t(c.source));
++        REQUIRE(acceptedLogs()==(accepted?1U:0U));
++        REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);
++        REQUIRE(units->grantSize()==0U);
++        if(c.mode!=7U) REQUIRE(units->isGroupAff(RID,1002U));
++        REQUIRE_FALSE(units->isGroupAff(RID,TG));
++        if(c.source==RID && c.mode!=7U && c.mode!=8U) {
++            REQUIRE(units->isUnitReg(RID)); REQUIRE(units->unitRegTimer(RID)==0U);
++        }
++        if(c.mode==8U) REQUIRE(units->unitRegTimer(RID)==1U);
++        json::object observation;
++        observation["case"].set<std::string>(c.name);
++        observation["accepted"].set<bool>(accepted);
++        observation["radio_id"].set<uint32_t>(c.source);
++        observation["talkgroup_id"].set<uint32_t>(c.group);
++        observation["deny_reason"].set<uint8_t>(c.reason);
++        observation["native_log"].set<std::string>(nativeLog().str());
++        observation["response_tsbk_hex"].set<std::string>(hex(output[0].data(),output[0].size()));
++        json::value record; record.set<json::object>(observation); observations.push_back(record);
++    }
++    if(const char* path=std::getenv("DVM_EMERGENCY_ADMISSION_EXPORT")) {
++        json::value document; document.set<json::array>(observations);
++        std::ofstream output(path,std::ios::trunc); REQUIRE(output.good());
++        output << document.serialize(true) << "\n"; REQUIRE(output.good());
++    }
++}
++
++TEST_CASE("admission precedes emergency cause event publication and remains valid during Site Trunking", "[p25][emergency-admission]") {
++    for(uint8_t si1:{0U,1U,2U,4U,8U,0x80U}) for(uint8_t si2:{0U,1U,0x80U}) {
++        CAPTURE(si1,si2); Fixture f; f.controller->affiliations()->groupUnaff(RID);
++        const uint64_t input=(uint64_t(si1)<<56U)|(uint64_t(si2)<<48U)|(uint64_t(TG)<<24U)|RID;
++        REQUIRE(f.signal(0x27U,input)); auto packets=f.responses(); REQUIRE(packets.size()==1U);
++        REQUIRE((packets[0][0]&0x3FU)==0x20U); REQUIRE((packets[0][2]&0x3FU)==0x27U);
++        REQUIRE(acceptedLogs()==1U); REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,TG));
++        f.groups.addEntry(TG,1U,false); nativeLog().str(""); nativeLog().clear();
++        REQUIRE_FALSE(f.signal(0x27U,input)); packets=f.responses(); REQUIRE(packets.size()==1U);
++        REQUIRE((packets[0][0]&0x3FU)==0x27U); REQUIRE(packets[0][3]==0x30U);
++        REQUIRE(acceptedLogs()==0U);
++    }
++}
+--- a/tests/p25/ZeroCapacity_Tests.cpp
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -480,7 +480,9 @@
+     REQUIRE(edac::CRC::checkCCITT162(response.data(), response.size()));
+     REQUIRE((response[0U] & 0x3FU) == TSBKO::IOSP_ACK_RSP);
+     REQUIRE(response[1U] == MFG_STANDARD);
+-    REQUIRE(response[2U] == (0x80U | TSBKO::IOSP_MSG_UPDT)); // AIV=1, EX=0, service=0x1C
++    // AABC-E 6.2.1.1 / Fig6.2.1-1: target-only basic ACK has
++    // AIV=0/EX=0; no additional source address is supplied by this helper.
++    REQUIRE(response[2U] == TSBKO::IOSP_MSG_UPDT); // AIV=0, EX=0, service=0x1C
+     for (size_t i = 3U; i < 7U; ++i)
+         REQUIRE(response[i] == 0U);
+     REQUIRE(response[7U] == 0U);

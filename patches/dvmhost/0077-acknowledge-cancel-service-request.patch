@@ -1,0 +1,88 @@
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -578,7 +578,7 @@
+                     // group eligibility changes. Do not demand membership,
+                     // direct-TX permission or current group availability.
+                     markValidatedWUID(srcId);
+-                    if (!writeRF_TSDU_ACK_FNE(srcId, isp->getService(), false, true)) {
++                    if (!writeRF_TSDU_ACK_FNE(srcId, TSBKO::ISP_CAN_SRV_REQ, false, true)) {
+                         m_inbound = false; m_p25->m_rfState = prevRfState;
+                         return false;
+                     }
+@@ -590,7 +590,7 @@
+                     ::ActivityLog("P25", true, "emergency alarm cancellation from %u on TG%u", srcId, group);
+                 } else {
+                     ::ActivityLog("P25", true, "cancel service request from %u", srcId);
+-                    writeRF_TSDU_ACK_FNE(srcId, isp->getService(), false, true);
++                    writeRF_TSDU_ACK_FNE(srcId, TSBKO::ISP_CAN_SRV_REQ, false, true);
+                 }
+             }
+             break;
+--- a/tests/p25/EmergencyCancellation_Tests.cpp
++++ b/tests/p25/EmergencyCancellation_Tests.cpp
+@@ -2,6 +2,12 @@
+ // Literal input/output fields from AABC-E6.1.5.1/Fig6.1.5-1 PDF101/p82,
+ // 6.1.5.2/Fig6.1.5-2 PDF102/p83; AABD-B11.2.2 PDF105-106/p100-101;
+ // ACK/DENY AABC-E6.2.1.1 PDF150/p131,6.2.5 PDF160/p141,AnnexB PDF232/p213.
++// Phase 1 CAI / RFSS Site cancellation ACK: TIA-102.CAEC (December 2011),
++// 19.4.5 PDF154/printed136 and 10.6.5 PDF95/printed77: Service Type=0x23,
++// AIV=0, EX=0, Target Address=WUIDorig. Document p25_32cb1ce5e2f241fb,
++// documents/tia-library/TIA-102 CAEC Final for Publication.pdf. Original PDFs
++// visually verified. The cancelled service remains 0x27 (alarm) or 0x00 (voice)
++// in the incoming request, not in the cancellation acknowledgment.
+ // Framing helpers supply CRC/Trellis/NID only, not expected service bytes.
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+@@ -168,7 +174,7 @@
+         if(c.mode==6) f.radios.addEntry(RID,false,"disabled");
+         nativeLog().str("");nativeLog().clear();
+         const bool accepted=c.denial==0;REQUIRE(f.signal(0x23,cancel(c.source,c.group,c.flags,c.reason,c.options),mfid)==accepted);
+-        auto output=f.responses();REQUIRE(output.size()==1U);reply(output[0],accepted?0x20U:0x27U,0x27U,c.denial,c.source);
++        auto output=f.responses();REQUIRE(output.size()==1U);reply(output[0],accepted?0x20U:0x27U,accepted?0x23U:0x27U,c.denial,c.source);
+         REQUIRE(acceptedLogs()==(accepted?1U:0U));
+         if(accepted) REQUIRE(nativeLog().str().find("Emergency Alarm Cancel Accepted, srcId = "+std::to_string(c.source)+", dstId = "+std::to_string(c.group))!=std::string::npos);
+         REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);REQUIRE(units->grantSize()==0U);
+@@ -179,17 +185,29 @@
+     }
+     if(const char* path=std::getenv("DVM_EMERGENCY_CANCEL_EXPORT")){json::value doc;doc.set<json::array>(observations);std::ofstream out(path,std::ios::trunc);REQUIRE(out.good());out<<doc.serialize(true)<<"\n";REQUIRE(out.good());}
+ }
++TEST_CASE("alarm and group voice cancellation ACKs identify the cancellation service", "[p25][emergency-cancel][cancel-ack-service]") {
++    for(uint8_t cancelledService:{0x27U,0x00U}) {
++        DYNAMIC_SECTION("cancelled service " << unsigned(cancelledService)) {
++            Fixture f;
++            REQUIRE(f.signal(0x23U,cancel(RID,TG,uint8_t(0x80U|cancelledService))));
++            auto output=f.responses(); REQUIRE(output.size()==1U);
++            // CAEC19.4.5/10.6.5: literal ACK opcode/service, AIV/EX and WUID.
++            reply(output[0],0x20U,0x23U,0U,RID); REQUIRE(output[0][1U]==0U);
++            REQUIRE(acceptedLogs()==(cancelledService==0x27U?1U:0U));
++        }
++    }
++}
+ TEST_CASE("lost cancellation ACK allows idempotent subscriber retries and fresh post-restart request", "[p25][emergency-cancel]") {
+     for(unsigned run=0;run<2U;++run){Fixture f;auto* units=f.controller->affiliations();
+-        for(unsigned retry=0;retry<5U;++retry){CAPTURE(run,retry);f.age(1000U);REQUIRE(f.signal(0x23,cancel()));auto responses=f.responses();REQUIRE(responses.size()==1U);reply(responses[0],0x20,0x27,0,RID);REQUIRE(acceptedLogs()==retry+1U);REQUIRE(units->unitRegTimer(RID)==0U);}
++        for(unsigned retry=0;retry<5U;++retry){CAPTURE(run,retry);f.age(1000U);REQUIRE(f.signal(0x23,cancel()));auto responses=f.responses();REQUIRE(responses.size()==1U);reply(responses[0],0x20,0x23,0,RID);REQUIRE(acceptedLogs()==retry+1U);REQUIRE(units->unitRegTimer(RID)==0U);}
+         f.age(12000U);REQUIRE(f.responses().empty());REQUIRE(acceptedLogs()==5U);
+     }
+ }
+ TEST_CASE("ordinary abbreviated and valid extended unit cancellation cannot clear emergencies", "[p25][emergency-cancel]") {
+-    for(uint8_t service:{0U,4U,0x18U,0x23U}){Fixture f;REQUIRE(f.signal(0x23,cancel(RID,TG,uint8_t(0x80U|service))));auto output=f.responses();REQUIRE(output.size()==1U);reply(output[0],0x20,service,0,RID);REQUIRE(acceptedLogs()==0U);}
++    for(uint8_t service:{0U,4U,0x18U,0x23U}){Fixture f;REQUIRE(f.signal(0x23,cancel(RID,TG,uint8_t(0x80U|service))));auto output=f.responses();REQUIRE(output.size()==1U);reply(output[0],0x20,0x23,0,RID);REQUIRE(acceptedLogs()==0U);}
+     for(uint8_t service:{4U,0x27U,0U})for(uint8_t mfid:{0U,1U}){Fixture f;ExtendedCancel p;p.header[2]=mfid;p.header[8]=0x80U|service;auto wire=p.frame();
+         REQUIRE(f.controller->processFrame(wire.data(),wire.size())==(service==4U));auto output=f.responses();REQUIRE(acceptedLogs()==0U);
+-        if(service==4U){REQUIRE(output.size()==1U);reply(output[0],0x20,4,0,RID);}else REQUIRE(output.empty());
++        if(service==4U){REQUIRE(output.size()==1U);reply(output[0],0x20,0x23,0,RID);}else REQUIRE(output.empty());
+     }
+ }
+ TEST_CASE("malformed reserved bit CRC and unavailable ACK queue cannot publish an accepted cancel", "[p25][emergency-cancel]") {
+--- a/tests/p25/AMBTIngress_Tests.cpp
++++ b/tests/p25/AMBTIngress_Tests.cpp
+@@ -87,7 +87,7 @@
+ TEST_CASE("local AMBT actions retain affiliation call alert ACK and cancel handler behavior", "[p25][ambt-ingress]"){
+  for(uint8_t opcode:{0x28,0x1F,0x20,0x23}){Fixture f;auto p=request(opcode);REQUIRE(f.input(p));auto responses=f.replies();REQUIRE_FALSE(responses.empty());
+   if(opcode==0x28)REQUIRE(f.controller->affiliations()->isGroupAff(RID,TG));
+-  if(opcode==0x23){bool ack=false;for(const auto& r:responses)if((r[0]&0x3F)==0x20&&(r[2]&0x3F)==4)ack=true;REQUIRE(ack);}
++  if(opcode==0x23){bool ack=false;for(const auto& r:responses)if((r[0]&0x3F)==0x20&&(r[2]&0x3F)==0x23)ack=true;REQUIRE(ack);}
+  }
+  Fixture f;auto p=request(0x24);data::DataHeader h;REQUIRE(h.decode(p.header.data(),true));data::DataBlock b;REQUIRE(b.decode(p.body.data(),h,true));auto typed=AMBTIngressTestAccess::typed(*f.controller,h,&b);REQUIRE(typed);REQUIRE(typed->getDstId()==RID);REQUIRE(typed->getSrcId()==WUID_FNE);REQUIRE(dynamic_cast<IOSP_EXT_FNCT*>(typed.get())->getExtendedFunction()==0x0080);
+ }

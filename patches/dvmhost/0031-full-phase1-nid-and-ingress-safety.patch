@@ -1,0 +1,1086 @@
+diff --git a/src/common/p25/FrameBounds.h b/src/common/p25/FrameBounds.h
+new file mode 100644
+--- /dev/null
++++ b/src/common/p25/FrameBounds.h
+@@ -0,0 +1,19 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Fixed CAI modem spans: BAAA-B7.2/Figs29-34; AABB-B5/Fig5-1.
++#ifndef P25_FRAME_BOUNDS_H
++#define P25_FRAME_BOUNDS_H
++#include "common/p25/P25Defines.h"
++namespace p25 {
++static inline uint32_t fixedRFFrameBytes(uint8_t duid) {
++    using namespace defines;
++    switch (duid) {
++    case DUID::HDU: return P25_HDU_FRAME_LENGTH_BYTES;
++    case DUID::TDU: return P25_TDU_FRAME_LENGTH_BYTES;
++    case DUID::LDU1: case DUID::LDU2: case DUID::VSELP1: case DUID::VSELP2: return P25_LDU_FRAME_LENGTH_BYTES;
++    case DUID::TSDU: return P25_TSDU_FRAME_LENGTH_BYTES;
++    case DUID::TDULC: return P25_TDULC_FRAME_LENGTH_BYTES;
++    default: return 0U; // Variable PDU requires its parsed header/body.
++    }
++}
++}
++#endif
+diff --git a/src/common/p25/NID.cpp b/src/common/p25/NID.cpp
+--- a/src/common/p25/NID.cpp
++++ b/src/common/p25/NID.cpp
+@@ -13,297 +13,60 @@
+ #include "p25/P25Defines.h"
+ #include "p25/NID.h"
+ #include "p25/P25Utils.h"
+-#include "edac/BCH.h"
+-
++#include "p25/NIDCodec.h"
+ using namespace p25;
+ using namespace p25::defines;
+ 
+-#include <cassert>
+-
+-// ---------------------------------------------------------------------------
+-//  Constants
+-// ---------------------------------------------------------------------------
+-
+-const uint32_t MAX_NID_ERRS = 7U;//5U;
+-
+-// ---------------------------------------------------------------------------
+-//  Public Class Members
+-// ---------------------------------------------------------------------------
+-
+-/* Initializes a new instance of the NID class. */
+-
+ NID::NID(uint32_t nac) :
+-    m_duid(DUID::HDU),
+-    m_nac(nac),
+-    m_rxTx(nullptr),
+-    m_tx(nullptr),
+-    m_splitNac(false)
++    m_duid(DUID::HDU), m_nac(nac), m_rxNac(nac), m_txNac(nac), m_splitNac(false)
+ {
+-    m_rxTx = new uint8_t*[16U];
+-    for (uint8_t i = 0; i < 16U; i++)
+-        m_rxTx[i] = nullptr;
+-
+-    m_tx = new uint8_t*[16U];
+-    for (uint8_t i = 0; i < 16U; i++)
+-        m_tx[i] = nullptr;
+-
+-    createRxTxNID(nac);
+ }
+-
+-/* Finalizes a instance of the NID class. */
+-
+-NID::~NID()
+-{
+-    cleanupArrays();
+-    delete[] m_rxTx;
+-    delete[] m_tx;
+-}
+-
+-/* Decodes P25 network identifier data. */
++NID::~NID() = default;
+ 
+ bool NID::decode(const uint8_t* data)
+ {
+-    assert(data != nullptr);
+-
+-    uint8_t nid[P25_NID_LENGTH_BYTES];
+-    P25Utils::decode(data, nid, 48U, 114U);
+-
+-    // handle digital "squelch" NAC
+-    if ((m_nac == NAC_DIGITAL_SQ) || (m_nac == NAC_REUSE_RX_NAC)) {
+-        uint32_t nac = ((nid[0U] << 4) + (nid[1U] >> 4)) & 0xFFFU;
+-        cleanupArrays();
+-        createRxTxNID(nac); // bryanb: I hate this and it'll be slow
++    m_duid = DUID::E(0xFFU);
++    if (data == nullptr)
++        return false;
++    uint8_t word[8U];
++    p25nid::extract(data, word);
++    p25nid::Result decoded;
++    if (!p25nid::decode(word, decoded))
++        return false;
++    // Preserve host profile semantics; the modem does not enable F7F repeat.
++    if (m_nac != NAC_DIGITAL_SQ && m_nac != NAC_REUSE_RX_NAC && decoded.nac != m_nac)
++        return false;
++    switch (decoded.duid) {
++    case DUID::HDU: case DUID::TDU: case DUID::LDU1: case DUID::LDU2:
++    case DUID::TSDU: case DUID::PDU: case DUID::TDULC:
++        m_rxNac = decoded.nac;
++        m_duid = DUID::E(decoded.duid);
++        return true;
++    default:
++        return false;
+     }
+-
+-    uint32_t errs = P25Utils::compare(nid, m_rxTx[DUID::LDU1], P25_NID_LENGTH_BYTES);
+-    if (errs < MAX_NID_ERRS) {
+-        m_duid = DUID::LDU1;
+-        return true;
+-    }
+-
+-    errs = P25Utils::compare(nid, m_rxTx[DUID::LDU2], P25_NID_LENGTH_BYTES);
+-    if (errs < MAX_NID_ERRS) {
+-        m_duid = DUID::LDU2;
+-        return true;
+-    }
+-
+-    errs = P25Utils::compare(nid, m_rxTx[DUID::PDU], P25_NID_LENGTH_BYTES);
+-    if (errs < MAX_NID_ERRS) {
+-        m_duid = DUID::PDU;
+-        return true;
+-    }
+-
+-    errs = P25Utils::compare(nid, m_rxTx[DUID::TSDU], P25_NID_LENGTH_BYTES);
+-    if (errs < MAX_NID_ERRS) {
+-        m_duid = DUID::TSDU;
+-        return true;
+-    }
+-
+-    errs = P25Utils::compare(nid, m_rxTx[DUID::HDU], P25_NID_LENGTH_BYTES);
+-    if (errs < MAX_NID_ERRS) {
+-        m_duid = DUID::HDU;
+-        return true;
+-    }
+-
+-    errs = P25Utils::compare(nid, m_rxTx[DUID::TDULC], P25_NID_LENGTH_BYTES);
+-    if (errs < MAX_NID_ERRS) {
+-        m_duid = DUID::TDULC;
+-        return true;
+-    }
+-
+-    errs = P25Utils::compare(nid, m_rxTx[DUID::TDU], P25_NID_LENGTH_BYTES);
+-    if (errs < MAX_NID_ERRS) {
+-        m_duid = DUID::TDU;
+-        return true;
+-    }
+-
+-    return false;
+ }
+-
+-/* Encodes P25 network identifier data. */
+ 
+ void NID::encode(uint8_t* data, defines::DUID::E duid)
+ {
+-    assert(data != nullptr);
+-
+-    if (m_splitNac) {
+-        switch (duid) {
+-            case DUID::HDU:
+-            case DUID::TDU:
+-            case DUID::LDU1:
+-            case DUID::PDU:
+-            case DUID::TSDU:
+-            case DUID::LDU2:
+-            case DUID::TDULC:
+-                P25Utils::encode(m_tx[duid], data, 48U, 114U);
+-                break;
+-            default:
+-                break;
+-        }
++    if (data == nullptr)
++        return;
++    switch (duid) {
++    case DUID::HDU: case DUID::TDU: case DUID::LDU1: case DUID::LDU2:
++    case DUID::TSDU: case DUID::PDU: case DUID::TDULC: break;
++    default: return;
+     }
+-    else {
+-        // handle digital "squelch" NAC
+-        if (m_nac == NAC_DIGITAL_SQ) {
+-            cleanupArrays();
+-            createRxTxNID(DEFAULT_NAC);
+-        }
+-
+-        switch (duid) {
+-            case DUID::HDU:
+-            case DUID::TDU:
+-            case DUID::LDU1:
+-            case DUID::PDU:
+-            case DUID::TSDU:
+-            case DUID::LDU2:
+-            case DUID::TDULC:
+-                P25Utils::encode(m_rxTx[duid], data, 48U, 114U);
+-                break;
+-            default:
+-                break;
+-        }
+-    }
++    const uint32_t nac = m_splitNac ? m_txNac :
++        (m_nac == NAC_DIGITAL_SQ ? DEFAULT_NAC : m_rxNac);
++    const uint64_t code = p25nid::encode(uint16_t((nac << 4U) | uint8_t(duid)));
++    uint8_t word[8U];
++    for (uint8_t i = 0U; i < 8U; ++i)
++        word[i] = uint8_t(code >> (56U - 8U * i));
++    P25Utils::encode(word, data, 48U, 114U);
+ }
+-
+-/* Helper to configure a separate Tx NAC. */
+ 
+ void NID::setTxNAC(uint32_t nac)
+ {
+-    if (nac == m_nac) {
+-        return;
+-    }
+-
+-    m_splitNac = true;
+-    createTxNID(nac);
++    m_splitNac = nac != m_nac;
++    m_txNac = nac;
+ }
+-
+-// ---------------------------------------------------------------------------
+-//  Private Class Members
+-// ---------------------------------------------------------------------------
+-
+-/* Cleanup NID arrays. */
+-
+-void NID::cleanupArrays()
+-{
+-    for (uint8_t i = 0; i < 16U; i++)
+-    {
+-        if (m_rxTx[i] != nullptr) {
+-            delete[] m_rxTx[i];
+-        }
+-
+-        if (m_tx[i] != nullptr) {
+-            delete[] m_tx[i];
+-        }
+-    }
+-}
+-
+-/* Internal helper to create the Rx/Tx NID. */
+-
+-void NID::createRxTxNID(uint32_t nac)
+-{
+-    edac::BCH bch;
+-
+-    m_rxTx[DUID::HDU] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_rxTx[DUID::HDU][0U] = (nac >> 4) & 0xFFU;
+-    m_rxTx[DUID::HDU][1U] = (nac << 4) & 0xF0U;
+-    m_rxTx[DUID::HDU][1U] |= DUID::HDU;
+-    bch.encode(m_rxTx[DUID::HDU]);
+-    m_rxTx[DUID::HDU][7U] &= 0xFEU;                          // Clear the parity bit
+-
+-    m_rxTx[DUID::TDU] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_rxTx[DUID::TDU][0U] = (nac >> 4) & 0xFFU;
+-    m_rxTx[DUID::TDU][1U] = (nac << 4) & 0xF0U;
+-    m_rxTx[DUID::TDU][1U] |= DUID::TDU;
+-    bch.encode(m_rxTx[DUID::TDU]);
+-    m_rxTx[DUID::TDU][7U] &= 0xFEU;                          // Clear the parity bit
+-
+-    m_rxTx[DUID::LDU1] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_rxTx[DUID::LDU1][0U] = (nac >> 4) & 0xFFU;
+-    m_rxTx[DUID::LDU1][1U] = (nac << 4) & 0xF0U;
+-    m_rxTx[DUID::LDU1][1U] |= DUID::LDU1;
+-    bch.encode(m_rxTx[DUID::LDU1]);
+-    m_rxTx[DUID::LDU1][7U] |= 0x01U;                         // Set the parity bit
+-
+-    m_rxTx[DUID::PDU] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_rxTx[DUID::PDU][0U] = (nac >> 4) & 0xFFU;
+-    m_rxTx[DUID::PDU][1U] = (nac << 4) & 0xF0U;
+-    m_rxTx[DUID::PDU][1U] |= DUID::PDU;
+-    bch.encode(m_rxTx[DUID::PDU]);
+-    m_rxTx[DUID::PDU][7U] &= 0xFEU;                          // Clear the parity bit
+-
+-    m_rxTx[DUID::TSDU] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_rxTx[DUID::TSDU][0U] = (nac >> 4) & 0xFFU;
+-    m_rxTx[DUID::TSDU][1U] = (nac << 4) & 0xF0U;
+-    m_rxTx[DUID::TSDU][1U] |= DUID::TSDU;
+-    bch.encode(m_rxTx[DUID::TSDU]);
+-    m_rxTx[DUID::TSDU][7U] &= 0xFEU;                         // Clear the parity bit
+-
+-    m_rxTx[DUID::LDU2] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_rxTx[DUID::LDU2][0U] = (nac >> 4) & 0xFFU;
+-    m_rxTx[DUID::LDU2][1U] = (nac << 4) & 0xF0U;
+-    m_rxTx[DUID::LDU2][1U] |= DUID::LDU2;
+-    bch.encode(m_rxTx[DUID::LDU2]);
+-    m_rxTx[DUID::LDU2][7U] |= 0x01U;                         // Set the parity bit
+-
+-    m_rxTx[DUID::TDULC] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_rxTx[DUID::TDULC][0U] = (nac >> 4) & 0xFFU;
+-    m_rxTx[DUID::TDULC][1U] = (nac << 4) & 0xF0U;
+-    m_rxTx[DUID::TDULC][1U] |= DUID::TDULC;
+-    bch.encode(m_rxTx[DUID::TDULC]);
+-    m_rxTx[DUID::TDULC][7U] &= 0xFEU;                        // Clear the parity bit
+-}
+-
+-/* Internal helper to create Tx NID. */
+-
+-void NID::createTxNID(uint32_t nac)
+-{
+-    edac::BCH bch;
+-
+-    m_tx[DUID::HDU] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_tx[DUID::HDU][0U] = (nac >> 4) & 0xFFU;
+-    m_tx[DUID::HDU][1U] = (nac << 4) & 0xF0U;
+-    m_tx[DUID::HDU][1U] |= DUID::HDU;
+-    bch.encode(m_tx[DUID::HDU]);
+-    m_tx[DUID::HDU][7U] &= 0xFEU;                            // Clear the parity bit
+-
+-    m_tx[DUID::TDU] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_tx[DUID::TDU][0U] = (nac >> 4) & 0xFFU;
+-    m_tx[DUID::TDU][1U] = (nac << 4) & 0xF0U;
+-    m_tx[DUID::TDU][1U] |= DUID::TDU;
+-    bch.encode(m_tx[DUID::TDU]);
+-    m_tx[DUID::TDU][7U] &= 0xFEU;                            // Clear the parity bit
+-
+-    m_tx[DUID::LDU1] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_tx[DUID::LDU1][0U] = (nac >> 4) & 0xFFU;
+-    m_tx[DUID::LDU1][1U] = (nac << 4) & 0xF0U;
+-    m_tx[DUID::LDU1][1U] |= DUID::LDU1;
+-    bch.encode(m_tx[DUID::LDU1]);
+-    m_tx[DUID::LDU1][7U] |= 0x01U;                           // Set the parity bit
+-
+-    m_tx[DUID::PDU] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_tx[DUID::PDU][0U] = (nac >> 4) & 0xFFU;
+-    m_tx[DUID::PDU][1U] = (nac << 4) & 0xF0U;
+-    m_tx[DUID::PDU][1U] |= DUID::PDU;
+-    bch.encode(m_tx[DUID::PDU]);
+-    m_tx[DUID::PDU][7U] &= 0xFEU;                            // Clear the parity bit
+-
+-    m_tx[DUID::TSDU] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_tx[DUID::TSDU][0U] = (nac >> 4) & 0xFFU;
+-    m_tx[DUID::TSDU][1U] = (nac << 4) & 0xF0U;
+-    m_tx[DUID::TSDU][1U] |= DUID::TSDU;
+-    bch.encode(m_tx[DUID::TSDU]);
+-    m_tx[DUID::TSDU][7U] &= 0xFEU;                           // Clear the parity bit
+-
+-    m_tx[DUID::LDU2] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_tx[DUID::LDU2][0U] = (nac >> 4) & 0xFFU;
+-    m_tx[DUID::LDU2][1U] = (nac << 4) & 0xF0U;
+-    m_tx[DUID::LDU2][1U] |= DUID::LDU2;
+-    bch.encode(m_tx[DUID::LDU2]);
+-    m_tx[DUID::LDU2][7U] |= 0x01U;                           // Set the parity bit
+-
+-    m_tx[DUID::TDULC] = new uint8_t[P25_NID_LENGTH_BYTES];
+-    m_tx[DUID::TDULC][0U] = (nac >> 4) & 0xFFU;
+-    m_tx[DUID::TDULC][1U] = (nac << 4) & 0xF0U;
+-    m_tx[DUID::TDULC][1U] |= DUID::TDULC;
+-    bch.encode(m_tx[DUID::TDULC]);
+-    m_tx[DUID::TDULC][7U] &= 0xFEU;                          // Clear the parity bit
+-}
+diff --git a/src/common/p25/NID.h b/src/common/p25/NID.h
+--- a/src/common/p25/NID.h
++++ b/src/common/p25/NID.h
+@@ -70,25 +70,11 @@
+     private:
+         uint32_t m_nac;
+ 
+-        uint8_t** m_rxTx;
+-        uint8_t** m_tx;
++        uint32_t m_rxNac;
++        uint32_t m_txNac;
+ 
+         bool m_splitNac;
+ 
+-        /**
+-         * @brief Cleanup NID arrays.
+-         */
+-        void cleanupArrays();
+-        /**
+-         * @brief Internal helper to create the Rx/Tx NID.
+-         * @param nac Network Access Code
+-         */
+-        void createRxTxNID(uint32_t nac);
+-        /**
+-         * @brief Internal helper to create Tx NID.
+-         * @param nac Network Access Code
+-         */
+-        void createTxNID(uint32_t nac);
+     };
+ } // namespace p25
+ 
+diff --git a/src/common/p25/NIDCodec.h b/src/common/p25/NIDCodec.h
+new file mode 100644
+--- /dev/null
++++ b/src/common/p25/NIDCodec.h
+@@ -0,0 +1,129 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Phase 1 NID codec: TIA-102.BAAA-B (June 2017), sections 4.9 and 7.5,
++ * Tables 6, 17-19; PDF pages 34, 57-59. Transmission order is MSB first.
++ * See docs/standards-audit/firmware-nid-plan.md for exact source provenance.
++ * Shared verbatim by the modem and host; no heap, recursion or hardware access.
++ */
++#ifndef P25_NID_CODEC_H
++#define P25_NID_CODEC_H
++#include <stdint.h>
++namespace p25nid {
++struct Result { uint16_t nac; uint8_t duid; uint8_t correctedBits; };
++// GF(64), primitive polynomial x^6+x+1. Values alpha^0 ... alpha^62.
++static const uint8_t EXP[63] = {
++    1,2,4,8,16,32,3,6,12,24,48,35,5,10,20,40,
++    19,38,15,30,60,59,53,41,17,34,7,14,28,56,51,37,
++    9,18,36,11,22,44,27,54,47,29,58,55,45,25,50,39,
++    13,26,52,43,21,42,23,46,31,62,63,61,57,49,33
++};
++static const uint8_t LOG[64] = {
++    255,0,1,6,2,12,7,26,3,32,13,35,8,48,27,18,
++    4,24,33,16,14,52,36,54,9,45,49,38,28,41,19,56,
++    5,62,25,11,34,31,17,47,15,23,53,51,37,44,55,40,
++    10,61,46,30,50,22,39,43,29,60,42,21,20,59,57,58
++};
++static inline uint8_t multiply(uint8_t a, uint8_t b)
++{
++    if (a == 0U || b == 0U) return 0U;
++    uint8_t exponent = LOG[a] + LOG[b];
++    if (exponent >= 63U) exponent -= 63U;
++    return EXP[exponent];
++}
++static inline uint8_t divide(uint8_t a, uint8_t b)
++{
++    if (a == 0U) return 0U; // caller guarantees nonzero divisor
++    int16_t exponent = int16_t(LOG[a]) - int16_t(LOG[b]);
++    if (exponent < 0) exponent += 63;
++    return EXP[exponent];
++}
++static inline uint64_t encode(uint16_t information)
++{
++    // Systematic (63,16,23), octal generator 6331 1413 6723 5453.
++    const uint64_t data = uint64_t(information) << 47U;
++    uint64_t remainder = data;
++    for (int8_t bit = 62; bit >= 47; --bit)
++        if ((remainder & (uint64_t(1U) << bit)) != 0U)
++            remainder ^= UINT64_C(0xCD930BDD3B2B) << (bit - 47);
++    const uint8_t p = ((information >> 1U) ^ information) & 1U;
++    return ((data | remainder) << 1U) | p;
++}
++static inline bool syndromes(uint64_t core, uint8_t out[22])
++{
++    // Binary-field identity S(2j)=S(j)^2 halves the explicit evaluations.
++    for (uint8_t j = 1U; j < 22U; j += 2U) {
++        uint8_t syndrome = 0U, exponent = 0U;
++        uint64_t bits = core;
++        for (uint8_t bit = 0U; bit < 63U; ++bit) {
++            if ((bits & 1U) != 0U) syndrome ^= EXP[exponent];
++            bits >>= 1U;
++            exponent += j;
++            if (exponent >= 63U) exponent -= 63U;
++        }
++        out[j - 1U] = syndrome;
++    }
++    for (uint8_t j = 2U; j <= 22U; j += 2U) {
++        const uint8_t half = out[j / 2U - 1U];
++        out[j - 1U] = multiply(half, half);
++    }
++    uint8_t any = 0U;
++    for (uint8_t i = 0U; i < 22U; ++i) any |= out[i];
++    return any == 0U;
++}
++static inline bool decode(const uint8_t word[8], Result& result)
++{
++    result.nac = 0U; result.duid = 0xFFU; result.correctedBits = 0U;
++    if (word == 0) return false;
++    uint64_t received = 0U;
++    for (uint8_t i = 0U; i < 8U; ++i) received = (received << 8U) | word[i];
++    uint64_t core = received >> 1U;
++    uint8_t s[22];
++    if (!syndromes(core, s)) {
++        // Berlekamp-Massey; fixed arrays, bounded by 22, no recursion or heap.
++        uint8_t c[23] = {1U}, b[23] = {1U}, previous[23];
++        uint8_t degree = 0U, shift = 1U, lastDiscrepancy = 1U;
++        for (uint8_t n = 0U; n < 22U; ++n) {
++            uint8_t discrepancy = s[n];
++            for (uint8_t i = 1U; i <= degree; ++i) discrepancy ^= multiply(c[i], s[n - i]);
++            if (discrepancy == 0U) { ++shift; continue; }
++            for (uint8_t i = 0U; i < 23U; ++i) previous[i] = c[i];
++            const uint8_t factor = divide(discrepancy, lastDiscrepancy);
++            for (uint8_t i = 0U; i + shift < 23U; ++i) c[i + shift] ^= multiply(factor, b[i]);
++            if (2U * degree <= n) {
++                degree = n + 1U - degree;
++                if (degree > 11U) return false;
++                for (uint8_t i = 0U; i < 23U; ++i) b[i] = previous[i];
++                lastDiscrepancy = discrepancy; shift = 1U;
++            } else ++shift;
++        }
++        uint8_t roots = 0U;
++        for (uint8_t bit = 0U; bit < 63U; ++bit) {
++            const uint8_t x = EXP[bit == 0U ? 0U : 63U - bit];
++            uint8_t value = c[degree];
++            for (uint8_t i = degree; i > 0U; --i) value = multiply(value, x) ^ c[i - 1U];
++            if (value == 0U) { core ^= uint64_t(1U) << bit; ++roots; }
++        }
++        if (roots != degree || !syndromes(core, s)) return false;
++    }
++    const uint16_t information = uint16_t(core >> 47U);
++    const uint64_t corrected = encode(information);
++    if ((corrected >> 1U) != core) return false;
++    uint64_t differences = received ^ corrected;
++    uint8_t errors = 0U;
++    while (differences != 0U) { differences &= differences - 1U; ++errors; }
++    if (errors > 11U) return false; // includes P, excludes status symbols
++    result.nac = information >> 4U; result.duid = information & 0x0FU;
++    result.correctedBits = errors;
++    return true;
++}
++// Caller guarantees full raw span: 114 bits/15 bytes, excluding no input bytes.
++static inline void extract(const uint8_t* raw, uint8_t word[8])
++{
++    for (uint8_t i = 0U; i < 8U; ++i) word[i] = 0U;
++    for (uint8_t bit = 0U; bit < 64U; ++bit) {
++        const uint8_t airBit = 48U + bit + (bit >= 22U ? 2U : 0U);
++        if ((raw[airBit >> 3U] & (0x80U >> (airBit & 7U))) != 0U)
++            word[bit >> 3U] |= 0x80U >> (bit & 7U);
++    }
++}
++} // namespace p25nid
++#endif
+diff --git a/src/common/p25/data/Assembler.cpp b/src/common/p25/data/Assembler.cpp
+--- a/src/common/p25/data/Assembler.cpp
++++ b/src/common/p25/data/Assembler.cpp
+@@ -31,6 +31,9 @@
+ // ---------------------------------------------------------------------------
+ //  Public Class Members
+ // ---------------------------------------------------------------------------
++
++// Storage includes every declared coded block and the six-bit header offset.
++static const uint32_t RAW_PDU_STORAGE_BYTES = P25_MAX_PDU_BLOCKS * P25_PDU_FEC_LENGTH_BYTES + 64U;
+ 
+ /* Initializes a new instance of the Assembler class. */
+ 
+@@ -55,8 +58,8 @@
+     m_pduUserData = new uint8_t[P25_MAX_PDU_BLOCKS * P25_PDU_CONFIRMED_LENGTH_BYTES + 2U];
+     ::memset(m_pduUserData, 0x00U, P25_MAX_PDU_BLOCKS * P25_PDU_CONFIRMED_LENGTH_BYTES + 2U);
+ 
+-    m_rawPDU = new uint8_t[P25_PDU_FRAME_LENGTH_BYTES + 2U];
+-    ::memset(m_rawPDU, 0x00U, P25_PDU_FRAME_LENGTH_BYTES + 2U);
++    m_rawPDU = new uint8_t[RAW_PDU_STORAGE_BYTES];
++    ::memset(m_rawPDU, 0x00U, RAW_PDU_STORAGE_BYTES);
+ }
+ 
+ /* Finalizes a instance of the Assembler class. */
+@@ -67,6 +70,7 @@
+         delete[] dataBlocks;
+     if (m_pduUserData != nullptr)
+         delete[] m_pduUserData;
++    delete[] m_rawPDU;
+ }
+ 
+ /* Helper to disassemble a P25 PDU frame into user data. */
+@@ -74,6 +78,7 @@
+ bool Assembler::disassemble(const uint8_t* pduBlock, uint32_t blockLength, bool resetState)
+ {
+     assert(pduBlock != nullptr);
++    if (blockLength != P25_PDU_FEC_LENGTH_BYTES) return false;
+ 
+     if (resetState) {
+         resetDisassemblyState();
+@@ -97,6 +102,17 @@
+             return false;
+         }
+ 
++        const uint32_t count = dataHeader.getBlocksToFollow();
++        const uint8_t format = dataHeader.getFormat();
++        if (format != PDUFormatType::RSP) {
++            const uint32_t capacity = count * (format == PDUFormatType::CONFIRMED ?
++                P25_PDU_CONFIRMED_DATA_LENGTH_BYTES : P25_PDU_UNCONFIRMED_LENGTH_BYTES);
++            if (capacity < 4U || dataHeader.getPadLength() > capacity - 4U) {
++                resetDisassemblyState();
++                return false;
++            }
++        }
++
+         if (s_verbose) {
+             LogInfoEx(LOG_P25, P25_PDU_STR ", ISP, ack = %u, outbound = %u, fmt = $%02X, mfId = $%02X, sap = $%02X, fullMessage = %u, blocksToFollow = %u, padLength = %u, packetLength = %u, S = %u, n = %u, seqNo = %u, lastFragment = %u, hdrOffset = %u, llId = %u",
+                 dataHeader.getAckNeeded(), dataHeader.getOutbound(), dataHeader.getFormat(), dataHeader.getMFId(), dataHeader.getSAP(), dataHeader.getFullMessage(),
+@@ -125,6 +141,7 @@
+         return true;
+     }
+     else {
++        if ((m_blockCount - 1U) * blockLength + blockLength > RAW_PDU_STORAGE_BYTES) return false;
+         ::memcpy(m_rawPDU + ((m_blockCount - 1U) * blockLength), pduBlock, blockLength);
+         m_dataOffset += blockLength;
+         m_blockCount++;
+@@ -155,6 +172,10 @@
+             // decode data blocks
+             for (uint32_t i = 0U; i < blocksToFollow; i++) {
+                 ::memset(buffer, 0x00U, P25_PDU_FEC_LENGTH_BYTES);
++                if (offset + P25_PDU_FEC_LENGTH_BYTES > m_dataOffset) {
++                    resetDisassemblyState();
++                    return false;
++                }
+                 ::memcpy(buffer, m_rawPDU + offset, P25_PDU_FEC_LENGTH_BYTES);
+ 
+                 bool ret = dataBlocks[i].decode(buffer, dataHeader);
+@@ -299,12 +320,16 @@
+                 }
+             }
+ 
+-            // reorganize PDU buffer for second header offsetting
++            // Secondary headers cannot consume more than the declared packet.
++            if (secondHeaderOffset > packetLength) {
++                resetDisassemblyState();
++                return false;
++            }
+             if (secondHeaderOffset > 0U) {
+-                uint8_t tempBuf[P25_MAX_PDU_BLOCKS * P25_PDU_CONFIRMED_LENGTH_BYTES + 2U];
+-                ::memcpy(tempBuf, m_pduUserData + secondHeaderOffset, packetLength - 4U);
+-                ::memset(m_pduUserData, 0x00U, P25_MAX_PDU_BLOCKS * P25_PDU_CONFIRMED_LENGTH_BYTES + 2U);
+-                ::memcpy(m_pduUserData, tempBuf, packetLength - secondHeaderOffset);
++                const uint32_t payloadLength = packetLength - secondHeaderOffset;
++                ::memmove(m_pduUserData, m_pduUserData + secondHeaderOffset, payloadLength);
++                ::memset(m_pduUserData + payloadLength, 0U,
++                    P25_MAX_PDU_BLOCKS * P25_PDU_CONFIRMED_LENGTH_BYTES + 2U - payloadLength);
+             }
+ 
+             if (s_dumpPDUData && m_dataBlockCnt > 0U) {
+@@ -425,8 +450,10 @@
+ #if DEBUG_P25_PDU_DATA
+         LogDebugEx(LOG_P25, "Assembler::assemble()", "packetLength = %u, secondHeaderOffset = %u, padLength = %u, pduLength = %u", packetLength, secondHeaderOffset, padLength, pduLength);
+ #endif
++        if (packetLength < secondHeaderOffset) return nullptr;
+         if (dataHeader.getFormat() != PDUFormatType::AMBT) {
+-            ::memcpy(packetData + secondHeaderOffset, pduUserData, packetLength);
++            // packetLength includes the secondary header already written above.
++            ::memcpy(packetData + secondHeaderOffset, pduUserData, packetLength - secondHeaderOffset);
+             edac::CRC::addCRC32(packetData, packetLength + 4U);
+ 
+             if (padLength > 0U) {
+@@ -536,7 +563,7 @@
+     m_dataOffset = 0U;
+ 
+     ::memset(m_pduUserData, 0x00U, P25_MAX_PDU_BLOCKS * P25_PDU_CONFIRMED_LENGTH_BYTES + 2U);
+-    ::memset(m_rawPDU, 0x00U, P25_PDU_FRAME_LENGTH_BYTES + 2U);
++    ::memset(m_rawPDU, 0x00U, RAW_PDU_STORAGE_BYTES);
+ 
+     m_packetCRCFailed = false;
+     m_complete = false;
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -10,6 +10,7 @@
+  */
+ #include "Defines.h"
+ #include "common/p25/P25Defines.h"
++#include "common/p25/FrameBounds.h"
+ #include "common/p25/acl/AccessControl.h"
+ #include "common/p25/P25Utils.h"
+ #include "common/p25/Sync.h"
+@@ -805,12 +806,6 @@
+     if (len < 17U) return false;
+     bool sync = data[1U] == 0x01U;
+ 
+-    if (m_rfState == RS_RF_AUDIO || m_rfState == RS_RF_DATA) {
+-        if (m_rfLossWatchdog.isRunning()) {
+-            m_rfLossWatchdog.start();
+-        }
+-    }
+-
+     if (!sync && m_rfState == RS_RF_LISTENING) {
+         uint8_t syncBytes[P25_SYNC_LENGTH_BYTES];
+         ::memcpy(syncBytes, data + 2U, P25_SYNC_LENGTH_BYTES);
+@@ -841,14 +836,30 @@
+     // Decode the NID
+     bool valid = m_nid.decode(data + 2U);
+ 
+-    if (!valid && m_rfState == RS_RF_LISTENING)
++    // Failed NID does not identify an operational data unit. Drop it before
++    // refreshing a live call, halting the control channel or selecting a handler.
++    // Raw sync/debug observations above are independent of this admission gate.
++    if (!valid)
+         return false;
+ 
+     // if the controller is currently in an reject state; block any RF traffic
+-    if (valid && m_rfState == RS_RF_REJECTED)
++    if (m_rfState == RS_RF_REJECTED)
+         return false;
+ 
+     DUID::E duid = m_nid.getDUID();
++    const uint32_t fixedBytes = fixedRFFrameBytes(duid);
++    if (duid == DUID::PDU) {
++        if (!packet::Data::validRFFrame(data, len)) return false;
++    } else if (fixedBytes == 0U || len < fixedBytes + 2U) return false;
++
++    if (m_rfState == RS_RF_AUDIO || m_rfState == RS_RF_DATA) {
++        if (m_rfLossWatchdog.isRunning()) {
++            m_rfLossWatchdog.start();
++        }
++    }
++
++
++
+     if (!m_authoritative && duid == DUID::LDU1 && m_permittedSrcId != 0U) {
+         if (len < P25_LDU_FRAME_LENGTH_BYTES + 2U) return false;
+         lc::LC identity;
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -312,6 +312,7 @@
+         friend struct CapacityPermitTestAccess;
+         friend struct DispatchGrantTestAccess;
+         friend struct MultiSiteTestAccess;
++        friend struct NIDReceiveTestAccess;
+ #endif
+         friend class packet::Voice;
+         packet::Voice* m_voice;
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -173,13 +173,11 @@
+ 
+     DUID::E duid = DUID::HDU;
+     if (preDecodedTSBK == nullptr) {
+-        // Decode the NID
+-        bool valid = m_p25->m_nid.decode(data + 2U);
+-
+-        if (m_p25->m_rfState == RS_RF_LISTENING && !valid)
+-            return false;
+-
++        // Parsed AMBT objects below have a separate validated-object contract.
++        if (len < P25_TSDU_FRAME_LENGTH_BYTES + 2U) return false;
++        if (!m_p25->m_nid.decode(data + 2U)) return false;
+         duid = m_p25->m_nid.getDUID();
++        if (duid != DUID::TSDU) return false;
+     } else {
+         duid = DUID::TSDU;
+     }
+diff --git a/src/host/p25/packet/Data.cpp b/src/host/p25/packet/Data.cpp
+--- a/src/host/p25/packet/Data.cpp
++++ b/src/host/p25/packet/Data.cpp
+@@ -16,6 +16,7 @@
+ #include "common/p25/P25Utils.h"
+ #include "common/p25/Sync.h"
+ #include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
+ #include "common/Log.h"
+ #include "common/Utils.h"
+ #include "p25/packet/Data.h"
+@@ -53,15 +54,65 @@
+ 
+ /* Process a data frame from the RF interface. */
+ 
++bool Data::validRFFrame(const uint8_t* data, uint32_t len)
++{
++    // BAAA-B7.2.4/Fig35: fill variable packets through the next status symbol.
++    // Current modem window: at most512 RF bytes; continuation is unqualified.
++    if (data == nullptr || len < 47U || len > P25_PDU_FRAME_LENGTH_BYTES + 2U)
++        return false;
++    uint8_t stripped[P25_PDU_FRAME_LENGTH_BYTES] = {0U};
++    const uint32_t available = P25Utils::decode(data + 2U, stripped, 0U, (len - 2U) * 8U);
++    if (available < P25_PREAMBLE_LENGTH_BITS + P25_PDU_FEC_LENGTH_BITS) return false;
++    uint8_t encoded[P25_PDU_FEC_LENGTH_BYTES] = {0U};
++    uint8_t decoded[P25_PDU_HEADER_LENGTH_BYTES] = {0U};
++    Utils::getBitRange(stripped, encoded, P25_PREAMBLE_LENGTH_BITS, P25_PDU_FEC_LENGTH_BITS);
++    edac::Trellis trellis;
++    if (!trellis.decode12(encoded, decoded) || !edac::CRC::checkCCITT162(decoded, sizeof(decoded))) return false;
++    data::DataHeader header;
++    if (!header.decode(decoded, true)) return false;
++    const uint32_t count = header.getBlocksToFollow();
++    const uint8_t format = header.getFormat();
++    if (format != PDUFormatType::CONFIRMED && format != PDUFormatType::UNCONFIRMED &&
++        format != PDUFormatType::RSP && format != PDUFormatType::AMBT) return false;
++    if (count >= P25_MAX_PDU_BLOCKS) return false;
++    if (format == PDUFormatType::RSP) {
++        if (count != 0U) return false; // supported response profile is header-only
++    } else {
++        const uint32_t capacity = count * (format == PDUFormatType::CONFIRMED ?
++            P25_PDU_CONFIRMED_DATA_LENGTH_BYTES : P25_PDU_UNCONFIRMED_LENGTH_BYTES);
++        if (capacity < 4U || header.getPadLength() > capacity - 4U ||
++            header.getHeaderOffset() > capacity - 4U - header.getPadLength()) return false;
++        const uint32_t packetLength = capacity - 4U - header.getPadLength();
++        uint32_t secondary = 0U;
++        if (header.getSAP() == PDUSAP::EXT_ADDR)
++            secondary = format == PDUFormatType::CONFIRMED ? 4U : 12U;
++        else if (header.getSAP() == PDUSAP::ENC_USER_DATA || header.getSAP() == PDUSAP::ENC_KMM)
++            secondary = 13U;
++        if (secondary > packetLength) return false;
++    }
++    const uint32_t bits = P25_PREAMBLE_LENGTH_BITS + (count + 1U) * P25_PDU_FEC_LENGTH_BITS;
++    const uint32_t rawBits = 72U * ((bits + 69U) / 70U);
++    if (available < bits || (len - 2U) * 8U < rawBits) return false;
++    // Verify body FEC/CRC in a local assembler before any CC/session effects.
++    if (format == PDUFormatType::RSP) return true;
++    data::Assembler probe;
++    if (!probe.disassemble(encoded, sizeof(encoded), true)) return false;
++    for (uint32_t i = 0U; i < count; ++i) {
++        Utils::getBitRange(stripped, encoded, P25_PREAMBLE_LENGTH_BITS + (i + 1U) * P25_PDU_FEC_LENGTH_BITS,
++            P25_PDU_FEC_LENGTH_BITS);
++        if (!probe.disassemble(encoded, sizeof(encoded))) return false;
++    }
++    return probe.getComplete() && !probe.getPacketCRCFailed() && probe.getUndecodableBlockCount() == 0U;
++}
++
+ bool Data::process(uint8_t* data, uint32_t len)
+ {
+     assert(data != nullptr);
+ 
+-    // decode the NID
+-    bool valid = m_p25->m_nid.decode(data + 2U);
+-
+-    if (m_p25->m_rfState == RS_RF_LISTENING && !valid)
+-        return false;
++    // Only complete first-window packets are supported by this ingress path.
++    // The former nonzero-count offset/append path was unsafe reassembly.
++    if (len < 17U || m_rfPDUCount != 0U || !validRFFrame(data, len)) return false;
++    if (!m_p25->m_nid.decode(data + 2U) || m_p25->m_nid.getDUID() != DUID::PDU) return false;
+ 
+     if (m_prevRfState != RS_RF_DATA) {
+         m_prevRfState = m_p25->m_rfState;
+@@ -92,12 +143,10 @@
+ 
+         //Utils::dump(1U, "P25, Data::process(), Raw PDU ISP", data, len);
+ 
+-        uint32_t start = m_rfPDUCount * P25_PDU_FRAME_LENGTH_BITS;
+-
+         uint8_t buffer[P25_PDU_FRAME_LENGTH_BYTES];
+         ::memset(buffer, 0x00U, P25_PDU_FRAME_LENGTH_BYTES);
+ 
+-        uint32_t bits = P25Utils::decode(data + 2U, buffer, start, start + P25_PDU_FRAME_LENGTH_BITS);
++        uint32_t bits = P25Utils::decode(data + 2U, buffer, 0U, (len - 2U) * 8U);
+         m_rfPDUBits += Utils::getBits(buffer, m_rfPDU, 0U, bits);
+ 
+         if (m_rfPDUCount == 0U) {
+@@ -236,23 +285,14 @@
+ 
+                     m_rfPDUCount++;
+                 }
+-            } else {
+-                LogDebugEx(LOG_P25, "Data::process()", "blocksToFollow = %u, bitLength = %u, rfPDUBits = %u, rfPDUCount = %u", blocksToFollow, bitLength, m_rfPDUBits, m_rfPDUCount);
+-                ::memset(buffer, 0x00U, P25_PDU_FEC_LENGTH_BYTES);
+-                Utils::getBitRange(m_rfPDU, buffer, P25_PREAMBLE_LENGTH_BITS + P25_PDU_FEC_LENGTH_BITS, P25_PDU_FEC_LENGTH_BITS);
+-
+-                bool ret = m_rfAssembler->disassemble(buffer, P25_PDU_FEC_LENGTH_BYTES);
+-                if (!ret) {
+-                    m_rfPDUCount = 0U;
+-                    m_rfPDUBits = 0U;
++            }
++
++            if (m_rfAssembler->getComplete()) {
++                if (m_rfAssembler->getPacketCRCFailed() || m_rfAssembler->getUndecodableBlockCount() != 0U) {
++                    resetRF();
+                     m_p25->m_rfState = m_prevRfState;
+                     return false;
+                 }
+-
+-                m_rfPDUCount++;
+-            }
+-
+-            if (m_rfAssembler->getComplete()) {
+                 m_rfPduUserDataLength = m_rfAssembler->getUserDataLength();
+                 m_rfAssembler->getUserData(m_rfPduUserData);
+ 
+diff --git a/src/host/p25/packet/Data.h b/src/host/p25/packet/Data.h
+--- a/src/host/p25/packet/Data.h
++++ b/src/host/p25/packet/Data.h
+@@ -64,6 +64,8 @@
+              * @returns bool True, if data frame is processed, otherwise false.
+              */
+             bool process(uint8_t* data, uint32_t len);
++            // Complete first-span CAI packet preflight, no operational effects.
++            static bool validRFFrame(const uint8_t* data, uint32_t len);
+             /**
+              * @brief Process a data frame from the network.
+              * @param data Buffer containing data frame.
+diff --git a/src/host/p25/packet/Voice.cpp b/src/host/p25/packet/Voice.cpp
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -10,6 +10,7 @@
+  */
+ #include "Defines.h"
+ #include "common/p25/P25Defines.h"
++#include "common/p25/FrameBounds.h"
+ #include "common/p25/acl/AccessControl.h"
+ #include "common/p25/dfsi/DFSIDefines.h"
+ #include "common/p25/lc/tsbk/OSP_GRP_VCH_GRANT_UPD.h"
+@@ -105,8 +106,8 @@
+     }
+ 
+     DUID::E duid = m_p25->m_nid.getDUID();
+-    if ((duid == DUID::HDU && len < P25_HDU_FRAME_LENGTH_BYTES + 2U) ||
+-        ((duid == DUID::LDU1 || duid == DUID::LDU2) && len < P25_LDU_FRAME_LENGTH_BYTES + 2U)) return false;
++    const uint32_t fixedBytes = fixedRFFrameBytes(duid);
++    if (duid == DUID::TSDU || fixedBytes == 0U || len < fixedBytes + 2U) return false;
+ 
+     if (m_p25->m_rfState != RS_RF_LISTENING) {
+         m_p25->m_rfTGHang.start();
+diff --git a/tests/p25/MultiAlgorithmVoice_Tests.cpp b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+--- a/tests/p25/MultiAlgorithmVoice_Tests.cpp
++++ b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+@@ -7,6 +7,10 @@
+ #include "host/modem/port/ModemNullPort.h"
+ #include "common/p25/Audio.h"
+ #include "common/p25/NID.h"
++#include "common/p25/FrameBounds.h"
++#include "common/p25/data/DataBlock.h"
++#include "common/edac/CRC.h"
++#include "common/p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.h"
+ #include "common/p25/P25Utils.h"
+ #include "common/p25/Sync.h"
+ #include "common/Log.h"
+@@ -17,6 +21,21 @@
+ #include <memory>
+ #include <string>
+ #include <vector>
++
++namespace p25 {
++struct NIDReceiveTestAccess {
++    static bool voice(Control& c,uint8_t* p,uint32_t n) { return c.m_voice->process(p,n); }
++    static bool signaling(Control& c,uint8_t* p,uint32_t n) { return c.m_control->process(p,n); }
++    static bool packet(Control& c,uint8_t* p,uint32_t n) { return c.m_data->process(p,n); }
++    static void enableControl(Control& c) { c.m_enableControl = true; }
++    static bool parsed(Control& c,std::unique_ptr<lc::TSBK> value) { uint8_t placeholder=0; return c.m_control->process(&placeholder,1U,std::move(value)); }
++    static void ageWatchdog(Control& c) { c.m_rfLossWatchdog.start(5U); c.m_rfLossWatchdog.clock(1500U); }
++    static std::array<uint32_t, 6U> state(const Control& c) {
++        return {{uint32_t(c.m_rfState.load()), uint32_t(c.m_ccRunning), uint32_t(c.m_ccHalted),
++            c.m_rfLossWatchdog.getTimer(), c.m_rssiCount, c.m_frameLossCnt}};
++    }
++};
++}
+ 
+ namespace {
+ using namespace p25;
+@@ -239,3 +258,130 @@
+         REQUIRE(fixture.network.outgoing.empty()); // Network voice must not loop back to its input.
+     }
+ }
++
++TEST_CASE("uncorrectable NID cannot halt or refresh active RF voice", "[p25][nid-receive][voice-path]") {
++    for (bool controlRunning : {false, true}) {
++        CAPTURE(controlRunning);
++        VoiceFixture fixture(0x84U, 7U);
++        MI first{1U,2U,3U,4U,5U,6U,7U,8U,0U};
++        REQUIRE(fixture.rf(DUID::HDU, first)); fixture.drain();
++        REQUIRE(fixture.rf(DUID::LDU1, first)); fixture.requireLDU(DUID::LDU1, first);
++        fixture.controller->setCCRunning(controlRunning); fixture.controller->setCCHalted(false);
++        NIDReceiveTestAccess::ageWatchdog(*fixture.controller);
++        const auto before = NIDReceiveTestAccess::state(*fixture.controller);
++        REQUIRE(before[0U] == RS_RF_AUDIO); REQUIRE(before[3U] == 1U);
++        const auto forwarded = fixture.network.outgoing.size();
++        auto invalid = fixture.frame(DUID::LDU1, 0x84U, 7U, first);
++        // Independent full BAAB-B matrix search: minimum distance15, outside11.
++        constexpr uint64_t bad = UINT64_C(0x0123456789ABCDEF);
++        uint8_t* raw = invalid.data() + 2U;
++        for (unsigned bit=0; bit<64; ++bit) {
++            unsigned air=48+bit+(bit>=22?2:0);
++            WRITE_BIT(raw, air, (bad>>(63-bit))&1U);
++        }
++        REQUIRE_FALSE(fixture.controller->processFrame(invalid.data(), invalid.size()));
++        REQUIRE(NIDReceiveTestAccess::state(*fixture.controller) == before);
++        REQUIRE(fixture.drain().empty()); REQUIRE(fixture.network.outgoing.size() == forwarded);
++        fixture.controller->setCCRunning(false);
++        REQUIRE(fixture.rf(DUID::LDU2, first)); fixture.requireLDU(DUID::LDU2, first);
++    }
++}
++
++TEST_CASE("seven through eleven NID errors reach actual RF voice", "[p25][nid-receive][voice-path]") {
++    for (unsigned errors=7; errors<=11; ++errors) {
++        CAPTURE(errors);
++        VoiceFixture fixture(0x84U,7U); MI first{1U,2U,3U,4U,5U,6U,7U,8U,0U};
++        REQUIRE(fixture.rf(DUID::HDU,first)); fixture.drain();
++        REQUIRE(fixture.rf(DUID::LDU1,first)); fixture.requireLDU(DUID::LDU1,first);
++        auto damaged=fixture.frame(DUID::LDU2,0x84U,7U,first);
++        if (errors%2U) { damaged.push_back(0U); damaged.push_back(0U); } // optional RSSI tail
++        for (unsigned i=0; i<errors; ++i) { unsigned bit=i*5,air=48+bit+(bit>=22?2:0); damaged[2+air/8]^=uint8_t(0x80U>>(air%8)); }
++        REQUIRE(fixture.controller->processFrame(damaged.data(),damaged.size()));
++        fixture.requireLDU(DUID::LDU2,first); REQUIRE(fixture.controller->getRFState()==RS_RF_AUDIO);
++    }
++}
++
++TEST_CASE("exact short fixed CAI buffers cannot change active receive state", "[p25][nid-ingress][voice-path]") {
++    VoiceFixture fixture(0x84U,7U); MI first{1U,2U,3U,4U,5U,6U,7U,8U,0U};
++    REQUIRE(fixture.rf(DUID::HDU,first)); fixture.drain();
++    REQUIRE(fixture.rf(DUID::LDU1,first)); fixture.requireLDU(DUID::LDU1,first);
++    NIDReceiveTestAccess::enableControl(*fixture.controller);
++    fixture.controller->setCCRunning(true); fixture.controller->setCCHalted(false);
++    NIDReceiveTestAccess::ageWatchdog(*fixture.controller);
++    const auto before=NIDReceiveTestAccess::state(*fixture.controller);
++    const auto forwarded=fixture.network.outgoing.size();
++    for (auto duid:{DUID::HDU,DUID::TDU,DUID::LDU1,DUID::LDU2,DUID::TSDU,DUID::TDULC}) {
++        const auto required=fixedRFFrameBytes(duid)+2U;
++        std::vector<uint8_t> full(required,0U);full[0]=modem::TAG_DATA;full[1]=1;
++        Sync::addP25Sync(full.data()+2);NID(NAC).encode(full.data()+2,duid);
++        for (unsigned n=0;n<required;++n) {
++            CAPTURE(unsigned(duid),n);
++            std::unique_ptr<uint8_t[]> exact(new uint8_t[n]);std::copy(full.begin(),full.begin()+n,exact.get());
++            REQUIRE_FALSE(fixture.controller->processFrame(exact.get(),n));
++            if(duid==DUID::TSDU) REQUIRE_FALSE(NIDReceiveTestAccess::signaling(*fixture.controller,exact.get(),n));
++            else REQUIRE_FALSE(NIDReceiveTestAccess::voice(*fixture.controller,exact.get(),n));
++            REQUIRE(NIDReceiveTestAccess::state(*fixture.controller)==before);
++        }
++    }
++    REQUIRE(fixture.drain().empty());REQUIRE(fixture.network.outgoing.size()==forwarded);
++    std::array<uint8_t,1> lost{{modem::TAG_LOST}};
++    REQUIRE_FALSE(fixture.controller->processFrame(lost.data(),lost.size())); // legitimate short loss input
++    REQUIRE(fixture.controller->getRFState()==RS_RF_AUDIO);
++}
++
++namespace {
++std::vector<uint8_t> pduFrame(uint8_t format,unsigned count,bool badCRC=false,unsigned pad=0,unsigned offset=0,uint8_t sap=PDUSAP::USER_DATA) {
++    p25::data::DataHeader header;header.setFormat(format);header.setMFId(MFG_STANDARD);
++    header.setAckNeeded(false);header.setOutbound(false);header.setFullMessage(true);
++    header.setLLId(Source);header.setSAP(format==PDUFormatType::AMBT?PDUSAP::TRUNK_CTRL:sap);
++    header.setBlocksToFollow(count);header.setPadLength(pad);header.setHeaderOffset(offset);
++    const unsigned encodedBits=112+(count+1)*196,rawBytes=9*((encodedBits+69)/70);
++    const unsigned blockBytes=format==PDUFormatType::CONFIRMED?16:12;
++    std::vector<uint8_t> stripped(rawBytes+1,0U),body(count*blockBytes,0U);
++    std::array<uint8_t,25> encoded{};header.encode(encoded.data());
++    Utils::setBitRange(encoded.data(),stripped.data(),112,196);
++    if(body.size()>=4){for(unsigned i=0;i<body.size()-4;++i)body[i]=uint8_t(i+1);edac::CRC::addCRC32(body.data(),body.size());if(badCRC)body[0]^=1;}
++    for(unsigned i=0;i<count;++i){p25::data::DataBlock block;block.setFormat(format);block.setData(body.data()+i*blockBytes);block.encode(encoded.data());Utils::setBitRange(encoded.data(),stripped.data(),112+(i+1)*196,196);}
++    std::vector<uint8_t> result(rawBytes+2,0U);result[0]=modem::TAG_DATA;result[1]=1;
++    P25Utils::encode(stripped.data(),result.data()+2,0,rawBytes*8);
++    Sync::addP25Sync(result.data()+2);NID(NAC).encode(result.data()+2,DUID::PDU);
++    return result;
++}
++}
++
++TEST_CASE("variable PDU ingress validates complete bounded header and packet before state", "[p25][nid-ingress][packet-integrity]") {
++    VoiceFixture fixture(0x84U,7U);MI first{1U,2U,3U,4U,5U,6U,7U,8U,0U};
++    REQUIRE(fixture.rf(DUID::HDU,first));fixture.drain();REQUIRE(fixture.rf(DUID::LDU1,first));fixture.requireLDU(DUID::LDU1,first);
++    fixture.controller->setCCRunning(true);fixture.controller->setCCHalted(false);NIDReceiveTestAccess::ageWatchdog(*fixture.controller);
++    const auto before=NIDReceiveTestAccess::state(*fixture.controller);const auto forwarded=fixture.network.outgoing.size();
++    for(auto format:{PDUFormatType::CONFIRMED,PDUFormatType::UNCONFIRMED,PDUFormatType::AMBT,PDUFormatType::RSP}) {
++        auto full=pduFrame(format,format==PDUFormatType::RSP?0:1);
++        REQUIRE(packet::Data::validRFFrame(full.data(),full.size()));
++        REQUIRE(full.size()==(format==PDUFormatType::RSP?47U:74U));
++        for(unsigned n=0;n<full.size();++n){CAPTURE(unsigned(format),n);std::unique_ptr<uint8_t[]> exact(new uint8_t[n]);std::copy(full.begin(),full.begin()+n,exact.get());REQUIRE_FALSE(fixture.controller->processFrame(exact.get(),n));REQUIRE_FALSE(NIDReceiveTestAccess::packet(*fixture.controller,exact.get(),n));REQUIRE(NIDReceiveTestAccess::state(*fixture.controller)==before);}
++    }
++    for(auto format:{PDUFormatType::UNCONFIRMED,PDUFormatType::AMBT}){auto bad=pduFrame(format,1,true);REQUIRE_FALSE(packet::Data::validRFFrame(bad.data(),bad.size()));REQUIRE_FALSE(fixture.controller->processFrame(bad.data(),bad.size()));REQUIRE_FALSE(NIDReceiveTestAccess::packet(*fixture.controller,bad.data(),bad.size()));REQUIRE(NIDReceiveTestAccess::state(*fixture.controller)==before);}
++    auto maximum=pduFrame(PDUFormatType::UNCONFIRMED,18);REQUIRE(maximum.size()==497);REQUIRE(packet::Data::validRFFrame(maximum.data(),maximum.size()));
++    for(uint8_t sap:{PDUSAP::EXT_ADDR,PDUSAP::ENC_USER_DATA,PDUSAP::ENC_KMM}) {
++        auto malformed=pduFrame(PDUFormatType::UNCONFIRMED,1,false,0,0,sap);
++        REQUIRE_FALSE(packet::Data::validRFFrame(malformed.data(),malformed.size()));
++        REQUIRE_FALSE(fixture.controller->processFrame(malformed.data(),malformed.size()));
++        REQUIRE_FALSE(NIDReceiveTestAccess::packet(*fixture.controller,malformed.data(),malformed.size()));
++        REQUIRE(NIDReceiveTestAccess::state(*fixture.controller)==before);
++        uint8_t stripped[512]{},encoded[25]{};P25Utils::decode(malformed.data()+2,stripped,0,(malformed.size()-2)*8);
++        p25::data::Assembler probe;Utils::getBitRange(stripped,encoded,112,196);REQUIRE(probe.disassemble(encoded,25,true));Utils::getBitRange(stripped,encoded,308,196);REQUIRE_FALSE(probe.disassemble(encoded,25));
++    }
++    auto noBody=pduFrame(PDUFormatType::UNCONFIRMED,0);REQUIRE_FALSE(packet::Data::validRFFrame(noBody.data(),noBody.size()));
++    auto unknown=pduFrame(0x1FU,1);REQUIRE_FALSE(packet::Data::validRFFrame(unknown.data(),unknown.size()));
++    auto offset=pduFrame(PDUFormatType::CONFIRMED,1,false,0,63);REQUIRE_FALSE(packet::Data::validRFFrame(offset.data(),offset.size()));
++    auto tooLarge=pduFrame(PDUFormatType::UNCONFIRMED,19);tooLarge.resize(514);REQUIRE_FALSE(packet::Data::validRFFrame(tooLarge.data(),tooLarge.size()));
++    auto underflow=pduFrame(PDUFormatType::UNCONFIRMED,1,false,31);REQUIRE_FALSE(packet::Data::validRFFrame(underflow.data(),underflow.size()));
++    REQUIRE(fixture.drain().empty());REQUIRE(fixture.network.outgoing.size()==forwarded);
++}
++
++TEST_CASE("parsed AMBT route preserves its one-byte placeholder contract", "[p25][nid-ingress]") {
++    VoiceFixture fixture(0x84U,7U);NIDReceiveTestAccess::enableControl(*fixture.controller);
++    auto parsed=std::make_unique<p25::lc::tsbk::MBT_IOSP_GRP_AFF>();parsed->setSrcId(Source);parsed->setDstId(Group);
++    REQUIRE(NIDReceiveTestAccess::parsed(*fixture.controller,std::move(parsed)));
++    // This checks raw-span bypass only; operational AMBT serialization is separate.
++}
+diff --git a/tests/p25/PDU_Confirmed_AuxES_Test.cpp b/tests/p25/PDU_Confirmed_AuxES_Test.cpp
+--- a/tests/p25/PDU_Confirmed_AuxES_Test.cpp
++++ b/tests/p25/PDU_Confirmed_AuxES_Test.cpp
+@@ -38,7 +38,7 @@
+         0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+     };
+ 
+-    uint8_t encryptMI[] =
++    uint8_t encryptMI[MI_LENGTH_BYTES] =
+     {
+         0x70, 0x30, 0xF1, 0xF7, 0x65, 0x69, 0x26, 0x67
+     };
+diff --git a/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp b/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp
+--- a/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp
++++ b/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp
+@@ -38,7 +38,7 @@
+         0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+     };
+ 
+-    uint8_t encryptMI[] =
++    uint8_t encryptMI[MI_LENGTH_BYTES] =
+     {
+         0x70, 0x30, 0xF1, 0xF7, 0x65, 0x69, 0x26, 0x67
+     };

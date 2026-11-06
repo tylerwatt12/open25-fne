@@ -1,0 +1,337 @@
+diff --git a/tests/p25/ZeroCapacity_Fixtures.cpp b/tests/p25/ZeroCapacity_Fixtures.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/ZeroCapacity_Fixtures.cpp
+@@ -0,0 +1,332 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Test-only M1 fixtures: synthetic encoded requests, actual controller output.
++ * No modem port or network socket is opened. No live grants are exported. */
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/json/json.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
++#include "common/p25/lc/tsbk/TSBKFactory.h"
++#include "common/Log.h"
++
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <cerrno>
++#include <cstdlib>
++#include <fstream>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++#include <sys/stat.h>
++
++namespace {
++using namespace p25;
++using namespace p25::defines;
++using namespace p25::lc;
++using namespace p25::lc::tsbk;
++constexpr uint32_t RID = 1001U, TARGET_RID = 1002U, DISABLED_RID = 1003U, UNKNOWN_RID = 1004U;
++constexpr uint32_t TG = 101U, DISABLED_TG = 102U, UNKNOWN_TG = 103U, NAC = 0x293U;
++using RawBlock = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++using TaggedFrame = std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES + 2U>;
++
++template<typename T> void put(json::value& target, const T& value) {
++    // This pinned JSON library declares undefined rvalue scalar overloads.
++    // Keep every value a const lvalue so its implemented specialization is used.
++    target.set<T>(value);
++}
++
++std::string hexBytes(const uint8_t* data, size_t size) {
++    static const char* digits = "0123456789ABCDEF";
++    std::string result;
++    for (size_t i = 0; i < size; ++i) {
++        result.push_back(digits[data[i] >> 4U]);
++        result.push_back(digits[data[i] & 15U]);
++    }
++    return result;
++}
++
++RawBlock block(uint8_t opcode, uint64_t payload) {
++    RawBlock raw{};
++    raw[0U] = 0x80U | opcode;
++    for (uint32_t i = 0U; i < 8U; ++i)
++        raw[2U + i] = uint8_t(payload >> ((7U - i) * 8U));
++    edac::CRC::addCCITT162(raw.data(), raw.size());
++    return raw;
++}
++
++RawBlock registration(uint32_t source, uint32_t system = 1U) {
++    return block(TSBKO::IOSP_U_REG, (uint64_t(1U) << 36U) | (uint64_t(system) << 24U) | source);
++}
++RawBlock affiliation(uint32_t source, uint32_t group) {
++    return block(TSBKO::IOSP_GRP_AFF, (uint64_t(1U) << 40U) | (uint64_t(group) << 24U) | source);
++}
++
++struct ExpectedFrame {
++    uint8_t opcode;
++    int response = -1;
++    int service = -1;
++    int radio = -1;
++    int group = -1;
++};
++
++struct FixtureController {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, true};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, true};
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-fixture-rpc", false};
++    network::NetRPC* previousRPC = g_RPC;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U,
++        true, true, false, false, false, false};
++    NID inboundNID{NAC};
++    std::unique_ptr<Control> controller;
++
++    FixtureController() {
++        g_logDisplayLevel = 0U;
++        g_RPC = &rpc;
++        radios.addEntry(RID, true, "Allowed fixture radio");
++        radios.addEntry(TARGET_RID, true, "Allowed fixture target");
++        radios.addEntry(DISABLED_RID, false, "Disabled fixture radio");
++        groups.addEntry(TG, 1U, true);
++        groups.addEntry(DISABLED_TG, 1U, false);
++        controller = std::make_unique<Control>(true, NAC, 1U, 16384U, &modem, nullptr,
++            120U, 1U, true, &channels, &radios, &groups, &identities, &rssi,
++            false, false, false, false, false);
++        yaml::Node config;
++        REQUIRE(yaml::Parse(config, std::string(R"(
++protocols:
++    p25:
++        inhibitUnauthorized: false
++        verifyReg: true
++        verifyAff: true
++        unitToUnitAvailCheck: false
++        sndcpSupport: false
++        tduPreambleCount: 0
++        control:
++            enable: true
++            dedicated: true
++            voiceOnControl: false
++            ackRequests: false
++            disableTSDUMBF: true
++            redundantImmediate: false
++system:
++    config:
++        controlCh:
++            notifyEnable: false
++)")));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(),
++            1U, 1U, 1U, 1U, 2U, 1U, false);
++        controller->setCCRunning(true);
++    }
++    ~FixtureController() {
++        controller.reset();
++        g_RPC = previousRPC;
++    }
++
++    TaggedFrame encode(const RawBlock& raw) {
++        TaggedFrame frame{};
++        frame[0U] = modem::TAG_DATA;
++        frame[1U] = 1U;
++        Sync::addP25Sync(frame.data() + 2U);
++        inboundNID.encode(frame.data() + 2U, DUID::TSDU);
++        std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{};
++        edac::Trellis trellis;
++        trellis.encode12(raw.data(), coded.data());
++        P25Utils::encode(coded.data(), frame.data() + 2U, 114U, 318U);
++        P25Utils::addStatusBits(frame.data() + 2U, P25_TSDU_FRAME_LENGTH_BITS, false, false);
++        return frame;
++    }
++    bool receive(const RawBlock& raw) {
++        auto frame = encode(raw);
++        return controller->processFrame(frame.data(), frame.size());
++    }
++    json::object state(uint32_t source = RID, uint32_t group = TG) {
++        json::object result;
++        put<bool>(result["radio_registered"], controller->affiliations()->isUnitReg(source));
++        put<bool>(result["radio_affiliated"], controller->affiliations()->isGroupAff(source, group));
++        put<uint32_t>(result["registration_count"], controller->affiliations()->unitRegSize());
++        put<uint32_t>(result["affiliation_count"], controller->affiliations()->grpAffSize());
++        put<uint32_t>(result["grant_count"], controller->affiliations()->grantSize());
++        put<uint32_t>(result["traffic_resource_count"], channels.rfChDataSize());
++        REQUIRE(controller->affiliations()->grantSize() == 0U);
++        REQUIRE(channels.rfChDataSize() == 0U);
++        REQUIRE(channels.rfChSize() == 0U);
++        return result;
++    }
++    json::array drain(const std::vector<ExpectedFrame>& expected) {
++        json::array frames;
++        std::array<uint8_t, 1024U> frame{};
++        uint32_t length;
++        bool immediate;
++        while ((length = controller->getFrame(frame.data(), &immediate)) != 0U) {
++            REQUIRE(length == P25_TSDU_FRAME_LENGTH_BYTES + 2U);
++            REQUIRE(frames.size() < expected.size());
++            const auto& wanted = expected[frames.size()];
++            std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{};
++            P25Utils::decode(frame.data() + 2U, coded.data(), 114U, 318U);
++            RawBlock raw{};
++            edac::Trellis trellis;
++            REQUIRE(trellis.decode12(coded.data(), raw.data()));
++            REQUIRE(edac::CRC::checkCCITT162(raw.data(), raw.size()));
++            REQUIRE((raw[0U] & 0x3FU) == wanted.opcode);
++            if (wanted.response >= 0) {
++                const int response = wanted.opcode == TSBKO::IOSP_U_REG ? (raw[2U] >> 4U) & 3U :
++                    wanted.opcode == TSBKO::IOSP_GRP_AFF ? raw[2U] & 3U : raw[3U];
++                REQUIRE(response == wanted.response);
++            }
++            if (wanted.service >= 0)
++                REQUIRE((raw[2U] & 0x3FU) == wanted.service);
++            json::object output;
++            put<std::string>(output["tsdu_hex"], hexBytes(frame.data() + 2U, length - 2U));
++            put<std::string>(output["raw_tsbk_hex"], hexBytes(raw.data(), raw.size()));
++            put<bool>(output["immediate"], immediate);
++            json::object fields;
++            put<int>(fields["opcode"], wanted.opcode);
++            put<int>(fields["response"], wanted.response);
++            put<int>(fields["service"], wanted.service);
++            put<int>(fields["radio"], wanted.radio);
++            put<int>(fields["talkgroup"], wanted.group);
++            put<json::object>(output["expected"], fields);
++            frames.emplace_back(output);
++        }
++        REQUIRE(frames.size() == expected.size());
++        return frames;
++    }
++    void prepareAccess(bool affiliate = true, bool registerTarget = false) {
++        REQUIRE(receive(registration(RID)));
++        drain({{TSBKO::IOSP_U_REG, ResponseCode::ACCEPT, -1, RID}});
++        if (affiliate) {
++            REQUIRE(receive(affiliation(RID, TG)));
++            drain({{TSBKO::IOSP_GRP_AFF, ResponseCode::ACCEPT, -1, RID, TG}});
++        }
++        if (registerTarget) {
++            REQUIRE(receive(registration(TARGET_RID)));
++            drain({{TSBKO::IOSP_U_REG, ResponseCode::ACCEPT, -1, TARGET_RID}});
++        }
++    }
++};
++
++json::object requestCase(FixtureController& fixture, const std::string& name,
++    const RawBlock& request, const std::vector<ExpectedFrame>& expected,
++    bool handled = true, uint32_t source = RID, uint32_t group = TG) {
++    json::object record;
++    put<std::string>(record["case"], name);
++    put<uint32_t>(record["source_radio"], source);
++    put<uint32_t>(record["talkgroup"], group);
++    put<json::object>(record["state_before"], fixture.state(source, group));
++    put<std::string>(record["request_raw_tsbk_hex"], hexBytes(request.data(), request.size()));
++    auto frame = fixture.encode(request);
++    put<std::string>(record["request_tsdu_hex"], hexBytes(frame.data() + 2U, frame.size() - 2U));
++    REQUIRE(fixture.controller->processFrame(frame.data(), frame.size()) == handled);
++    put<bool>(record["handler_accepted"], handled);
++    put<json::array>(record["frames"], fixture.drain(expected));
++    put<json::object>(record["state_after"], fixture.state(source, group));
++    return record;
++}
++}
++
++TEST_CASE("Export actual zero-capacity controller response frames for independent M1 decode", "[p25][zero-capacity-fixtures]") {
++    const char* destination = std::getenv("TRUNKSYSTEM_FIXTURE_DIR");
++    if (destination == nullptr || *destination == '\0') {
++        SUCCEED("Set TRUNKSYSTEM_FIXTURE_DIR to a new absolute output directory to export synthetic M1 fixtures");
++        return;
++    }
++    const std::string directory(destination);
++    REQUIRE(directory.front() == '/');
++    struct stat existing;
++    REQUIRE(::stat(directory.c_str(), &existing) == -1);
++    REQUIRE(errno == ENOENT);
++    REQUIRE(::mkdir(directory.c_str(), 0700) == 0);
++    json::array cases;
++    for (const auto& radio : std::vector<std::pair<uint32_t, std::string>>{
++        {RID, "registration-allowed"}, {DISABLED_RID, "registration-disabled"}, {UNKNOWN_RID, "registration-unknown"}}) {
++        FixtureController fixture;
++        const uint8_t response = radio.first == RID ? ResponseCode::ACCEPT : ResponseCode::REFUSED;
++        cases.emplace_back(requestCase(fixture, radio.second, registration(radio.first),
++            {{TSBKO::IOSP_U_REG, response, -1, int(radio.first)}}, true, radio.first));
++        REQUIRE(fixture.controller->affiliations()->isUnitReg(radio.first) == (radio.first == RID));
++    }
++    {
++        FixtureController fixture;
++        cases.emplace_back(requestCase(fixture, "registration-wrong-system", registration(RID, 2U),
++            {{TSBKO::IOSP_U_REG, ResponseCode::DENY, -1, RID}}));
++        REQUIRE_FALSE(fixture.controller->affiliations()->isUnitReg(RID));
++    }
++    for (const auto& group : std::vector<std::pair<uint32_t, std::string>>{
++        {TG, "affiliation-allowed"}, {DISABLED_TG, "affiliation-disabled"}, {UNKNOWN_TG, "affiliation-unknown"}}) {
++        FixtureController fixture;
++        fixture.prepareAccess(false);
++        const uint8_t response = group.first == TG ? ResponseCode::ACCEPT : ResponseCode::DENY;
++        cases.emplace_back(requestCase(fixture, group.second, affiliation(RID, group.first),
++            {{TSBKO::IOSP_GRP_AFF, response, -1, RID, int(group.first)}}, true, RID, group.first));
++        REQUIRE(fixture.controller->affiliations()->isGroupAff(RID, group.first) == (group.first == TG));
++    }
++    for (bool group : {true, false}) {
++        FixtureController fixture;
++        fixture.prepareAccess(true, !group);
++        const uint8_t opcode = group ? TSBKO::IOSP_GRP_VCH : TSBKO::IOSP_UU_VCH;
++        const uint32_t target = group ? TG : TARGET_RID;
++        cases.emplace_back(requestCase(fixture, group ? "group-no-capacity" : "individual-no-capacity",
++            block(opcode, (uint64_t(target) << 24U) | RID),
++            {{TSBKO::OSP_DENY_RSP, ReasonCode::DENY_NO_RF_RSRC_AVAIL, opcode, RID, group ? int(TG) : -1}}));
++    }
++    {
++        FixtureController fixture;
++        fixture.prepareAccess();
++        json::object expiry;
++        put<std::string>(expiry["case"], "registration-expiry");
++        put<uint32_t>(expiry["source_radio"], RID);
++        put<json::object>(expiry["state_before"], fixture.state());
++        const uint32_t elapsed = fixture.controller->affiliations()->unitRegTimeout(RID) * 1000U + 1U;
++        put<uint32_t>(expiry["synthetic_elapsed_ms"], elapsed);
++        fixture.controller->affiliations()->clock(elapsed);
++        put<json::array>(expiry["frames"], fixture.drain({{TSBKO::OSP_U_REG_CMD, -1, -1, RID}}));
++        put<json::object>(expiry["state_after"], fixture.state());
++        cases.emplace_back(expiry);
++        REQUIRE_FALSE(fixture.controller->affiliations()->isUnitReg(RID));
++        REQUIRE_FALSE(fixture.controller->affiliations()->isGroupAff(RID, TG));
++        cases.emplace_back(requestCase(fixture, "registration-after-expiry", registration(RID),
++            {{TSBKO::IOSP_U_REG, ResponseCode::ACCEPT, -1, RID}}));
++        cases.emplace_back(requestCase(fixture, "affiliation-after-expiry", affiliation(RID, TG),
++            {{TSBKO::IOSP_GRP_AFF, ResponseCode::ACCEPT, -1, RID, TG}}));
++    }
++    {
++        FixtureController fixture;
++        RawBlock corrupt = registration(RID);
++        corrupt.back() ^= 1U; // Valid trellis/NID, deliberately invalid TSBK CRC.
++        REQUIRE_FALSE(edac::CRC::checkCCITT162(corrupt.data(), corrupt.size()));
++        cases.emplace_back(requestCase(fixture, "malformed-registration-crc", corrupt, {}, false));
++        REQUIRE_FALSE(fixture.controller->affiliations()->isUnitReg(RID));
++        cases.emplace_back(requestCase(fixture, "registration-after-malformed", registration(RID),
++            {{TSBKO::IOSP_U_REG, ResponseCode::ACCEPT, -1, RID}}));
++    }
++    json::object manifest;
++    put<int>(manifest["schema"], 1);
++    put<std::string>(manifest["engine_base_revision"], "435ff45b367887ffa94c89cb1a2779628e0f7bfb");
++    put<std::string>(manifest["fixture_kind"], "synthetic encoded requests; actual Control::getFrame responses");
++    put<uint32_t>(manifest["nac"], NAC);
++    put<bool>(manifest["radio_hardware_opened"], false);
++    put<bool>(manifest["rf_transmitted"], false);
++    put<bool>(manifest["all_cases_no_grants"], true);
++    json::object options;
++    put<bool>(options["ack_requests"], false);
++    put<bool>(options["multi_block_output"], false);
++    put<bool>(options["redundant_immediate_output"], false);
++    put<bool>(options["inhibit_unauthorized"], false);
++    put<bool>(options["strict_rid_acl"], true);
++    put<bool>(options["strict_talkgroup_acl"], true);
++    put<json::object>(manifest["fixture_options"], options);
++    put<json::array>(manifest["cases"], cases);
++    std::ofstream output(directory + "/fixtures.json", std::ios::binary);
++    REQUIRE(output.good());
++    output << json::value(manifest).serialize(true) << '\n';
++    output.close();
++    REQUIRE(output.good());
++}

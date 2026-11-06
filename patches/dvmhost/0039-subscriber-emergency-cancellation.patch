@@ -1,0 +1,341 @@
+--- a/src/common/p25/P25Defines.h
++++ b/src/common/p25/P25Defines.h
+@@ -357,6 +357,7 @@
+                 DENY_PTT_COLLIDE = 0x67U,               //!< Push-to-Talk Collision
+                 DENY_PTT_BONK = 0x77U,                  //!< Push-to-Talk Denial/Bonk
+ 
++                DENY_CALL_OPTIONS_NOT_VALID = 0xF0U,   //!< Call Options Invalid For This Service
+                 DENY_SYS_UNSUPPORTED_SVC = 0xFFU,       //!< Service Unsupported
+             
+             // Queue Codes
+--- a/src/common/p25/lc/tsbk/ISP_CAN_SRV_REQ.cpp
++++ b/src/common/p25/lc/tsbk/ISP_CAN_SRV_REQ.cpp
+@@ -43,10 +43,13 @@
+ 
+     ulong64_t tsbkValue = TSBK::toValue(tsbk);
+ 
++    // AABC-E Figure6.1.5-1 fixes octet2 bit6 to zero.
++    if ((tsbk[0U] & 0x40U) != 0U) return false;
++
+     m_aivFlag = (((tsbkValue >> 56) & 0xFFU) & 0x80U) == 0x80U;                     // Additional Info. Flag
+     m_service = (uint8_t)((tsbkValue >> 56) & 0x3FU);                               // Service Type
+     m_response = (uint8_t)((tsbkValue >> 48) & 0xFFU);                              // Reason
+-    m_dstId = (uint32_t)((tsbkValue >> 24) & 0xFFFFFFU);                            // Target Radio Address
++    m_dstId = (uint32_t)((tsbkValue >> 24) & 0xFFFFFFU);                            // Additional Information: service options/address
+     m_srcId = (uint32_t)(tsbkValue & 0xFFFFFFU);                                    // Source Radio Address
+ 
+     return true;
+--- a/src/host/p25/packet/AMBTIngress.h
++++ b/src/host/p25/packet/AMBTIngress.h
+@@ -32,7 +32,11 @@
+         if (dynamic_cast<const MBT_IOSP_GRP_AFF*>(&source) == nullptr) return nullptr;
+         message = std::make_unique<IOSP_GRP_AFF>(); message->setEmergency(source.getEmergency()); break;
+     case TSBKO::ISP_CAN_SRV_REQ:
+-        if (dynamic_cast<const MBT_ISP_CAN_SRV_REQ*>(&source) == nullptr) return nullptr;
++        // AABC-E 6.1.5.2 permits extended cancellation only for Unit-to-Unit
++        // calls. It has no emergency options/group field; never reinterpret
++        // the other SU address as an abbreviated emergency cancellation.
++        if (dynamic_cast<const MBT_ISP_CAN_SRV_REQ*>(&source) == nullptr ||
++            !source.getAIV() || source.getService() != TSBKO::IOSP_UU_VCH) return nullptr;
+         message = std::make_unique<ISP_CAN_SRV_REQ>(); message->setService(source.getService());
+         message->setAIV(source.getAIV()); message->setResponse(source.getResponse()); break;
+     case TSBKO::IOSP_EXT_FNCT: {
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -235,7 +235,9 @@
+         }
+         if (physicalSourceRequest && !m_p25->physicalSubscriberPermitted(srcId)) {
+             LogWarning(LOG_RF, P25_TSDU_STR ", physical subscriber denial, srcId = %u, dstId = %u", srcId, dstId);
+-            writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_REQ_UNIT_NOT_VALID, tsbk->getLCO());
++            const uint8_t deniedService = tsbk->getLCO() == TSBKO::ISP_CAN_SRV_REQ
++                ? tsbk->getService() : tsbk->getLCO();
++            writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_REQ_UNIT_NOT_VALID, deniedService);
+             m_inbound = false; m_p25->m_rfState = prevRfState;
+             return false;
+         }
+@@ -530,9 +532,44 @@
+                         tsbk->toString(true).c_str(), isp->getAIV(), isp->getService(), isp->getResponse(), srcId, dstId);
+                 }
+ 
+-                ::ActivityLog("P25", true, "cancel service request from %u", srcId);
+-
+-                writeRF_TSDU_ACK_FNE(srcId, isp->getService(), false, true);
++                // AABD-B 11.2.2: this SU can cancel its own alarm, not a
++                // different radio or a dispatcher-created incident. Source is
++                // octets 7-9; dstId holds options8/group16, not a target RID.
++                if (!m_p25->m_affiliations->isUnitReg(srcId)) {
++                    writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_REQ_UNIT_NOT_VALID, isp->getService());
++                    m_inbound = false; m_p25->m_rfState = prevRfState;
++                    return false;
++                }
++                if (isp->getService() == TSBKO::ISP_EMERG_ALRM_REQ) {
++                    const uint32_t group = dstId & 0xFFFFU;
++                    if (!isp->getAIV() || isp->getResponse() != CancelService::NONE || (dstId & 0x800000U) == 0U) {
++                        writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_CALL_OPTIONS_NOT_VALID, isp->getService());
++                        m_inbound = false; m_p25->m_rfState = prevRfState;
++                        return false;
++                    }
++                    if (group == 0U || group == 0xFFFFU) {
++                        writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_TGT_GROUP_NOT_VALID, isp->getService());
++                        m_inbound = false; m_p25->m_rfState = prevRfState;
++                        return false;
++                    }
++                    // Cancellation can retire an earlier accepted alarm after
++                    // group eligibility changes. Do not demand membership,
++                    // direct-TX permission or current group availability.
++                    markValidatedWUID(srcId);
++                    if (!writeRF_TSDU_ACK_FNE(srcId, isp->getService(), false, true)) {
++                        m_inbound = false; m_p25->m_rfState = prevRfState;
++                        return false;
++                    }
++                    // Exactly one operational event per accepted request,
++                    // independent of verbose diagnostics. Repeated requests
++                    // receive ACK again; the Site clears its matching RF record
++                    // idempotently. No group-wide latch or OTA remote knockdown.
++                    LogInfoEx(LOG_RF, P25_TSDU_STR ", Emergency Alarm Cancel Accepted, srcId = %u, dstId = %u", srcId, group);
++                    ::ActivityLog("P25", true, "emergency alarm cancellation from %u on TG%u", srcId, group);
++                } else {
++                    ::ActivityLog("P25", true, "cancel service request from %u", srcId);
++                    writeRF_TSDU_ACK_FNE(srcId, isp->getService(), false, true);
++                }
+             }
+             break;
+             case TSBKO::IOSP_EXT_FNCT:
+@@ -3135,7 +3172,7 @@
+ 
+ /* Helper to write a acknowledge packet. */
+ 
+-void ControlSignaling::writeRF_TSDU_ACK_FNE(uint32_t srcId, uint32_t service, bool extended, bool noNetwork)
++bool ControlSignaling::writeRF_TSDU_ACK_FNE(uint32_t srcId, uint32_t service, bool extended, bool noNetwork)
+ {
+     std::unique_ptr<IOSP_ACK_RSP> iosp = std::make_unique<IOSP_ACK_RSP>();
+     iosp->setSrcId(srcId);
+@@ -3151,7 +3188,7 @@
+             iosp->toString().c_str(), iosp->getAIV(), iosp->getEX(), iosp->getService(), srcId);
+     }
+ 
+-    writeRF_TSDU_SBF_Imm(iosp.get(), noNetwork);
++    return writeRF_TSDU_SBF_Imm(iosp.get(), noNetwork);
+ }
+ 
+ /* Helper to write a deny packet. */
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -385,9 +385,10 @@
+              * @param srcId Source Radio ID.
+              * @param service Service being acknowledged.
+              * @param extended Flag indicating this is an extended acknowledgement.
+-             * @param noActivityLog 
+-             */
+-            void writeRF_TSDU_ACK_FNE(uint32_t srcId, uint32_t service, bool extended, bool noActivityLog);
++             * @param noNetwork Suppress internal network forwarding.
++             * @returns True when the acknowledgment is queued for RF.
++             */
++            bool writeRF_TSDU_ACK_FNE(uint32_t srcId, uint32_t service, bool extended, bool noNetwork);
+             /**
+              * @brief Helper to write a deny packet.
+              * @param srcId Source Radio ID.
+--- /dev/null
++++ b/tests/p25/EmergencyCancellation_Tests.cpp
+@@ -0,0 +1,201 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Literal input/output fields from AABC-E6.1.5.1/Fig6.1.5-1 PDF101/p82,
++// 6.1.5.2/Fig6.1.5-2 PDF102/p83; AABD-B11.2.2 PDF105-106/p100-101;
++// ACK/DENY AABC-E6.2.1.1 PDF150/p131,6.2.5 PDF160/p141,AnnexB PDF232/p213.
++// Framing helpers supply CRC/Trellis/NID only, not expected service bytes.
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/network/P25SiteRouting.h"
++#include "common/p25/acl/AccessControl.h"
++#include "common/p25/Audio.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/Log.h"
++#include "common/Utils.h"
++#include "common/json/json.h"
++#include <iostream>
++#include <fstream>
++#include <cstdlib>
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <sstream>
++#include <vector>
++
++namespace {
++using namespace p25;
++using namespace p25::defines;
++constexpr uint32_t RID = 10001U, OTHER = 10005U, APP = 10002U, TG = 1001U, NAC = 0x293U;
++using Block = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++std::ostringstream& nativeLog() { static std::ostringstream log; return log; }
++size_t acceptedLogs() {
++    const auto log=nativeLog().str(); size_t count=0U, at=0U;
++    while ((at=log.find("Emergency Alarm Cancel Accepted",at))!=std::string::npos) { ++count; ++at; }
++    return count;
++}
++std::string hex(const uint8_t* bytes,size_t length) {
++    static const char* digits="0123456789ABCDEF"; std::string value;
++    for(size_t i=0U;i<length;++i) { value+=digits[bytes[i]>>4U]; value+=digits[bytes[i]&15U]; }
++    return value;
++}
++::lookups::TalkgroupRuleGroupVoice policy(bool affRestricted, const std::vector<uint32_t>& aff,
++    bool txRestricted, const std::vector<uint32_t>& tx) {
++    std::ostringstream text;
++    text << "name: TEST\nsource:\n    tgid: 1001\n    slot: 1\nconfig:\n    active: true\n    subscriber_access:\n        affiliation:\n            restricted: " << (affRestricted ? "true" : "false") << "\n            radio_ids:";
++    if (aff.empty()) text << " []\n";
++    else { text << "\n"; for (auto id : aff) text << "                - " << id << "\n"; }
++    text << "        transmit:\n            restricted: " << (txRestricted ? "true" : "false") << "\n            radio_ids:";
++    if (tx.empty()) text << " []\n";
++    else { text << "\n"; for (auto id : tx) text << "                - " << id << "\n"; }
++    yaml::Node node; REQUIRE(yaml::Parse(node, text.str()));
++    return ::lookups::TalkgroupRuleGroupVoice(node);
++}
++struct Fixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, true};
++    ::lookups::TalkgroupRulesLookup groups;
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U, true, true, false, false, false, false};
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-subscriber-test", false};
++    network::NetRPC* oldRPC = g_RPC;
++    std::unique_ptr<Control> controller;
++    explicit Fixture(bool groupACL = true, uint32_t queue = 16384U) : groups("",0U,groupACL) {
++        const bool cc=true; const bool physicalInventory=true;
++        g_logDisplayLevel = 0U; g_RPC = &rpc;
++        nativeLog().str(""); nativeLog().clear(); log_internal::SetInternalOutputStream(nativeLog());
++        radios.addEntry(RID, true, "Subscriber"); radios.addEntry(OTHER, false, "Disabled"); radios.addEntry(APP, true, "Console"); radios.addEntry(10006U, true, "Not physical");
++        groups.addEntry(TG, 1U, true); groups.addEntry(1002U, 1U, true);
++        controller = std::make_unique<Control>(true, NAC, 1U, queue, &modem, nullptr, 120U, 1U, true,
++            &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
++        yaml::Node config; std::string mode = cc ? "true" : "false";
++        const std::string inventory = physicalInventory ? "        dispatchSubscribers:\n            - 10001\n            - 10005\n" : "        dispatchSubscribers: []\n";
++        REQUIRE(yaml::Parse(config, std::string("protocols:\n    p25:\n        managedSite: true\n") + inventory + "        verifyReg: true\n        verifyAff: true\n        inhibitUnauthorized: false\n        tduPreambleCount: 0\n        control:\n            enable: " + mode + "\n            dedicated: " + mode + "\n            ackRequests: false\n            disableTSDUMBF: true\n            redundantImmediate: false\nsystem:\n    config:\n        controlCh:\n            notifyEnable: false\n"));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 25U, false);
++        controller->setDebugVerbose(false,false);
++        controller->configureIdentification(false); controller->setCCRunning(cc); controller->setZoneConnected(false);
++        controller->affiliations()->unitReg(RID);
++    }
++    ~Fixture() { controller.reset(); g_RPC = oldRPC; log_internal::SetInternalOutputStream(std::cerr); }
++    void apply(bool ar, std::vector<uint32_t> a, bool tr, std::vector<uint32_t> t) { groups.addEntry(policy(ar, a, tr, t)); }
++    bool signal(uint8_t opcode, uint64_t value, uint8_t manufacturer = 0U, bool corruptCRC = false) {
++        Block raw{}; raw[0] = 0x80U | opcode; raw[1] = manufacturer;
++        for (unsigned i = 0U; i < 8U; ++i) raw[2U+i] = uint8_t(value >> ((7U-i)*8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        if (corruptCRC) raw[11U] ^= 1U;
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES+2U> frame{}; frame[0] = modem::TAG_DATA; frame[1] = 1U;
++        Sync::addP25Sync(frame.data()+2U); NID nid(NAC); nid.encode(frame.data()+2U, DUID::TSDU);
++        std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> encoded{}; edac::Trellis trellis;
++        trellis.encode12(raw.data(), encoded.data()); P25Utils::encode(encoded.data(), frame.data()+2U, 114U, 318U);
++        P25Utils::addStatusBits(frame.data()+2U, P25_TSDU_FRAME_LENGTH_BITS, false, false);
++        return controller->processFrame(frame.data(), frame.size());
++    }
++    std::vector<Block> responses() {
++        std::array<uint8_t, 1024> frame{}; std::vector<Block> blocks;
++        while (controller->getFrame(frame.data()) != 0U) {
++            NID nid(NAC); if (!nid.decode(frame.data()+2U) || nid.getDUID()!=DUID::TSDU) continue;
++            std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{}; Block raw{}; edac::Trellis trellis;
++            P25Utils::decode(frame.data()+2U, coded.data(), 114U, 318U); REQUIRE(trellis.decode12(coded.data(), raw.data()));
++            REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); blocks.push_back(raw);
++        }
++        return blocks;
++    }
++    void age(uint32_t ms) { controller->affiliations()->clock(ms); }
++};
++}
++
++namespace {
++uint64_t cancel(uint32_t source=RID, uint32_t group=TG, uint8_t flags=0xA7U, uint8_t reason=0U, uint8_t options=0x80U) {
++    return (uint64_t(flags)<<56U)|(uint64_t(reason)<<48U)|(uint64_t(options)<<40U)|(uint64_t(group)<<24U)|source;
++}
++void reply(const Block& b,uint8_t opcode,uint8_t service,uint8_t reason,uint32_t target) {
++    REQUIRE(b[0]==uint8_t(0x80U|opcode)); REQUIRE((b[2]&0x3FU)==service);
++    REQUIRE((b[2]&0xC0U)==0U); REQUIRE(b[3]==reason);
++    for(size_t i=4U;i<=6U;++i) REQUIRE(b[i]==0U);
++    REQUIRE(b[7]==uint8_t(target>>16));REQUIRE(b[8]==uint8_t(target>>8));REQUIRE(b[9]==uint8_t(target));
++}
++struct ExtendedCancel {
++    Block header{{0x17U,0xFDU,0U,0U,0x27U,0x11U,0x81U,0x23U,0x84U,0U,0U,0U}};
++    Block body{{0U,0U,0U,0x10U,1U,0U,0x27U,0x13U,0U,0U,0U,0U}};
++    std::vector<uint8_t> frame() {
++        edac::CRC::addCCITT162(header.data(),header.size());edac::CRC::addCRC32(body.data(),body.size());
++        std::array<uint8_t,72U> plain{};std::array<uint8_t,25U> coded{};edac::Trellis trellis;
++        trellis.encode12(header.data(),coded.data());Utils::setBitRange(coded.data(),plain.data(),112U,196U);
++        trellis.encode12(body.data(),coded.data());Utils::setBitRange(coded.data(),plain.data(),308U,196U);
++        std::vector<uint8_t> frame(74U);frame[0]=modem::TAG_DATA;frame[1]=1U;
++        P25Utils::encode(plain.data(),frame.data()+2U,0U,576U);Sync::addP25Sync(frame.data()+2U);
++        NID nid(NAC);nid.encode(frame.data()+2U,DUID::PDU);return frame;
++    }
++};
++}
++TEST_CASE("own emergency cancellation validates literal fields and not current group audience", "[p25][emergency-cancel]") {
++    struct Case {const char* name; unsigned mode;uint32_t group;uint32_t source;uint8_t flags;uint8_t reason;uint8_t options;uint8_t denial;};
++    const Case cases[]={
++      {"ordinary_valid",0,TG,RID,0xA7,0,0x80,0},
++      {"preprogrammed_unaffiliated_direct_tx_denied",1,TG,RID,0xA7,0,0x80,0},
++      {"group_now_disabled",2,TG,RID,0xA7,0,0x80,0},
++      {"group_now_removed",3,TG,RID,0xA7,0,0x80,0},
++      {"affiliation_eligibility_now_denied",4,TG,RID,0xA7,0,0x80,0},
++      {"no_prior_native_alarm_unknown_assignable_group",0,1099,RID,0xA7,0,0x80,0},
++      {"lowest_assignable_group",0,1,RID,0xA7,0,0x80,0},
++      {"highest_assignable_group",0,0xFFFE,RID,0xA7,0,0x80,0},
++      {"all_remaining_option_bits_are_x",0,TG,RID,0xA7,0,0xFF,0},
++      {"aiv_missing",0,TG,RID,0x27,0,0x80,0xF0},
++      {"reason_queued",0,TG,RID,0xA7,0x10,0x80,0xF0},
++      {"reason_assignment",0,TG,RID,0xA7,0x20,0x80,0xF0},
++      {"vendor_defined_reason_not_emergency_cancel",0,TG,RID,0xA7,0x80,0x80,0xF0},
++      {"emergency_bit_missing",0,TG,RID,0xA7,0,0x7F,0xF0},
++      {"null_group",0,0,RID,0xA7,0,0x80,0x30},
++      {"All_Group",0,0xFFFF,RID,0xA7,0,0x80,0x30},
++      {"unregistered",5,TG,RID,0xA7,0,0x80,0x10},
++      {"disabled",6,TG,RID,0xA7,0,0x80,0x10},
++      {"unknown_SU",0,TG,19999,0xA7,0,0x80,0x10},
++      {"application_RID",0,TG,APP,0xA7,0,0x80,0x10}
++    };
++    json::array observations;
++    for(const auto& c:cases)for(uint8_t mfid:{0U,1U}) {
++        CAPTURE(c.name,unsigned(mfid));Fixture f;auto* units=f.controller->affiliations();units->groupAff(RID,1002U);f.age(1000U);
++        if(c.mode==1) {f.apply(true,{RID},true,{});units->groupUnaff(RID);}
++        if(c.mode==2) f.groups.addEntry(TG,1,false);
++        if(c.mode==3) f.groups.eraseEntry(TG,1);
++        if(c.mode==4) f.apply(true,{},true,{});
++        if(c.mode==5) units->unitDereg(RID,false);
++        if(c.mode==6) f.radios.addEntry(RID,false,"disabled");
++        nativeLog().str("");nativeLog().clear();
++        const bool accepted=c.denial==0;REQUIRE(f.signal(0x23,cancel(c.source,c.group,c.flags,c.reason,c.options),mfid)==accepted);
++        auto output=f.responses();REQUIRE(output.size()==1U);reply(output[0],accepted?0x20U:0x27U,0x27U,c.denial,c.source);
++        REQUIRE(acceptedLogs()==(accepted?1U:0U));
++        if(accepted) REQUIRE(nativeLog().str().find("Emergency Alarm Cancel Accepted, srcId = "+std::to_string(c.source)+", dstId = "+std::to_string(c.group))!=std::string::npos);
++        REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);REQUIRE(units->grantSize()==0U);
++        if(c.mode!=5)REQUIRE(units->isUnitReg(RID));
++        if(c.mode!=5)REQUIRE(units->unitRegTimer(RID)==(accepted?0U:1U));
++        if(c.mode!=1&&c.mode!=5)REQUIRE(units->isGroupAff(RID,1002U));
++        json::object o;o["case"].set<std::string>(c.name);o["accepted"].set<bool>(accepted);o["radio_id"].set<uint32_t>(c.source);o["talkgroup_id"].set<uint32_t>(c.group);o["mfid"].set<uint8_t>(mfid);o["deny_reason"].set<uint8_t>(c.denial);o["native_log"].set<std::string>(nativeLog().str());o["response_tsbk_hex"].set<std::string>(hex(output[0].data(),output[0].size()));json::value record;record.set<json::object>(o);observations.push_back(record);
++    }
++    if(const char* path=std::getenv("DVM_EMERGENCY_CANCEL_EXPORT")){json::value doc;doc.set<json::array>(observations);std::ofstream out(path,std::ios::trunc);REQUIRE(out.good());out<<doc.serialize(true)<<"\n";REQUIRE(out.good());}
++}
++TEST_CASE("lost cancellation ACK allows idempotent subscriber retries and fresh post-restart request", "[p25][emergency-cancel]") {
++    for(unsigned run=0;run<2U;++run){Fixture f;auto* units=f.controller->affiliations();
++        for(unsigned retry=0;retry<5U;++retry){CAPTURE(run,retry);f.age(1000U);REQUIRE(f.signal(0x23,cancel()));auto responses=f.responses();REQUIRE(responses.size()==1U);reply(responses[0],0x20,0x27,0,RID);REQUIRE(acceptedLogs()==retry+1U);REQUIRE(units->unitRegTimer(RID)==0U);}
++        f.age(12000U);REQUIRE(f.responses().empty());REQUIRE(acceptedLogs()==5U);
++    }
++}
++TEST_CASE("ordinary abbreviated and valid extended unit cancellation cannot clear emergencies", "[p25][emergency-cancel]") {
++    for(uint8_t service:{0U,4U,0x18U,0x23U}){Fixture f;REQUIRE(f.signal(0x23,cancel(RID,TG,uint8_t(0x80U|service))));auto output=f.responses();REQUIRE(output.size()==1U);reply(output[0],0x20,service,0,RID);REQUIRE(acceptedLogs()==0U);}
++    for(uint8_t service:{4U,0x27U,0U})for(uint8_t mfid:{0U,1U}){Fixture f;ExtendedCancel p;p.header[2]=mfid;p.header[8]=0x80U|service;auto wire=p.frame();
++        REQUIRE(f.controller->processFrame(wire.data(),wire.size())==(service==4U));auto output=f.responses();REQUIRE(acceptedLogs()==0U);
++        if(service==4U){REQUIRE(output.size()==1U);reply(output[0],0x20,4,0,RID);}else REQUIRE(output.empty());
++    }
++}
++TEST_CASE("malformed reserved bit CRC and unavailable ACK queue cannot publish an accepted cancel", "[p25][emergency-cancel]") {
++    {Fixture f;REQUIRE_FALSE(f.signal(0x23,cancel(RID,TG,0xE7)));REQUIRE(f.responses().empty());REQUIRE(acceptedLogs()==0U);}
++    {Fixture f;REQUIRE_FALSE(f.signal(0x23,cancel(),0U,true));REQUIRE(f.responses().empty());REQUIRE(acceptedLogs()==0U);}
++    {Fixture f;REQUIRE_FALSE(f.signal(0x23,cancel(),0xAAU));REQUIRE(f.responses().empty());REQUIRE(acceptedLogs()==0U);}
++    {Fixture f(true,0U);f.age(1000U);REQUIRE_FALSE(f.signal(0x23,cancel()));REQUIRE(f.responses().empty());REQUIRE(acceptedLogs()==0U);REQUIRE(f.controller->affiliations()->unitRegTimer(RID)==1U);}
++    {Fixture f;ExtendedCancel p;p.header[8]=0x84;p.header[9]=0;p.header[5]=0x19;auto wire=p.frame();REQUIRE_FALSE(f.controller->processFrame(wire.data(),wire.size()));REQUIRE(f.responses().empty());REQUIRE(acceptedLogs()==0U);}
++}

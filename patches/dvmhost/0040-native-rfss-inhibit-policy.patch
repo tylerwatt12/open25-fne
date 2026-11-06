@@ -1,0 +1,1817 @@
+--- a/src/common/p25/P25Defines.h
++++ b/src/common/p25/P25Defines.h
+@@ -231,6 +231,8 @@
+ 
+         /** @brief FNE Working Unit ID */
+         const uint32_t  WUID_FNE = 0xFFFFFCU;
++        /** @brief System Default call-processing WUID (AABD-B A.5.2.2). */
++        const uint32_t  WUID_SYSTEM_DEFAULT = 0xFFFFFDU;
+         /** @brief Registration Working Unit ID */
+         const uint32_t  WUID_REG = 0xFFFFFEU;
+         /** @brief All-call Working Unit ID */
+@@ -343,6 +345,7 @@
+                 DENY_TGT_UNIT_NOT_VALID = 0x20U,        //!< Target Unit Not Vaild
+                 DENY_TGT_UNIT_NOT_AUTH = 0x21U,         //!< Target Unit Not Authenticated
+                 DENY_SU_FAILED_AUTH = 0x22U,            //!< Subscriber Failed Authentication
++                DENY_TGT_UNIT_UNAVAILABLE = 0x27U,      //!< Target Unit Unavailable (AABC-E AnnexB)
+                 DENY_TGT_UNIT_REFUSED = 0x2FU,          //!< Target Unit Refused
+ 
+                 DENY_TGT_GROUP_NOT_VALID = 0x30U,       //!< Target Group Not Valid
+--- a/src/host/p25/Control.Dispatch.cpp
++++ b/src/host/p25/Control.Dispatch.cpp
+@@ -87,7 +87,7 @@
+     if (m_affiliations == nullptr) return false;
+     const auto affiliations = m_affiliations->grpAffTable();
+     for (const auto& entry : affiliations) {
+-        if (entry.second != destination || m_dispatchSubscribers.count(entry.first) == 0U) continue;
++        if (entry.second != destination || m_dispatchSubscribers.count(entry.first) == 0U || isRadioInhibited(entry.first)) continue;
+         const auto radio = m_ridLookup->find(entry.first);
+         if (!radio.radioDefault() && radio.radioEnabled() && acl::AccessControl::validateGroupAffiliation(entry.first, destination)) return true;
+     }
+@@ -216,7 +216,7 @@
+             const auto& grant = entry.second;
+             if (m_affiliations->ownsGrant(entry.first, grant.source, grant.channel, grant.epoch) &&
+                 !m_affiliations->isNetGranted(entry.first) &&
+-                (!physicalSubscriberPermitted(grant.source) || !acl::AccessControl::validateGroupTransmit(grant.source, entry.first)))
++                (isRadioInhibited(grant.source) || !physicalSubscriberPermitted(grant.source) || !acl::AccessControl::validateGroupTransmit(grant.source, entry.first)))
+                 revoked.push_back(entry.first);
+         }
+         for (auto group : revoked) {
+--- /dev/null
++++ b/src/host/p25/Control.Inhibit.cpp
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "p25/Control.h"
++#include "p25/packet/ControlSignaling.h"
++#include "p25/packet/Voice.h"
++#include "p25/lookups/P25AffiliationLookup.h"
++#include "common/Log.h"
++using namespace p25;
++bool Control::isRadioInhibited(uint32_t source) const {return m_control!=nullptr&&m_control->isInhibited(source);}
++void Control::noteInhibitedService(uint32_t source){if(m_control)m_control->noteInhibitedService(source);}
++TxFrameOwnership Control::serviceFrameOwner(uint32_t source,uint32_t target) const
++{
++    if(m_dispatchSubscribers.count(source)==0U&&m_dispatchSubscribers.count(target)==0U)return {};
++    auto owner=std::make_shared<TxFrameOwner>(source,true,source,target);
++    if(isRadioInhibited(source)||isRadioInhibited(target))owner->active.store(false);
++    return owner;
++}
++void Control::cancelInhibitedFrames(const std::set<uint32_t>& blocked)
++{
++    std::lock_guard<std::mutex> lock(s_queueLock);
++    const auto cancel=[&](const TxFrameOwnership& owner){
++        if(owner->service&&(blocked.count(owner->source)!=0U||blocked.count(owner->individualTarget)!=0U))owner->active.store(false);
++        return !owner->active.load();
++    };
++    m_txImmQueue.discard(cancel);m_txQueue.discard(cancel);
++}
++void Control::revokeInhibitedServices(const std::set<uint32_t>& newlyBlocked)
++{
++    const auto blocked=[&](uint32_t id){return newlyBlocked.count(id)!=0U||isRadioInhibited(id);};
++    std::lock_guard<std::recursive_mutex> permit(m_permitMutex);
++    const bool retirePermit=m_permittedSrcId!=0U&&blocked(m_permittedSrcId);
++    const bool retireRF=retirePermit||(m_rfLastSrcId!=0U&&blocked(m_rfLastSrcId));
++    if(retirePermit) {
++        m_inhibitRetiredPermitToken=m_permitToken;
++        clearIdentificationTraffic();
++    }
++    if(retireRF){
++        m_voice->resetRF();m_rfState=RS_RF_LISTENING;m_rfLossWatchdog.stop();m_rfTimeout.stop();
++        m_rfLastSrcId=m_rfLastDstId=0U;
++    }
++    if((m_netLastSrcId!=0U&&blocked(m_netLastSrcId))||
++        (!m_voice->m_netLC.getGroup()&&blocked(m_voice->m_netLC.getDstId()))){m_voice->resetNet();m_netState=RS_NET_IDLE;m_netLastSrcId=m_netLastDstId=0U;}
++    auto guard=m_affiliations->lockGrants();
++    const auto grants=m_affiliations->grantTable();
++    for(const auto& item:grants){
++        const auto source=m_affiliations->getGrantedSrcId(item.first);
++        if(blocked(source)||(!m_affiliations->isGroup(item.first)&&blocked(item.first))){
++            m_affiliations->releaseGrant(item.first,false);m_grantPriorities.erase(item.first);
++        }
++    }
++}
+--- a/src/host/p25/Control.RFAdmission.cpp
++++ b/src/host/p25/Control.RFAdmission.cpp
+@@ -14,6 +14,7 @@
+ 
+ bool Control::queueRFAdmission(uint32_t source, uint32_t destination, uint8_t serviceOptions)
+ {
++    if (isRadioInhibited(source)) return false;
+     if (!m_managedSite || !m_zoneConnected.load() || m_rfAllStartTalkgroups.count(destination) == 0U)
+         return false;
+     auto allocations = m_affiliations->lockGrants();
+@@ -113,7 +114,7 @@
+         const auto affiliations = m_affiliations->grpAffTable();
+         const auto membership = affiliations.find(current.srcId);
+         const bool permitted = !radio.radioDefault() && radio.radioEnabled() && !group.isInvalid() && group.config().active() &&
+-            physicalSubscriberPermitted(current.srcId) && acl::AccessControl::validateGroupTransmit(current.srcId, current.dstId) &&
++            !isRadioInhibited(current.srcId) && physicalSubscriberPermitted(current.srcId) && acl::AccessControl::validateGroupTransmit(current.srcId, current.dstId) &&
+             membership != affiliations.end() && membership->second == current.dstId;
+         bool committed = false;
+         const bool granted = permitted && dispatchReady() && m_control->writeRF_TSDU_Grant(current.srcId, current.dstId, current.serviceOptions, true, false, false, 0U, [&] {
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -18,6 +18,7 @@
+ #include "common/Log.h"
+ #include "common/Utils.h"
+ #include "p25/Control.h"
++#include "common/p25/lc/tsbk/TSBKFactory.h"
+ #include "modem/ModemV24.h"
+ #include "ActivityLog.h"
+ #include "HostMain.h"
+@@ -220,7 +221,7 @@
+ 
+ void Control::reset()
+ {
+-    if (m_control != nullptr) m_control->cancelRadioChecks();
++    if (m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelInhibitions(); }
+     m_rfState = RS_RF_LISTENING;
+     m_ccHalted = false;
+ 
+@@ -355,6 +356,8 @@
+             if (id > 0U && id < 0xFFFFFCU) m_dispatchSubscribers.insert(id);
+         }
+     }
++    if (!m_control->configureInhibitions(p25Protocol["inhibitPolicy"]))
++        ::fatal("Invalid P25 inhibit policy: expected bounded physical subscriber intent and startup restore state.\n");
+     m_dispatchTalkgroupPriorities.clear();
+     m_rfTalkgroupSecurity.clear();
+     auto security = p25Protocol["rfTalkgroupSecurity"];
+@@ -769,7 +772,9 @@
+ bool Control::processFrame(uint8_t* data, uint32_t len)
+ {
+     std::unique_lock<std::recursive_mutex> permitLock(m_permitMutex, std::defer_lock);
+-    if (!m_authoritative) permitLock.lock();
++    // Policy revocation and correlated permit retirement share this existing
++    // lock with the RF reader, including an authoritative CC's RF path.
++    permitLock.lock();
+     if (identificationActive()) return false;
+     assert(data != nullptr);
+ 
+@@ -849,9 +854,27 @@
+ 
+     DUID::E duid = m_nid.getDUID();
+     const uint32_t fixedBytes = fixedRFFrameBytes(duid);
++    bool localControlPDU = false;
+     if (duid == DUID::PDU) {
+-        if (!m_data->admitRFFrame(data, len)) return false;
++        if (!m_data->admitRFFrame(data, len, &localControlPDU)) return false;
+     } else if (fixedBytes == 0U || len < fixedBytes + 2U) return false;
++
++    std::unique_ptr<lc::TSBK> preDecodedControl;
++    if (duid == DUID::TSDU) {
++        preDecodedControl = lc::tsbk::TSBKFactory::createTSBK(data + 2U, lc::tsbk::TSBKFactory::Direction::Inbound);
++        if (!preDecodedControl || !m_control->inhibitAdmitsTSBK(*preDecodedControl)) return false;
++    } else if (duid != DUID::PDU) {
++        if ((!m_authoritative && isRadioInhibited(m_permittedSrcId)) || isRadioInhibited(m_rfLastSrcId)) {
++            noteInhibitedService(m_permittedSrcId != 0U ? m_permittedSrcId : m_rfLastSrcId); return false;
++        }
++        if (duid == DUID::LDU1) {
++            lc::LC candidate;
++            if (candidate.decodeLDU1(data + 2U) && (isRadioInhibited(candidate.getSrcId()) ||
++                (!candidate.getGroup() && isRadioInhibited(candidate.getDstId())))) {
++                noteInhibitedService(candidate.getSrcId()); return false;
++            }
++        }
++    }
+ 
+     if (m_rfState == RS_RF_AUDIO || m_rfState == RS_RF_DATA) {
+         if (m_rfLossWatchdog.isRunning()) {
+@@ -903,8 +926,10 @@
+ 
+     // are we interrupting a running CC?
+     if (m_ccRunning) {
+-        if (duid != DUID::TSDU) {
+-            m_ccHalted = true;
++        // A validated local AMBT is a control transaction carried in a PDU,
++        // not a voice/data interruption. Preserve any pre-existing withdrawal.
++        if (duid != DUID::TSDU && !localControlPDU) {
++            setCCHalted(true);
+         }
+     }
+ 
+@@ -943,7 +968,7 @@
+             break;
+ 
+         case DUID::TSDU:
+-            ret = m_control->process(data, len);
++            ret = m_control->process(data, len, std::move(preDecodedControl));
+             break;
+ 
+         default:
+@@ -959,7 +984,11 @@
+ void Control::discardCancelledChecks()
+ {
+     const auto cancelled = [this](const TxFrameOwnership& owner) {
+-        if (!physicalSubscriberPermitted(owner->destination)) owner->active.store(false);
++        if (owner->service) {
++            if (isRadioInhibited(owner->source) || isRadioInhibited(owner->individualTarget) ||
++                (m_dispatchSubscribers.count(owner->source) != 0U && !physicalSubscriberPermitted(owner->source)) ||
++                (m_dispatchSubscribers.count(owner->individualTarget) != 0U && !physicalSubscriberPermitted(owner->individualTarget))) owner->active.store(false);
++        } else if (!physicalSubscriberPermitted(owner->destination)) owner->active.store(false);
+         return !owner->active.load();
+     };
+     m_txImmQueue.discard(cancelled);
+@@ -1059,13 +1088,13 @@
+ void Control::setCCRunning(bool ccRunning)
+ {
+     m_ccPrevRunning = m_ccRunning; m_ccRunning = ccRunning;
+-    if (!ccRunning && m_control != nullptr) m_control->cancelRadioChecks();
++    if (!ccRunning && m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelInhibitions(); }
+ }
+ 
+ void Control::setCCHalted(bool ccHalted)
+ {
+     m_ccHalted = ccHalted;
+-    if (ccHalted && m_control != nullptr) m_control->cancelRadioChecks();
++    if (ccHalted && m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelInhibitions(); }
+ }
+ 
+ /* Updates the processor. */
+@@ -1075,10 +1104,10 @@
+     std::unique_lock<std::recursive_mutex> permitLock(m_permitMutex, std::defer_lock);
+     if (!m_authoritative) permitLock.lock();
+     if (!m_authoritative) retryPermitReleases();
+-    clockDispatch();
+     uint32_t ms = m_interval.elapsed();
+     m_interval.start();
+-    if (m_control != nullptr) m_control->clockRadioChecks(ms);
++    if (m_control != nullptr) { m_control->clockInhibitions(ms); m_control->clockRadioChecks(ms); }
++    clockDispatch();
+ 
+     if (m_network != nullptr) {
+         processNetwork();
+@@ -2260,6 +2289,9 @@
+         g_RPC->defaultResponse(reply, "permit requires a valid source ID", network::NetRPC::INVALID_ARGS); return;
+     }
+     const uint32_t srcId = dstId == 0U ? 0U : req["srcId"].get<uint32_t>();
++    if (dstId != 0U && isRadioInhibited(srcId)) {
++        g_RPC->defaultResponse(reply, "source subscriber is inhibited", network::NetRPC::BAD_REQUEST); return;
++    }
+     std::string token;
+     if (!req["permitToken"].is<std::string>() || req["permitToken"].get<std::string>().empty() ||
+         req["permitToken"].get<std::string>().size() > 64U) {
+@@ -2267,6 +2299,12 @@
+         return;
+     }
+     token = req["permitToken"].get<std::string>();
++    // Inhibition can retire this VC before the CC's withdrawal arrives.
++    // Acknowledge that one bounded old token without touching a new permit.
++    if (dstId == 0U && !m_inhibitRetiredPermitToken.empty() && token == m_inhibitRetiredPermitToken) {
++        const uint32_t none = 0U;
++        reply["permitToken"].set<std::string>(token); reply["dstId"].set<uint32_t>(none); reply["srcId"].set<uint32_t>(none); return;
++    }
+     if (dstId == 0U && token != m_permitToken) {
+         g_RPC->defaultResponse(reply, "permit is no longer owned by that allocation", network::NetRPC::BAD_REQUEST);
+         return;
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -40,6 +40,7 @@
+ #include "common/network/Network.h"
+ #include "common/p25/SiteData.h"
+ #include "p25/TxFrameQueue.h"
++#include "p25/InhibitPolicy.h"
+ #include "common/StopWatch.h"
+ #include "common/Timer.h"
+ #include "common/yaml/Yaml.h"
+@@ -303,6 +304,12 @@
+         bool zoneConnected() const { return m_zoneConnected.load(); }
+         bool externalNetworkAvailable() const { return !m_managedSite || m_zoneConnected.load(); }
+         bool physicalSubscriberPermitted(uint32_t source) const;
++        bool isRadioInhibited(uint32_t source) const;
++        void noteInhibitedService(uint32_t source);
++        void revokeInhibitedServices(const std::set<uint32_t>& newlyBlocked = {});
++        void cancelInhibitedFrames(const std::set<uint32_t>& blocked);
++        TxFrameOwnership serviceFrameOwner(uint32_t source, uint32_t individualTarget = 0U) const;
++
+         // Media terminates at the Site-local FNE. Zone authority controls the
+         // wide-area advertisement and application routing, not this local path.
+         bool localMediaAvailable() const { return !m_managedSite || m_network != nullptr; }
+@@ -312,6 +319,7 @@
+         friend struct CapacityPermitTestAccess;
+         friend struct DispatchGrantTestAccess;
+         friend struct RadioCheckTestAccess;
++        friend struct InhibitProcedureTestAccess;
+         friend struct MultiSiteTestAccess;
+         friend struct NIDReceiveTestAccess;
+         friend struct AMBTIngressTestAccess;
+@@ -434,6 +442,7 @@
+         std::atomic<bool> m_identificationUnavailable{false};
+         std::atomic<bool> m_identificationActive{false};
+         std::string m_permitToken;
++        std::string m_inhibitRetiredPermitToken;
+         struct PermitReleaseBarrier {
+             std::mutex mutex;
+             std::unordered_map<std::string, uint32_t> pending;
+--- /dev/null
++++ b/src/host/p25/InhibitPolicy.h
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Current Zone intent and local RFSS observations are distinct; no wire fields.
++#pragma once
++#include <cstdint>
++#include <string>
++#include <vector>
++namespace p25 {
++struct InhibitDesired { uint32_t radioId = 0U; bool inhibited = false; };
++struct InhibitRestore { uint32_t radioId = 0U; bool blocked = false; bool pendingUninhibit = false; };
++struct InhibitStatus {
++    uint32_t radioId = 0U; bool desiredInhibited = false; bool blocked = false;
++    bool pendingUninhibit = false; std::string procedure = "idle"; uint32_t attempts = 0U;
++};
++struct InhibitResult { uint32_t status = 200U; std::string message = "OK"; std::vector<InhibitStatus> radios; };
++}
+--- a/src/host/p25/TxFrameQueue.h
++++ b/src/host/p25/TxFrameQueue.h
+@@ -13,8 +13,11 @@
+ 
+ namespace p25 {
+ struct TxFrameOwner {
+-    explicit TxFrameOwner(uint32_t destination) : destination(destination) {}
++    explicit TxFrameOwner(uint32_t destination, bool service = false, uint32_t source = 0U, uint32_t target = 0U) :
++        destination(destination), service(service), source(source), individualTarget(target) {}
+     const uint32_t destination;
++    const bool service;
++    const uint32_t source, individualTarget;
+     std::atomic<bool> active{true};
+ };
+ using TxFrameOwnership = std::shared_ptr<TxFrameOwner>;
+--- /dev/null
++++ b/src/host/p25/packet/ControlSignaling.Inhibit.cpp
+@@ -0,0 +1,301 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// AABD-B13.3/13.4: operational RFSS inhibition is distinct from provisioning.
++#include "p25/packet/ControlSignaling.h"
++#include "common/p25/acl/AccessControl.h"
++#include "common/p25/lc/tsbk/IOSP_ACK_RSP.h"
++#include "common/Log.h"
++#include <atomic>
++using namespace p25;
++using namespace p25::packet;
++using namespace p25::defines;
++namespace { constexpr size_t MAX_INHIBIT_RADIOS=32U, MAX_INHIBIT_OPERATIONS=16U;
++constexpr uint32_t INHIBIT_WAIT_MS=2000U, INHIBIT_ATTEMPTS=5U;
++bool active(const std::string& state){return state=="queued"||state=="awaiting";}
++}
++
++bool ControlSignaling::validInhibitRID(uint32_t radio) const
++{
++    return radio>0U && radio<0xFFFFFCU && m_p25->m_dispatchSubscribers.count(radio)!=0U;
++}
++bool ControlSignaling::isInhibited(uint32_t target) const
++{
++    const auto blocked=std::atomic_load(&m_blockedRadios);
++    return blocked->count(target)!=0U;
++}
++void ControlSignaling::publishInhibitionLocked()
++{
++    auto blocked=std::make_shared<std::set<uint32_t>>();
++    for(const auto& item:m_inhibitions)if(item.second.blocked)blocked->insert(item.first);
++    std::shared_ptr<const std::set<uint32_t>> snapshot=blocked;
++    std::atomic_store(&m_blockedRadios,snapshot);
++}
++InhibitResult ControlSignaling::inhibitSnapshotLocked() const
++{
++    InhibitResult out;
++    for(const auto& item:m_inhibitions){const auto& r=item.second;
++        out.radios.push_back(InhibitStatus{item.first,r.desired,r.blocked,r.pending,r.procedure,r.attempts});}
++    return out;
++}
++InhibitResult ControlSignaling::inhibitSnapshot()
++{
++    std::lock_guard<std::mutex> lock(m_inhibitMutex);return inhibitSnapshotLocked();
++}
++void ControlSignaling::emitInhibitState(uint32_t target,const InhibitRecord& r)
++{
++    LogInfoEx(LOG_HOST,"P25 Inhibit State, radio_id = %u, desired_inhibited = %u, blocked = %u, pending_uninhibit = %u, attempts = %u",
++        target,r.desired,r.blocked,r.pending,r.attempts);
++}
++bool ControlSignaling::configureInhibitions(yaml::Node policy)
++{
++    if(!policy.isNone()&&!policy.isMap())return false;
++    if(policy.isMap())for(auto it=policy.begin();it!=policy.end();it++)if((*it).first!="desired"&&(*it).first!="restore")return false;
++    auto desired=policy["desired"],restore=policy["restore"];
++    // This bundled YAML parser stores the valid empty flow sequence[] as a
++    // scalar. Accept exactly that spelling, not arbitrary scalar policy data.
++    const auto sequence=[](yaml::Node node){return node.isNone()||node.isSequence()||(node.isScalar()&&node.as<std::string>("")=="[]");};
++    if(!sequence(desired)||!sequence(restore)||desired.size()>MAX_INHIBIT_RADIOS||restore.size()>MAX_INHIBIT_RADIOS)return false;
++    std::map<uint32_t,InhibitRecord> next;std::set<uint32_t> declared;
++    for(size_t i=0;i<desired.size();++i){auto entry=desired[i];const uint32_t id=entry["radio_id"].as<uint32_t>(0U);
++        const auto flag=entry["inhibited"].as<std::string>("");
++        if(!validInhibitRID(id)||(flag!="true"&&flag!="false")||!declared.insert(id).second)return false;
++        if(flag=="true"){InhibitRecord record;record.desired=record.blocked=true;next.emplace(id,record);}
++    }
++    std::set<uint32_t> seen;
++    for(size_t i=0;i<restore.size();++i){auto entry=restore[i];const auto id=entry["radio_id"].as<uint32_t>(0U);
++        const auto blocked=entry["blocked"].as<std::string>(""),pending=entry["pending_uninhibit"].as<std::string>("");
++        if(!validInhibitRID(id)||!seen.insert(id).second||(blocked!="true"&&blocked!="false")||(pending!="true"&&pending!="false")||(pending=="true"&&blocked!="true"))return false;
++        auto found=next.find(id);InhibitRecord record;if(found!=next.end())record=found->second;
++        record.blocked=record.desired||blocked=="true";record.pending=!record.desired&&(record.blocked||pending=="true");
++        if(record.desired||record.blocked||record.pending)next[id]=record;
++    }
++    if(next.size()>MAX_INHIBIT_RADIOS)return false;
++    std::lock_guard<std::mutex> lock(m_inhibitMutex);
++    for(auto& item:m_inhibitions)if(item.second.owner)item.second.owner->active.store(false);
++    m_inhibitions=std::move(next);m_inhibitCompletions.clear();m_inhibitCompletionOrder.clear();publishInhibitionLocked();return true;
++}
++InhibitResult ControlSignaling::submitInhibitOperation(const std::shared_ptr<InhibitOperation>& op,uint32_t waitMs)
++{
++    std::unique_lock<std::mutex> lock(m_inhibitMutex);
++    if(m_inhibitOperations.size()+m_inhibitCompleting>=MAX_INHIBIT_OPERATIONS)return InhibitResult{503U,"inhibit owner mailbox full",{}};
++    op->deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(std::min(waitMs?waitMs:750U,750U));
++    m_inhibitOperations.push_back(op);
++    if(waitMs==0U)return InhibitResult{202U,"queued for protocol owner",{}};
++    m_inhibitChanged.wait_until(lock,op->deadline,[&]{return op->done;});
++    if(!op->done){
++        op->cancelled=true;
++        if(op->owner){
++            op->owner->active.store(false);const auto found=m_inhibitions.find(op->target);
++            if(found!=m_inhibitions.end()&&found->second.serial==op->serial&&active(found->second.procedure))found->second.procedure="cancelled";
++        }
++        return InhibitResult{503U,op->committed?"inhibit owner completion timed out; committed protection retained":"inhibit operation cancelled before owner commit",{}};
++    }
++    return op->result;
++}
++InhibitResult ControlSignaling::updateInhibitPolicy(const std::vector<InhibitDesired>& desired,
++    const std::vector<InhibitRestore>& controlState,bool hasControlState,uint32_t waitMs)
++{
++    if(desired.size()>MAX_INHIBIT_RADIOS||controlState.size()>MAX_INHIBIT_RADIOS)
++        return InhibitResult{400U,"inhibit policy exceeds 32 records",{}};
++    auto op=std::make_shared<InhibitOperation>();op->desired=desired;op->controlState=controlState;op->hasControlState=hasControlState;
++    return submitInhibitOperation(op,waitMs);
++}
++InhibitResult ControlSignaling::requestInhibitCommand(uint32_t target,bool inhibit,uint32_t waitMs)
++{
++    auto op=std::make_shared<InhibitOperation>();op->policy=false;op->target=target;op->inhibit=inhibit;
++    return submitInhibitOperation(op,waitMs);
++}
++void ControlSignaling::noteInhibitedService(uint32_t target)
++{
++    std::lock_guard<std::mutex> lock(m_inhibitMutex);const auto it=m_inhibitions.find(target);
++    if(it!=m_inhibitions.end()&&it->second.blocked)it->second.wake=true;
++}
++void ControlSignaling::noteInhibitPresence(uint32_t target)
++{
++    std::lock_guard<std::mutex> lock(m_inhibitMutex);const auto it=m_inhibitions.find(target);
++    if(it!=m_inhibitions.end()&&!it->second.desired&&it->second.pending)it->second.wake=true;
++}
++void ControlSignaling::cancelInhibitions()
++{
++    std::lock_guard<std::mutex> lock(m_inhibitMutex);
++    for(auto& item:m_inhibitions){auto& r=item.second;if(r.owner)r.owner->active.store(false);
++        if(active(r.procedure)||r.attempts!=0U)r.procedure="cancelled";r.wake=false;}
++    for(auto& op:m_inhibitOperations){op->cancelled=true;op->done=true;op->result={503U,"inhibit owner withdrawn",{}};}
++    m_inhibitOperations.clear();m_inhibitCompletions.clear();m_inhibitCompletionOrder.clear();m_inhibitChanged.notify_all();
++}
++bool ControlSignaling::startInhibitLocked(uint32_t target,InhibitRecord& r)
++{
++    if(!m_p25->m_enableControl||!m_p25->m_dedicatedControl||!m_p25->m_ccRunning||m_p25->m_ccHalted||
++        m_p25->identificationActive()||!m_p25->physicalSubscriberPermitted(target)||m_p25->m_modem==nullptr||
++        m_p25->m_modem->hasError()||m_p25->m_modem->hasLockout())return false;
++    if(r.owner)r.owner->active.store(false);
++    r.owner=std::make_shared<TxFrameOwner>(target);r.serial=++m_inhibitSerial;
++    r.function=r.desired?ExtendedFunctions::INHIBIT:ExtendedFunctions::UNINHIBIT;
++    r.attempts=0U;r.remainingMs=0U;r.procedure="queued";r.wake=false;
++    if(!r.desired)r.pending=true;
++    return true;
++}
++void ControlSignaling::clockInhibitions(uint32_t ms)
++{
++    bool revoke=false;std::set<uint32_t> newlyBlocked;
++    std::vector<std::shared_ptr<InhibitOperation>> completed;
++    {
++        std::lock_guard<std::mutex> lock(m_inhibitMutex);std::set<uint32_t> firstSent;
++        while(!m_inhibitOperations.empty()){
++            auto op=m_inhibitOperations.front();m_inhibitOperations.pop_front();
++            if(op->cancelled||std::chrono::steady_clock::now()>=op->deadline){op->done=true;op->result={503U,"inhibit operation expired before owner commit",{}};continue;}
++            ++m_inhibitCompleting;
++            if(op->policy){
++                bool valid=!op->hasControlState||(!m_p25->m_enableControl&&!m_p25->m_authoritative&&m_p25->m_managedSite);
++                std::set<uint32_t> desired,declared;
++                for(const auto& item:op->desired){if(!validInhibitRID(item.radioId)||!declared.insert(item.radioId).second){valid=false;break;}if(item.inhibited)desired.insert(item.radioId);}
++                auto next=m_inhibitions;
++                // Omission changes intent only. Existing blocked state becomes
++                // pending re-enable and remains blocked until a valid issued ACK.
++                for(auto& item:next){auto& record=item.second;const bool wanted=desired.count(item.first)!=0U;
++                    if(record.desired!=wanted){record.owner.reset();record.procedure="idle";record.attempts=0U;record.wake=false;}
++                    record.desired=wanted;if(wanted){record.blocked=true;record.pending=false;}else if(record.blocked)record.pending=true;
++                }
++                for(const auto id:desired)if(next.count(id)==0U){InhibitRecord record;record.desired=record.blocked=true;next.emplace(id,record);}
++                if(op->hasControlState){
++                    // A dedicated VC has no independent ACK authority. Only a
++                    // complete snapshot from its current CC owner replaces the
++                    // actual mirror. Desired=true always wins over a stale false.
++                    std::map<uint32_t,InhibitRecord> mirror;std::set<uint32_t> seen;
++                    for(const auto& state:op->controlState){
++                        if(!validInhibitRID(state.radioId)||!seen.insert(state.radioId).second){valid=false;break;}
++                        InhibitRecord record;record.desired=desired.count(state.radioId)!=0U;
++                        if((state.pendingUninhibit&&!state.blocked)||(!record.desired&&state.blocked&&!state.pendingUninhibit)){valid=false;break;}
++                        record.blocked=record.desired||state.blocked;record.pending=!record.desired&&state.pendingUninhibit;
++                        if(record.desired||record.blocked||record.pending)mirror.emplace(state.radioId,record);
++                    }
++                    for(const auto id:desired)if(seen.count(id)==0U)valid=false;
++                    next=std::move(mirror);
++                }
++                for(auto it=next.begin();it!=next.end();)if(!it->second.desired&&!it->second.blocked&&!it->second.pending&&!active(it->second.procedure))it=next.erase(it);else ++it;
++                if(next.size()>MAX_INHIBIT_RADIOS)valid=false;
++                if(valid){
++                    for(auto& old:m_inhibitions){const auto found=next.find(old.first);
++                        if(old.second.owner&&(found==next.end()||old.second.desired!=found->second.desired||op->hasControlState))old.second.owner->active.store(false);}
++                    m_inhibitions=std::move(next);publishInhibitionLocked();
++                    std::set<uint32_t> blocked;for(const auto& item:m_inhibitions)if(item.second.blocked){blocked.insert(item.first);newlyBlocked.insert(item.first);}
++                    for(const auto id:desired){m_inhibitCompletions.erase(id);m_inhibitCompletionOrder.erase(std::remove(m_inhibitCompletionOrder.begin(),m_inhibitCompletionOrder.end(),id),m_inhibitCompletionOrder.end());}
++                    m_p25->cancelInhibitedFrames(blocked);revoke=true;op->committed=true;op->result=inhibitSnapshotLocked();
++                }else op->result={400U,"invalid inhibit policy, mirror role/identity, or current union exceeds 32 records",{}};
++            }else{
++                auto found=m_inhibitions.find(op->target);
++                const bool wanted=found!=m_inhibitions.end()&&found->second.desired;
++                if(!validInhibitRID(op->target))op->result={400U,"target is not a provisioned physical subscriber",{}};
++                else if(wanted!=op->inhibit)op->result={409U,"command disagrees with current Zone inhibit policy",{}};
++                else if(!m_p25->m_managedSite||!m_p25->m_zoneConnected.load())op->result={503U,"new inhibit commands require the connected Zone",{}};
++                else if(found!=m_inhibitions.end()&&active(found->second.procedure))op->result={409U,"inhibit procedure already active",{}};
++                else if((found==m_inhibitions.end()&&m_inhibitions.size()>=MAX_INHIBIT_RADIOS)||std::count_if(m_inhibitions.begin(),m_inhibitions.end(),[](const auto& x){return active(x.second.procedure);})>=MAX_INHIBIT_OPERATIONS)op->result={503U,"inhibit state or active procedure capacity full",{}};
++                else {
++                    if(found==m_inhibitions.end()){
++                        // An explicit re-enable has unknown prior handset state.
++                        // Keep conservative RFSS protection until its issued ACK.
++                        InhibitRecord record;record.blocked=record.pending=true;found=m_inhibitions.emplace(op->target,record).first;
++                        publishInhibitionLocked();std::set<uint32_t> blocked;
++                        for(const auto& item:m_inhibitions)if(item.second.blocked)blocked.insert(item.first);
++                        m_p25->cancelInhibitedFrames(blocked);newlyBlocked.insert(op->target);revoke=true;
++                    }
++                    auto& record=found->second;
++                    if(!startInhibitLocked(op->target,record))op->result={503U,"inhibit RF owner or target unavailable",{}};
++                    else if(writeRF_TSDU_Ext_Func(record.function,WUID_FNE,op->target,record.owner)){
++                        op->owner=record.owner;op->serial=record.serial;op->committed=true;
++                        record.attempts=1U;record.remainingMs=INHIBIT_WAIT_MS;record.procedure="awaiting";firstSent.insert(op->target);op->result=inhibitSnapshotLocked();
++                    }else{record.owner->active.store(false);record.procedure="cancelled";op->result={503U,"inhibit command could not enter RF queue",{}};}
++                }
++            }
++            completed.push_back(op);
++        }
++        size_t activeCount=std::count_if(m_inhibitions.begin(),m_inhibitions.end(),[](const auto& x){return active(x.second.procedure);});
++        for(auto& item:m_inhibitions){auto& record=item.second;if(firstSent.count(item.first)!=0U)continue;
++            if(!active(record.procedure)&&record.wake){if(activeCount>=MAX_INHIBIT_OPERATIONS)continue;if(!startInhibitLocked(item.first,record))continue;++activeCount;}
++            if(!active(record.procedure))continue;
++            if(!m_p25->m_enableControl||!m_p25->m_ccRunning||m_p25->m_ccHalted||m_p25->identificationActive()||
++                !m_p25->physicalSubscriberPermitted(item.first)||m_p25->m_modem==nullptr||m_p25->m_modem->hasError()||m_p25->m_modem->hasLockout()){
++                record.owner->active.store(false);record.procedure="cancelled";continue;}
++            if(record.procedure=="awaiting"){
++                if(ms<record.remainingMs){record.remainingMs-=ms;continue;}
++                if(record.attempts==INHIBIT_ATTEMPTS){record.owner->active.store(false);record.procedure="no_response";
++                    LogInfoEx(LOG_HOST,"P25 Radio %s, no response, arg = %u, tgt = %u, attempts = %u",record.desired?"Inhibit":"Uninhibit",WUID_FNE,item.first,record.attempts);
++                    emitInhibitState(item.first,record);continue;}
++            }
++            if(!writeRF_TSDU_Ext_Func(record.function,WUID_FNE,item.first,record.owner)){record.owner->active.store(false);record.procedure="cancelled";continue;}
++            ++record.attempts;record.remainingMs=INHIBIT_WAIT_MS;record.procedure="awaiting";
++        }
++    }
++    if(revoke)m_p25->revokeInhibitedServices(newlyBlocked);
++    // Complete the REST owner operation only after old permits/grants/voice
++    // have retired. Never retain m_inhibitMutex while taking m_permitMutex.
++    {
++        std::lock_guard<std::mutex> lock(m_inhibitMutex);
++        for(auto& op:completed){op->done=true;--m_inhibitCompleting;}
++        m_inhibitChanged.notify_all();
++    }
++}
++bool ControlSignaling::acceptInhibitResponse(uint32_t function,uint32_t argument,uint32_t source,uint8_t mfid)
++{
++    if(!m_p25->m_enableControl||!m_p25->m_dedicatedControl||!m_p25->m_ccRunning||m_p25->m_ccHalted||
++        (mfid!=MFG_STANDARD&&mfid!=MFG_STANDARD_ALT)||argument!=WUID_FNE)return false;
++    std::unique_lock<std::mutex> lock(m_inhibitMutex);auto found=m_inhibitions.find(source);
++    const bool completion=found==m_inhibitions.end();
++    auto retired=m_inhibitCompletions.find(source);
++    if(completion&&retired==m_inhibitCompletions.end())return false;
++    auto& record=completion?retired->second:found->second;
++    if((record.procedure!="awaiting"&&record.procedure!="no_response"&&record.procedure!="acknowledged")||record.attempts==0U||
++        function!=(record.desired?ExtendedFunctions::INHIBIT_ACK:ExtendedFunctions::UNINHIBIT_ACK)||
++        record.function!=(record.desired?ExtendedFunctions::INHIBIT:ExtendedFunctions::UNINHIBIT))return false;
++    // AABD-B13.3.2/13.4.2: System Default source, not EXT_FNCT RF echo.
++    lc::tsbk::IOSP_ACK_RSP ack;ack.setAIV(true);ack.setEX(false);ack.setService(TSBKO::IOSP_EXT_FNCT);
++    ack.setDstId(WUID_SYSTEM_DEFAULT);ack.setSrcId(source);
++    if(!writeRF_TSDU_SBF(&ack,true,true,true,false))return false;
++    if(record.owner)record.owner->active.store(false);
++    const bool first=record.procedure!="acknowledged";record.procedure="acknowledged";record.wake=false;
++    if(!record.desired){record.blocked=false;record.pending=false;}
++    const auto observed=record;
++    if(!record.desired&&!completion){
++        m_inhibitCompletionOrder.erase(std::remove(m_inhibitCompletionOrder.begin(),m_inhibitCompletionOrder.end(),source),m_inhibitCompletionOrder.end());
++        if(m_inhibitCompletionOrder.size()>=16U){m_inhibitCompletions.erase(m_inhibitCompletionOrder.front());m_inhibitCompletionOrder.pop_front();}
++        m_inhibitCompletions[source]=observed;m_inhibitCompletionOrder.push_back(source);m_inhibitions.erase(found);publishInhibitionLocked();
++    }
++    lock.unlock();markValidatedWUID(source);refreshAcknowledgedWUID();
++    if(first){LogInfoEx(LOG_RF,P25_TSDU_STR ", TSBKO, IOSP_EXT_FNCT (Extended Function Response), op = $%02X, arg = %u, tgt = %u",function,argument,source);emitInhibitState(source,observed);}
++    return true;
++}
++
++bool ControlSignaling::inhibitAdmitsTSBK(const lc::TSBK& message,bool reassert)
++{
++    switch(message.getLCO()){
++    case TSBKO::IOSP_U_REG:case TSBKO::ISP_LOC_REG_REQ:
++    case TSBKO::ISP_AUTH_RESP:case TSBKO::IOSP_EXT_FNCT:return true;
++    case TSBKO::IOSP_GRP_AFF:case TSBKO::ISP_GRP_AFF_Q_RSP:
++        if(message.getDstId()==0U)return true;
++        break;
++    default:break;
++    }
++    if(!isInhibited(message.getSrcId())||!m_p25->physicalSubscriberPermitted(message.getSrcId()))return true;
++    if(reassert)noteInhibitedService(message.getSrcId());
++    return false;
++}
++uint32_t ControlSignaling::inhibitedIndividualTarget(const lc::TSBK& message) const
++{
++    switch(message.getLCO()){
++    case TSBKO::IOSP_UU_VCH:case TSBKO::IOSP_UU_ANS:case TSBKO::IOSP_STS_UPDT:
++    case TSBKO::IOSP_MSG_UPDT:case TSBKO::IOSP_RAD_MON:case TSBKO::IOSP_CALL_ALRT:
++        return isInhibited(message.getDstId())?message.getDstId():0U;
++    default:return 0U;
++    }
++}
++
++TxFrameOwnership ControlSignaling::signalingServiceOwner(const lc::TSBK& message) const
++{
++    switch(message.getLCO()){
++    case TSBKO::IOSP_GRP_VCH:return m_p25->serviceFrameOwner(message.getSrcId());
++    case TSBKO::OSP_GRP_VCH_GRANT_UPD:return m_p25->serviceFrameOwner(m_p25->m_affiliations->getGrantedSrcId(message.getDstId()));
++    case TSBKO::IOSP_UU_VCH:case TSBKO::OSP_UU_VCH_GRANT_UPD:case TSBKO::IOSP_UU_ANS:
++    case TSBKO::IOSP_STS_UPDT:case TSBKO::IOSP_MSG_UPDT:case TSBKO::IOSP_RAD_MON:case TSBKO::IOSP_CALL_ALRT:
++        return m_p25->serviceFrameOwner(message.getSrcId(),message.getDstId());
++    default:return {};
++    }
++}
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -220,6 +220,9 @@
+         uint32_t srcId = tsbk->getSrcId();
+         uint32_t dstId = tsbk->getDstId();
+         m_lastMFID = tsbk->getMFId();
++        if (!inhibitAdmitsTSBK(*tsbk)) {
++            m_inbound = false; m_p25->m_rfState = prevRfState; return false;
++        }
+ 
+         // These existing request handlers already define srcId as the SU.
+         // Do not reinterpret vendor/extended-function argument fields as IDs.
+@@ -249,6 +252,16 @@
+         } validityGuard{s_wuidTransaction, s_wuidTransaction};
+         s_wuidTransaction = WUIDTransaction{this, 0U};
+ 
++        if (inhibitedIndividualTarget(*tsbk) != 0U) {
++            if (!m_p25->m_affiliations->isUnitReg(srcId))
++                writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_REQ_UNIT_NOT_VALID, tsbk->getLCO());
++            else {
++                markValidatedWUID(srcId);
++                const bool individualVoice = tsbk->getLCO() == TSBKO::IOSP_UU_VCH || tsbk->getLCO() == TSBKO::IOSP_UU_ANS;
++                writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_TGT_UNIT_UNAVAILABLE, tsbk->getLCO(), false, individualVoice);
++            }
++            m_inbound = false; m_p25->m_rfState = prevRfState; return false;
++        }
+         // handle standard P25 reference opcodes
+         switch (tsbk->getLCO()) {
+             case TSBKO::IOSP_GRP_VCH:
+@@ -583,6 +596,10 @@
+                     return false;
+                 }
+                 const uint32_t function = iosp->getExtendedFunction();
++                if (function == ExtendedFunctions::INHIBIT_ACK || function == ExtendedFunctions::UNINHIBIT_ACK) {
++                    const bool accepted = acceptInhibitResponse(function, srcId, respondingSU, iosp->getMFId());
++                    m_inbound = false; m_p25->m_rfState = prevRfState; return accepted;
++                }
+                 if (function == ExtendedFunctions::CHECK_ACK &&
+                     !acceptRadioCheckResponse(function, srcId, respondingSU, iosp->getMFId())) {
+                     LogWarning(LOG_RF, P25_TSDU_STR ", unmatched radio check response, arg = %u, tgt = %u", srcId, respondingSU);
+@@ -1261,6 +1278,7 @@
+ 
+ void ControlSignaling::writeRF_TSDU_Call_Alrt(uint32_t srcId, uint32_t dstId)
+ {
++    if (m_p25->isRadioInhibited(dstId)) return;
+     std::unique_ptr<IOSP_CALL_ALRT> iosp = std::make_unique<IOSP_CALL_ALRT>();
+     iosp->setSrcId(srcId);
+     iosp->setDstId(dstId);
+@@ -1308,7 +1326,9 @@
+         m_lastMFID = MFG_STANDARD;
+     }
+ 
+-    if (func == ExtendedFunctions::CHECK) iosp->setMFId(MFG_STANDARD);
++    const bool trackedStandard = func == ExtendedFunctions::CHECK || func == ExtendedFunctions::INHIBIT || func == ExtendedFunctions::UNINHIBIT;
++    if (trackedStandard) iosp->setMFId(MFG_STANDARD);
++    if (m_p25->m_managedSite && (func == ExtendedFunctions::INHIBIT || func == ExtendedFunctions::UNINHIBIT) && !owner) return false;
+ 
+     // class $02 is Motorola -- set the MFID properly
+     if ((func >> 8) == 0x02U) {
+@@ -1317,7 +1337,7 @@
+ 
+     // A requested check owns its Nmax transmissions. The generic immediate
+     // redundancy option must not silently double the standard retry budget.
+-    if (!writeRF_TSDU_SBF(iosp.get(), true, true, true, func != ExtendedFunctions::CHECK, owner)) return false;
++    if (!writeRF_TSDU_SBF(iosp.get(), true, true, true, !trackedStandard, owner)) return false;
+ 
+     if (m_verbose) {
+         LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, mfId = $%02X, op = $%02X, arg = %u, tgt = %u",
+@@ -1492,7 +1512,10 @@
+     const auto transaction = s_wuidTransaction;
+     if (transaction.owner == this && transaction.source != 0U &&
+         m_p25->physicalSubscriberPermitted(transaction.source) && m_p25->m_affiliations->isUnitReg(transaction.source))
++    {
+         m_p25->m_affiliations->touchUnitReg(transaction.source);
++        noteInhibitPresence(transaction.source);
++    }
+ }
+ 
+ /* Helper to write a group affiliation query packet. */
+@@ -1796,6 +1819,9 @@
+         return false;
+ 
+     assert(tsbk != nullptr);
++    const auto effectiveOwner = owner ? owner : signalingServiceOwner(*tsbk);
++    if (effectiveOwner && !effectiveOwner->active.load()) return false;
++    if (effectiveOwner && effectiveOwner->service) forceSingle = true;
+ 
+     uint8_t data[P25_TSDU_FRAME_LENGTH_BYTES + 2U];
+     ::memset(data + 2U, 0x00U, P25_TSDU_FRAME_LENGTH_BYTES);
+@@ -1847,11 +1873,11 @@
+         data[0U] = modem::TAG_DATA;
+         data[1U] = 0x00U;
+ 
+-        bool queued = m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm, owner);
++        bool queued = m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm, effectiveOwner);
+         
+         if (imm && m_redundantImmediate && allowRedundant) {
+             // queue an immediate frame at least twice
+-            queued = m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm, owner) || queued;
++            queued = m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm, effectiveOwner) || queued;
+         }
+         if (queued) refreshAcknowledgedWUID();
+         return queued;
+@@ -1863,6 +1889,13 @@
+ 
+ void ControlSignaling::writeNet_TSDU(lc::TSBK* tsbk)
+ {
++    if (m_p25->m_managedSite && tsbk->getLCO() == TSBKO::IOSP_EXT_FNCT) {
++        const auto* function = dynamic_cast<const IOSP_EXT_FNCT*>(tsbk);
++        if (function && (function->getExtendedFunction() == ExtendedFunctions::INHIBIT || function->getExtendedFunction() == ExtendedFunctions::UNINHIBIT)) return;
++    }
++    const auto serviceOwner = signalingServiceOwner(*tsbk);
++    if (serviceOwner && !serviceOwner->active.load()) return;
++
+     if (dynamic_cast<lc::AMBT*>(tsbk) != nullptr) {
+         LogError(LOG_P25, "AMBT requires a typed message or its PDU encoder; single-block output refused");
+         return;
+@@ -1891,7 +1924,7 @@
+     P25Utils::addIdleStatusBits(buffer + 2U, P25_TSDU_FRAME_LENGTH_BYTES);
+     P25Utils::setStatusBitsStartIdle(buffer + 2U);
+ 
+-    m_p25->addFrame(buffer, P25_TSDU_FRAME_LENGTH_BYTES + 2U, true);
++    m_p25->addFrame(buffer, P25_TSDU_FRAME_LENGTH_BYTES + 2U, true, false, serviceOwner);
+ 
+     if (m_p25->m_network != nullptr)
+         m_p25->m_network->resetP25();
+@@ -1901,6 +1934,11 @@
+ 
+ void ControlSignaling::writeRF_TSDU_MBF(lc::TSBK* tsbk)
+ {
++    if (tsbk != nullptr) {
++        const auto owned = signalingServiceOwner(*tsbk);
++        if (owned) { writeRF_TSDU_SBF(tsbk, true, true, false, false, owned); return; }
++    }
++
+     if (dynamic_cast<lc::AMBT*>(tsbk) != nullptr) {
+         LogError(LOG_P25, "AMBT requires a typed message or its PDU encoder; single-block output refused");
+         return;
+@@ -2050,7 +2088,9 @@
+         Utils::dump(1U, "!!! *PDU (AMBT) TSBK Block Data", pduUserData, P25_PDU_UNCONFIRMED_LENGTH_BYTES * header.getBlocksToFollow());
+     }
+ 
+-    m_p25->m_data->writeRF_PDU_User(header, false, false, pduUserData, imm);
++    const auto serviceOwner = signalingServiceOwner(*ambt);
++    if (serviceOwner && !serviceOwner->active.load()) return;
++    m_p25->m_data->writeRF_PDU_User(header, false, false, pduUserData, imm, serviceOwner);
+ }
+ 
+ /*
+@@ -2516,6 +2556,7 @@
+ 
+ bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net, bool skip, uint32_t chNo, const std::function<bool()>& commit)
+ {
++    if (m_p25->isRadioInhibited(srcId) || (!grp && m_p25->isRadioInhibited(dstId))) return false;
+     if (m_p25->identificationUnavailable()) return false;
+     if (grp && !net && (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateGroupTransmit(srcId, dstId))) {
+         LogWarning(LOG_RF, P25_TSDU_STR ", subscriber transmit denial, srcId = %u, dstId = %u", srcId, dstId);
+@@ -2717,7 +2758,8 @@
+ 
+             // A lookup reload can revoke access while the VC permit RPC waits.
+             // Recheck at the RF enqueue boundary before announcing the grant.
+-            if (!net && (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateGroupTransmit(srcId, dstId))) {
++            if (m_p25->isRadioInhibited(srcId) || (!grp && m_p25->isRadioInhibited(dstId)) ||
++                (!net && (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateGroupTransmit(srcId, dstId)))) {
+                 const uint64_t epoch = m_p25->m_affiliations->grantEpoch(dstId);
+                 if (m_p25->m_affiliations->ownsGrant(dstId, srcId, chNo, epoch))
+                     m_p25->m_affiliations->releaseGrant(dstId, false);
+@@ -3161,6 +3203,7 @@
+ 
+ void ControlSignaling::writeRF_TSDU_UU_Ans_Req(uint32_t srcId, uint32_t dstId)
+ {
++    if (m_p25->isRadioInhibited(dstId)) return;
+     std::unique_ptr<IOSP_UU_ANS> iosp = std::make_unique<IOSP_UU_ANS>();
+     iosp->setMFId(m_lastMFID);
+     iosp->setSrcId(srcId);
+@@ -3384,6 +3427,9 @@
+ 
+         if (m_p25->m_network != nullptr)
+             m_p25->m_network->announceUnitRegistration(srcId);
++        // Repeated accepted registration is a valid acknowledged transaction;
++        // it can also establish presence for a pending authorized re-enable.
++        markValidatedWUID(srcId);
+     }
+ 
+     writeRF_TSDU_SBF_Imm(iosp.get(), true);
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -20,6 +20,9 @@
+ #include "common/lookups/ChannelLookup.h"
+ #include <mutex>
+ #include <condition_variable>
++#include <map>
++#include <set>
++#include <deque>
+ #include "common/p25/data/DataHeader.h"
+ #include "common/p25/data/DataBlock.h"
+ #include "common/p25/lc/TSBK.h"
+@@ -37,6 +40,7 @@
+ {
+     struct DispatchGrantTestAccess;
+     struct RadioCheckTestAccess;
++    struct InhibitProcedureTestAccess;
+     struct AMBTIngressTestAccess;
+     // ---------------------------------------------------------------------------
+     //  Class Prototypes
+@@ -118,6 +122,16 @@
+             bool requestRadioCheck(uint32_t dstId, uint32_t waitMs = 0U);
+             RadioCheckState radioCheckState(uint32_t dstId);
+             void cancelRadioChecks();
++            InhibitResult updateInhibitPolicy(const std::vector<InhibitDesired>& desired,
++                const std::vector<InhibitRestore>& controlState = {}, bool hasControlState = false, uint32_t waitMs = 750U);
++            InhibitResult inhibitSnapshot();
++            InhibitResult requestInhibitCommand(uint32_t target, bool inhibit, uint32_t waitMs = 750U);
++            bool isInhibited(uint32_t target) const;
++            void noteInhibitedService(uint32_t target);
++            void cancelInhibitions();
++            bool inhibitAdmitsTSBK(const lc::TSBK& message, bool reassert = true);
++            uint32_t inhibitedIndividualTarget(const lc::TSBK& message) const;
++
+             /**
+              * @brief Helper to write a group affiliation query packet.
+              * @param dstId Destination Radio ID.
+@@ -162,6 +176,7 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+             friend struct p25::DispatchGrantTestAccess;
+             friend struct p25::RadioCheckTestAccess;
++            friend struct p25::InhibitProcedureTestAccess;
+             friend struct p25::AMBTIngressTestAccess;
+ #endif
+             friend class packet::Voice;
+@@ -235,6 +250,44 @@
+             std::unordered_map<uint32_t, RadioCheck> m_radioChecks;
+             void clockRadioChecks(uint32_t ms);
+             bool acceptRadioCheckResponse(uint32_t function, uint32_t argument, uint32_t source, uint8_t mfid);
++
++            struct InhibitRecord {
++                bool desired = false, blocked = false, pending = false, wake = false;
++                uint32_t function = 0U, attempts = 0U, remainingMs = 0U;
++                uint64_t serial = 0U;
++                std::string procedure = "idle";
++                TxFrameOwnership owner;
++            };
++            struct InhibitOperation {
++                bool policy = true, hasControlState = false, inhibit = false, done = false, cancelled = false, committed = false;
++                uint32_t target = 0U;
++                uint64_t serial = 0U;
++                TxFrameOwnership owner;
++                std::vector<InhibitDesired> desired;
++                std::vector<InhibitRestore> controlState;
++                std::chrono::steady_clock::time_point deadline;
++                InhibitResult result;
++            };
++            std::mutex m_inhibitMutex;
++            std::condition_variable m_inhibitChanged;
++            std::map<uint32_t, InhibitRecord> m_inhibitions;
++            std::map<uint32_t, InhibitRecord> m_inhibitCompletions;
++            std::deque<uint32_t> m_inhibitCompletionOrder;
++            std::deque<std::shared_ptr<InhibitOperation>> m_inhibitOperations;
++            std::shared_ptr<const std::set<uint32_t>> m_blockedRadios = std::make_shared<const std::set<uint32_t>>();
++            uint64_t m_inhibitSerial = 0U;
++            size_t m_inhibitCompleting = 0U;
++            bool configureInhibitions(yaml::Node policy);
++            void clockInhibitions(uint32_t ms);
++            InhibitResult inhibitSnapshotLocked() const;
++            void publishInhibitionLocked();
++            bool validInhibitRID(uint32_t radio) const;
++            bool startInhibitLocked(uint32_t target, InhibitRecord& record);
++            void emitInhibitState(uint32_t target, const InhibitRecord& record);
++            void noteInhibitPresence(uint32_t target);
++            TxFrameOwnership signalingServiceOwner(const lc::TSBK& message) const;
++            bool acceptInhibitResponse(uint32_t function, uint32_t argument, uint32_t source, uint8_t mfid);
++            InhibitResult submitInhibitOperation(const std::shared_ptr<InhibitOperation>& op, uint32_t waitMs);
+             void markValidatedWUID(uint32_t source);
+             void refreshAcknowledgedWUID();
+ 
+--- a/src/host/p25/packet/Data.cpp
++++ b/src/host/p25/packet/Data.cpp
+@@ -61,13 +61,14 @@
+     return inspectRFFrame(data, len, nullptr);
+ }
+ 
+-bool Data::admitRFFrame(const uint8_t* data, uint32_t len) const
+-{
+-    return inspectRFFrame(data, len, m_p25);
+-}
+-
+-bool Data::inspectRFFrame(const uint8_t* data, uint32_t len, const Control* owner)
+-{
++bool Data::admitRFFrame(const uint8_t* data, uint32_t len, bool* localControl) const
++{
++    return inspectRFFrame(data, len, m_p25, localControl);
++}
++
++bool Data::inspectRFFrame(const uint8_t* data, uint32_t len, const Control* owner, bool* localControl)
++{
++    if (localControl != nullptr) *localControl = false;
+     // BAAA-B7.2.4/Fig35: fill variable packets through the next status symbol.
+     // Current modem window: at most512 RF bytes; continuation is unqualified.
+     if (data == nullptr || len < 47U || len > P25_PDU_FRAME_LENGTH_BYTES + 2U)
+@@ -109,7 +110,15 @@
+     const uint32_t rawBits = p25pdu::completeBits(bits);
+     if (rawBits == 0U || available < bits || (len - 2U) * 8U != rawBits) return false;
+     // Verify body FEC/CRC in a local assembler before any CC/session effects.
+-    if (format == PDUFormatType::RSP) return true;
++    if (format == PDUFormatType::RSP) {
++        // BAAA-B5.5/Fig21: X=0 names an enhanced-address destination
++        // in LLID and the actual responding SU in octets7-9.
++        const auto source=header.getFullMessage()?header.getLLId():header.getSrcLLId();
++        if(owner!=nullptr&&(owner->isRadioInhibited(source)||(!header.getFullMessage()&&owner->isRadioInhibited(header.getLLId())))){
++            if(owner->isRadioInhibited(source))const_cast<Control*>(owner)->noteInhibitedService(source);return false;
++        }
++        return true;
++    }
+     data::Assembler probe;
+     if (!probe.disassemble(encoded, sizeof(encoded), true)) return false;
+     for (uint32_t i = 0U; i < count; ++i) {
+@@ -118,8 +127,26 @@
+         if (!probe.disassemble(encoded, sizeof(encoded))) return false;
+     }
+     if (!probe.getComplete() || probe.getPacketCRCFailed() || probe.getUndecodableBlockCount() != 0U) return false;
+-    if (owner != nullptr && format == PDUFormatType::AMBT)
+-        return owner->m_control->decodeMBTForSite(probe.dataHeader, probe.dataBlocks) != nullptr;
++    if (owner != nullptr && format == PDUFormatType::AMBT) {
++        auto typed = owner->m_control->decodeMBTForSite(probe.dataHeader, probe.dataBlocks);
++        const bool admitted = typed != nullptr && owner->m_control->inhibitAdmitsTSBK(*typed);
++        if (admitted && localControl != nullptr) *localControl = true;
++        return admitted;
++    }
++    if(probe.getExtendedAddress()&&format==PDUFormatType::UNCONFIRMED){
++        // BAAA-B5.7/Fig25: the first data block is a separate source
++        // header. The inherited assembler does not propagate its decode error.
++        uint8_t secondary[P25_PDU_UNCONFIRMED_LENGTH_BYTES]={0U};probe.dataBlocks[0].getData(secondary);
++        if(secondary[0]!=0x15U||(secondary[1]&0xC0U)!=0xC0U||
++            secondary[6]!=0U||secondary[7]!=0U||secondary[8]!=0U||secondary[9]!=0U||
++            !edac::CRC::checkCCITT162(secondary,sizeof(secondary)))return false;
++    }
++    if (owner != nullptr) {
++        const auto source = probe.getExtendedAddress() ? probe.dataHeader.getSrcLLId() : probe.dataHeader.getLLId();
++        if(owner->isRadioInhibited(source)||(probe.getExtendedAddress()&&owner->isRadioInhibited(probe.dataHeader.getLLId()))){
++            if(owner->isRadioInhibited(source))const_cast<Control*>(owner)->noteInhibitedService(source);return false;
++        }
++    }
+     return true;
+ }
+ 
+@@ -129,7 +156,8 @@
+ 
+     // Only complete first-window packets are supported by this ingress path.
+     // The former nonzero-count offset/append path was unsafe reassembly.
+-    if (len < 17U || m_rfPDUCount != 0U || !admitRFFrame(data, len)) return false;
++    bool localControlPDU = false;
++    if (len < 17U || m_rfPDUCount != 0U || !admitRFFrame(data, len, &localControlPDU)) return false;
+     if (!m_p25->m_nid.decode(data + 2U) || m_p25->m_nid.getDUID() != DUID::PDU) return false;
+ 
+     if (m_prevRfState != RS_RF_DATA) {
+@@ -139,8 +167,8 @@
+     uint8_t duid = m_p25->m_nid.getDUID();
+ 
+     // are we interrupting a running CC?
+-    if (m_p25->m_ccRunning) {
+-        m_p25->m_ccHalted = true;
++    if (m_p25->m_ccRunning && !localControlPDU) {
++        m_p25->setCCHalted(true);
+     }
+ 
+     // handle individual DUIDs
+@@ -450,6 +478,10 @@
+ 
+ bool Data::processNetwork(uint8_t* data, uint32_t len, uint8_t currentBlock, uint32_t blockLength, uint16_t totalBlocks)
+ {
++    if (currentBlock == 0U && len >= 24U + blockLength) {
++        data::DataHeader header;
++        if (header.decode(data + 24U) && m_p25->isRadioInhibited(header.getLLId())) return false;
++    }
+     if (m_p25->m_netState != RS_NET_DATA) {
+         m_p25->m_netState = RS_NET_DATA;
+         m_inbound = false;
+@@ -552,6 +584,9 @@
+ 
+                             uint32_t srcId = (m_netAssembler->getExtendedAddress()) ? m_netAssembler->dataHeader.getSrcLLId() : m_netAssembler->dataHeader.getLLId();
+                             uint32_t dstId = m_netAssembler->dataHeader.getLLId();
++                            if (m_p25->isRadioInhibited(srcId) || m_p25->isRadioInhibited(dstId)) {
++                                m_p25->m_netState = RS_NET_IDLE; resetReceivedBlocks(); return false;
++                            }
+ 
+                             uint8_t sap = (m_netAssembler->getExtendedAddress()) ? m_netAssembler->dataHeader.getEXSAP() : m_netAssembler->dataHeader.getSAP();
+                             if (m_netAssembler->getAuxiliaryES())
+@@ -648,7 +683,7 @@
+ 
+ /* Helper to write user data as a P25 PDU packet. */
+ 
+-void Data::writeRF_PDU_User(data::DataHeader& dataHeader, bool extendedAddress, bool auxiliaryES, uint8_t* pduUserData, bool imm)
++void Data::writeRF_PDU_User(data::DataHeader& dataHeader, bool extendedAddress, bool auxiliaryES, uint8_t* pduUserData, bool imm, const TxFrameOwnership& owner)
+ {
+     assert(pduUserData != nullptr);
+ 
+@@ -657,7 +692,10 @@
+ 
+     if (data == nullptr || !fitsRFOutput(bitLength)) return;
+     m_p25->writeRF_TDU(true, imm);
+-    writeRF_PDU(data.get(), bitLength, imm);
++    auto serviceOwner = owner;
++    if (!serviceOwner && dataHeader.getFormat() != PDUFormatType::RSP && dataHeader.getFormat() != PDUFormatType::AMBT)
++        serviceOwner = m_p25->serviceFrameOwner(dataHeader.getSrcLLId(), dataHeader.getLLId());
++    writeRF_PDU(data.get(), bitLength, imm, false, serviceOwner);
+ }
+ 
+ /* Helper to write user data as a P25 PDU packet. */
+@@ -1024,9 +1062,11 @@
+     return p25pdu::completeBits(bitLength) != 0U;
+ }
+ 
+-void Data::writeRF_PDU(const uint8_t* pdu, uint32_t bitLength, bool imm, bool ackRetry)
++void Data::writeRF_PDU(const uint8_t* pdu, uint32_t bitLength, bool imm, bool ackRetry, const TxFrameOwnership& owner)
+ {
+     assert(pdu != nullptr);
++    const auto effectiveOwner = ackRetry ? m_retryPDUOwner : owner;
++    if (effectiveOwner && !effectiveOwner->active.load()) return;
+     if (!fitsRFOutput(bitLength)) {
+         LogWarning(LOG_RF, P25_PDU_STR ", unsupported RF output span, coded bits = %u", bitLength);
+         return;
+@@ -1044,6 +1084,7 @@
+         // store PDU for ACK RETRY logic
+         m_retryCount = 0U;
+         m_retryPDUBitLength = bitLength;
++        m_retryPDUOwner = effectiveOwner;
+         const uint32_t retryByteLength = (bitLength + 7U) / 8U;
+ 
+         m_retryPDUData = new uint8_t[retryByteLength];
+@@ -1079,7 +1120,7 @@
+         data[0U] = modem::TAG_DATA;
+         data[1U] = 0x00U;
+ 
+-        if (m_p25->addFrame(data, newByteLength + 2U, false, imm))
++        if (m_p25->addFrame(data, newByteLength + 2U, false, imm, effectiveOwner))
+             m_p25->m_control->refreshAcknowledgedWUID();
+     }
+ 
+@@ -1092,7 +1133,8 @@
+ {
+     uint32_t bitLength = 0U;
+     UInt8Array data = m_rfAssembler->assemble(m_netAssembler->dataHeader, m_netAssembler->getExtendedAddress(), m_netAssembler->getAuxiliaryES(), m_netPduUserData, &bitLength);
+-    if (data != nullptr && bitLength != 0U) writeRF_PDU(data.get(), bitLength);
++    if (data != nullptr && bitLength != 0U) writeRF_PDU(data.get(), bitLength, false, false,
++        m_p25->serviceFrameOwner(m_netAssembler->getExtendedAddress() ? m_netAssembler->dataHeader.getSrcLLId() : 0U, m_netAssembler->dataHeader.getLLId()));
+ }
+ 
+ /* Helper to re-write a received P25 PDU packet. */
+@@ -1101,7 +1143,8 @@
+ {
+     uint32_t bitLength = 0U;
+     UInt8Array data = m_rfAssembler->assemble(m_rfAssembler->dataHeader, m_rfAssembler->getExtendedAddress(), m_rfAssembler->getAuxiliaryES(), m_rfPduUserData, &bitLength);
+-    if (data != nullptr && bitLength != 0U) writeRF_PDU(data.get(), bitLength);
++    if (data != nullptr && bitLength != 0U) writeRF_PDU(data.get(), bitLength, false, false,
++        m_p25->serviceFrameOwner(m_rfAssembler->getExtendedAddress() ? m_rfAssembler->dataHeader.getSrcLLId() : m_rfAssembler->dataHeader.getLLId()));
+ }
+ 
+ /* Helper to write a PDU registration response. */
+--- a/src/host/p25/packet/Data.h
++++ b/src/host/p25/packet/Data.h
+@@ -68,9 +68,9 @@
+             // Complete first-span CAI packet preflight, no operational effects.
+             static bool validRFFrame(const uint8_t* data, uint32_t len);
+             // Operational admission also enforces this Site's typed AMBT profile.
+-            bool admitRFFrame(const uint8_t* data, uint32_t len) const;
++            bool admitRFFrame(const uint8_t* data, uint32_t len, bool* localControl = nullptr) const;
+         private:
+-            static bool inspectRFFrame(const uint8_t* data, uint32_t len, const Control* owner);
++            static bool inspectRFFrame(const uint8_t* data, uint32_t len, const Control* owner, bool* localControl = nullptr);
+         public:
+             /**
+              * @brief Process a data frame from the network.
+@@ -100,7 +100,7 @@
+              * @param pduUserData Buffer containing user data to transmit.
+              * @param imm Flag indicating the PDU should be written to the immediate queue.
+              */
+-            void writeRF_PDU_User(data::DataHeader& dataHeader, bool extendedAddress, bool auxiliaryES, uint8_t* pduUserData, bool imm = false);
++            void writeRF_PDU_User(data::DataHeader& dataHeader, bool extendedAddress, bool auxiliaryES, uint8_t* pduUserData, bool imm = false, const TxFrameOwnership& owner = {});
+             /**
+              * @brief Helper to write user data as a P25 PDU packet.
+              * @param dataHeader Instance of a PDU data header.
+@@ -155,6 +155,7 @@
+             uint16_t m_netTotalBlocks;
+ 
+             uint8_t* m_retryPDUData;
++            TxFrameOwnership m_retryPDUOwner;
+             uint32_t m_retryPDUBitLength;
+             uint8_t m_retryCount;
+ 
+@@ -225,7 +226,7 @@
+              * @param imm Flag indicating the PDU should be written to the immediate queue.
+              * @param ackRetry Flag indicating the PDU is being sent as an acknowledged retry.
+              */
+-            void writeRF_PDU(const uint8_t* pdu, uint32_t bitLength, bool imm = false, bool ackRetry = false);
++            void writeRF_PDU(const uint8_t* pdu, uint32_t bitLength, bool imm = false, bool ackRetry = false, const TxFrameOwnership& owner = {});
+             /**
+              * @brief Helper to write a network P25 PDU packet.
+              * This will take buffered network PDU data and repeat it over the air.
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -238,7 +238,7 @@
+ 
+             bool group = lc.getGroup();
+             bool encrypted = lc.getEncrypted();
+-            if (!m_p25->physicalSubscriberPermitted(srcId) || (group && !acl::AccessControl::validateGroupTransmit(srcId, dstId))) return false;
++            if (m_p25->isRadioInhibited(srcId) || (!group && m_p25->isRadioInhibited(dstId)) || !m_p25->physicalSubscriberPermitted(srcId) || (group && !acl::AccessControl::validateGroupTransmit(srcId, dstId))) return false;
+ 
+             alreadyDecoded = true;
+ 
+@@ -513,7 +513,7 @@
+                     buffer[0U] = modem::TAG_DATA;
+                     buffer[1U] = 0x00U;
+ 
+-                    m_p25->addFrame(buffer, P25_HDU_FRAME_LENGTH_BYTES + 2U);
++                    m_p25->addFrame(buffer, P25_HDU_FRAME_LENGTH_BYTES + 2U, false, false, m_p25->serviceFrameOwner(m_rfLC.getSrcId(), m_rfLC.getGroup() ? 0U : m_rfLC.getDstId()));
+                 }
+ 
+                 frameType = FrameType::HDU_VALID;
+@@ -616,7 +616,7 @@
+             if (!alreadyDecoded) {
+                 lc::LC candidate = m_rfLC;
+                 bool ret = candidate.decodeLDU1(data + 2U);
+-                if (ret && (!m_p25->physicalSubscriberPermitted(candidate.getSrcId()) || (candidate.getGroup() && !acl::AccessControl::validateGroupTransmit(candidate.getSrcId(), candidate.getDstId())))) return false;
++                if (ret && (m_p25->isRadioInhibited(candidate.getSrcId()) || (!candidate.getGroup() && m_p25->isRadioInhibited(candidate.getDstId())) || !m_p25->physicalSubscriberPermitted(candidate.getSrcId()) || (candidate.getGroup() && !acl::AccessControl::validateGroupTransmit(candidate.getSrcId(), candidate.getDstId())))) return false;
+                 if (ret) m_rfLC = candidate;
+                 if (!ret) {
+                     LogWarning(LOG_RF, P25_LDU1_STR ", undecodable LC, using last LDU1 LC");
+@@ -656,7 +656,7 @@
+                 m_rfLC.setEncrypted(hduEncrypt);
+             }
+ 
+-            if (!m_p25->physicalSubscriberPermitted(m_rfLC.getSrcId()) || (m_rfLC.getGroup() && !acl::AccessControl::validateGroupTransmit(m_rfLC.getSrcId(), m_rfLC.getDstId()))) return false;
++            if (m_p25->isRadioInhibited(m_rfLC.getSrcId()) || (!m_rfLC.getGroup() && m_p25->isRadioInhibited(m_rfLC.getDstId())) || !m_p25->physicalSubscriberPermitted(m_rfLC.getSrcId()) || (m_rfLC.getGroup() && !acl::AccessControl::validateGroupTransmit(m_rfLC.getSrcId(), m_rfLC.getDstId()))) return false;
+             m_inbound = true;
+ 
+             rsValue = m_rfLC.getRS();
+@@ -761,7 +761,7 @@
+                 data[0U] = modem::TAG_DATA;
+                 data[1U] = 0x00U;
+ 
+-                m_p25->addFrame(data, P25_LDU_FRAME_LENGTH_BYTES + 2U);
++                m_p25->addFrame(data, P25_LDU_FRAME_LENGTH_BYTES + 2U, false, false, m_p25->serviceFrameOwner(m_rfLC.getSrcId(), m_rfLC.getGroup() ? 0U : m_rfLC.getDstId()));
+             }
+ 
+             if (m_verbose) {
+@@ -781,7 +781,7 @@
+             return false;
+         }
+         else if (m_p25->m_rfState == RS_RF_AUDIO) {
+-            if (!m_p25->physicalSubscriberPermitted(m_rfLC.getSrcId()) || (m_rfLC.getGroup() && !acl::AccessControl::validateGroupTransmit(m_rfLC.getSrcId(), m_rfLC.getDstId()))) return false;
++            if (m_p25->isRadioInhibited(m_rfLC.getSrcId()) || (!m_rfLC.getGroup() && m_p25->isRadioInhibited(m_rfLC.getDstId())) || !m_p25->physicalSubscriberPermitted(m_rfLC.getSrcId()) || (m_rfLC.getGroup() && !acl::AccessControl::validateGroupTransmit(m_rfLC.getSrcId(), m_rfLC.getDstId()))) return false;
+             lc::LC candidate = m_rfLC;
+             bool ret = candidate.decodeLDU2(data + 2U);
+             if (ret && candidate.getGroup() && !m_p25->rfSecurityPermitted(candidate.getDstId(),
+@@ -884,7 +884,7 @@
+                 data[0U] = modem::TAG_DATA;
+                 data[1U] = 0x00U;
+ 
+-                m_p25->addFrame(data, P25_LDU_FRAME_LENGTH_BYTES + 2U);
++                m_p25->addFrame(data, P25_LDU_FRAME_LENGTH_BYTES + 2U, false, false, m_p25->serviceFrameOwner(m_rfLC.getSrcId(), m_rfLC.getGroup() ? 0U : m_rfLC.getDstId()));
+             }
+ 
+             if (m_verbose) {
+@@ -981,7 +981,7 @@
+                     buffer[0U] = modem::TAG_DATA;
+                     buffer[1U] = 0x00U;
+ 
+-                    m_p25->addFrame(buffer, P25_HDU_FRAME_LENGTH_BYTES + 2U);
++                    m_p25->addFrame(buffer, P25_HDU_FRAME_LENGTH_BYTES + 2U, false, false, m_p25->serviceFrameOwner(m_rfLC.getSrcId(), m_rfLC.getGroup() ? 0U : m_rfLC.getDstId()));
+                 }
+ 
+                 if (m_verbose) {
+@@ -1025,7 +1025,7 @@
+                 data[0U] = modem::TAG_DATA;
+                 data[1U] = 0x00U;
+ 
+-                m_p25->addFrame(data, P25_LDU_FRAME_LENGTH_BYTES + 2U);
++                m_p25->addFrame(data, P25_LDU_FRAME_LENGTH_BYTES + 2U, false, false, m_p25->serviceFrameOwner(m_rfLC.getSrcId(), m_rfLC.getGroup() ? 0U : m_rfLC.getDstId()));
+             }
+ 
+             if (m_verbose) {
+@@ -1067,7 +1067,7 @@
+                 data[0U] = modem::TAG_DATA;
+                 data[1U] = 0x00U;
+ 
+-                m_p25->addFrame(data, P25_LDU_FRAME_LENGTH_BYTES + 2U);
++                m_p25->addFrame(data, P25_LDU_FRAME_LENGTH_BYTES + 2U, false, false, m_p25->serviceFrameOwner(m_rfLC.getSrcId(), m_rfLC.getGroup() ? 0U : m_rfLC.getDstId()));
+             }
+ 
+             if (m_verbose) {
+@@ -1172,6 +1172,7 @@
+ {
+     uint32_t dstId = control.getDstId();
+     uint32_t srcId = control.getSrcId();
++    if (m_p25->isRadioInhibited(srcId) || (!control.getGroup() && m_p25->isRadioInhibited(dstId))) return false;
+ 
+     if (checkNetTrafficCollision(srcId, dstId, duid))
+         return false;
+@@ -1739,7 +1740,7 @@
+     // add status bits
+     P25Utils::addStatusBits(buffer + 2U, P25_TDU_FRAME_LENGTH_BITS, false, false);
+ 
+-    m_p25->addFrame(buffer, P25_TDU_FRAME_LENGTH_BYTES + 2U, true);
++    m_p25->addFrame(buffer, P25_TDU_FRAME_LENGTH_BYTES + 2U, true, false, m_p25->serviceFrameOwner(m_netLC.getSrcId(), m_netLC.getGroup() ? 0U : m_netLC.getDstId()));
+ 
+     if (m_verbose) {
+         LogInfoEx(LOG_NET, P25_TDU_STR ", srcId = %u", m_netLC.getSrcId());
+@@ -2030,7 +2031,7 @@
+                 buffer[0U] = modem::TAG_DATA;
+                 buffer[1U] = 0x00U;
+ 
+-                m_p25->addFrame(buffer, P25_HDU_FRAME_LENGTH_BYTES + 2U, true);
++                m_p25->addFrame(buffer, P25_HDU_FRAME_LENGTH_BYTES + 2U, true, false, m_p25->serviceFrameOwner(m_netLC.getSrcId(), m_netLC.getGroup() ? 0U : m_netLC.getDstId()));
+ 
+                 if (m_verbose) {
+                     LogInfoEx(LOG_NET, P25_HDU_STR ", dstId = %u, algo = $%02X, kid = $%04X", m_netLC.getDstId(), m_netLC.getAlgId(), m_netLC.getKId());
+@@ -2163,7 +2164,7 @@
+     buffer[0U] = modem::TAG_DATA;
+     buffer[1U] = 0x00U;
+ 
+-    m_p25->addFrame(buffer, P25_LDU_FRAME_LENGTH_BYTES + 2U, true);
++    m_p25->addFrame(buffer, P25_LDU_FRAME_LENGTH_BYTES + 2U, true, false, m_p25->serviceFrameOwner(m_netLC.getSrcId(), m_netLC.getGroup() ? 0U : m_netLC.getDstId()));
+ 
+     if (m_verbose) {
+         LogInfoEx(LOG_NET, P25_LDU1_STR " audio, mfId = $%02X, srcId = %u, dstId = %u, group = %u, emerg = %u, encrypt = %u, prio = %u, sysId = $%03X, netId = $%05X",
+@@ -2254,7 +2255,7 @@
+     buffer[0U] = modem::TAG_DATA;
+     buffer[1U] = 0x00U;
+ 
+-    m_p25->addFrame(buffer, P25_LDU_FRAME_LENGTH_BYTES + 2U, true);
++    m_p25->addFrame(buffer, P25_LDU_FRAME_LENGTH_BYTES + 2U, true, false, m_p25->serviceFrameOwner(m_netLC.getSrcId(), m_netLC.getGroup() ? 0U : m_netLC.getDstId()));
+ 
+     if (m_verbose) {
+         LogInfoEx(LOG_NET, P25_LDU2_STR " audio, algo = $%02X, kid = $%04X", m_netLC.getAlgId(), m_netLC.getKId());
+--- a/src/host/restapi/RESTAPI.cpp
++++ b/src/host/restapi/RESTAPI.cpp
+@@ -324,6 +324,7 @@
+     m_dispatcher.match(GET_P25_DUMP_TSBK, true).get(REST_API_BIND(RESTAPI::restAPI_GetP25DumpTSBK, this));
+     m_dispatcher.match("/p25/site-state").put(REST_API_BIND(RESTAPI::restAPI_PutP25SiteState, this));
+     m_dispatcher.match(PUT_P25_RID).put(REST_API_BIND(RESTAPI::restAPI_PutP25RID, this));
++    m_dispatcher.match(P25_INHIBIT_POLICY).get(REST_API_BIND(RESTAPI::restAPI_GetP25InhibitPolicy, this)).put(REST_API_BIND(RESTAPI::restAPI_PutP25InhibitPolicy, this));
+     m_dispatcher.match(GET_P25_CC_DEDICATED).get(REST_API_BIND(RESTAPI::restAPI_GetP25CCEnable, this));
+     m_dispatcher.match(GET_P25_CC_BCAST).get(REST_API_BIND(RESTAPI::restAPI_GetP25CCBroadcast, this));
+     m_dispatcher.match(PUT_P25_RAW_TSBK).put(REST_API_BIND(RESTAPI::restAPI_PutP25RawTSBK, this));
+@@ -1400,6 +1401,69 @@
+     reply.payload(response);
+ }
+ 
++namespace {
++bool inhibitRadioId(const json::value& value, uint32_t& id)
++{
++    if (!value.is<double>()) return false;
++    const double number = value.get<double>();
++    if (!std::isfinite(number) || number < 1.0 || number > 16777211.0 || std::floor(number) != number) return false;
++    id = static_cast<uint32_t>(number); return true;
++}
++void inhibitResponse(HTTPPayload& reply, const p25::InhibitResult& result)
++{
++    if (result.status != 200U) { errorPayload(reply, result.message, static_cast<HTTPPayload::StatusType>(result.status)); return; }
++    json::object response; setResponseDefaultStatus(response); json::array rows;
++    for (const auto& item : result.radios) {
++        json::object row; row["radio_id"].set<uint32_t>(item.radioId); row["desired_inhibited"].set<bool>(item.desiredInhibited);
++        row["blocked"].set<bool>(item.blocked); row["pending_uninhibit"].set<bool>(item.pendingUninhibit);
++        row["procedure"].set<std::string>(item.procedure); row["attempts"].set<uint32_t>(item.attempts);
++        json::value value; value.set<json::object>(row); rows.push_back(value);
++    }
++    const uint32_t count = rows.size(), limit = 32U;
++    response["radios"].set<json::array>(rows); response["record_count"].set<uint32_t>(count);
++    response["record_limit"].set<uint32_t>(limit); reply.payload(response);
++}
++}
++void RESTAPI::restAPI_GetP25InhibitPolicy(const HTTPPayload& request, HTTPPayload& reply, const RequestMatch& match)
++{
++    if (!validateAuth(request, reply)) return;
++    if (m_p25 == nullptr) { errorPayload(reply, "P25 mode is not enabled", HTTPPayload::SERVICE_UNAVAILABLE); return; }
++    inhibitResponse(reply, m_p25->control()->inhibitSnapshot());
++}
++void RESTAPI::restAPI_PutP25InhibitPolicy(const HTTPPayload& request, HTTPPayload& reply, const RequestMatch& match)
++{
++    if (!validateAuth(request, reply)) return;
++    if (m_p25 == nullptr) { errorPayload(reply, "P25 mode is not enabled", HTTPPayload::SERVICE_UNAVAILABLE); return; }
++    if (request.content.size() > 4096U) { errorPayload(reply, "inhibit policy body exceeds 4096 bytes"); return; }
++    json::object req; if (!parseRequestBody(request, reply, req)) return;
++    if (!req["radios"].is<json::array>()) { errorPayload(reply, "radios must be the complete desired array"); return; }
++    for (const auto& item : req) if (item.first != "radios" && item.first != "control_state") { errorPayload(reply, "unknown inhibit policy field"); return; }
++    const auto rows = req["radios"].get<json::array>();
++    if (rows.size() > 32U) { errorPayload(reply, "inhibit policy exceeds 32 records"); return; }
++    std::vector<p25::InhibitDesired> desired; std::vector<p25::InhibitRestore> mirror;
++    for (const auto& value : rows) {
++        if (!value.is<json::object>()) { errorPayload(reply, "each desired record must be an object"); return; }
++        auto row = value.get<json::object>();
++        uint32_t radioId = 0U;
++        if (row.size() != 2U || !inhibitRadioId(row["radio_id"], radioId) || !row["inhibited"].is<bool>()) { errorPayload(reply, "desired record requires radio_id and inhibited only"); return; }
++        desired.push_back(p25::InhibitDesired{radioId,row["inhibited"].get<bool>()});
++    }
++    const bool hasMirror = req.find("control_state") != req.end();
++    if (hasMirror) {
++        if (!req["control_state"].is<json::array>()) { errorPayload(reply, "control_state must be an array"); return; }
++        const auto actual = req["control_state"].get<json::array>();
++        if (actual.size() > 32U) { errorPayload(reply, "control_state exceeds 32 records"); return; }
++        for (const auto& value : actual) {
++            if (!value.is<json::object>()) { errorPayload(reply, "each control_state record must be an object"); return; }
++            auto row = value.get<json::object>();
++            uint32_t radioId = 0U;
++            if (row.size() != 3U || !inhibitRadioId(row["radio_id"], radioId) || !row["blocked"].is<bool>() || !row["pending_uninhibit"].is<bool>()) { errorPayload(reply, "control_state requires radio_id, blocked and pending_uninhibit only"); return; }
++            mirror.push_back(p25::InhibitRestore{radioId,row["blocked"].get<bool>(),row["pending_uninhibit"].get<bool>()});
++        }
++    }
++    inhibitResponse(reply, m_p25->control()->updateInhibitPolicy(desired,mirror,hasMirror,750U));
++}
++
+ /* REST API endpoint; implements P25 RID operation request. */
+ 
+ void RESTAPI::restAPI_PutP25RID(const HTTPPayload& request, HTTPPayload& reply, const RequestMatch& match)
+@@ -1457,6 +1521,7 @@
+         m_p25->control()->setLastMFId(mfId);
+     }
+     else if (::strtolower(command) == RID_CMD_PAGE) {
++        if (m_p25->isRadioInhibited(dstId)) { errorPayload(reply, "target subscriber is inhibited", HTTPPayload::SERVICE_UNAVAILABLE); return; }
+         m_p25->control()->writeRF_TSDU_Call_Alrt(WUID_FNE, dstId);
+     }
+     else if (::strtolower(command) == RID_CMD_CHECK) {
+@@ -1465,11 +1530,9 @@
+             return;
+         }
+     }
+-    else if (::strtolower(command) == RID_CMD_INHIBIT) {
+-        m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::INHIBIT, WUID_FNE, dstId);
+-    }
+-    else if (::strtolower(command) == RID_CMD_UNINHIBIT) {
+-        m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::UNINHIBIT, WUID_FNE, dstId);
++    else if (::strtolower(command) == RID_CMD_INHIBIT || ::strtolower(command) == RID_CMD_UNINHIBIT) {
++        const auto result = m_p25->control()->requestInhibitCommand(dstId, ::strtolower(command) == RID_CMD_INHIBIT,750U);
++        inhibitResponse(reply,result); return;
+     }
+     else if (::strtolower(command) == RID_CMD_DYN_REGRP) {
+         // validate source ID is a integer within the JSON blob
+--- a/src/host/restapi/RESTAPI.h
++++ b/src/host/restapi/RESTAPI.h
+@@ -36,7 +36,7 @@
+ 
+ class HOST_SW_API Host;
+ namespace dmr { class HOST_SW_API Control; }
+-namespace p25 { class HOST_SW_API Control; }
++namespace p25 { class HOST_SW_API Control; struct InhibitProcedureTestAccess; }
+ namespace nxdn { class HOST_SW_API Control; }
+ 
+ // ---------------------------------------------------------------------------
+@@ -48,6 +48,9 @@
+  * @ingroup host_rest
+  */
+ class HOST_SW_API RESTAPI : private Thread {
++#if defined(CATCH2_TEST_COMPILATION)
++    friend struct p25::InhibitProcedureTestAccess;
++#endif
+ public:
+     /**
+      * @brief Initializes a new instance of the RESTAPI class.
+@@ -335,6 +338,8 @@
+      * @param match HTTP request matcher.
+      */
+     void restAPI_PutP25SiteState(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
++    void restAPI_GetP25InhibitPolicy(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
++    void restAPI_PutP25InhibitPolicy(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+     void restAPI_PutP25RID(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+     /**
+      * @brief REST API endpoint; implements toggle P25 CC request.
+--- a/src/host/restapi/RESTDefines.h
++++ b/src/host/restapi/RESTDefines.h
+@@ -92,6 +92,7 @@
+ #define GET_P25_DUMP_TSBK_BASE          "/p25/dump-tsbk/"
+ #define GET_P25_DUMP_TSBK               GET_P25_DUMP_TSBK_BASE"(\\d+)"
+ #define PUT_P25_RID                     "/p25/rid"
++#define P25_INHIBIT_POLICY              "/p25/inhibit-policy"
+ #define GET_P25_CC_DEDICATED            "/p25/cc-enable"
+ #define GET_P25_CC_BCAST                "/p25/cc-broadcast"
+ #define PUT_P25_RAW_TSBK                "/p25/raw-tsbk"
+--- /dev/null
++++ b/tests/p25/InhibitProcedure_Tests.cpp
+@@ -0,0 +1,395 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// AABD-B13.3/13.4 PDF120-123/p115-118, A.5.2.2/Table18-5 PDF145/p140;
++// AABC-E2.3.15/Table2.3.15-1 PDF34/p15;6.1.7.1 PDF105/p86;
++// ACK6.2.1.1 PDF150-151/p131-132. Body/response bytes are literal.
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/network/P25SiteRouting.h"
++#include "common/p25/acl/AccessControl.h"
++#include "common/p25/Audio.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/Log.h"
++#include "host/p25/packet/ControlSignaling.h"
++#include "host/restapi/RESTAPI.h"
++#include <future>
++#include <thread>
++#include <chrono>
++#include "common/Utils.h"
++#include "common/json/json.h"
++#include <iostream>
++#include <fstream>
++#include <cstdlib>
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <sstream>
++#include <vector>
++
++namespace p25 {
++struct InhibitProcedureTestAccess {
++ static void tick(Control& c,uint32_t ms=0U){c.m_control->clockInhibitions(ms);}
++ static void checkTick(Control& c,uint32_t ms=0U){c.m_control->clockRadioChecks(ms);}
++ static bool configure(Control& c,const yaml::Node& policy){return c.m_control->configureInhibitions(policy);}
++ static void physical(Control& c,uint32_t id){c.m_dispatchSubscribers.insert(id);}
++ static bool frame(Control& c,const std::vector<uint8_t>& data,const TxFrameOwnership& owner={}){return c.addFrame(data.data(),data.size(),false,false,owner);}
++ static std::array<uint32_t,3> state(Control& c){return {{uint32_t(c.m_rfState.load()),c.m_rfLossWatchdog.getTimer(),c.m_permittedDstId.load()}};}
++ static json::object permit(Control& c,uint32_t source,uint32_t group,const std::string& token){json::object req,reply;const int from=source,to=group;req["srcId"].set<int>(from);req["dstId"].set<int>(to);req["permitToken"].set<std::string>(token);json::value decoded;const auto wire=json::value(req).serialize();REQUIRE(json::parse(decoded,wire).empty());auto parsed=decoded.get<json::object>();c.RPC_permittedTG(parsed,reply);return reply;}
++ static void auth(RESTAPI& api){api.m_authTokens["inhibit-fixture"]=1U;}
++ static restapi::http::HTTPPayload api(RESTAPI& api,const std::string& body,bool get=false,bool authorized=true){
++  restapi::http::HTTPPayload request,reply;request.content=body;request.headers.add("Content-Type","application/json");request.headers.add("RemoteHost","inhibit-fixture");if(authorized)request.headers.add("X-DVM-Auth-Token","1");restapi::RequestMatch match(std::smatch{},body);
++  if(get)api.restAPI_GetP25InhibitPolicy(request,reply,match);else api.restAPI_PutP25InhibitPolicy(request,reply,match);return reply;
++ }
++ static std::unique_lock<std::recursive_mutex> permitLock(Control& c){return std::unique_lock<std::recursive_mutex>(c.m_permitMutex);}
++ static size_t queued(Control& c){std::lock_guard<std::mutex> lock(c.m_control->m_inhibitMutex);return c.m_control->m_inhibitOperations.size();}
++ static bool ownerLive(Control& c,uint32_t id){std::lock_guard<std::mutex> lock(c.m_control->m_inhibitMutex);const auto it=c.m_control->m_inhibitions.find(id);return it!=c.m_control->m_inhibitions.end()&&it->second.owner&&it->second.owner->active.load();}
++ static size_t completions(Control& c){std::lock_guard<std::mutex> lock(c.m_control->m_inhibitMutex);return c.m_control->m_inhibitCompletions.size();}
++};
++}
++namespace {
++using namespace p25;
++using namespace p25::defines;
++constexpr uint32_t RID = 10001U, OTHER = 10005U, APP = 10002U, TG = 1001U, NAC = 0x293U;
++using Block = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++std::ostringstream& nativeLog() { static std::ostringstream log; return log; }
++size_t acceptedLogs() {
++    const auto log=nativeLog().str(); size_t count=0U, at=0U;
++    while ((at=log.find("Emergency Alarm Cancel Accepted",at))!=std::string::npos) { ++count; ++at; }
++    return count;
++}
++std::string hex(const uint8_t* bytes,size_t length) {
++    static const char* digits="0123456789ABCDEF"; std::string value;
++    for(size_t i=0U;i<length;++i) { value+=digits[bytes[i]>>4U]; value+=digits[bytes[i]&15U]; }
++    return value;
++}
++::lookups::TalkgroupRuleGroupVoice policy(bool affRestricted, const std::vector<uint32_t>& aff,
++    bool txRestricted, const std::vector<uint32_t>& tx) {
++    std::ostringstream text;
++    text << "name: TEST\nsource:\n    tgid: 1001\n    slot: 1\nconfig:\n    active: true\n    subscriber_access:\n        affiliation:\n            restricted: " << (affRestricted ? "true" : "false") << "\n            radio_ids:";
++    if (aff.empty()) text << " []\n";
++    else { text << "\n"; for (auto id : aff) text << "                - " << id << "\n"; }
++    text << "        transmit:\n            restricted: " << (txRestricted ? "true" : "false") << "\n            radio_ids:";
++    if (tx.empty()) text << " []\n";
++    else { text << "\n"; for (auto id : tx) text << "                - " << id << "\n"; }
++    yaml::Node node; REQUIRE(yaml::Parse(node, text.str()));
++    return ::lookups::TalkgroupRuleGroupVoice(node);
++}
++struct Fixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, true};
++    ::lookups::TalkgroupRulesLookup groups;
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U, true, true, false, false, false, false};
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-subscriber-test", false};
++    network::NetRPC* oldRPC = g_RPC;
++    std::unique_ptr<Control> controller;
++    explicit Fixture(bool groupACL = true, uint32_t queue = 16384U, bool control = true) : groups("",0U,groupACL) {
++        const bool cc=control; const bool physicalInventory=true;
++        g_logDisplayLevel = 0U; g_RPC = &rpc;
++        nativeLog().str(""); nativeLog().clear(); log_internal::SetInternalOutputStream(nativeLog());
++        radios.addEntry(RID, true, "Subscriber"); radios.addEntry(OTHER, false, "Disabled"); radios.addEntry(APP, true, "Console"); radios.addEntry(10006U, true, "Not physical");
++        groups.addEntry(TG, 1U, true); groups.addEntry(1002U, 1U, true);
++        controller = std::make_unique<Control>(cc, NAC, 1U, queue, &modem, nullptr, 120U, 1U, true,
++            &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
++        yaml::Node config; std::string mode = cc ? "true" : "false";
++        const std::string inventory = physicalInventory ? "        dispatchSubscribers:\n            - 10001\n            - 10005\n" : "        dispatchSubscribers: []\n";
++        REQUIRE(yaml::Parse(config, std::string("protocols:\n    p25:\n        managedSite: true\n") + inventory + "        verifyReg: true\n        verifyAff: true\n        inhibitUnauthorized: false\n        tduPreambleCount: 0\n        control:\n            enable: " + mode + "\n            dedicated: " + mode + "\n            ackRequests: false\n            disableTSDUMBF: true\n            redundantImmediate: false\nsystem:\n    config:\n        controlCh:\n            notifyEnable: false\n"));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 25U, false);
++        controller->setDebugVerbose(false,false);
++        controller->configureIdentification(false); controller->setCCRunning(cc); controller->setZoneConnected(true);
++        controller->affiliations()->unitReg(RID);
++    }
++    ~Fixture() { controller.reset(); g_RPC = oldRPC; log_internal::SetInternalOutputStream(std::cerr); }
++    void apply(bool ar, std::vector<uint32_t> a, bool tr, std::vector<uint32_t> t) { groups.addEntry(policy(ar, a, tr, t)); }
++    bool signal(uint8_t opcode, uint64_t value, uint8_t manufacturer = 0U, bool corruptCRC = false) {
++        Block raw{}; raw[0] = 0x80U | opcode; raw[1] = manufacturer;
++        for (unsigned i = 0U; i < 8U; ++i) raw[2U+i] = uint8_t(value >> ((7U-i)*8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        if (corruptCRC) raw[11U] ^= 1U;
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES+2U> frame{}; frame[0] = modem::TAG_DATA; frame[1] = 1U;
++        Sync::addP25Sync(frame.data()+2U); NID nid(NAC); nid.encode(frame.data()+2U, DUID::TSDU);
++        std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> encoded{}; edac::Trellis trellis;
++        trellis.encode12(raw.data(), encoded.data()); P25Utils::encode(encoded.data(), frame.data()+2U, 114U, 318U);
++        P25Utils::addStatusBits(frame.data()+2U, P25_TSDU_FRAME_LENGTH_BITS, false, false);
++        return controller->processFrame(frame.data(), frame.size());
++    }
++    std::vector<Block> responses() {
++        std::array<uint8_t, 1024> frame{}; std::vector<Block> blocks;
++        while (controller->getFrame(frame.data()) != 0U) {
++            NID nid(NAC); if (!nid.decode(frame.data()+2U) || nid.getDUID()!=DUID::TSDU) continue;
++            std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{}; Block raw{}; edac::Trellis trellis;
++            P25Utils::decode(frame.data()+2U, coded.data(), 114U, 318U); REQUIRE(trellis.decode12(coded.data(), raw.data()));
++            REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); blocks.push_back(raw);
++        }
++        return blocks;
++    }
++    bool voice(DUID::E duid,uint32_t source=RID,uint32_t target=TG,bool group=true) {
++        const unsigned size=duid==DUID::HDU?P25_HDU_FRAME_LENGTH_BYTES:P25_LDU_FRAME_LENGTH_BYTES;
++        std::vector<uint8_t> frame(size+2U);frame[0]=modem::TAG_DATA;frame[1]=1U;
++        lc::LC value;value.setSrcId(source);value.setDstId(target);value.setLCO(group?LCO::GROUP:LCO::PRIVATE);value.setGroup(group);value.setAlgId(ALGO_UNENCRYPT);value.setKId(0U);
++        if(duid!=DUID::HDU){Audio audio;for(unsigned i=0;i<9U;++i)audio.encode(frame.data()+2U,NULL_IMBE,i);}
++        if(duid==DUID::HDU)value.encodeHDU(frame.data()+2U);
++        if(duid==DUID::LDU1)value.encodeLDU1(frame.data()+2U);
++        if(duid==DUID::LDU2)value.encodeLDU2(frame.data()+2U);
++        Sync::addP25Sync(frame.data()+2U);NID(NAC).encode(frame.data()+2U,duid);P25Utils::addStatusBits(frame.data()+2U,size*8U,true,false);
++        return controller->processFrame(frame.data(),frame.size());
++    }
++    void age(uint32_t ms) { controller->affiliations()->clock(ms); }
++};
++}
++namespace {
++using Access=p25::InhibitProcedureTestAccess;
++constexpr uint32_t SECOND=10003U;
++template<typename F> auto owned(Fixture& f,F operation) {
++    auto result=std::async(std::launch::async,operation);const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(2);
++    while(result.wait_for(std::chrono::milliseconds(0))!=std::future_status::ready&&std::chrono::steady_clock::now()<end){Access::tick(*f.controller);std::this_thread::yield();}
++    REQUIRE(result.wait_for(std::chrono::milliseconds(0))==std::future_status::ready);return result.get();
++}
++InhibitResult apply(Fixture& f,std::vector<InhibitDesired> desired,std::vector<InhibitRestore> mirror={},bool hasMirror=false){return owned(f,[&]{return f.controller->control()->updateInhibitPolicy(desired,mirror,hasMirror,750U);});}
++InhibitResult command(Fixture& f,bool inhibit,uint32_t target=RID){return owned(f,[&]{return f.controller->control()->requestInhibitCommand(target,inhibit,750U);});}
++uint64_t response(uint16_t function,uint32_t argument=0xFFFFFCU,uint32_t source=RID){return (uint64_t(function)<<48U)|(uint64_t(argument)<<24U)|source;}
++void extended(const Block& b,uint16_t function,uint32_t target=RID){
++    const std::array<uint8_t,10> expected{{0xA4,0,uint8_t(function>>8),uint8_t(function),0xFF,0xFF,0xFC,uint8_t(target>>16),uint8_t(target>>8),uint8_t(target)}};
++    for(size_t i=0;i<expected.size();++i)REQUIRE(b[i]==expected[i]);
++}
++void finalACK(const Block& b,uint32_t target=RID){
++    const std::array<uint8_t,10> expected{{0xA0,0,0xA4,0,0xFF,0xFF,0xFD,uint8_t(target>>16),uint8_t(target>>8),uint8_t(target)}};
++    for(size_t i=0;i<expected.size();++i)REQUIRE(b[i]==expected[i]);
++}
++void second(Fixture& f){f.radios.addEntry(SECOND,true,"Second physical SU");Access::physical(*f.controller,SECOND);f.controller->affiliations()->unitReg(SECOND);}
++json::object payload(const restapi::http::HTTPPayload& reply){json::value result;REQUIRE(json::parse(result,reply.content).empty());REQUIRE(result.is<json::object>());return result.get<json::object>();}
++size_t countLog(const char* marker){auto text=nativeLog().str();size_t at=0,count=0;while((at=text.find(marker,at))!=std::string::npos){++count;++at;}return count;}
++}
++TEST_CASE("startup restores operational block separately from provisioning without operation replay", "[p25][inhibit]") {
++    Fixture f;auto* units=f.controller->affiliations();yaml::Node policy;
++    REQUIRE(yaml::Parse(policy,std::string("desired:\n  - radio_id: 10001\n    inhibited: true\nrestore:\n  - radio_id: 10001\n    blocked: false\n    pending_uninhibit: false\n")));
++    REQUIRE(Access::configure(*f.controller,policy));REQUIRE(f.controller->isRadioInhibited(RID));REQUIRE(f.controller->physicalSubscriberPermitted(RID));
++    Access::tick(*f.controller,20000U);REQUIRE(f.responses().empty());REQUIRE(units->isUnitReg(RID));
++    policy=yaml::Node();
++    REQUIRE(yaml::Parse(policy,std::string("desired: []\nrestore:\n  - radio_id: 10001\n    blocked: true\n    pending_uninhibit: false\n")));
++    REQUIRE(Access::configure(*f.controller,policy));auto rows=f.controller->control()->inhibitSnapshot().radios;REQUIRE(rows.size()==1);REQUIRE_FALSE(rows[0].desiredInhibited);REQUIRE(rows[0].blocked);REQUIRE(rows[0].pendingUninhibit);
++    Access::tick(*f.controller,20000U);REQUIRE(f.responses().empty());
++    auto empty=apply(f,{});REQUIRE(empty.status==200);REQUIRE(empty.radios[0].blocked);REQUIRE(f.responses().empty());
++    policy=yaml::Node();
++    REQUIRE(yaml::Parse(policy,std::string("desired: []\nrestore:\n  - radio_id: 10002\n    blocked: true\n    pending_uninhibit: true\n")));
++    REQUIRE_FALSE(Access::configure(*f.controller,policy));REQUIRE(f.controller->isRadioInhibited(RID));
++}
++TEST_CASE("inhibit and re-enable use exact literal commands five attempts and FNE final acknowledgment", "[p25][inhibit]") {
++    for(uint8_t mfid:{0U,1U}){Fixture f;REQUIRE(apply(f,{{RID,true}}).status==200);REQUIRE(f.responses().empty());REQUIRE(command(f,true).status==200);
++        auto frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007F);
++        f.age(1000U);REQUIRE(f.signal(0x24,response(0x00FF),mfid));frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);REQUIRE(f.controller->isRadioInhibited(RID));REQUIRE(f.controller->affiliations()->unitRegTimer(RID)==0U);
++        REQUIRE(countLog("(Extended Function Response)")==1);REQUIRE(f.signal(0x24,response(0x00FF),mfid));frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);REQUIRE(countLog("(Extended Function Response)")==1);
++        REQUIRE(apply(f,{}).status==200);REQUIRE(f.controller->isRadioInhibited(RID));REQUIRE(f.responses().empty());REQUIRE(command(f,false).status==200);
++        frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007E);
++        for(unsigned retry=1;retry<5;++retry){Access::tick(*f.controller,1999);REQUIRE(f.responses().empty());Access::tick(*f.controller,1);frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007E);}
++        Access::tick(*f.controller,2000);REQUIRE(f.responses().empty());Access::tick(*f.controller,10000);REQUIRE(f.responses().empty());REQUIRE(countLog("P25 Radio Uninhibit, no response")==1);
++        auto current=f.controller->control()->inhibitSnapshot();REQUIRE(current.radios[0].blocked);REQUIRE(current.radios[0].pendingUninhibit);REQUIRE(current.radios[0].attempts==5);
++        // Valid registration is processed normally and restarts pending re-enable.
++        REQUIRE(f.signal(0x2C,(uint64_t(1)<<36U)|(uint64_t(1)<<24U)|RID));frames=f.responses();REQUIRE_FALSE(frames.empty());REQUIRE(f.controller->isRadioInhibited(RID));
++        Access::tick(*f.controller);frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007E);
++        REQUIRE(f.signal(0x24,response(0x00FE),mfid));frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);REQUIRE_FALSE(f.controller->isRadioInhibited(RID));REQUIRE(f.controller->control()->inhibitSnapshot().radios.empty());
++        REQUIRE(f.signal(0x24,response(0x00FE),mfid));frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);REQUIRE(Access::completions(*f.controller)==1);
++        f.controller->setCCRunning(false);f.controller->setCCRunning(true);REQUIRE_FALSE(f.signal(0x24,response(0x00FE),mfid));REQUIRE(f.responses().empty());
++    }
++}
++TEST_CASE("wrong or unsolicited responses cannot change inhibition or refresh another identity", "[p25][inhibit]") {
++    for(unsigned mode=0;mode<6;++mode){Fixture f;second(f);REQUIRE(apply(f,{{RID,true}}).status==200);REQUIRE(command(f,true).status==200);f.responses();f.age(1000);
++        const uint16_t fn=mode==0?0x00FE:mode==1?0x0080:0x00FF;const uint32_t arg=mode==2?SECOND:0xFFFFFC;const uint32_t actual=mode==3?SECOND:RID;const uint8_t mfid=mode==4?0xAA:mode==5?0x90:0;
++        REQUIRE_FALSE(f.signal(0x24,response(fn,arg,actual),mfid));REQUIRE(f.responses().empty());REQUIRE(f.controller->isRadioInhibited(RID));REQUIRE(f.controller->affiliations()->unitRegTimer(RID)==1);REQUIRE(f.controller->affiliations()->unitRegTimer(SECOND)==1);
++        Access::tick(*f.controller,2000);auto frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007F);
++    }
++}
++TEST_CASE("inhibited services are ignored while registration and null affiliation remain valid", "[p25][inhibit]") {
++    for(uint8_t opcode:{0U,0x18U,0x1CU,0x1FU,0x27U,0x23U,0x28U,0x2BU}){
++        Fixture f;REQUIRE(apply(f,{{RID,true}}).status==200);f.age(1000);const auto before=Access::state(*f.controller);
++        uint64_t value=(uint64_t(TG)<<24U)|RID;
++        if(opcode==0x23)value=(uint64_t(0xA7)<<56U)|(uint64_t(0x80)<<40U)|(uint64_t(TG)<<24U)|RID;
++        REQUIRE_FALSE(f.signal(opcode,value));REQUIRE(f.responses().empty());REQUIRE(Access::state(*f.controller)==before);REQUIRE(f.controller->affiliations()->unitRegTimer(RID)==1);
++        REQUIRE(countLog("Emergency Alarm Cancel Accepted")==0);REQUIRE(countLog("(Emergency Alarm Request)")==0);
++        Access::tick(*f.controller);auto frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007F);
++    }
++    Fixture f;REQUIRE(apply(f,{{RID,true}}).status==200);REQUIRE(f.signal(0x28,RID));REQUIRE_FALSE(f.responses().empty());REQUIRE(f.controller->isRadioInhibited(RID));REQUIRE(f.controller->affiliations()->isUnitReg(RID));
++    REQUIRE(f.signal(0x2C,(uint64_t(1)<<36U)|(uint64_t(1)<<24U)|RID));REQUIRE_FALSE(f.responses().empty());REQUIRE(f.controller->isRadioInhibited(RID));
++    second(f);REQUIRE_FALSE(f.signal(0x1F,(uint64_t(RID)<<24U)|SECOND));auto frames=f.responses();REQUIRE(frames.size()==1);REQUIRE((frames[0][0]&0x3F)==0x27);REQUIRE(frames[0][3]==0x27);REQUIRE(frames[0][9]==uint8_t(SECOND));
++}
++TEST_CASE("current record bound is atomic and completed false intent does not consume lifetime capacity", "[p25][inhibit]") {
++    Fixture f;std::vector<InhibitDesired> desired;
++    for(uint32_t n=0;n<33;++n){const auto id=20000+n;f.radios.addEntry(id,true,"Capacity SU");Access::physical(*f.controller,id);if(n<32)desired.push_back({id,true});}
++    REQUIRE(apply(f,desired).status==200);REQUIRE(f.controller->control()->inhibitSnapshot().radios.size()==32);
++    auto tooMany=desired;tooMany.push_back({20032,true});REQUIRE(apply(f,tooMany).status==400);REQUIRE(f.controller->control()->inhibitSnapshot().radios.size()==32);REQUIRE_FALSE(f.controller->isRadioInhibited(20032));
++    REQUIRE(apply(f,{{20032,true}}).status==400);REQUIRE(f.controller->isRadioInhibited(20000));
++    Fixture clean;for(unsigned n=0;n<100;++n){REQUIRE(apply(clean,{{RID,false}}).status==200);REQUIRE(clean.controller->control()->inhibitSnapshot().radios.empty());}
++    REQUIRE(apply(clean,{{RID,true}}).status==200);REQUIRE(command(clean,true).status==200);REQUIRE(Access::ownerLive(*clean.controller,RID));
++    REQUIRE(apply(clean,{{RID,false},{19999,true}}).status==400);REQUIRE(Access::ownerLive(*clean.controller,RID));auto frames=clean.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007F);
++}
++TEST_CASE("VC accepts only a complete scoped CC mirror and cannot self-acknowledge or re-enable", "[p25][inhibit]") {
++    Fixture f(true,16384,false);second(f);
++    REQUIRE(apply(f,{{RID,true}},{{RID,false,false}},true).status==200);REQUIRE(f.controller->isRadioInhibited(RID));
++    REQUIRE_FALSE(f.signal(0x24,response(0x00FE)));REQUIRE(f.responses().empty());REQUIRE(f.controller->isRadioInhibited(RID));REQUIRE(command(f,false).status!=200);
++    REQUIRE(apply(f,{{RID,true}},{},true).status==400);REQUIRE(f.controller->isRadioInhibited(RID));
++    REQUIRE(apply(f,{},{{19999,true,true}},true).status==400);REQUIRE(f.controller->isRadioInhibited(RID));
++    REQUIRE(apply(f,{},{{RID,true,false}},true).status==400);REQUIRE(f.controller->isRadioInhibited(RID));
++    REQUIRE(apply(f,{}).status==200);REQUIRE(f.controller->isRadioInhibited(RID));REQUIRE(apply(f,{},{},true).status==200);REQUIRE_FALSE(f.controller->isRadioInhibited(RID));
++    auto permitted=Access::permit(*f.controller,RID,TG,"abcd:1");REQUIRE(permitted["status"].get<int>()==200);REQUIRE(Access::state(*f.controller)[2]==TG);
++    REQUIRE(apply(f,{{RID,true}},{{RID,true,false}},true).status==200);REQUIRE(Access::state(*f.controller)[2]==0);
++    auto clear=Access::permit(*f.controller,0,0,"abcd:1");REQUIRE(clear["status"].get<int>()==200);
++    REQUIRE(apply(f,{},{},true).status==200);permitted=Access::permit(*f.controller,SECOND,TG,"abcd:2");REQUIRE(permitted["status"].get<int>()==200);
++    clear=Access::permit(*f.controller,0,0,"abcd:1");REQUIRE(clear["status"].get<int>()==200);REQUIRE(Access::state(*f.controller)[2]==TG);
++    Fixture cc;REQUIRE(apply(cc,{{RID,true}},{{RID,false,false}},true).status==400);REQUIRE_FALSE(cc.controller->isRadioInhibited(RID));
++}
++TEST_CASE("unsent commands and service frames cannot survive policy withdrawal ACK timeout or failed REST wait", "[p25][inhibit]") {
++    Fixture f;second(f);const std::vector<uint8_t> old{{0x01,0,0x11}},other{{0x01,0,0x22}},normal{{0x01,0,0x33}};
++    REQUIRE(Access::frame(*f.controller,old,f.controller->serviceFrameOwner(RID)));REQUIRE(Access::frame(*f.controller,other,f.controller->serviceFrameOwner(SECOND)));REQUIRE(Access::frame(*f.controller,normal));
++    REQUIRE(apply(f,{{RID,true}}).status==200);REQUIRE(apply(f,{}).status==200);REQUIRE(command(f,false).status==200);REQUIRE(f.signal(0x24,response(0x00FE)));
++    std::array<uint8_t,1024> frame{};std::vector<uint8_t> preserved;
++    while(auto length=f.controller->getFrame(frame.data())){if(length==3U)preserved.push_back(frame[2]);}
++    REQUIRE(preserved==std::vector<uint8_t>{0x22,0x33});
++    Fixture timeout;REQUIRE(apply(timeout,{{RID,true}}).status==200);auto failed=timeout.controller->control()->requestInhibitCommand(RID,true,1U);REQUIRE(failed.status==503);Access::tick(*timeout.controller);REQUIRE(timeout.responses().empty());
++    REQUIRE(command(timeout,true).status==200);timeout.controller->setCCRunning(false);timeout.controller->setCCRunning(true);REQUIRE(timeout.responses().empty());Access::tick(*timeout.controller,10000);REQUIRE(timeout.responses().empty());
++    REQUIRE_FALSE(timeout.signal(0x24,response(0x00FF)));REQUIRE(timeout.responses().empty());
++}
++TEST_CASE("authenticated policy handlers enforce JSON size identity role and exact count without opening sockets", "[p25][inhibit][inhibit-api]") {
++    Fixture f;RESTAPI api("127.0.0.1",48993U,"unopened-inhibit-fixture","","",false,nullptr,false);api.setProtocols(nullptr,f.controller.get(),nullptr);Access::auth(api);
++    auto invoke=[&](const std::string& body,bool get=false,bool authorized=true){return payload(owned(f,[&]{return Access::api(api,body,get,authorized);}));};
++    REQUIRE(invoke("{}",true,false)["status"].get<int>()==401);
++    REQUIRE(invoke("{\"radios\":[{\"radio_id\":10001,\"inhibited\":true}]}")["status"].get<int>()==200);
++    for(const auto& text:std::vector<std::string>{"{}","{\"radios\":true}","{\"radios\":[{\"radio_id\":10001,\"inhibited\":0}]}","{\"radios\":[{\"radio_id\":10002,\"inhibited\":true}]}","{\"radios\":[],\"restore\":[]}","{\"radios\":[],\"control_state\":[]}",std::string(4097,' ')}){REQUIRE(invoke(text)["status"].get<int>()==400);REQUIRE(f.controller->isRadioInhibited(RID));}
++    for(const auto& id:std::vector<std::string>{"10001.5","4294977297","-4294957295","0","16777212","16777215"}){REQUIRE(invoke("{\"radios\":[{\"radio_id\":"+id+",\"inhibited\":true}]}")["status"].get<int>()==400);REQUIRE(f.controller->isRadioInhibited(RID));}
++    auto read=invoke("",true);REQUIRE(read["record_count"].get<int>()==1);REQUIRE(read["record_limit"].get<int>()==32);REQUIRE(read["radios"].get<json::array>().size()==1);
++}
++
++TEST_CASE("cached offline enforcement and CHECK exceptions preserve policy without Site administrative choices", "[p25][inhibit]") {
++    Fixture f;REQUIRE(apply(f,{{RID,true}}).status==200);f.controller->setZoneConnected(false);
++    REQUIRE(command(f,true).status==503);REQUIRE(f.responses().empty());
++    REQUIRE_FALSE(f.signal(0,(uint64_t(TG)<<24U)|RID));Access::tick(*f.controller);auto frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007F);
++    REQUIRE(f.signal(0x24,response(0x00FF)));frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);
++    REQUIRE(f.controller->control()->requestRadioCheck(RID,0U));Access::checkTick(*f.controller);frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x0000);
++    REQUIRE(f.signal(0x24,response(0x0080)));REQUIRE(f.responses().empty());REQUIRE(f.controller->isRadioInhibited(RID));
++    REQUIRE(apply(f,{}).status==200);f.controller->affiliations()->unitDereg(RID,false);
++    REQUIRE(f.signal(0x2C,(uint64_t(1)<<36U)|(uint64_t(1)<<24U)|RID));f.responses();Access::tick(*f.controller);frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007E);
++    REQUIRE(f.signal(0x24,response(0x00FE)));frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);REQUIRE_FALSE(f.controller->isRadioInhibited(RID));
++}
++TEST_CASE("ACK cancels all unsent procedure generations and failed ACK enqueue cannot clear", "[p25][inhibit]") {
++    Fixture f;REQUIRE(apply(f,{{RID,true}}).status==200);REQUIRE(command(f,true).status==200);Access::tick(*f.controller,2000);
++    REQUIRE(f.signal(0x24,response(0x00FF)));auto frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);
++    REQUIRE(command(f,true).status==200);REQUIRE(apply(f,{}).status==200);REQUIRE(f.responses().empty());
++    REQUIRE(command(f,false).status==200);f.controller->setCCHalted(true);f.controller->setCCHalted(false);REQUIRE(f.responses().empty());Access::tick(*f.controller,20000);REQUIRE(f.responses().empty());
++    Fixture full(true,49U);yaml::Node policy;REQUIRE(yaml::Parse(policy,std::string("restore:\n  - radio_id: 10001\n    blocked: true\n    pending_uninhibit: true\n")));REQUIRE(Access::configure(*full.controller,policy));
++    REQUIRE(command(full,false).status==200);full.age(1000);REQUIRE_FALSE(full.signal(0x24,response(0x00FE)));REQUIRE(full.controller->isRadioInhibited(RID));REQUIRE(full.controller->affiliations()->unitRegTimer(RID)==1);
++    frames=full.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007E);REQUIRE(full.signal(0x24,response(0x00FE)));frames=full.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);REQUIRE_FALSE(full.controller->isRadioInhibited(RID));
++}
++TEST_CASE("completion cache is current-run bounded and active procedure capacity is explicit", "[p25][inhibit]") {
++    Fixture f;for(uint32_t n=0;n<17;++n){const auto id=20000+n;f.radios.addEntry(id,true,"Completion SU");Access::physical(*f.controller,id);f.controller->affiliations()->unitReg(id);
++        REQUIRE(command(f,false,id).status==200);f.responses();REQUIRE(f.signal(0x24,response(0x00FE,0xFFFFFC,id)));auto frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0],id);
++        REQUIRE(f.controller->control()->inhibitSnapshot().radios.empty());REQUIRE(Access::completions(*f.controller)==std::min<size_t>(n+1,16));}
++    REQUIRE_FALSE(f.signal(0x24,response(0x00FE,0xFFFFFC,20000)));REQUIRE(f.responses().empty());REQUIRE(f.signal(0x24,response(0x00FE,0xFFFFFC,20016)));REQUIRE(f.responses().size()==1);
++    std::vector<InhibitDesired> desired;for(uint32_t n=0;n<17;++n)desired.push_back({20000+n,true});REQUIRE(apply(f,desired).status==200);
++    for(uint32_t n=0;n<16;++n)REQUIRE(command(f,true,20000+n).status==200);REQUIRE(command(f,true,20016).status==503);
++    auto current=f.controller->control()->inhibitSnapshot();REQUIRE(std::count_if(current.radios.begin(),current.radios.end(),[](const auto& row){return row.procedure=="awaiting";})==16);
++    f.controller->setCCRunning(false);f.controller->setCCRunning(true);REQUIRE(f.responses().empty());
++}
++TEST_CASE("typed local AMBT acknowledgment uses actual SU and exact requestor before changing state", "[p25][inhibit][ambt-ingress]") {
++    struct Packet {
++        Block header{{0x17,0xFD,0,0,0x27,0x11,0x81,0x24,0,0,0,0}},body{{0x10,1,0,0xFF,0xFF,0xFF,0xFC,0,0,0,0,0}};
++        std::vector<uint8_t> frame(){edac::CRC::addCCITT162(header.data(),12);edac::CRC::addCRC32(body.data(),12);std::array<uint8_t,72> plain{};std::array<uint8_t,25> coded{};edac::Trellis trellis;trellis.encode12(header.data(),coded.data());Utils::setBitRange(coded.data(),plain.data(),112,196);trellis.encode12(body.data(),coded.data());Utils::setBitRange(coded.data(),plain.data(),308,196);std::vector<uint8_t> wire(74);wire[0]=modem::TAG_DATA;wire[1]=1;P25Utils::encode(plain.data(),wire.data()+2,0,576);Sync::addP25Sync(wire.data()+2);NID nid(NAC);nid.encode(wire.data()+2,DUID::PDU);return wire;}
++    };
++    for(uint8_t mfid:{0U,1U}){Fixture f;REQUIRE(apply(f,{{RID,true}}).status==200);REQUIRE(command(f,true).status==200);f.responses();f.age(1000);
++        Packet p;p.header[2]=mfid;p.body[6]=0xFDU;auto wire=p.frame();f.controller->processFrame(wire.data(),wire.size());REQUIRE(f.responses().empty());REQUIRE(f.controller->affiliations()->unitRegTimer(RID)==1);REQUIRE(f.controller->isRadioInhibited(RID));
++        p.body[6]=0xFC;wire=p.frame();REQUIRE(f.controller->processFrame(wire.data(),wire.size()));auto frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);REQUIRE(f.controller->isRadioInhibited(RID));
++        REQUIRE(apply(f,{}).status==200);REQUIRE(command(f,false).status==200);f.responses();p.body[3]=0xFE;wire=p.frame();REQUIRE(f.controller->processFrame(wire.data(),wire.size()));frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);REQUIRE_FALSE(f.controller->isRadioInhibited(RID));
++    }
++    Fixture withdrawn;REQUIRE(apply(withdrawn,{{RID,true}}).status==200);REQUIRE(command(withdrawn,true).status==200);withdrawn.responses();withdrawn.controller->setCCHalted(true);Packet late;auto wire=late.frame();REQUIRE(withdrawn.controller->processFrame(wire.data(),wire.size()));REQUIRE(withdrawn.responses().empty());REQUIRE(withdrawn.controller->isRadioInhibited(RID));withdrawn.controller->setCCHalted(false);Access::tick(*withdrawn.controller,20000);REQUIRE(withdrawn.responses().empty());
++}
++TEST_CASE("HTTP policy maximum and maximum-plus-one preserve exact scoped state and product bounds", "[p25][inhibit][inhibit-api]") {
++    Fixture f;RESTAPI api("127.0.0.1",48994U,"unopened-inhibit-fixture","","",false,nullptr,false);api.setProtocols(nullptr,f.controller.get(),nullptr);Access::auth(api);
++    json::array desired;for(uint32_t n=0;n<33;++n){const auto id=16777000+n;f.radios.addEntry(id,true,"Max-body physical SU");Access::physical(*f.controller,id);json::object row;row["radio_id"].set<uint32_t>(id);const bool inhibited=true;row["inhibited"].set<bool>(inhibited);desired.push_back(json::value(row));}
++    json::object object;auto atLimit=desired;atLimit.pop_back();object["radios"].set<json::array>(atLimit);auto good=json::value(object).serialize();auto result=payload(owned(f,[&]{return Access::api(api,good);}));REQUIRE(result["status"].get<int>()==200);REQUIRE(result["record_count"].get<int>()==32);
++    object["radios"].set<json::array>(desired);auto bad=json::value(object).serialize();result=payload(owned(f,[&]{return Access::api(api,bad);}));REQUIRE(result["status"].get<int>()==400);REQUIRE(f.controller->control()->inhibitSnapshot().radios.size()==32);REQUIRE_FALSE(f.controller->isRadioInhibited(16777032));
++    Fixture vc(true,16384,false);RESTAPI vapi("127.0.0.1",48995U,"unopened-inhibit-fixture","","",false,nullptr,false);vapi.setProtocols(nullptr,vc.controller.get(),nullptr);Access::auth(vapi);
++    json::array wanted,actual;for(uint32_t n=0;n<32;++n){const uint32_t id=16777000+n;vc.radios.addEntry(id,true,"Max mirror SU");Access::physical(*vc.controller,id);json::object d,a;const bool no=false;d["radio_id"].set<uint32_t>(id);d["inhibited"].set<bool>(no);a["radio_id"].set<uint32_t>(id);a["blocked"].set<bool>(no);a["pending_uninhibit"].set<bool>(no);wanted.push_back(json::value(d));actual.push_back(json::value(a));}
++    json::object mirror;mirror["radios"].set<json::array>(wanted);mirror["control_state"].set<json::array>(actual);const auto maxBody=json::value(mirror).serialize();REQUIRE(maxBody.size()==3358U);REQUIRE(maxBody.size()<4096U);result=payload(owned(vc,[&]{return Access::api(vapi,maxBody);}));REQUIRE(result["status"].get<int>()==200);REQUIRE(result["record_count"].get<int>()==0);
++}
++TEST_CASE("individual voice denial carries its known home target and disabled provisioning remains distinct", "[p25][inhibit]") {
++    Fixture f;second(f);REQUIRE(apply(f,{{RID,true}}).status==200);REQUIRE_FALSE(f.signal(0x04,(uint64_t(RID)<<24U)|SECOND));auto frames=f.responses();REQUIRE(frames.size()==1);
++    const std::array<uint8_t,10> expected{{0xA7,0,0x84,0x27,0,0x27,0x11,0,0x27,0x13}};for(size_t i=0;i<expected.size();++i)REQUIRE(frames[0][i]==expected[i]);
++    f.radios.addEntry(RID,false,"Disabled subscriber");REQUIRE(f.controller->isRadioInhibited(RID));REQUIRE_FALSE(f.controller->physicalSubscriberPermitted(RID));
++    REQUIRE_FALSE(f.signal(0x27,(uint64_t(TG)<<24U)|RID));frames=f.responses();REQUIRE(frames.size()==1);REQUIRE(frames[0][3]==0x10);REQUIRE(f.controller->isRadioInhibited(RID));
++}
++
++TEST_CASE("unknown-actual re-enable remains blocked through readback until issued acknowledgment", "[p25][inhibit]") {
++    Fixture f;REQUIRE(f.controller->control()->inhibitSnapshot().radios.empty());
++    auto issued=command(f,false);REQUIRE(issued.status==200);REQUIRE(issued.radios.size()==1);REQUIRE_FALSE(issued.radios[0].desiredInhibited);REQUIRE(issued.radios[0].blocked);REQUIRE(issued.radios[0].pendingUninhibit);REQUIRE(f.controller->isRadioInhibited(RID));
++    auto frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007E);
++    REQUIRE(f.signal(0x24,response(0x00FE)));frames=f.responses();REQUIRE(frames.size()==1);finalACK(frames[0]);REQUIRE_FALSE(f.controller->isRadioInhibited(RID));REQUIRE(f.controller->control()->inhibitSnapshot().radios.empty());
++    Fixture vc(true,16384,false);REQUIRE(apply(vc,{},{{RID,false,true}},true).status==400);REQUIRE(vc.controller->control()->inhibitSnapshot().radios.empty());
++    yaml::Node bad;REQUIRE(yaml::Parse(bad,std::string("restore:\n  - radio_id: 10001\n    blocked: false\n    pending_uninhibit: true\n")));REQUIRE_FALSE(Access::configure(*vc.controller,bad));
++}
++TEST_CASE("real VC voice frames cannot refresh or resume a withdrawn inhibited permit", "[p25][inhibit][inhibit-voice]") {
++    Fixture f(false,16384,false);REQUIRE(Access::permit(*f.controller,RID,TG,"abcd:1")["status"].get<int>()==200);
++    REQUIRE(f.voice(DUID::HDU));REQUIRE(f.voice(DUID::LDU1));REQUIRE(f.controller->peekFrameLength()!=0U);
++    REQUIRE(apply(f,{{RID,true}},{{RID,true,false}},true).status==200);REQUIRE(f.controller->peekFrameLength()==0U);const auto before=Access::state(*f.controller);REQUIRE(before[2]==0U);
++    for(const auto duid:{DUID::HDU,DUID::LDU1,DUID::LDU2}){REQUIRE_FALSE(f.voice(duid));REQUIRE(Access::state(*f.controller)==before);REQUIRE(f.controller->peekFrameLength()==0U);}
++    REQUIRE(Access::permit(*f.controller,RID,TG,"abcd:2")["status"].get<int>()!=200);
++    REQUIRE(apply(f,{},{},true).status==200);REQUIRE(f.controller->peekFrameLength()==0U);REQUIRE(Access::permit(*f.controller,RID,TG,"abcd:3")["status"].get<int>()==200);
++    REQUIRE(f.voice(DUID::HDU));REQUIRE(f.voice(DUID::LDU1));REQUIRE(f.controller->peekFrameLength()!=0U);
++}
++TEST_CASE("ordinary header-only packet response from inhibited SU has no state or watchdog effect", "[p25][inhibit][inhibit-packet]") {
++    // AABB-B response header: inbound Format3, full message, ACK class0/type1,
++    // LLID10001 and no following blocks. Only CRC/Trellis/status are generated.
++    Block header{{0x03,0x08,0,0,0x27,0x11,0x80,0,0,0,0,0}};edac::CRC::addCCITT162(header.data(),12);
++    std::array<uint8_t,45> plain{};std::array<uint8_t,25> encoded{};edac::Trellis trellis;trellis.encode12(header.data(),encoded.data());Utils::setBitRange(encoded.data(),plain.data(),112,196);
++    std::vector<uint8_t> wire(47);wire[0]=modem::TAG_DATA;wire[1]=1;P25Utils::encode(plain.data(),wire.data()+2,0,360);Sync::addP25Sync(wire.data()+2);NID(NAC).encode(wire.data()+2,DUID::PDU);
++    Fixture f;REQUIRE(apply(f,{{RID,true}}).status==200);const auto before=Access::state(*f.controller);REQUIRE_FALSE(f.controller->processFrame(wire.data(),wire.size()));REQUIRE(Access::state(*f.controller)==before);REQUIRE(f.responses().empty());
++    Access::tick(*f.controller);auto frames=f.responses();REQUIRE(frames.size()==1);extended(frames[0],0x007F);
++    Fixture allowed(false,16384,false);REQUIRE(allowed.controller->processFrame(wire.data(),wire.size()));
++}
++
++TEST_CASE("native policy completion joins permit retirement and timed-out owner cancels unsent command", "[p25][inhibit][inhibit-ordering]") {
++    for(bool expire:{false,true}){
++        Fixture f;auto permit=Access::permitLock(*f.controller);
++        auto operation=std::async(std::launch::async,[&]{return expire?f.controller->control()->requestInhibitCommand(RID,false,50U):f.controller->control()->updateInhibitPolicy({{RID,true}},{},false,750U);});
++        auto end=std::chrono::steady_clock::now()+std::chrono::seconds(2);while(Access::queued(*f.controller)==0&&std::chrono::steady_clock::now()<end)std::this_thread::yield();REQUIRE(Access::queued(*f.controller)==1);
++        auto owner=std::async(std::launch::async,[&]{Access::tick(*f.controller);});
++        end=std::chrono::steady_clock::now()+std::chrono::seconds(2);while(!f.controller->isRadioInhibited(RID)&&std::chrono::steady_clock::now()<end)std::this_thread::yield();REQUIRE(f.controller->isRadioInhibited(RID));
++        const bool wasPending=operation.wait_for(std::chrono::milliseconds(0))==std::future_status::timeout;
++        const bool expiredReady=!expire||operation.wait_for(std::chrono::milliseconds(200))==std::future_status::ready;
++        InhibitResult expiredResult;uint32_t queuedLength=0U;
++        if(expire&&expiredReady){expiredResult=operation.get();queuedLength=f.controller->peekFrameLength();}
++        // Release/join even when deliberately broken code violates an assertion.
++        permit.unlock();owner.get();REQUIRE(wasPending);REQUIRE(expiredReady);
++        if(expire){REQUIRE(expiredResult.status==503);REQUIRE(queuedLength==0U);}else REQUIRE(operation.get().status==200);
++        REQUIRE(f.controller->isRadioInhibited(RID));if(expire){const auto rows=f.controller->control()->inhibitSnapshot().radios;REQUIRE(rows[0].blocked);REQUIRE(rows[0].pendingUninhibit);REQUIRE(rows[0].procedure=="cancelled");REQUIRE(f.responses().empty());}
++    }
++}
++TEST_CASE("enhanced packet source target and secondary integrity are classified before state", "[p25][inhibit][inhibit-packet]") {
++    // BAAA-B5.5/Fig21 +5.7/Fig25: EA primary destination10003,
++    // actual source10001 in separate header; all address/layout bytes literal.
++    auto packet=[](bool enhancedResponse,unsigned malformed){
++        Block header=enhancedResponse?Block{{3,8,0,0,0x27,0x13,0,0,0x27,0x11,0,0}}:Block{{0x35,0xDF,0,0,0x27,0x13,0x82,0,0,0,0,0}};
++        std::vector<uint8_t> body(enhancedResponse?0:24);
++        if(!enhancedResponse){const Block secondary{{0x15,0xC0,0,0,0x27,0x11,0,0,0,0,0,0}};std::copy(secondary.begin(),secondary.end(),body.begin());if(malformed==2)body[6]=1;edac::CRC::addCCITT162(body.data(),12);if(malformed==1)body[11]^=1;edac::CRC::addCRC32(body.data(),24);}
++        edac::CRC::addCCITT162(header.data(),12);const unsigned rawBits=enhancedResponse?360:720;
++        std::vector<uint8_t> plain(rawBits/8),wire(rawBits/8+2);std::array<uint8_t,25> coded{};edac::Trellis trellis;trellis.encode12(header.data(),coded.data());Utils::setBitRange(coded.data(),plain.data(),112,196);
++        if(!enhancedResponse)for(unsigned block=0;block<2;++block){trellis.encode12(body.data()+12*block,coded.data());Utils::setBitRange(coded.data(),plain.data(),308+196*block,196);}
++        wire[0]=modem::TAG_DATA;wire[1]=1;P25Utils::encode(plain.data(),wire.data()+2,0,rawBits);Sync::addP25Sync(wire.data()+2);NID(NAC).encode(wire.data()+2,DUID::PDU);return wire;
++    };
++    for(bool response:{false,true})for(uint32_t inhibited:{RID,SECOND}){
++        Fixture f(false,16384,false);second(f);REQUIRE(apply(f,{{inhibited,true}},{{inhibited,true,false}},true).status==200);auto wire=packet(response,0);const auto before=Access::state(*f.controller);REQUIRE_FALSE(f.controller->processFrame(wire.data(),wire.size()));REQUIRE(Access::state(*f.controller)==before);REQUIRE(f.responses().empty());
++    }
++    for(bool response:{false,true}){Fixture f(false,16384,false);second(f);auto wire=packet(response,0);REQUIRE(f.controller->processFrame(wire.data(),wire.size()));}
++    for(unsigned malformed:{1U,2U}){Fixture f(false,16384,false);second(f);auto wire=packet(false,malformed);const auto before=Access::state(*f.controller);REQUIRE_FALSE(f.controller->processFrame(wire.data(),wire.size()));REQUIRE(Access::state(*f.controller)==before);REQUIRE(f.responses().empty());}
++}
++
++TEST_CASE("RF interruption cancels queued procedures through actual native withdrawal sites", "[p25][inhibit][check-withdrawal]") {
++    for(bool packet:{false,true}){Fixture f;second(f);REQUIRE(apply(f,{{RID,true}}).status==200);REQUIRE(command(f,true).status==200);REQUIRE(f.controller->control()->requestRadioCheck(SECOND,0));Access::checkTick(*f.controller);REQUIRE(f.controller->peekFrameLength()!=0U);
++        if(packet){Block header{{3,8,0,0,0x27,0x13,0x80,0,0,0,0,0}};edac::CRC::addCCITT162(header.data(),12);std::array<uint8_t,45> plain{};std::array<uint8_t,25> coded{};edac::Trellis trellis;trellis.encode12(header.data(),coded.data());Utils::setBitRange(coded.data(),plain.data(),112,196);std::vector<uint8_t> wire(47);wire[0]=modem::TAG_DATA;wire[1]=1;P25Utils::encode(plain.data(),wire.data()+2,0,360);Sync::addP25Sync(wire.data()+2);NID(NAC).encode(wire.data()+2,DUID::PDU);REQUIRE_FALSE(f.controller->processFrame(wire.data(),wire.size()));}
++        else REQUIRE_FALSE(f.voice(DUID::HDU,SECOND));
++        f.controller->setCCHalted(false);REQUIRE(f.responses().empty());Access::tick(*f.controller,20000);Access::checkTick(*f.controller,20000);REQUIRE(f.responses().empty());REQUIRE(f.controller->isRadioInhibited(RID));REQUIRE(f.controller->control()->inhibitSnapshot().radios[0].procedure=="cancelled");
++    }
++}

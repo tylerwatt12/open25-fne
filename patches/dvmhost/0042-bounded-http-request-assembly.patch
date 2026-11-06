@@ -1,0 +1,1403 @@
+--- a/src/common/restapi/http/HTTPPayload.cpp
++++ b/src/common/restapi/http/HTTPPayload.cpp
+@@ -30,6 +30,9 @@
+     const std::string unauthorized = "HTTP/1.0 401 Unauthorized\r\n";
+     const std::string forbidden = "HTTP/1.0 403 Forbidden\r\n";
+     const std::string not_found = "HTTP/1.0 404 Not Found\r\n";
++    const std::string payload_too_large = "HTTP/1.0 413 Payload Too Large\r\n";
++    const std::string expectation_failed = "HTTP/1.0 417 Expectation Failed\r\n";
++    const std::string request_header_fields_too_large = "HTTP/1.0 431 Request Header Fields Too Large\r\n";
+     const std::string internal_server_error = "HTTP/1.0 500 Internal Server Error\r\n";
+     const std::string not_implemented = "HTTP/1.0 501 Not Implemented\r\n";
+     const std::string bad_gateway = "HTTP/1.0 502 Bad Gateway\r\n";
+@@ -63,6 +66,12 @@
+             return asio::buffer(forbidden);
+         case HTTPPayload::NOT_FOUND:
+             return asio::buffer(not_found);
++        case HTTPPayload::PAYLOAD_TOO_LARGE:
++            return asio::buffer(payload_too_large);
++        case HTTPPayload::EXPECTATION_FAILED:
++            return asio::buffer(expectation_failed);
++        case HTTPPayload::REQUEST_HEADER_FIELDS_TOO_LARGE:
++            return asio::buffer(request_header_fields_too_large);
+         case HTTPPayload::INTERNAL_SERVER_ERROR:
+             return asio::buffer(internal_server_error);
+         case HTTPPayload::NOT_IMPLEMENTED:
+@@ -154,6 +163,12 @@
+         "<body><h1>404 Not Found</h1></body>"
+         "</html>";
+     const char json_not_found[] = "{status:404,message:\"not found\"}";
++    const char payload_too_large[] = "<html><body><h1>413 Payload Too Large</h1></body></html>";
++    const char json_payload_too_large[] = "{status:413,message:\"payload too large\"}";
++    const char expectation_failed[] = "<html><body><h1>417 Expectation Failed</h1></body></html>";
++    const char json_expectation_failed[] = "{status:417,message:\"expectation failed\"}";
++    const char request_header_fields_too_large[] = "<html><body><h1>431 Request Header Fields Too Large</h1></body></html>";
++    const char json_request_header_fields_too_large[] = "{status:431,message:\"request header fields too large\"}";
+     const char internal_server_error[] =
+         "<html>"
+         "<head><title>Internal Server Error</title></head>"
+@@ -209,6 +224,12 @@
+                 return json_forbidden;
+             case HTTPPayload::NOT_FOUND:
+                 return json_not_found;
++            case HTTPPayload::PAYLOAD_TOO_LARGE:
++                return json_payload_too_large;
++            case HTTPPayload::EXPECTATION_FAILED:
++                return json_expectation_failed;
++            case HTTPPayload::REQUEST_HEADER_FIELDS_TOO_LARGE:
++                return json_request_header_fields_too_large;
+             case HTTPPayload::INTERNAL_SERVER_ERROR:
+                 return json_internal_server_error;
+             case HTTPPayload::NOT_IMPLEMENTED:
+@@ -248,6 +269,12 @@
+                 return forbidden;
+             case HTTPPayload::NOT_FOUND:
+                 return not_found;
++            case HTTPPayload::PAYLOAD_TOO_LARGE:
++                return payload_too_large;
++            case HTTPPayload::EXPECTATION_FAILED:
++                return expectation_failed;
++            case HTTPPayload::REQUEST_HEADER_FIELDS_TOO_LARGE:
++                return request_header_fields_too_large;
+             case HTTPPayload::INTERNAL_SERVER_ERROR:
+                 return internal_server_error;
+             case HTTPPayload::NOT_IMPLEMENTED:
+--- a/src/common/restapi/http/HTTPPayload.h
++++ b/src/common/restapi/http/HTTPPayload.h
+@@ -69,6 +69,10 @@
+                 FORBIDDEN = 403,                //!< HTTP Forbidden 403
+                 NOT_FOUND = 404,                //!< HTTP Not Found 404
+                 
++                PAYLOAD_TOO_LARGE = 413,
++                EXPECTATION_FAILED = 417,
++                REQUEST_HEADER_FIELDS_TOO_LARGE = 431,
++
+                 INTERNAL_SERVER_ERROR = 500,    //!< HTTP Internal Server Error 500
+                 NOT_IMPLEMENTED = 501,          //!< HTTP Not Implemented 501
+                 BAD_GATEWAY = 502,              //!< HTTP Bad Gateway 502
+--- a/src/common/restapi/http/HTTPServer.h
++++ b/src/common/restapi/http/HTTPServer.h
+@@ -111,14 +111,21 @@
+              */
+             void stop()
+             {
+-                // the server is stopped by cancelling all outstanding asynchronous
+-                // operations; once all operations have finished the m_ioService::run()
+-                // call will exit
+-                m_acceptor.close();
+-                m_connectionManager.stopAll();
++                // RESTAPI::close can run on its caller thread. Keep socket,
++                // registry and per-connection state on the I/O owner; close()
++                // joins that owner after all cancelled callbacks have retired.
++                asio::dispatch(m_ioService, [this] {
++                    asio::error_code ignored;
++                    m_acceptor.close(ignored);
++                    m_socket.close(ignored);
++                    m_connectionManager.stopAll();
++                });
+             }
+ 
+         private:
++#if defined(CATCH2_TEST_COMPILATION) || defined(HTTP_ASSEMBLER_STANDALONE)
++            friend struct HTTPServerTestAccess;
++#endif
+             /**
+              * @brief Perform an asynchronous accept operation.
+              */
+--- /dev/null
++++ b/src/common/restapi/http/RequestAssembler.h
+@@ -0,0 +1,256 @@
++// SPDX-License-Identifier: BSL-1.0
++// Bounded request framing shared by the existing TCP and TLS REST transports.
++#if !defined(__REST_HTTP__REQUEST_ASSEMBLER_H__)
++#define __REST_HTTP__REQUEST_ASSEMBLER_H__
++
++#include "common/restapi/http/HTTPLexer.h"
++#include "common/restapi/http/HTTPPayload.h"
++
++#include <algorithm>
++#include <cctype>
++#include <string>
++#include <vector>
++
++namespace restapi { namespace http {
++
++class RequestAssembler {
++public:
++    enum { HeaderLimit = 16 * 1024, HeaderCountLimit = 128, BodyLimit = 64 * 1024,
++        MetadataLimit = 16 * 1024, ChunkLineLimit = 1024 };
++    enum Result { More, Complete, BadRequest, HeaderTooLarge, BodyTooLarge,
++        UnsupportedTransfer, UnsupportedExpectation };
++
++    RequestAssembler() : m_lexer(false) { reset(); }
++
++    void reset()
++    {
++        m_lexer.reset(); m_request = HTTPPayload(); m_header.clear(); m_line.clear();
++        m_state = Headers; m_result = More; m_remaining = 0U; m_metadata = 0U;
++        m_trailers = 0U; m_lineCR = false; m_input = false;
++    }
++
++    HTTPPayload& request() { return m_request; }
++    const HTTPPayload& request() const { return m_request; }
++    Result result() const { return m_result; }
++    bool hasInput() const { return m_input; }
++
++    // consumed always describes this supplied span, including only one message.
++    Result append(const char* data, size_t length, size_t& consumed)
++    {
++        consumed = 0U;
++        if (m_result != More) return m_result;
++        if (data == nullptr && length != 0U) return fail(BadRequest);
++        while (consumed < length && m_result == More) {
++            m_input = true;
++            if (m_state == Fixed || m_state == ChunkData) {
++                const size_t count = std::min(m_remaining, length - consumed);
++                m_request.content.append(data + consumed, count);
++                consumed += count; m_remaining -= count;
++                if (m_remaining == 0U) {
++                    if (m_state == Fixed) finish();
++                    else m_state = ChunkCR;
++                }
++                continue;
++            }
++            const char ch = data[consumed++];
++            if (m_state == Headers) {
++                if (m_header.size() >= HeaderLimit) return fail(HeaderTooLarge);
++                m_header.push_back(ch);
++                if (m_header.size() >= 4U && m_header.compare(m_header.size()-4U,4U,"\r\n\r\n") == 0)
++                    parseHeader();
++            } else {
++                if (++m_metadata > MetadataLimit) return fail(BodyTooLarge);
++                if (m_state == ChunkCR) {
++                    if (ch != '\r') return fail(BadRequest);
++                    m_state = ChunkLF;
++                } else if (m_state == ChunkLF) {
++                    if (ch != '\n') return fail(BadRequest);
++                    m_state = ChunkSize;
++                } else if (m_lineCR) {
++                    if (ch != '\n') return fail(BadRequest);
++                    m_lineCR = false;
++                    if (m_state == ChunkSize) parseChunkSize();
++                    else parseTrailer();
++                    m_line.clear();
++                } else if (ch == '\r') {
++                    m_lineCR = true;
++                } else {
++                    if (ch == '\n' || m_line.size() >= ChunkLineLimit) return fail(BadRequest);
++                    m_line.push_back(ch);
++                }
++            }
++        }
++        return m_result;
++    }
++
++    // EOF is never a body delimiter for requests. Empty idle EOF is harmless.
++    Result eof() { return m_result == More && m_input ? fail(BadRequest) : m_result; }
++
++private:
++    enum State { Headers, Fixed, ChunkSize, ChunkData, ChunkCR, ChunkLF, Trailers, Done, Failed };
++    HTTPLexer m_lexer;
++    HTTPPayload m_request;
++    std::string m_header, m_line;
++    State m_state;
++    Result m_result;
++    size_t m_remaining, m_metadata, m_trailers;
++    bool m_lineCR, m_input;
++
++    Result fail(Result value) { m_state = Failed; return m_result = value; }
++    void finish() { m_request.contentLength = m_request.content.size(); m_state = Done; m_result = Complete; }
++    static bool ows(char ch) { return ch == ' ' || ch == '\t'; }
++    static std::string trim(const std::string& text)
++    {
++        size_t first=0U,last=text.size();
++        while (first<last && ows(text[first])) ++first;
++        while (last>first && ows(text[last-1U])) --last;
++        return text.substr(first,last-first);
++    }
++    static std::string lower(std::string value)
++    {
++        for (char& ch:value) ch=static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
++        return value;
++    }
++    static bool token(unsigned char ch)
++    {
++        return (ch>='0'&&ch<='9') || (ch>='A'&&ch<='Z') || (ch>='a'&&ch<='z') ||
++            std::string("!#$%&'*+-.^_`|~").find(static_cast<char>(ch)) != std::string::npos;
++    }
++    static bool field(const std::string& line, std::string& name, std::string& value)
++    {
++        const size_t colon=line.find(':');
++        if (colon==std::string::npos || colon==0U) return false;
++        for (size_t i=0U;i<colon;++i) if (!token(static_cast<unsigned char>(line[i]))) return false;
++        name=lower(line.substr(0U,colon)); value=trim(line.substr(colon+1U));
++        for (unsigned char ch:value) if ((ch<32U && ch!='\t') || ch==127U) return false;
++        return true;
++    }
++
++    void parseHeader()
++    {
++        const size_t end=m_header.find("\r\n"), space=m_header.find(' ');
++        if (end==std::string::npos || space==std::string::npos || space==0U || space>=end) { fail(BadRequest); return; }
++        const size_t versionAt=m_header.find(' ',space+1U);
++        if (versionAt==std::string::npos || versionAt==space+1U || versionAt>=end) { fail(BadRequest); return; }
++        const std::string version=m_header.substr(versionAt+1U,end-versionAt-1U);
++        // Bounds the legacy lexer's integer version accumulation as well.
++        if (version!="HTTP/1.0" && version!="HTTP/1.1") { fail(BadRequest); return; }
++        std::string normalized=m_header.substr(0U,end)+"\r\n";
++        size_t at=end+2U,count=0U,cl=0U,te=0U,hosts=0U;
++        std::string lengthValue,transferValue;
++        bool expect=false;
++        while (at<m_header.size()-2U) {
++            const size_t next=m_header.find("\r\n",at);
++            if (next==std::string::npos || ++count>HeaderCountLimit) { fail(HeaderTooLarge); return; }
++            std::string name,value;
++            if (!field(m_header.substr(at,next-at),name,value)) { fail(BadRequest); return; }
++            if (name=="content-length") { ++cl; lengthValue=value; }
++            if (name=="transfer-encoding") { ++te; transferValue=lower(value); }
++            if (name=="expect") expect=true;
++            if (name=="host") {
++                ++hosts;
++                if (value.empty() || value.find_first_of(" \t,/#")!=std::string::npos) { fail(BadRequest); return; }
++            }
++            normalized+=name+": "+value+"\r\n"; at=next+2U;
++        }
++        if (cl>1U || te>1U || hosts>1U || (version=="HTTP/1.1" && hosts!=1U) || (cl && te)) { fail(BadRequest); return; }
++        if (expect) { fail(UnsupportedExpectation); return; }
++        if (te) {
++            if (version!="HTTP/1.1") { fail(BadRequest); return; }
++            size_t pos=0U,chunked=0U,codings=0U;std::string last;
++            while (pos<=transferValue.size()) {
++                const size_t comma=transferValue.find(',',pos);
++                last=trim(transferValue.substr(pos,comma==std::string::npos?comma:comma-pos));
++                if (last.empty() || !std::all_of(last.begin(),last.end(),[](unsigned char c){return token(c);})) { fail(BadRequest); return; }
++                ++codings;if (last=="chunked") ++chunked;
++                if (comma==std::string::npos) break;
++                pos=comma+1U;
++            }
++            if (last!="chunked" || chunked!=1U) { fail(BadRequest); return; }
++            if (codings!=1U) { fail(UnsupportedTransfer); return; }
++        }
++        size_t body=0U;
++        if (cl) {
++            if (lengthValue.empty() || !std::all_of(lengthValue.begin(),lengthValue.end(),[](unsigned char c){return c>='0'&&c<='9';})) { fail(BadRequest); return; }
++            for (char ch:lengthValue) {
++                const size_t digit=static_cast<size_t>(ch-'0');
++                if (body>(BodyLimit-digit)/10U) { fail(BodyTooLarge); return; }
++                body=body*10U+digit;
++            }
++        }
++        normalized+="\r\n";
++        HTTPLexer::ResultType parsed;std::string::iterator consumed;
++        std::tie(parsed,consumed)=m_lexer.parse(m_request,normalized.begin(),normalized.end());
++        if (parsed!=HTTPLexer::GOOD || consumed!=normalized.end()) { fail(BadRequest); return; }
++        m_header.clear();m_request.content.clear();m_request.contentLength=body;
++        if (te) m_state=ChunkSize;
++        else if (body!=0U) { m_request.content.reserve(body); m_remaining=body; m_state=Fixed; }
++        else finish();
++    }
++
++    bool chunkExtensions(size_t at)
++    {
++        while (at<m_line.size()) {
++            while (at<m_line.size() && ows(m_line[at])) ++at;
++            if (at==m_line.size() || m_line[at++]!=';') return false;
++            while (at<m_line.size() && ows(m_line[at])) ++at;
++            const size_t begin=at;
++            while (at<m_line.size() && token(static_cast<unsigned char>(m_line[at]))) ++at;
++            if (at==begin) return false;
++            while (at<m_line.size() && ows(m_line[at])) ++at;
++            if (at==m_line.size() || m_line[at]!='=') continue;
++            ++at;while (at<m_line.size() && ows(m_line[at])) ++at;
++            if (at==m_line.size()) return false;
++            if (m_line[at]=='"') {
++                ++at;bool closed=false;
++                while (at<m_line.size()) {
++                    const unsigned char ch=m_line[at++];
++                    if (ch=='"') { closed=true;break; }
++                    if (ch=='\\') {
++                        if (at==m_line.size()) return false;
++                        const unsigned char escaped=m_line[at++];
++                        if ((escaped<32U && escaped!='\t') || escaped==127U) return false;
++                    } else if ((ch<32U && ch!='\t') || ch==127U) return false;
++                }
++                if (!closed) return false;
++            } else {
++                const size_t beginValue=at;
++                while (at<m_line.size() && token(static_cast<unsigned char>(m_line[at]))) ++at;
++                if (at==beginValue) return false;
++            }
++        }
++        return true;
++    }
++
++    void parseChunkSize()
++    {
++        size_t at=0U,size=0U;
++        while (at<m_line.size()) {
++            const unsigned char ch=m_line[at];size_t digit;
++            if (ch>='0'&&ch<='9') digit=ch-'0';
++            else if (ch>='a'&&ch<='f') digit=ch-'a'+10U;
++            else if (ch>='A'&&ch<='F') digit=ch-'A'+10U;
++            else break;
++            if (size>(BodyLimit-digit)/16U) { fail(BodyTooLarge); return; }
++            size=size*16U+digit;++at;
++        }
++        if (at==0U || (at<m_line.size() && !chunkExtensions(at))) { fail(BadRequest); return; }
++        if (size>BodyLimit-m_request.content.size()) { fail(BodyTooLarge); return; }
++        m_remaining=size;m_state=size==0U?Trailers:ChunkData;
++    }
++
++    void parseTrailer()
++    {
++        if (m_line.empty()) {
++            m_request.headers.remove("Transfer-Encoding");m_request.headers.remove("Trailer");
++            m_request.headers.add("Content-Length",std::to_string(m_request.content.size()));finish();return;
++        }
++        std::string name,value;
++        if (++m_trailers>HeaderCountLimit || !field(m_line,name,value) || name=="content-length" || name=="transfer-encoding" || name=="host") { fail(BadRequest); return; }
++        // Deliberately discard trailers; they can never overwrite application
++        // routing, authentication or content metadata from the initial header.
++    }
++};
++
++} }
++#endif
+--- a/src/common/restapi/http/SecureHTTPServer.h
++++ b/src/common/restapi/http/SecureHTTPServer.h
+@@ -133,14 +133,21 @@
+              */
+             void stop()
+             {
+-                // the server is stopped by cancelling all outstanding asynchronous
+-                // operations; once all operations have finished the m_ioService::run()
+-                // call will exit
+-                m_acceptor.close();
+-                m_connectionManager.stopAll();
++                // RESTAPI::close can run on its caller thread. Keep socket,
++                // registry and per-connection state on the I/O owner; close()
++                // joins that owner after all cancelled callbacks have retired.
++                asio::dispatch(m_ioService, [this] {
++                    asio::error_code ignored;
++                    m_acceptor.close(ignored);
++                    m_socket.close(ignored);
++                    m_connectionManager.stopAll();
++                });
+             }
+ 
+         private:
++#if defined(CATCH2_TEST_COMPILATION) || defined(HTTP_ASSEMBLER_STANDALONE)
++            friend struct HTTPServerTestAccess;
++#endif
+             /**
+              * @brief Perform an asynchronous accept operation.
+              */
+--- a/src/common/restapi/http/SecureServerConnection.h
++++ b/src/common/restapi/http/SecureServerConnection.h
+@@ -18,9 +18,10 @@
+ #if defined(ENABLE_SSL)
+ 
+ #include "common/Defines.h"
+-#include "common/restapi/http/HTTPLexer.h"
++#include "common/restapi/http/RequestAssembler.h"
+ #include "common/restapi/http/HTTPPayload.h"
+ #include "common/Log.h"
++#include "common/Utils.h"
+ 
+ #include <array>
+ #include <memory>
+@@ -73,9 +74,9 @@
+                 m_socket(std::move(socket), context),
+                 m_connectionManager(manager),
+                 m_requestHandler(handler),
+-                m_lexer(HTTPLexer(false)),
+-                m_continue(false),
+-                m_contResult(HTTPLexer::INDETERMINATE),
++                m_closeAfterReply(false),
++                m_stopped(false),
++                m_inputEnded(false),
+                 m_persistent(persistent),
+                 m_debug(debug)
+             {
+@@ -91,6 +92,7 @@
+              */
+             void stop()
+             {
++                m_stopped = true;
+                 try
+                 {
+                     if (m_socket.lowest_layer().is_open()) {
+@@ -101,160 +103,116 @@
+             }
+ 
+         private:
+-            /**
+-             * @brief Perform an asynchronous SSL handshake.
+-             */
+             void handshake()
+             {
+-                if (!m_persistent) {
+-                    auto self(this->shared_from_this());
+-                }
+-
+-                m_socket.async_handshake(asio::ssl::stream_base::server, [this](asio::error_code ec) {
+-                    if (!ec) {
+-                        read();
+-                    }
++                auto self(this->shared_from_this());
++                m_socket.async_handshake(asio::ssl::stream_base::server, [this, self](asio::error_code ec) {
++                    if (m_stopped) return;
++                    if (ec) m_connectionManager.stop(self);
++                    else read();
+                 });
+             }
+ 
+-            /**
+-             * @brief Perform an asynchronous read operation.
+-             */
+             void read()
+             {
+-                if (!m_persistent) {
+-                    auto self(this->shared_from_this());
+-                }
+-
+-                m_socket.async_read_some(asio::buffer(m_buffer), [=](asio::error_code ec, std::size_t recvLength) {
+-                    if (!ec) {
+-                        HTTPLexer::ResultType result = HTTPLexer::GOOD;
+-                        char* content;
+-
+-                        // catch exceptions here so we don't blatently crash the system
+-                        try
+-                        {
+-                            if (!m_continue) {
+-                                std::tie(result, content) = m_lexer.parse(m_request, m_buffer.data(), m_buffer.data() + recvLength);
+-
+-                                m_request.content = std::string();
+-                                std::string contentLength = m_request.headers.find("Content-Length");
+-                                if (contentLength != "" && (::strlen(content) != 0)) {
+-                                    size_t length = (size_t)::strtoul(contentLength.c_str(), NULL, 10);
+-                                    m_request.contentLength = length;
+-                                    m_request.content = std::string(content, length);
+-                                }
+-
+-                                m_request.headers.add("RemoteHost", m_socket.lowest_layer().remote_endpoint().address().to_string());
+-
+-                                uint32_t consumed = m_lexer.consumed();
+-                                if (result == HTTPLexer::GOOD && consumed == recvLength && 
+-                                    ((m_request.method == HTTP_POST) || (m_request.method == HTTP_PUT))) {
+-                                    if (m_debug) {
+-                                        LogDebug(LOG_REST, "HTTPS Partial Request, recvLength = %u, consumed = %u, result = %u", recvLength, consumed, result);
+-                                        Utils::dump(1U, "SecureServerConnection::read(), m_buffer", (uint8_t*)m_buffer.data(), recvLength);
+-                                    }
+-
+-                                    result = HTTPLexer::INDETERMINATE;
+-                                    m_continue = true;
+-                                }
+-                            } else {
+-                                if (m_debug) {
+-                                    LogDebug(LOG_REST, "HTTP Partial Request, recvLength = %u, result = %u", recvLength, result);
+-                                    Utils::dump(1U, "SecureServerConnection::read(), m_buffer", (uint8_t*)m_buffer.data(), recvLength);
+-                                }
+-
+-                                if (m_contResult == HTTPLexer::INDETERMINATE) {
+-                                    m_request.content = std::string(m_buffer.data(), recvLength);
+-                                } else {
+-                                    m_request.content.append(std::string(m_buffer.data(), recvLength));
+-                                }
+-
+-                                if (m_request.contentLength != 0 && recvLength < m_request.contentLength) {
+-                                    m_contResult = result = HTTPLexer::CONTINUE;
+-                                    m_continue = true;
+-                                }
+-                            }
+-
+-                            if (result == HTTPLexer::GOOD) {
+-                                if (m_debug) {
+-                                    Utils::dump(1U, "SecureServerConnection::read(), HTTPS Request Content", (uint8_t*)m_request.content.c_str(), m_request.content.length());
+-                                }
+-
+-                                m_continue = false;
+-                                m_contResult = HTTPLexer::INDETERMINATE;
+-                                m_requestHandler.handleRequest(m_request, m_reply);
+-
+-                                if (m_debug) {
+-                                    Utils::dump(1U, "SecureServerConnection::read(), HTTPS Reply Content", (uint8_t*)m_reply.content.c_str(), m_reply.content.length());
+-                                }
+-
+-                                write();
+-                            }
+-                            else if (result == HTTPLexer::BAD) {
+-                                m_continue = false;
+-                                m_contResult = HTTPLexer::INDETERMINATE;
+-                                m_reply = HTTPPayload::statusPayload(HTTPPayload::BAD_REQUEST);
+-                                write();
+-                            }
+-                            else {
+-                                read();
+-                            }
++                auto self(this->shared_from_this());
++                m_socket.async_read_some(asio::buffer(m_buffer), [this, self](asio::error_code ec, std::size_t length) {
++                    if (m_stopped) return;
++                    try {
++                        // No further read is issued while a reply owns its buffers.
++                        if (ec && ec != asio::error::eof && ec != asio::ssl::error::stream_truncated) {
++                            m_connectionManager.stop(self);
++                            return;
+                         }
+-                        catch(const std::exception& e) { 
+-                            ::LogError(LOG_REST, "SecureServerConnection::read(), %s", ec.message().c_str());
+-                            m_continue = false;
+-                            m_contResult = HTTPLexer::INDETERMINATE;
+-                        }
+-                    }
+-                    else if (ec != asio::error::operation_aborted) {
+-                        if (ec) {
+-                            ::LogError(LOG_REST, "SecureServerConnection::read(), %s, code = %u", ec.message().c_str(), ec.value());
+-                        }
+-                        m_connectionManager.stop(this->shared_from_this());
+-                        m_continue = false;
++                        m_inputEnded = bool(ec);
++                        m_closeAfterReply = !m_persistent || m_inputEnded;
++                        if (length != 0U) consume(m_buffer.data(), length);
++                        else if (ec) {
++                            if (m_assembler.hasInput()) {
++                                m_assembler.eof();
++                                reject(RequestAssembler::BadRequest);
++                            } else m_connectionManager.stop(self);
++                        } else read();
++                    } catch (const std::exception& e) {
++                        ::LogError(LOG_REST, "SecureServerConnection::read(), %s", e.what());
++                        m_connectionManager.stop(self);
+                     }
+                 });
+             }
+ 
+-            /**
+-             * @brief Perform an asynchronous write operation.
+-             */
++            void reject(RequestAssembler::Result result)
++            {
++                m_closeAfterReply = true;
++                HTTPPayload::StatusType status = HTTPPayload::BAD_REQUEST;
++                if (result == RequestAssembler::HeaderTooLarge) status = HTTPPayload::REQUEST_HEADER_FIELDS_TOO_LARGE;
++                else if (result == RequestAssembler::BodyTooLarge) status = HTTPPayload::PAYLOAD_TOO_LARGE;
++                else if (result == RequestAssembler::UnsupportedTransfer) status = HTTPPayload::NOT_IMPLEMENTED;
++                else if (result == RequestAssembler::UnsupportedExpectation) status = HTTPPayload::EXPECTATION_FAILED;
++                m_reply = HTTPPayload::statusPayload(status);
++                write();
++            }
++
++            void consume(const char* data, size_t length)
++            {
++                size_t consumed = 0U;
++                const RequestAssembler::Result result = m_assembler.append(data, length, consumed);
++                if (result == RequestAssembler::More) {
++                    if (m_inputEnded) {
++                        m_assembler.eof();
++                        reject(RequestAssembler::BadRequest);
++                    } else read();
++                } else if (result == RequestAssembler::Complete) {
++                    // A single read has at most 8192 bytes. Hold only its unused
++                    // tail and do not read again until this response completes.
++                    if (length - consumed > m_buffer.size()) { reject(RequestAssembler::BadRequest); return; }
++                    m_pending.assign(data + consumed, length - consumed);
++                    HTTPPayload& request = m_assembler.request();
++                    request.headers.add("RemoteHost", m_socket.lowest_layer().remote_endpoint().address().to_string());
++                    const std::string connection = request.headers.find("Connection");
++                    size_t at = 0U;
++                    while (at <= connection.size()) {
++                        const size_t comma = connection.find(',', at);
++                        std::string value = connection.substr(at, comma == std::string::npos ? comma : comma - at);
++                        value.erase(0U, value.find_first_not_of(" \t"));
++                        const size_t last = value.find_last_not_of(" \t");
++                        if (last != std::string::npos) value.erase(last + 1U);
++                        for (char& ch : value) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
++                        if (value == "close") m_closeAfterReply = true;
++                        if (comma == std::string::npos) break;
++                        at = comma + 1U;
++                    }
++                    // Request bodies can contain authentication or key material.
++                    if (m_debug) LogDebugEx(LOG_REST, "SecureServerConnection::read()", "HTTP request body bytes = %u", static_cast<unsigned>(request.content.size()));
++                    m_requestHandler.handleRequest(request, m_reply);
++                    write();
++                } else reject(result);
++            }
++
+             void write()
+             {
+-                if (!m_persistent) {
+-                    auto self(this->shared_from_this());
+-                } else {
+-                    m_reply.headers.add("Connection", "keep-alive");
+-                }
+-
++                auto self(this->shared_from_this());
++                m_reply.headers.add("Connection", m_closeAfterReply ? "close" : "keep-alive");
+                 auto buffers = m_reply.toBuffers();
+-                asio::async_write(m_socket, buffers, [=](asio::error_code ec, std::size_t) {
+-                    if (m_persistent) {
+-                        m_lexer.reset();
+-                        m_reply.headers = HTTPHeaders();
+-                        m_reply.status = HTTPPayload::OK;
+-                        m_reply.content = "";
+-                        m_request = HTTPPayload();
+-                        read();
+-                    }
+-                    else {
+-                        if (!ec) {
+-                            try
+-                            {
+-                                // initiate graceful connection closure
+-                                asio::error_code ignored_ec;
+-                                m_socket.lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_both, ignored_ec);
+-                            }
+-                            catch(const std::exception& e) { ::LogError(LOG_REST, "%s", ec.message().c_str()); }
+-                        }
+-
+-                        if (ec != asio::error::operation_aborted) {
+-                            if (ec) {
+-                                ::LogError(LOG_REST, "SecureServerConnection::write(), %s, code = %u", ec.message().c_str(), ec.value());
+-                            }
+-                            m_connectionManager.stop(this->shared_from_this());
+-                        }
++                asio::async_write(m_socket, buffers, [this, self](asio::error_code ec, std::size_t) {
++                    if (m_stopped) return;
++                    if (ec || m_closeAfterReply) {
++                        asio::error_code ignored;
++                        m_socket.lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
++                        m_connectionManager.stop(self);
++                        return;
++                    }
++                    try {
++                        m_assembler.reset();
++                        m_reply = HTTPPayload();
++                        m_closeAfterReply = !m_persistent;
++                        if (!m_pending.empty()) {
++                            const std::string pending = std::move(m_pending);
++                            m_pending.clear();
++                            consume(pending.data(), pending.size());
++                        } else read();
++                    } catch (const std::exception& e) {
++                        ::LogError(LOG_REST, "SecureServerConnection::write(), %s", e.what());
++                        m_connectionManager.stop(self);
+                     }
+                 });
+             }
+@@ -266,12 +224,13 @@
+ 
+             std::array<char, 8192> m_buffer;
+ 
+-            HTTPPayload m_request;
+-            HTTPLexer m_lexer;
++            RequestAssembler m_assembler;
++            std::string m_pending;
+             HTTPPayload m_reply;
+ 
+-            bool m_continue;
+-            HTTPLexer::ResultType m_contResult;
++            bool m_closeAfterReply;
++            bool m_stopped;
++            bool m_inputEnded;
+ 
+             bool m_persistent;
+             bool m_debug;
+--- a/src/common/restapi/http/ServerConnection.h
++++ b/src/common/restapi/http/ServerConnection.h
+@@ -16,7 +16,7 @@
+ #define __REST_HTTP__SERVER_CONNECTION_H__
+ 
+ #include "common/Defines.h"
+-#include "common/restapi/http/HTTPLexer.h"
++#include "common/restapi/http/RequestAssembler.h"
+ #include "common/restapi/http/HTTPPayload.h"
+ #include "common/Log.h"
+ #include "common/Utils.h"
+@@ -70,9 +70,9 @@
+                 m_socket(std::move(socket)),
+                 m_connectionManager(manager),
+                 m_requestHandler(handler),
+-                m_lexer(HTTPLexer(false)),
+-                m_continue(false),
+-                m_contResult(HTTPLexer::INDETERMINATE),
++                m_closeAfterReply(false),
++                m_stopped(false),
++                m_inputEnded(false),
+                 m_persistent(persistent),
+                 m_debug(debug)
+             {
+@@ -88,6 +88,7 @@
+              */
+             void stop()
+             {
++                m_stopped = true;
+                 try
+                 {
+                     if (m_socket.is_open()) {
+@@ -98,145 +99,106 @@
+             }
+ 
+         private:
+-            /**
+-             * @brief Perform an asynchronous read operation.
+-             */
+             void read()
+             {
+-                if (!m_persistent) {
+-                    auto self(this->shared_from_this());
+-                }
+-
+-                m_socket.async_read_some(asio::buffer(m_buffer), [=](asio::error_code ec, std::size_t recvLength) {
+-                    if (!ec) {
+-                        HTTPLexer::ResultType result = HTTPLexer::GOOD;
+-                        char* content;
+-
+-                        // catch exceptions here so we don't blatently crash the system
+-                        try
+-                        {
+-                            if (!m_continue) {
+-                                std::tie(result, content) = m_lexer.parse(m_request, m_buffer.data(), m_buffer.data() + recvLength);
+-
+-                                m_request.content = std::string();
+-                                std::string contentLength = m_request.headers.find("Content-Length");
+-                                if (contentLength != "" && (::strlen(content) != 0)) {
+-                                    size_t length = (size_t)::strtoul(contentLength.c_str(), NULL, 10);
+-                                    m_request.contentLength = length;
+-                                    m_request.content = std::string(content, length);
+-                                }
+-
+-                                m_request.headers.add("RemoteHost", m_socket.remote_endpoint().address().to_string());
+-
+-                                uint32_t consumed = m_lexer.consumed();
+-                                if (result == HTTPLexer::GOOD && consumed == recvLength && 
+-                                    ((m_request.method == HTTP_POST) || (m_request.method == HTTP_PUT))) {
+-                                    if (m_debug) {
+-                                        LogDebug(LOG_REST, "HTTP Partial Request, recvLength = %u, consumed = %u, result = %u", recvLength, consumed, result);
+-                                        Utils::dump(1U, "ServerConnection::read(), m_buffer", (uint8_t*)m_buffer.data(), recvLength);
+-                                    }
+-
+-                                    m_contResult = result = HTTPLexer::INDETERMINATE;
+-                                    m_continue = true;
+-                                }
+-                            } else {
+-                                if (m_debug) {
+-                                    LogDebug(LOG_REST, "HTTP Partial Request, recvLength = %u, result = %u", recvLength, result);
+-                                    Utils::dump(1U, "ServerConnection::read(), m_buffer", (uint8_t*)m_buffer.data(), recvLength);
+-                                }
+-
+-                                if (m_contResult == HTTPLexer::INDETERMINATE) {
+-                                    m_request.content = std::string(m_buffer.data(), recvLength);
+-                                } else {
+-                                    m_request.content.append(std::string(m_buffer.data(), recvLength));
+-                                }
+-
+-                                if (m_request.contentLength != 0 && recvLength < m_request.contentLength) {
+-                                    m_contResult = result = HTTPLexer::CONTINUE;
+-                                    m_continue = true;
+-                                }
+-                            }
+-
+-                            if (result == HTTPLexer::GOOD) {
+-                                if (m_debug) {
+-                                    Utils::dump(1U, "ServerConnection::read(), HTTP Request Content", (uint8_t*)m_request.content.c_str(), m_request.content.length());
+-                                }
+-
+-                                m_continue = false;
+-                                m_contResult = HTTPLexer::INDETERMINATE;
+-                                m_requestHandler.handleRequest(m_request, m_reply);
+-
+-                                if (m_debug) {
+-                                    Utils::dump(1U, "ServerConnection::read(), HTTP Reply Content", (uint8_t*)m_reply.content.c_str(), m_reply.content.length());
+-                                }
+-
+-                                write();
+-                            }
+-                            else if (result == HTTPLexer::BAD) {
+-                                m_continue = false;
+-                                m_contResult = HTTPLexer::INDETERMINATE;
+-                                m_reply = HTTPPayload::statusPayload(HTTPPayload::BAD_REQUEST);
+-                                write();
+-                            }
+-                            else {
+-                                read();
+-                            }
++                auto self(this->shared_from_this());
++                m_socket.async_read_some(asio::buffer(m_buffer), [this, self](asio::error_code ec, std::size_t length) {
++                    if (m_stopped) return;
++                    try {
++                        // No further read is issued while a reply owns its buffers.
++                        if (ec && ec != asio::error::eof) {
++                            m_connectionManager.stop(self);
++                            return;
+                         }
+-                        catch(const std::exception& e) { 
+-                            ::LogError(LOG_REST, "ServerConnection::read(), %s", ec.message().c_str());
+-                            m_continue = false;
+-                            m_contResult = HTTPLexer::INDETERMINATE;
+-                        }
+-                    }
+-                    else if (ec != asio::error::operation_aborted) {
+-                        if (ec) {
+-                            ::LogError(LOG_REST, "ServerConnection::read(), %s, code = %u", ec.message().c_str(), ec.value());
+-                        }
+-                        m_connectionManager.stop(this->shared_from_this());
+-                        m_continue = false;
+-                        m_contResult = HTTPLexer::INDETERMINATE;
++                        m_inputEnded = bool(ec);
++                        m_closeAfterReply = !m_persistent || m_inputEnded;
++                        if (length != 0U) consume(m_buffer.data(), length);
++                        else if (ec) {
++                            if (m_assembler.hasInput()) {
++                                m_assembler.eof();
++                                reject(RequestAssembler::BadRequest);
++                            } else m_connectionManager.stop(self);
++                        } else read();
++                    } catch (const std::exception& e) {
++                        ::LogError(LOG_REST, "ServerConnection::read(), %s", e.what());
++                        m_connectionManager.stop(self);
+                     }
+                 });
+             }
+ 
+-            /**
+-             * @brief Perform an asynchronous write operation.
+-             */
++            void reject(RequestAssembler::Result result)
++            {
++                m_closeAfterReply = true;
++                HTTPPayload::StatusType status = HTTPPayload::BAD_REQUEST;
++                if (result == RequestAssembler::HeaderTooLarge) status = HTTPPayload::REQUEST_HEADER_FIELDS_TOO_LARGE;
++                else if (result == RequestAssembler::BodyTooLarge) status = HTTPPayload::PAYLOAD_TOO_LARGE;
++                else if (result == RequestAssembler::UnsupportedTransfer) status = HTTPPayload::NOT_IMPLEMENTED;
++                else if (result == RequestAssembler::UnsupportedExpectation) status = HTTPPayload::EXPECTATION_FAILED;
++                m_reply = HTTPPayload::statusPayload(status);
++                write();
++            }
++
++            void consume(const char* data, size_t length)
++            {
++                size_t consumed = 0U;
++                const RequestAssembler::Result result = m_assembler.append(data, length, consumed);
++                if (result == RequestAssembler::More) {
++                    if (m_inputEnded) {
++                        m_assembler.eof();
++                        reject(RequestAssembler::BadRequest);
++                    } else read();
++                } else if (result == RequestAssembler::Complete) {
++                    // A single read has at most 8192 bytes. Hold only its unused
++                    // tail and do not read again until this response completes.
++                    if (length - consumed > m_buffer.size()) { reject(RequestAssembler::BadRequest); return; }
++                    m_pending.assign(data + consumed, length - consumed);
++                    HTTPPayload& request = m_assembler.request();
++                    request.headers.add("RemoteHost", m_socket.remote_endpoint().address().to_string());
++                    const std::string connection = request.headers.find("Connection");
++                    size_t at = 0U;
++                    while (at <= connection.size()) {
++                        const size_t comma = connection.find(',', at);
++                        std::string value = connection.substr(at, comma == std::string::npos ? comma : comma - at);
++                        value.erase(0U, value.find_first_not_of(" \t"));
++                        const size_t last = value.find_last_not_of(" \t");
++                        if (last != std::string::npos) value.erase(last + 1U);
++                        for (char& ch : value) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
++                        if (value == "close") m_closeAfterReply = true;
++                        if (comma == std::string::npos) break;
++                        at = comma + 1U;
++                    }
++                    // Request bodies can contain authentication or key material.
++                    if (m_debug) LogDebugEx(LOG_REST, "ServerConnection::read()", "HTTP request body bytes = %u", static_cast<unsigned>(request.content.size()));
++                    m_requestHandler.handleRequest(request, m_reply);
++                    write();
++                } else reject(result);
++            }
++
+             void write()
+             {
+-                if (!m_persistent) {
+-                    auto self(this->shared_from_this());
+-                } else {
+-                    m_reply.headers.add("Connection", "keep-alive");
+-                }
+-
++                auto self(this->shared_from_this());
++                m_reply.headers.add("Connection", m_closeAfterReply ? "close" : "keep-alive");
+                 auto buffers = m_reply.toBuffers();
+-                asio::async_write(m_socket, buffers, [=](asio::error_code ec, std::size_t) {
+-                    if (m_persistent) {
+-                        m_lexer.reset();
+-                        m_reply.headers = HTTPHeaders();
+-                        m_reply.status = HTTPPayload::OK;
+-                        m_reply.content = "";
+-                        m_request = HTTPPayload();
+-                        read();
+-                    }
+-                    else {
+-                        if (!ec) {
+-                            try
+-                            {
+-                                // initiate graceful connection closure
+-                                asio::error_code ignored_ec;
+-                                m_socket.shutdown(asio::ip::tcp::socket::shutdown_both, ignored_ec);
+-                            }
+-                            catch(const std::exception& e) { ::LogError(LOG_REST, "ServerConnection::write(), %s", ec.message().c_str()); }
+-                        }
+-
+-                        if (ec != asio::error::operation_aborted) {
+-                            if (ec) {
+-                                ::LogError(LOG_REST, "ServerConnection::write(), %s, code = %u", ec.message().c_str(), ec.value());
+-                            }
+-                            m_connectionManager.stop(this->shared_from_this());
+-                        }
++                asio::async_write(m_socket, buffers, [this, self](asio::error_code ec, std::size_t) {
++                    if (m_stopped) return;
++                    if (ec || m_closeAfterReply) {
++                        asio::error_code ignored;
++                        m_socket.shutdown(asio::ip::tcp::socket::shutdown_both, ignored);
++                        m_connectionManager.stop(self);
++                        return;
++                    }
++                    try {
++                        m_assembler.reset();
++                        m_reply = HTTPPayload();
++                        m_closeAfterReply = !m_persistent;
++                        if (!m_pending.empty()) {
++                            const std::string pending = std::move(m_pending);
++                            m_pending.clear();
++                            consume(pending.data(), pending.size());
++                        } else read();
++                    } catch (const std::exception& e) {
++                        ::LogError(LOG_REST, "ServerConnection::write(), %s", e.what());
++                        m_connectionManager.stop(self);
+                     }
+                 });
+             }
+@@ -248,12 +210,13 @@
+ 
+             std::array<char, 8192> m_buffer;
+ 
+-            HTTPPayload m_request;
+-            HTTPLexer m_lexer;
++            RequestAssembler m_assembler;
++            std::string m_pending;
+             HTTPPayload m_reply;
+ 
+-            bool m_continue;
+-            HTTPLexer::ResultType m_contResult;
++            bool m_closeAfterReply;
++            bool m_stopped;
++            bool m_inputEnded;
+ 
+             bool m_persistent;
+             bool m_debug;
+--- a/src/common/restapi/http/ServerConnectionManager.h
++++ b/src/common/restapi/http/ServerConnectionManager.h
+@@ -52,8 +52,8 @@
+              */
+             void start(ConnectionPtr c)
+             {
+-                std::lock_guard<std::mutex> guard(m_lock);
+                 {
++                    std::lock_guard<std::mutex> guard(m_lock);
+                     m_connections.insert(c);
+                 }
+                 c->start();
+@@ -65,8 +65,8 @@
+              */
+             void stop(ConnectionPtr c)
+             {
+-                std::lock_guard<std::mutex> guard(m_lock);
+                 {
++                    std::lock_guard<std::mutex> guard(m_lock);
+                     m_connections.erase(c);
+                 }
+                 c->stop();
+@@ -77,11 +77,15 @@
+              */
+             void stopAll()
+             {
+-                for (auto c : m_connections)
++                std::set<ConnectionPtr> retired;
++                {
++                    std::lock_guard<std::mutex> guard(m_lock);
++                    retired.swap(m_connections);
++                }
++                // The server dispatches this command on its I/O owner. Do not
++                // hold the registry mutex across connection cancellation.
++                for (auto& c : retired)
+                     c->stop();
+-
+-                std::lock_guard<std::mutex> guard(m_lock);
+-                m_connections.clear();
+             }
+ 
+         private:
+--- /dev/null
++++ b/tests/HTTPRequestAssembly_Tests.cpp
+@@ -0,0 +1,369 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Literal wire inputs: independent framing expectations, no production encoder.
++#include "common/restapi/http/RequestAssembler.h"
++#include "common/restapi/http/ServerConnectionManager.h"
++#include "common/restapi/http/ServerConnection.h"
++#include "common/restapi/http/SecureServerConnection.h"
++#include "common/restapi/http/HTTPServer.h"
++#include "common/restapi/http/SecureHTTPServer.h"
++#include <atomic>
++#include <future>
++#include <thread>
++#include <chrono>
++#include <functional>
++#include <iostream>
++#include <memory>
++#include <stdexcept>
++#include <vector>
++#if defined(ENABLE_SSL)
++#include <openssl/rsa.h>
++#include <openssl/x509.h>
++#endif
++#if !defined(HTTP_ASSEMBLER_STANDALONE)
++#include <catch2/catch_test_macros.hpp>
++#endif
++
++namespace restapi { namespace http {
++struct HTTPServerTestAccess {
++    template<class Server> static asio::ip::tcp::endpoint endpoint(Server& server) {return server.m_acceptor.local_endpoint();}
++    template<class Server> static void forceStop(Server& server) {server.m_ioService.stop();}
++#if defined(ENABLE_SSL)
++    template<class Server> static asio::ssl::context& context(Server& server) {return server.m_context;}
++#endif
++};
++} }
++
++namespace {
++using namespace restapi::http;
++using namespace std::string_literals;
++size_t checks = 0U;
++void check(bool value, const char* text) { ++checks; if (!value) throw std::runtime_error(text); }
++
++RequestAssembler::Result feed(RequestAssembler& parser, const std::string& wire, size_t fragment)
++{
++    size_t at = 0U;
++    while (at < wire.size() && parser.result() == RequestAssembler::More) {
++        const size_t count = std::min(fragment, wire.size() - at);
++        // Exact-sized independent allocations expose speculative reads to ASan.
++        std::unique_ptr<char[]> bytes(new char[count]);
++        std::copy(wire.begin() + at, wire.begin() + at + count, bytes.get());
++        size_t used = 0U;
++        parser.append(bytes.get(), count, used);
++        check(used <= count, "consumed beyond supplied bytes");
++        check(used != 0U, "incremental parser made no progress");
++        at += used;
++    }
++    return parser.result();
++}
++void goodSplits(const std::string& wire, const std::string& body)
++{
++    for (size_t split = 0U; split <= wire.size(); ++split) {
++        RequestAssembler p;
++        size_t first = 0U, second = 0U;
++        std::unique_ptr<char[]> a(new char[split]);
++        std::copy(wire.begin(), wire.begin() + split, a.get());
++        p.append(a.get(), split, first);
++        check(first == split, "valid first fragment consumption");
++        if (split != wire.size()) check(p.result() == RequestAssembler::More, "handler-ready before full message");
++        std::unique_ptr<char[]> b(new char[wire.size()-split]);
++        std::copy(wire.begin()+split, wire.end(), b.get());
++        p.append(b.get(), wire.size()-split, second);
++        check(p.result() == RequestAssembler::Complete, "valid split rejected");
++        check(first+second == wire.size(), "valid total consumption");
++        check(p.request().content == body && p.request().contentLength == body.size(), "body not byte-exact");
++        size_t used = 55U;
++        check(p.append("next",4U,used)==RequestAssembler::Complete && used==0U, "completed parser consumed next message");
++    }
++}
++void assemblerVectors()
++{
++    goodSplits("POST /auth HTTP/1.0\r\nContent-Length: 5\r\n\r\nhello", "hello");
++    goodSplits("PUT /state HTTP/1.1\r\nHost: localhost\r\nContent-Length:\t0003\t\r\n\r\na\0b"s, "a\0b"s);
++    goodSplits("POST /empty HTTP/1.0\r\nContent-Length: 0\r\n\r\n", "");
++    goodSplits("GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n", "");
++    const std::string chunked="POST /state HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: ChUnKeD\r\nTrailer: X-Ignored\r\n\r\n2; a=\"b\\\"c\"\r\nhe\r\n3\r\nllo\r\n0\r\nX-Ignored: discard\r\nAuthorization: never-merge\r\n\r\n";
++    goodSplits(chunked,"hello");
++    RequestAssembler p;
++    check(feed(p,chunked,1U)==RequestAssembler::Complete,"bytewise chunk framing");
++    check(p.request().headers.find("Authorization").empty() && p.request().headers.find("X-Ignored").empty(),"trailer merged into app headers");
++    check(p.request().headers.find("Transfer-Encoding").empty() && p.request().headers.find("Content-Length")=="5", "decoded framing not normalized");
++    struct Bad { std::string wire; RequestAssembler::Result result; };
++    const std::vector<Bad> bad={
++        {"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\ncOnTeNt-LeNgTh: 2\r\n\r\nxx",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1, 1\r\n\r\nx",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: +1\r\n\r\nx",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 65537\r\n\r\n",RequestAssembler::BodyTooLarge},
++        {"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1844674407370955161600000\r\n\r\n",RequestAssembler::BodyTooLarge},
++        {"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",RequestAssembler::UnsupportedTransfer},
++        {"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, chunked\r\n\r\n",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked; x=1\r\n\r\n",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n\r\n",RequestAssembler::UnsupportedExpectation},
++        {"GET / HTTP/1.1\r\n\r\n",RequestAssembler::BadRequest},
++        {"GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n",RequestAssembler::BadRequest},
++        {"GET / HTTP/1.1\r\nHost: a b\r\n\r\n",RequestAssembler::BadRequest},
++        {"GET / HTTP/111111111111111111111.1\r\nHost: a\r\n\r\n",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.0\r\nContent-Length : 1\r\n\r\nx",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.0\r\nContent-Length: 1\r\n folded\r\n\r\nx",RequestAssembler::BadRequest},
++        {"GET / HTTP/1.0\r\nX: a\0b\r\n\r\n"s,RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx!\n0\r\n\r\n",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n10001\r\n",RequestAssembler::BodyTooLarge},
++        {"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffffffffffffffffffff\r\n",RequestAssembler::BodyTooLarge},
++        {"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 9\r\n\r\n",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nHost: evil\r\n\r\n",RequestAssembler::BadRequest},
++        {"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;bad=\"unterminated\r\nx\r\n0\r\n\r\n",RequestAssembler::BadRequest}
++    };
++    for (const auto& item:bad) for (size_t fragment: {1U,7U,8192U}) {
++        p.reset();check(feed(p,item.wire,fragment)==item.result,"malformed framing accepted/wrong classification");
++        p.reset();check(feed(p,"GET /reset HTTP/1.0\r\n\r\n",3U)==RequestAssembler::Complete,"failed state survived explicit reset");
++    }
++    const std::string fixed="POST / HTTP/1.0\r\nContent-Length: 5\r\n\r\nhello";
++    for (size_t n=1U;n<fixed.size();++n) {p.reset();feed(p,fixed.substr(0U,n),3U);check(p.eof()==RequestAssembler::BadRequest,"short EOF accepted");}
++    for (size_t n=1U;n<chunked.size();++n) {p.reset();feed(p,chunked.substr(0U,n),7U);check(p.eof()==RequestAssembler::BadRequest,"short chunk EOF accepted");}
++    p.reset();check(p.eof()==RequestAssembler::More,"idle EOF invented message");
++    std::string limit="GET / HTTP/1.0\r\nX: ";limit+=std::string(RequestAssembler::HeaderLimit-limit.size()-4U,'a');limit+="\r\n\r\n";
++    p.reset();check(feed(p,limit,8192U)==RequestAssembler::Complete,"exact header limit rejected");
++    limit.insert(limit.size()-4U,1U,'a');p.reset();check(feed(p,limit,8192U)==RequestAssembler::HeaderTooLarge,"oversize header accepted");
++    std::string fields="GET / HTTP/1.0\r\n";for(size_t n=0;n<128U;++n)fields+="X: a\r\n";
++    p.reset();check(feed(p,fields+"\r\n",17U)==RequestAssembler::Complete,"128 fields rejected");
++    p.reset();check(feed(p,fields+"X: b\r\n\r\n",17U)==RequestAssembler::HeaderTooLarge,"129 fields accepted");
++    const std::string largeBody(65536U,'b');p.reset();check(feed(p,"POST / HTTP/1.0\r\nContent-Length: 65536\r\n\r\n"+largeBody,137U)==RequestAssembler::Complete&&p.request().content==largeBody,"64KiB fixed body");
++    p.reset();check(feed(p,"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n10000\r\n"+largeBody+"\r\n0\r\n\r\n",131U)==RequestAssembler::Complete&&p.request().content==largeBody,"64KiB chunk body");
++    p.reset();check(feed(p,"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n10000\r\n"+largeBody+"\r\n1\r\nx\r\n0\r\n\r\n",131U)==RequestAssembler::BodyTooLarge,"cumulative chunk size escaped body limit");
++    std::string metadata="POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";for(size_t i=0;i<4000U;++i)metadata+="1\r\nx\r\n";
++    p.reset();check(feed(p,metadata,103U)==RequestAssembler::BodyTooLarge,"chunk metadata budget ignored");
++    p.reset();check(feed(p,"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1;"+std::string(1024U,'x')+"\r\n",3U)==RequestAssembler::BadRequest,"chunk line budget ignored");
++    // One message consumes exactly its own bytes, even with an embedded pipeline.
++    p.reset();size_t used=0U;const std::string a="GET /a HTTP/1.0\r\n\r\n",b="GET /b HTTP/1.0\r\n\r\n";
++    check(p.append((a+b).data(),a.size()+b.size(),used)==RequestAssembler::Complete&&used==a.size(),"pipeline crossed first boundary");
++}
++
++struct WireHandler {
++    std::vector<HTTPPayload> requests;
++    bool largeReply=false;
++    void handleRequest(const HTTPPayload& request,HTTPPayload& reply) {
++        requests.push_back(request);
++        std::string body=largeReply?std::string(1024U*1024U,'r'):"ok";
++        reply.payload(body,HTTPPayload::OK);
++    }
++};
++struct WireResult { std::vector<HTTPPayload> requests;std::string replies;bool timeout;size_t beforeLast;bool retired; };
++
++#if defined(ENABLE_SSL)
++void certificate(asio::ssl::context& context)
++{
++    std::unique_ptr<EVP_PKEY_CTX,decltype(&EVP_PKEY_CTX_free)> generation(EVP_PKEY_CTX_new_id(EVP_PKEY_RSA,nullptr),EVP_PKEY_CTX_free);
++    check(bool(generation)&&EVP_PKEY_keygen_init(generation.get())==1&&EVP_PKEY_CTX_set_rsa_keygen_bits(generation.get(),2048)==1,"test RSA setup");
++    EVP_PKEY* raw=nullptr;check(EVP_PKEY_keygen(generation.get(),&raw)==1,"test key generation");
++    std::unique_ptr<EVP_PKEY,decltype(&EVP_PKEY_free)> key(raw,EVP_PKEY_free);
++    std::unique_ptr<X509,decltype(&X509_free)> cert(X509_new(),X509_free);
++    check(bool(cert),"test cert allocation");X509_set_version(cert.get(),2L);ASN1_INTEGER_set(X509_get_serialNumber(cert.get()),1L);
++    X509_gmtime_adj(X509_get_notBefore(cert.get()),-60L);X509_gmtime_adj(X509_get_notAfter(cert.get()),3600L);X509_set_pubkey(cert.get(),key.get());
++    X509_NAME_add_entry_by_txt(X509_get_subject_name(cert.get()),"CN",MBSTRING_ASC,reinterpret_cast<const unsigned char*>("localhost"),-1,-1,0);
++    X509_set_issuer_name(cert.get(),X509_get_subject_name(cert.get()));
++    check(X509_sign(cert.get(),key.get(),EVP_sha256())>0&&SSL_CTX_use_certificate(context.native_handle(),cert.get())==1&&SSL_CTX_use_PrivateKey(context.native_handle(),key.get())==1,"test cert install");
++}
++#endif
++
++template<class Stream,class Connection,class Start,class Shutdown,class StartClient>
++WireResult exchange(Stream& client,asio::io_context& io,asio::ip::tcp::socket serverSocket,const std::vector<std::string>& fragments,bool persistent,bool large,Start start,Shutdown shutdown,StartClient startClient)
++{
++    WireHandler handler;handler.largeReply=large;
++    ServerConnectionManager<std::shared_ptr<Connection>> manager;
++    serverSocket.set_option(asio::socket_base::send_buffer_size(4096));
++    std::shared_ptr<Connection> connection=start(std::move(serverSocket),manager,handler);
++    std::weak_ptr<Connection> weak=connection;manager.start(connection);connection.reset();
++    WireResult result;result.timeout=false;result.beforeLast=0U;result.retired=false;
++    std::array<char,8192> buffer;
++    asio::steady_timer deadline(io),delay(io),readerDelay(io);
++    deadline.expires_after(std::chrono::seconds(6));
++    deadline.async_wait([&](asio::error_code ec){if(ec)return;result.timeout=true;manager.stopAll();shutdown();delay.cancel();readerDelay.cancel();});
++    std::function<void()> read;
++    read=[&]{client.async_read_some(asio::buffer(buffer),[&](asio::error_code ec,size_t n){
++        result.replies.append(buffer.data(),n);
++        if(ec){deadline.cancel();delay.cancel();readerDelay.cancel();manager.stopAll();}
++        else read();
++    });};
++    size_t next=0U;
++    std::function<void()> send;
++    send=[&]{
++        if(next==fragments.size())return;
++        if(next+1U==fragments.size())result.beforeLast=handler.requests.size();
++        const auto& fragment=fragments[next++];
++        asio::async_write(client,asio::buffer(fragment),[&](asio::error_code ec,size_t){
++            if(ec)return;
++            if(next==fragments.size()&&fragments.back().empty()){shutdown();return;}
++            delay.expires_after(std::chrono::milliseconds(2));delay.async_wait([&](asio::error_code e){if(!e)send();});
++        });
++    };
++    startClient([&]{
++        send();
++        if(large){readerDelay.expires_after(std::chrono::milliseconds(60));readerDelay.async_wait([&](asio::error_code ec){if(!ec){check(handler.requests.size()==1U,"pipelined handler ran before prior write completion");read();}});}
++        else read();
++    });
++    io.run();
++    result.requests=handler.requests;result.retired=weak.expired();return result;
++}
++
++WireResult plain(const std::vector<std::string>& fragments,bool persistent=false,bool large=false)
++{
++    asio::io_context io;
++    asio::ip::tcp::acceptor listener(io,{asio::ip::address_v4::loopback(),0U});
++    asio::ip::tcp::socket client(io),server(io);client.connect(listener.local_endpoint());listener.accept(server);listener.close();
++    using Connection=ServerConnection<WireHandler>;
++    return exchange<asio::ip::tcp::socket,Connection>(client,io,std::move(server),fragments,persistent,large,
++        [&](asio::ip::tcp::socket socket,ServerConnectionManager<std::shared_ptr<Connection>>& manager,WireHandler& handler){return std::make_shared<Connection>(std::move(socket),manager,handler,persistent);},
++        [&]{asio::error_code ignored;client.shutdown(asio::ip::tcp::socket::shutdown_send,ignored);},
++        [&](std::function<void()> ready){ready();});
++}
++#if defined(ENABLE_SSL)
++WireResult tls(const std::vector<std::string>& fragments,bool persistent=false,bool large=false)
++{
++    asio::io_context io;asio::ssl::context serverContext(asio::ssl::context::tls_server),clientContext(asio::ssl::context::tls_client);certificate(serverContext);
++    clientContext.set_verify_mode(asio::ssl::verify_none);
++    asio::ip::tcp::acceptor listener(io,{asio::ip::address_v4::loopback(),0U});
++    asio::ssl::stream<asio::ip::tcp::socket> client(io,clientContext);asio::ip::tcp::socket server(io);
++    client.lowest_layer().connect(listener.local_endpoint());listener.accept(server);listener.close();
++    using Connection=SecureServerConnection<WireHandler>;
++    return exchange<asio::ssl::stream<asio::ip::tcp::socket>,Connection>(client,io,std::move(server),fragments,persistent,large,
++        [&](asio::ip::tcp::socket socket,ServerConnectionManager<std::shared_ptr<Connection>>& manager,WireHandler& handler){return std::make_shared<Connection>(std::move(socket),serverContext,manager,handler,persistent);},
++        [&]{asio::error_code ignored;client.lowest_layer().shutdown(asio::ip::tcp::socket::shutdown_send,ignored);},
++        [&](std::function<void()> ready){client.async_handshake(asio::ssl::stream_base::client,[ready](asio::error_code ec){check(!ec,"loopback TLS handshake");ready();});});
++}
++#endif
++template<class Connection,class Start>
++void retirePending(asio::io_context& io,asio::ip::tcp::socket server,asio::ip::tcp::socket& client,Start start,bool sendJunk)
++{
++    WireHandler handler;ServerConnectionManager<std::shared_ptr<Connection>> manager;
++    auto connection=start(std::move(server),manager,handler);std::weak_ptr<Connection> weak=connection;
++    manager.start(connection);connection.reset();
++    const std::string partial="POST /partial HTTP/1.0\r\nContent-Length: 6\r\n\r\nx";
++    if(sendJunk)asio::async_write(client,asio::buffer(partial),[](asio::error_code,size_t){});
++    asio::steady_timer stop(io);stop.expires_after(std::chrono::milliseconds(10));
++    stop.async_wait([&](asio::error_code ec){if(!ec)manager.stopAll();});io.run();
++    check(weak.expired()&&handler.requests.empty(),"stop/handshake failure retained connection or dispatched incomplete request");
++}
++void retirementVectors()
++{
++    for(bool sendJunk:{false,true}) {
++        asio::io_context io;asio::ip::tcp::acceptor listener(io,{asio::ip::address_v4::loopback(),0U});
++        asio::ip::tcp::socket client(io),server(io);client.connect(listener.local_endpoint());listener.accept(server);listener.close();
++        using Connection=ServerConnection<WireHandler>;
++        retirePending<Connection>(io,std::move(server),client,[&](asio::ip::tcp::socket socket,ServerConnectionManager<std::shared_ptr<Connection>>& manager,WireHandler& handler){return std::make_shared<Connection>(std::move(socket),manager,handler);},sendJunk);
++    }
++#if defined(ENABLE_SSL)
++    for(bool sendJunk:{false,true}) {
++        asio::io_context io;asio::ssl::context context(asio::ssl::context::tls_server);certificate(context);
++        asio::ip::tcp::acceptor listener(io,{asio::ip::address_v4::loopback(),0U});
++        asio::ip::tcp::socket client(io),server(io);client.connect(listener.local_endpoint());listener.accept(server);listener.close();
++        using Connection=SecureServerConnection<WireHandler>;
++        retirePending<Connection>(io,std::move(server),client,[&](asio::ip::tcp::socket socket,ServerConnectionManager<std::shared_ptr<Connection>>& manager,WireHandler& handler){return std::make_shared<Connection>(std::move(socket),context,manager,handler);},sendJunk);
++    }
++#endif
++}
++#if !defined(HTTP_OLD_PARSER_PROBE)
++struct ClosingHandler {
++    std::shared_ptr<std::atomic<size_t>> handled;
++    void handleRequest(const HTTPPayload&,HTTPPayload& reply) {
++        ++*handled;
++        std::string body(4U*1024U*1024U,'r');reply.payload(body,HTTPPayload::OK);
++    }
++};
++template<class Server,class OpenClients>
++void closeFromCaller(Server& server,OpenClients openClients)
++{
++    auto handled=std::make_shared<std::atomic<size_t>>(0U);server.setHandler(ClosingHandler{handled});
++    server.open();const auto endpoint=HTTPServerTestAccess::endpoint(server);
++    std::promise<void> exited;auto done=exited.get_future();
++    std::thread owner([&]{try{server.run();exited.set_value();}catch(...){exited.set_exception(std::current_exception());}});
++    // Client wrappers remain alive through Stop/join. Half have incomplete bodies;
++    // the others provoke replies larger than the clients' receive windows.
++    auto clients=openClients(endpoint);
++    const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(3);
++    while(handled->load()!=4U&&std::chrono::steady_clock::now()<until)std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    server.stop();
++    const bool retired=done.wait_for(std::chrono::seconds(3))==std::future_status::ready;
++    if(!retired)HTTPServerTestAccess::forceStop(server);
++    owner.join();check(retired,"caller Stop did not join active read/write owner");done.get();
++    check(handled->load()==4U,"caller close dispatched partial request or missed complete input");
++}
++void callerCloseVectors()
++{
++    const std::string header="POST /closing HTTP/1.0\r\nContent-Length: 5\r\n\r\n";
++    {
++        HTTPServer<ClosingHandler> server("127.0.0.1",0U,false);asio::io_context clientIO;
++        closeFromCaller(server,[&](asio::ip::tcp::endpoint endpoint){
++            std::vector<std::unique_ptr<asio::ip::tcp::socket>> clients;
++            for(size_t i=0U;i<8U;++i){std::unique_ptr<asio::ip::tcp::socket> socket(new asio::ip::tcp::socket(clientIO));socket->connect(endpoint);socket->set_option(asio::socket_base::receive_buffer_size(2048));asio::write(*socket,asio::buffer(header+(i%2U?"hello":"he")));clients.push_back(std::move(socket));}
++            return clients;
++        });
++    }
++#if defined(ENABLE_SSL)
++    {
++        SecureHTTPServer<ClosingHandler> server("127.0.0.1",0U,false);certificate(HTTPServerTestAccess::context(server));
++        asio::io_context clientIO;asio::ssl::context context(asio::ssl::context::tls_client);context.set_verify_mode(asio::ssl::verify_none);
++        closeFromCaller(server,[&](asio::ip::tcp::endpoint endpoint){
++            std::vector<std::unique_ptr<asio::ssl::stream<asio::ip::tcp::socket>>> clients;
++            for(size_t i=0U;i<8U;++i){std::unique_ptr<asio::ssl::stream<asio::ip::tcp::socket>> socket(new asio::ssl::stream<asio::ip::tcp::socket>(clientIO,context));socket->lowest_layer().connect(endpoint);socket->lowest_layer().set_option(asio::socket_base::receive_buffer_size(2048));socket->handshake(asio::ssl::stream_base::client);asio::write(*socket,asio::buffer(header+(i%2U?"hello":"he")));clients.push_back(std::move(socket));}
++            return clients;
++        });
++    }
++#endif
++}
++#endif
++void transportVectors(bool secure)
++{
++    auto run=[&](const std::vector<std::string>& f,bool persistent=false,bool large=false){
++#if defined(ENABLE_SSL)
++        return secure?tls(f,persistent,large):plain(f,persistent,large);
++#else
++        return plain(f,persistent,large);
++#endif
++    };
++    auto verify=[](const WireResult& result,size_t requests,const std::string& status){check(!result.timeout,"loopback exchange timed out");check(result.retired,"connection owner survived completed IO");check(result.requests.size()==requests,"wrong handler count");check(result.replies.find(status)!=std::string::npos,"wrong HTTP result");};
++    auto result=run({"POST /x HTTP/1.0\r\nContent-Length: 5\r\n\r\n","he","ll","o"});verify(result,1U,"200 OK");check(result.beforeLast==0U&&result.requests[0].content=="hello","premature handler or overwritten body");
++    const std::string body(20000U,'b');std::vector<std::string> fragments={"PUT /x HTTP/1.0\r\nContent-Length: 20003\r\n\r\n"};for(size_t n=0;n<body.size();n+=997U)fragments.push_back(body.substr(n,997U));fragments.push_back("a\0z"s);result=run(fragments);verify(result,1U,"200 OK");check(result.requests[0].content==body+"a\0z"s,"large/binary fragmented body");
++    result=run({"POST /x HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n","2\r\nhe\r","\n3\r\nllo\r\n0\r\nAuthorization: discarded\r\n","\r\n"});verify(result,1U,"200 OK");check(result.requests[0].content=="hello"&&result.requests[0].headers.find("Authorization").empty(),"chunk trailer/body mismatch");
++    result=run({"POST /a HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\nxGET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"},true,true);verify(result,2U,"200 OK");check(result.requests[0].uri=="/a"&&result.requests[1].uri=="/b","pipeline order");
++    result=run({"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nxGET /bad HTTP/1.0\r\n\r\n"},true);verify(result,0U,"400 Bad Request");
++    result=run({"POST /x HTTP/1.0\r\nContent-Length: 65537\r\n\r\n"});verify(result,0U,"413 Payload Too Large");
++    result=run({"POST /x HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n\r\n"});verify(result,0U,"417 Expectation Failed");
++    result=run({"GET /x HTTP/1.0\r\nX: "+std::string(17000U,'a')+"\r\n\r\n"});verify(result,0U,"431 Request Header Fields Too Large");
++    result=run({"POST /x HTTP/1.0\r\nContent-Length: 65536\r\n\r\nX",""});check(!result.timeout&&result.requests.empty()&&result.retired,"old overread input dispatched/leaked");
++    result=run({"POST /x HTTP/1.0\r\nContent-Length: 5\r\n\r\nhe",""});check(!result.timeout&&result.requests.empty()&&result.retired,"partial EOF dispatched/leaked");
++    result=run({"POST /x HTTP/1.0\r\nContent-Len",""});check(!result.timeout&&result.requests.empty()&&result.retired,"header EOF dispatched/leaked");
++    result=run({"GET /after HTTP/1.0\r\n\r\n"});verify(result,1U,"200 OK");
++    result=run({"GET /peer HTTP/1.0\r\nRemoteHost: forged\r\nrEmOtEhOsT: still-forged\r\n\r\n"});verify(result,1U,"200 OK");check(result.requests[0].headers.find("RemoteHost")=="127.0.0.1","incoming header overrode socket peer identity");
++}
++} // namespace
++
++#if defined(HTTP_ASSEMBLER_STANDALONE)
++int main(int argc,char** argv)
++{
++    try {
++#if defined(HTTP_OLD_PARSER_PROBE)
++        if(argc>1)tls({"POST /old HTTP/1.0\r\nContent-Length: 65536\r\n\r\nX"});
++        else plain({"POST /old HTTP/1.0\r\nContent-Length: 65536\r\n\r\nX"});
++        std::cerr << "old parser unexpectedly survived\n";return 3;
++#else
++        assemblerVectors();retirementVectors();callerCloseVectors();transportVectors(false);
++#if defined(ENABLE_SSL)
++        transportVectors(true);
++#endif
++        std::cout<<"HTTP request checks passed: "<<checks<<"\n";return 0;
++#endif
++    } catch(const std::exception& e){std::cerr<<"HTTP test failure: "<<e.what()<<" checks="<<checks<<"\n";return 1;}
++}
++#else
++TEST_CASE("HTTP bounded incremental request assembly", "[http-request]") {REQUIRE_NOTHROW(assemblerVectors());}
++TEST_CASE("HTTP caller closes active partial reads and blocked writes", "[http-request]") {REQUIRE_NOTHROW(callerCloseVectors());}
++TEST_CASE("HTTP pending connection retirement", "[http-request]") {REQUIRE_NOTHROW(retirementVectors());}
++TEST_CASE("HTTP fragmented plain loopback ownership", "[http-request]") {REQUIRE_NOTHROW(transportVectors(false));}
++#if defined(ENABLE_SSL)
++TEST_CASE("HTTP fragmented TLS loopback ownership", "[http-request]") {REQUIRE_NOTHROW(transportVectors(true));}
++#endif
++#endif

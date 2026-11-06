@@ -1,0 +1,63 @@
+--- a/tests/crypto/P25_KEK_Crypto_Test.cpp
++++ b/tests/crypto/P25_KEK_Crypto_Test.cpp
+@@ -52,7 +52,8 @@
+ 
+     p25::crypto::P25Crypto crypto;
+ 
+-    UInt8Array wrappedKey = crypto.cryptAES_TEK(K, message, 32U);
++    UInt8Array wrappedKey = crypto.cryptAES_TEK(K, message, sizeof(message));
++    REQUIRE(wrappedKey != nullptr);
+ 
+     Utils::dump(2U, "KEK_Crypto_Test, Wrapped", wrappedKey.get(), 40);
+ 
+@@ -63,9 +64,10 @@
+         }
+     }
+ 
+-    UInt8Array unwrappedKey = crypto.decryptAES_TEK(K, wrappedKey.get(), 40U);
++    UInt8Array unwrappedKey = crypto.decryptAES_TEK(K, wrappedKey.get(), sizeof(testWrappedKeyFrame));
++    REQUIRE(unwrappedKey != nullptr);
+ 
+-    Utils::dump(2U, "KEK_Crypto_Test, Unwrapped", unwrappedKey.get(), 40);
++    Utils::dump(2U, "KEK_Crypto_Test, Unwrapped", unwrappedKey.get(), sizeof(message));
+ 
+     for (uint32_t i = 0; i < 32U; i++) {
+         if (unwrappedKey[i] != message[i]) {
+--- a/tests/edac/CRC_12_Test.cpp
++++ b/tests/edac/CRC_12_Test.cpp
+@@ -27,18 +27,21 @@
+ 
+     const uint32_t len = 32U;
+     const uint32_t lenBits = len * 8U;
+-    uint8_t* random = (uint8_t*)malloc(len);
++    // The API appends twelve CRC bits after lenBits payload bits.
++    const uint32_t storageLen = len + 2U;
++    uint8_t* random = (uint8_t*)calloc(storageLen, 1U);
++    REQUIRE(random != nullptr);
+ 
+-    for (size_t i = 0; i < len - 2U; i++) {
++    for (size_t i = 0; i < len; i++) {
+         random[i] = rand();
+     }
+ 
+     CRC::addCRC12(random, lenBits);
+ 
+-    uint16_t inCrc = (random[len - 2U] << 8) | (random[len - 1U] << 0);
++    uint16_t inCrc = (random[len] << 4) | (random[len + 1U] >> 4);
+     ::LogInfoEx("T", "CRC::checkCRC12(), crc = $%04X", inCrc);
+ 
+-    Utils::dump(2U, "12_Sanity_Test CRC", random, len);
++    Utils::dump(2U, "12_Sanity_Test CRC", random, storageLen);
+ 
+     bool ret = CRC::checkCRC12(random, lenBits);
+     if (!ret) {
+@@ -47,8 +50,7 @@
+         goto cleanup;
+     }
+ 
+-    random[10U] >>= 8;
+-    random[11U] >>= 8;
++    random[10U] ^= 0x01U; // definite one-bit payload error
+ 
+     ret = CRC::checkCRC12(random, lenBits);
+     if (ret) {

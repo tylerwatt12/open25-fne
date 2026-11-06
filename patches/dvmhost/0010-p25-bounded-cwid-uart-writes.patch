@@ -1,0 +1,230 @@
+diff --git a/src/host/Host.cpp b/src/host/Host.cpp
+index 13e2acf..cbbbf16 100644
+--- a/src/host/Host.cpp
++++ b/src/host/Host.cpp
+@@ -1649,6 +1649,22 @@ public:
+         m_lastPump = now;
+         m_modem.clearP25Receive(); // Drop RF while quiesced; preserve parser/status framing.
+     }
++    void logFailure(const char* phase, identification::DrainResult result, uint64_t operationStarted) const {
++        const char* resultName = "unknown";
++        switch (result) {
++        case identification::DrainResult::Completed: resultName = "completed"; break;
++        case identification::DrainResult::Fault: resultName = "fault"; break;
++        case identification::DrainResult::Timeout: resultName = "timeout"; break;
++        case identification::DrainResult::WriteFailed: resultName = "write-failed"; break;
++        }
++        LogError(LOG_HOST, "CW, %s failed code=%u result=%s elapsed_ms=%llu mode=%u tx=%u error=%u lockout=%u queued=%u status=%llu/%llu barrier=%llu/%llu reject=%llu/%llu requested=%u passed=%u failed=%u quiet=%u killed=%u signal=%d",
++            phase, unsigned(result), resultName, static_cast<unsigned long long>(nowMs() - operationStarted),
++            unsigned(m_modem.getState()), unsigned(m_modem.hasTX()), unsigned(m_modem.hasError()), unsigned(m_modem.hasLockout()),
++            unsigned(hasQueued()), static_cast<unsigned long long>(m_lastStatus), static_cast<unsigned long long>(m_modem.statusGeneration()),
++            static_cast<unsigned long long>(m_barrierGeneration), static_cast<unsigned long long>(m_modem.serialBarrierGeneration()),
++            static_cast<unsigned long long>(m_rejectGeneration), static_cast<unsigned long long>(m_modem.p25WriteRejectGeneration()),
++            unsigned(m_barrierRequested), unsigned(m_barrierPassed), unsigned(m_failed), m_quietSamples, unsigned(g_killed), int(g_signal));
++    }
+ private:
+     p25::Control& m_controller;
+     modem::Modem& m_modem;
+@@ -1753,7 +1769,7 @@ bool Host::sendIdentification(const char* reason, bool resume)
+             uint32_t(std::min(uint64_t(2000U), operationDeadline - now));
+         const auto drained = identification::drain(drainTransport, remaining);
+         if (drained != identification::DrainResult::Completed) {
+-            LogError(LOG_HOST, "CW, voice drain failed code %u", unsigned(drained));
++            drainTransport.logFailure("voice drain", drained, operationStarted);
+             return fault(true);
+         }
+         LogInfoEx(LOG_HOST, "CW, normal voice queue drained");
+@@ -1791,8 +1807,9 @@ bool Host::sendIdentification(const char* reason, bool resume)
+         CWVoiceDrainTransport resumeTransport(*m_p25, *m_modem, [this]() { m_mainLoopWatchdogTimer.start(); });
+         const uint64_t now = identificationNow();
+         const uint32_t remaining = now >= operationDeadline ? 0U : uint32_t(operationDeadline - now);
+-        if (identification::drain(resumeTransport, remaining) != identification::DrainResult::Completed) {
+-            LogError(LOG_HOST, "CW, P25 resume fence failed");
++        const auto resumed = identification::drain(resumeTransport, remaining);
++        if (resumed != identification::DrainResult::Completed) {
++            resumeTransport.logFailure("P25 resume fence", resumed, operationStarted);
+             return fault(true);
+         }
+         m_modem->clearP25Receive();
+diff --git a/src/host/modem/port/UARTPort.cpp b/src/host/modem/port/UARTPort.cpp
+index 8196adf..733cab4 100644
+--- a/src/host/modem/port/UARTPort.cpp
++++ b/src/host/modem/port/UARTPort.cpp
+@@ -17,6 +17,7 @@ using namespace modem::port;
+ 
+ #include <cstring>
+ #include <cassert>
++#include <chrono>
+ 
+ #if defined(_WIN32)
+ #include <setupapi.h>
+@@ -317,21 +318,41 @@ int UARTPort::write(const uint8_t* buffer, uint32_t length)
+         return 0;
+ 
+     if (m_boundedIO.load()) {
+-        fd_set fds;
+-        FD_ZERO(&fds);
+-        FD_SET(m_fd, &fds);
+-        struct timeval timeout = {0, 0};
+-        const int ready = ::select(m_fd + 1, NULL, &fds, NULL, &timeout);
+-        if (ready == 0 || (ready < 0 && errno == EINTR))
+-            return 0;
+-        if (ready < 0)
+-            return -1;
+-        // No EAGAIN/zero-write retry loop is allowed in bounded mode. A short
+-        // serial frame is an explicit failure for the modem transaction owner.
+-        const ssize_t count = ::write(m_fd, buffer, length);
+-        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+-            return 0;
+-        return int(count);
++        using Clock = std::chrono::steady_clock;
++        const auto deadline = Clock::now() + std::chrono::milliseconds(20);
++        bool waiting = false;
++        for (;;) {
++            const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - Clock::now()).count();
++            if (remaining <= 0)
++                return 0;
++            fd_set fds;
++            FD_ZERO(&fds);
++            FD_SET(m_fd, &fds);
++            struct timeval timeout = {0, waiting ? static_cast<suseconds_t>(remaining) : 0};
++            const int ready = ::select(m_fd + 1, NULL, &fds, NULL, &timeout);
++            if (ready < 0 && errno != EINTR)
++                return -1;
++            if (Clock::now() >= deadline)
++                return 0;
++            if (ready > 0) {
++                const ssize_t count = ::write(m_fd, buffer, length);
++                // Return the first positive result, including a partial frame.
++                // Never resend its prefix or retry its remaining suffix here.
++                if (count > 0) {
++                    if (waiting)
++                        LogDebugEx(LOG_HOST, "UARTPort::write()", "CW bounded UART write resumed, bytes = %u", uint32_t(count));
++                    return int(count);
++                }
++                if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
++                    return -1;
++            }
++            // Only zero-progress conditions may wait. EINTR/EAGAIN never reset
++            // the original deadline, and the descriptor stays nonblocking.
++            if (!waiting) {
++                waiting = true;
++                LogDebugEx(LOG_HOST, "UARTPort::write()", "CW bounded UART write waiting, budget = 20ms");
++            }
++        }
+     }
+ 
+     uint32_t ptr = 0U;
+diff --git a/tests/CWIDUART_Tests.cpp b/tests/CWIDUART_Tests.cpp
+index fcc8e07..d41d3a1 100644
+--- a/tests/CWIDUART_Tests.cpp
++++ b/tests/CWIDUART_Tests.cpp
+@@ -18,6 +18,8 @@
+ #include <future>
+ #include <vector>
+ #include <algorithm>
++#include <thread>
++#include <cerrno>
+ 
+ namespace {
+ using Clock = std::chrono::steady_clock;
+@@ -50,6 +52,42 @@ public:
+     int descriptor() const { return m_fd; }
+ };
+ 
++// Fill the real slave output queue without calling the API under test.
++size_t fillOutput(PTYUART& uart) {
++    std::array<uint8_t, 4096U> filler{};
++    size_t total = 0U;
++    for (unsigned i = 0U; i < 4096U; ++i) {
++        const ssize_t count = ::write(uart.descriptor(), filler.data(), filler.size());
++        if (count > 0) { total += size_t(count); continue; }
++        REQUIRE(count == -1);
++        REQUIRE((errno == EAGAIN || errno == EWOULDBLOCK));
++        fd_set fds; FD_ZERO(&fds); FD_SET(uart.descriptor(), &fds);
++        struct timeval timeout = {0, 0};
++        if (::select(uart.descriptor() + 1, nullptr, &fds, nullptr, &timeout) == 0)
++            return total;
++    }
++    FAIL("Could not fill bounded local PTY output queue");
++    return 0U;
++}
++
++std::vector<uint8_t> readExactMaster(LocalPTY& pty, size_t length) {
++    const int flags = ::fcntl(pty.master, F_GETFL, 0);
++    REQUIRE(flags != -1);
++    REQUIRE(::fcntl(pty.master, F_SETFL, flags | O_NONBLOCK) == 0);
++    std::vector<uint8_t> bytes(length);
++    size_t offset = 0U;
++    const auto deadline = Clock::now() + std::chrono::milliseconds(500);
++    while (offset < length && Clock::now() < deadline) {
++        const ssize_t count = ::read(pty.master, bytes.data() + offset, length - offset);
++        if (count > 0) offset += size_t(count);
++        else if (count == -1 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        else break;
++    }
++    REQUIRE(offset == length);
++    return bytes;
++}
++
+ class PTYModem final : public modem::Modem {
+ public:
+     explicit PTYModem(PTYUART* port) : Modem(port, true, false, false, false,
+@@ -161,6 +199,56 @@ TEST_CASE("Bounded UART stops promptly at PTY backpressure and EOF", "[modem][cw
+     }
+ }
+ 
++TEST_CASE("Bounded UART waits for a transiently busy real PTY and writes once it recovers", "[modem][cwid][uart]") {
++    LocalPTY pty;
++    PTYUART uart(pty.takeSlave());
++    REQUIRE(uart.boundedIO(true));
++    const size_t queued = fillOutput(uart);
++    REQUIRE(queued > 0U);
++    const std::array<uint8_t, 7U> marker{{0xFEU, 7U, 3U, 1U, 2U, 3U, 4U}};
++    auto drainer = std::async(std::launch::async, [&]() {
++        std::this_thread::sleep_for(std::chrono::milliseconds(5));
++        return readExactMaster(pty, queued);
++    });
++    const auto start = Clock::now();
++    const int written = uart.write(marker.data(), marker.size());
++    const auto elapsed = Clock::now() - start;
++    drainer.get();
++    REQUIRE(written == int(marker.size()));
++    REQUIRE(elapsed < std::chrono::milliseconds(200));
++    const auto received = readExactMaster(pty, marker.size());
++    REQUIRE(std::equal(marker.begin(), marker.end(), received.begin()));
++}
++
++TEST_CASE("Bounded UART returns zero when real PTY backpressure lasts past its single budget", "[modem][cwid][uart]") {
++    LocalPTY pty;
++    PTYUART uart(pty.takeSlave());
++    REQUIRE(uart.boundedIO(true));
++    REQUIRE(fillOutput(uart) > 0U);
++    const std::array<uint8_t, 3U> marker{{0xFEU, 3U, 0U}};
++    const auto start = Clock::now();
++    REQUIRE(uart.write(marker.data(), marker.size()) == 0);
++    const auto elapsed = Clock::now() - start;
++    REQUIRE(elapsed >= std::chrono::milliseconds(15));
++    REQUIRE(elapsed < std::chrono::milliseconds(200));
++}
++
++TEST_CASE("Bounded UART returns its first partial write without duplicating a frame prefix", "[modem][cwid][uart]") {
++    LocalPTY pty;
++    PTYUART uart(pty.takeSlave());
++    REQUIRE(uart.boundedIO(true));
++    std::vector<uint8_t> payload(1U << 20U);
++    for (size_t i = 0U; i < payload.size(); ++i) payload[i] = uint8_t(i % 251U);
++    const int written = uart.write(payload.data(), payload.size());
++    REQUIRE(written > 0);
++    REQUIRE(written < int(payload.size()));
++    const auto received = readExactMaster(pty, size_t(written));
++    REQUIRE(std::equal(received.begin(), received.end(), payload.begin()));
++    uint8_t extra = 0U;
++    REQUIRE(::read(pty.master, &extra, 1U) == -1);
++    REQUIRE((errno == EAGAIN || errno == EWOULDBLOCK));
++}
++
+ TEST_CASE("A UART bounded-mode hook failure marks the modem unhealthy", "[modem][cwid][uart]") {
+     PTYModem modem(new PTYUART(-1));
+     REQUIRE_FALSE(modem.boundedCWOperation(true));

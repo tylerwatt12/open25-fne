@@ -1,0 +1,37 @@
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -1123,7 +1123,10 @@
+             m_p25->m_rfTimeout.stop();
+         }
+         else {
+-            if (m_rfLC.getGroup() && (m_p25->m_enableControl || m_p25->m_notifyCC)) {
++            // An HDU alone does not identify group versus individual service.
++            // Normalize only a call whose accepted voice LC identifies a group.
++            if (m_p25->m_rfState == RS_RF_AUDIO && m_rfLC.getDstId() != 0U &&
++                m_rfLC.getGroup() && (m_p25->m_enableControl || m_p25->m_notifyCC)) {
+                 // AABD-B 3.5/AABF-D 7.3.8: the outbound RFSS group termination
+                 // addresses every SU. Keep the received target for internal routing.
+                 lc::tdulc::LC_CALL_TERM outboundLC;
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -1834,6 +1834,20 @@
+     REQUIRE(voice.controller->getRFState() == RS_RF_LISTENING);
+ }
+ 
++TEST_CASE("Received HDU-only termination retains an unconfirmed individual destination", "[p25][received-group-termination][received-group-hdu-only]") {
++    ReceivedTerminationNetwork network;
++    ControllerFixture voice(true, false, false, false, false, &network);
++    voice.voiceMode(false); receivedTerminationPermit(voice, TARGET, "ab12:756");
++    REQUIRE(voice.voiceFrame(DUID::HDU, TARGET, false, false)); voice.drainVoice();
++    REQUIRE(voice.voiceFrame(DUID::TDULC, TARGET, false, false));
++    const std::array<uint8_t, 9U> expected{{0x4FU, 0U, 0U, 0U, 0U, 0U, 0U, 0x03U, 0xEAU}};
++    REQUIRE(receivedTerminationRF(*voice.controller) == expected);
++    REQUIRE(network.destinations == std::vector<uint32_t>{TARGET});
++    REQUIRE(network.payloads == std::vector<std::array<uint8_t, 9U>>{expected});
++    REQUIRE(voice.rpc.releases == std::vector<uint32_t>{TARGET});
++    REQUIRE(voice.controller->getRFState() == RS_RF_LISTENING);
++}
++
+ 
+ #include "../OpaqueWireFixture.h"
+ std::vector<std::vector<uint8_t>> opaqueActualProducerDatagrams()

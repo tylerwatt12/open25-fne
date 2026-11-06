@@ -1,0 +1,178 @@
+--- a/src/bridge/HostBridge.Opaque.cpp
++++ b/src/bridge/HostBridge.Opaque.cpp
+@@ -44,7 +44,15 @@
+     using namespace p25;
+     using namespace p25::defines;
+     using namespace p25::dfsi::defines;
+-    if (length<24 || m_txMode!=TX_MODE_P25 || m_trafficFromUDP || buffer[4]!=LCO::GROUP) return;
++    if (length<24 || m_txMode!=TX_MODE_P25 || m_trafficFromUDP) return;
++    // Voice LDUs may carry associated group/channel or RFSS status LC. The
++    // host forwards that opcode in the DVM header (and the following LDU2),
++    // while their nine voice words still belong to the same group call.
++    // Match the established non-opaque P25 path's explicit LC allowlist;
++    // never treat private calls or arbitrary signaling as group audio.
++    const uint8_t lco=buffer[4];
++    if (lco!=LCO::GROUP && lco!=LCO::GROUP_UPDT && lco!=LCO::RFSS_STS_BCAST) return;
++    if (buffer[14]&network::NET_CTRL_U2U) return;
+     uint32_t src=GET_UINT24(buffer,5);
+     uint32_t dst=GET_UINT24(buffer,8);
+     if (!src || src>0xfffffb || dst!=m_dstId || dst>65534) return;
+--- /dev/null
++++ b/tests/BridgeOpaqueContinuity_Tests.cpp
+@@ -0,0 +1,156 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Offline production-method regression. The only replaced boundaries are the
++// constructor (no devices/threads), outbound Socket::write, and unused TX end.
++// Compile this standalone file; it includes the unmodified production .cpp.
++#if defined(DVM_BRIDGE_OPAQUE_CONTINUITY_STANDALONE)
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <deque>
++#include <functional>
++#include <iostream>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <random>
++#include <sstream>
++#include <string>
++#include <thread>
++#include <vector>
++#define private public
++#include "bridge/HostBridge.h"
++#undef private
++#include "bridge/HostBridge.Opaque.cpp"
++#include <catch2/catch_test_macros.hpp>
++
++HostBridge::HostBridge(const std::string& conf) :
++    m_confFile(conf), m_inputAudio(1,"test-in"), m_outputAudio(1,"test-out"),
++    m_networkWatchdog(1000U,1U)
++{
++    m_network=nullptr;m_udpAudioSocket=nullptr;m_dstId=1001;
++    m_txMode=TX_MODE_P25;m_trafficFromUDP=false;
++    m_rxStreamId=0;m_callInProgress=false;
++    m_udpSendAddress="127.0.0.1";m_udpSendPort=1;
++}
++HostBridge::~HostBridge() {}
++void HostBridge::callEnd(uint32_t,uint32_t) { FAIL("Offline RX fixture must not enter TX callEnd"); }
++
++namespace {
++using namespace p25;
++using namespace p25::defines;
++using Word=std::array<uint8_t,11>;
++class CapturingSocket : public network::udp::Socket {
++public:
++    std::vector<std::vector<uint8_t>> packets;
++    CapturingSocket():Socket(0U){}
++    bool write(const uint8_t* b,uint32_t n,const sockaddr_storage&,uint32_t,ssize_t* written=nullptr) noexcept override {
++        packets.emplace_back(b,b+n);if(written)*written=n;return true;
++    }
++};
++class TestPeer : public network::PeerNetwork {
++public:
++    TestPeer():PeerNetwork("127.0.0.1",1,0,12345,"offline-only",true,false,false,true,false,false,false,false,false,false,false,false) {m_p25StreamId=0x12345678;}
++    UInt8Array packet(uint32_t& size,uint8_t lco,DUID::E duid,unsigned marker,bool header=true,uint8_t mfid=0,uint8_t algorithm=0x80,uint16_t key=0) {
++        lc::LC control;control.setLCO(lco);control.setGroup(true);control.setSrcId(10001);control.setDstId(1001);control.setMFId(mfid);
++        control.setAlgId(algorithm);control.setKId(key);uint8_t mi[9]={1,2,3,4,5,6,7,8,9};control.setMI(mi);
++        control.setGrpVchNo(81);data::LowSpeedData lsd;
++        if(duid==DUID::TDU) return createP25_TDUMessage(size,control,lsd,0);
++        uint8_t air[P25_LDU_FRAME_LENGTH_BYTES]{};Audio audio;
++        for(unsigned i=0;i<9;i++){auto word=expected(marker,i);audio.encode(air,word.data(),i);}
++        if(duid==DUID::LDU1) return createP25_LDU1Message(size,control,lsd,air,header?FrameType::HDU_VALID:FrameType::DATA_UNIT,0);
++        return createP25_LDU2Message(size,control,lsd,air,0);
++    }
++    static Word expected(unsigned marker,unsigned index) {
++        Word word{};for(unsigned j=0;j<11;j++)word[j]=uint8_t(17*marker+13*index+j);return word;
++    }
++};
++struct Fixture {
++    std::string conf="offline";TestPeer peer;CapturingSocket output;HostBridge bridge{conf};
++    Fixture(){bridge.m_network=&peer;bridge.m_udpAudioSocket=&output;}
++    void send(uint8_t lco,DUID::E duid,unsigned marker,bool header=true,uint8_t mfid=0,uint8_t algorithm=0x80,uint16_t key=0) {
++        uint32_t n=0;auto p=peer.packet(n,lco,duid,marker,header,mfid,algorithm,key);
++        REQUIRE(p[4]==lco);REQUIRE(p[22]==duid);bridge.processOpaqueP25Network(p.get(),n);
++    }
++    void assertWords(unsigned offset,unsigned marker,unsigned firstIndex=0,uint8_t algorithm=0x80,uint16_t key=0,uint8_t manufacturer=0) {
++        REQUIRE(output.packets.size()>=offset+9);
++        for(unsigned i=0;i<9;i++) {
++            const auto& p=output.packets[offset+i];REQUIRE(p.size()==75);
++            REQUIRE(std::memcmp(p.data(),"DV25",4)==0);REQUIRE(p[6]==algorithm);REQUIRE(p[7]==firstIndex+i);
++            REQUIRE(read16(p.data()+8)==key);REQUIRE(read16(p.data()+10)==0);
++            REQUIRE(read32(p.data()+12)==10001);REQUIRE(read32(p.data()+16)==1001);
++            REQUIRE(read64(p.data()+24)==offset+i+1);
++            REQUIRE(std::memcmp(p.data()+32,output.packets.front().data()+32,16)==0);
++            REQUIRE(p[57]==manufacturer);REQUIRE(read16(p.data()+58)==11);
++            auto expected=TestPeer::expected(marker,i);REQUIRE(std::equal(expected.begin(),expected.end(),p.begin()+64));
++        }
++    }
++};
++}
++TEST_CASE("Group update LC retains every opaque audio word and stream identity", "[bridge-opaque-continuity]") {
++    Fixture f;
++    f.send(LCO::GROUP,DUID::LDU1,1);f.send(LCO::GROUP,DUID::LDU2,2);
++    REQUIRE(f.output.packets.size()==18);f.assertWords(0,1);f.assertWords(9,2,9);
++    f.send(LCO::GROUP_UPDT,DUID::LDU1,3);f.send(LCO::GROUP_UPDT,DUID::LDU2,4);
++    REQUIRE(f.output.packets.size()==36);f.assertWords(18,3);f.assertWords(27,4,9);
++    f.send(LCO::GROUP,DUID::LDU1,5);f.send(LCO::GROUP,DUID::LDU2,6);
++    REQUIRE(f.output.packets.size()==54);f.assertWords(36,5);f.assertWords(45,6,9);
++    f.send(LCO::RFSS_STS_BCAST,DUID::LDU1,7);f.send(LCO::RFSS_STS_BCAST,DUID::LDU2,8);
++    REQUIRE(f.output.packets.size()==72);f.assertWords(54,7);f.assertWords(63,8,9);
++    f.send(LCO::GROUP_UPDT,DUID::TDU,9);
++    REQUIRE(f.output.packets.size()==73);const auto& end=f.output.packets.back();
++    REQUIRE(end.size()==64);REQUIRE(read16(end.data()+10)==1);REQUIRE(read64(end.data()+24)==73);
++    REQUIRE(std::memcmp(end.data()+32,f.output.packets.front().data()+32,16)==0);
++    REQUIRE_FALSE(f.bridge.m_callInProgress);
++}
++TEST_CASE("The following LDU2 retains its associated LDU1 opcode while updating ESS", "[bridge-opaque-continuity]") {
++    for(auto opcode:{LCO::GROUP_UPDT,LCO::RFSS_STS_BCAST}) {
++        lc::LC inherited;inherited.setLCO(opcode);inherited.setGroup(true);inherited.setSrcId(10001);inherited.setDstId(1001);
++        lc::LC ess;ess.setAlgId(0x80);ess.setKId(0);uint8_t mi[9]={1,2,3,4,5,6,7,8,9};ess.setMI(mi);
++        uint8_t air[P25_LDU_FRAME_LENGTH_BYTES]{};ess.encodeLDU2(air);
++        REQUIRE(inherited.decodeLDU2(air));REQUIRE(inherited.getLCO()==opcode);
++        REQUIRE(inherited.getSrcId()==10001);REQUIRE(inherited.getDstId()==1001);
++        REQUIRE(inherited.getAlgId()==0x80);REQUIRE(inherited.getKId()==0);
++    }
++}
++TEST_CASE("Opaque audio ingress retains identity profile and malformed-frame rejection", "[bridge-opaque-continuity]") {
++    Fixture f;f.send(LCO::GROUP,DUID::LDU1,1);REQUIRE(f.output.packets.size()==9);
++    const auto reject=[&](std::function<void(uint8_t*,uint32_t&)> alter) {
++        uint32_t n=0;auto p=f.peer.packet(n,LCO::GROUP_UPDT,DUID::LDU1,2);alter(p.get(),n);
++        auto token=f.output.packets.front();auto size=f.output.packets.size();
++        f.bridge.processOpaqueP25Network(p.get(),n);REQUIRE(f.output.packets.size()==size);
++        REQUIRE(f.bridge.m_rxStreamId==0x12345678);REQUIRE(f.bridge.m_callInProgress);
++        REQUIRE(std::memcmp(f.bridge.m_opaqueRxToken,token.data()+32,16)==0);
++    };
++    SECTION("unrelated LC"){reject([](uint8_t*p,uint32_t&){p[4]=LCO::PRIVATE;});reject([](uint8_t*p,uint32_t&){p[4]=0x3f;});}
++    SECTION("wrong source or destination"){reject([](uint8_t*p,uint32_t&){p[5]=p[6]=p[7]=0;});reject([](uint8_t*p,uint32_t&){p[10]^=1;});}
++    SECTION("short or malformed DFSI"){reject([](uint8_t*,uint32_t&n){n=23;});reject([](uint8_t*p,uint32_t&){p[77]=0;});}
++    SECTION("unsupported or changed manufacturer"){reject([](uint8_t*p,uint32_t&){p[15]=2;});reject([](uint8_t*p,uint32_t&){p[15]=1;});}
++    SECTION("embedded manufacturer disagreement"){reject([](uint8_t*p,uint32_t&){p[62]=1;});}
++    SECTION("private-call control bit"){reject([](uint8_t*p,uint32_t&){p[14]|=network::NET_CTRL_U2U;});}
++    SECTION("opposite direction active"){f.bridge.m_trafficFromUDP=true;reject([](uint8_t*,uint32_t&){});}
++    SECTION("wrong transmit mode"){f.bridge.m_txMode=TX_MODE_DMR;reject([](uint8_t*,uint32_t&){});}
++}
++TEST_CASE("Update LC retains opaque encryption and late-entry fail-closed behavior", "[bridge-opaque-continuity]") {
++    SECTION("supported MFID1 retains the existing stream profile") {
++        Fixture f;f.send(LCO::GROUP,DUID::LDU1,1,true,1);
++        f.send(LCO::GROUP_UPDT,DUID::LDU1,2,false,1);
++        REQUIRE(f.output.packets.size()==18);f.assertWords(0,1,0,0x80,0,1);f.assertWords(9,2,0,0x80,0,1);
++    }
++    SECTION("encryption metadata and codewords stay opaque") {
++        Fixture f;f.send(LCO::GROUP,DUID::LDU1,1,true,0,0x84,7);
++        f.send(LCO::GROUP_UPDT,DUID::LDU1,2,false,0,0x84,7);
++        REQUIRE(f.output.packets.size()==18);f.assertWords(0,1,0,0x84,7);f.assertWords(9,2,0,0x84,7);
++        for(const auto&p:f.output.packets){const uint8_t mi[9]={1,2,3,4,5,6,7,8,9};REQUIRE(std::memcmp(p.data()+48,mi,9)==0);}
++    }
++    SECTION("late entry must learn ESS before exporting") {
++        Fixture f;f.send(LCO::GROUP_UPDT,DUID::LDU1,1,false);REQUIRE(f.output.packets.empty());
++        f.send(LCO::GROUP_UPDT,DUID::LDU2,2);REQUIRE(f.output.packets.empty());
++        f.send(LCO::GROUP_UPDT,DUID::LDU1,3,false);REQUIRE(f.output.packets.size()==9);f.assertWords(0,3);
++    }
++    SECTION("invalid encrypted MI is not reinterpreted as clear") {
++        Fixture f;uint32_t n=0;auto p=f.peer.packet(n,LCO::GROUP_UPDT,DUID::LDU1,1,true,0,0x84,7);
++        std::memset(p.get()+184,0,9);f.bridge.processOpaqueP25Network(p.get(),n);REQUIRE(f.output.packets.empty());
++    }
++}
++
++#endif // DVM_BRIDGE_OPAQUE_CONTINUITY_STANDALONE

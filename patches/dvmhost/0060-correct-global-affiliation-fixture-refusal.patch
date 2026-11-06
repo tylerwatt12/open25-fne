@@ -1,0 +1,13 @@
+diff --git a/tests/p25/ZeroCapacity_Fixtures.cpp b/tests/p25/ZeroCapacity_Fixtures.cpp
+--- a/tests/p25/ZeroCapacity_Fixtures.cpp
++++ b/tests/p25/ZeroCapacity_Fixtures.cpp
+@@ -267,7 +267,8 @@
+         {TG, "affiliation-allowed"}, {DISABLED_TG, "affiliation-disabled"}, {UNKNOWN_TG, "affiliation-unknown"}}) {
+         FixtureController fixture;
+         fixture.prepareAccess(false);
+-        const uint8_t response = group.first == TG ? ResponseCode::ACCEPT : ResponseCode::DENY;
++        // AABD-B 6.7.2.1(e): both groups are invalid on this system.
++        const uint8_t response = group.first == TG ? ResponseCode::ACCEPT : ResponseCode::REFUSED;
+         cases.emplace_back(requestCase(fixture, group.second, affiliation(RID, group.first),
+             {{TSBKO::IOSP_GRP_AFF, response, -1, RID, int(group.first)}}, true, RID, group.first));
+         REQUIRE(fixture.controller->affiliations()->isGroupAff(RID, group.first) == (group.first == TG));

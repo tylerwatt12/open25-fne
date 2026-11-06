@@ -1,0 +1,606 @@
+diff --git a/src/common/p25/lc/tsbk/IOSP_ACK_RSP.cpp b/src/common/p25/lc/tsbk/IOSP_ACK_RSP.cpp
+--- a/src/common/p25/lc/tsbk/IOSP_ACK_RSP.cpp
++++ b/src/common/p25/lc/tsbk/IOSP_ACK_RSP.cpp
+@@ -44,6 +44,7 @@
+     ulong64_t tsbkValue = TSBK::toValue(tsbk);
+ 
+     m_aivFlag = (((tsbkValue >> 56) & 0xFFU) & 0x80U) == 0x80U;                     // Additional Info. Flag
++    m_extendedAddrFlag = (((tsbkValue >> 56) & 0xFFU) & 0x40U) == 0x40U;           // Extended Addressing Flag
+     m_service = (uint8_t)((tsbkValue >> 56) & 0x3FU);                               // Service Type
+     m_dstId = (uint32_t)((tsbkValue >> 24) & 0xFFFFFFU);                            // Target Radio Address
+     m_srcId = (uint32_t)(tsbkValue & 0xFFFFFFU);                                    // Source Radio Address
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -224,7 +224,7 @@
+ {
+     m_receivedNetworkTailOwner = NetworkReceiveOwner{};
+     retireNetworkVoiceReceive();
+-    if (m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelStatusQueries(); m_control->cancelInhibitions(); }
++    if (m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelStatusQueries(); m_control->cancelMessageUpdates(); m_control->cancelInhibitions(); }
+     m_rfState = RS_RF_LISTENING;
+     m_ccHalted = false;
+ 
+@@ -1101,13 +1101,13 @@
+ void Control::setCCRunning(bool ccRunning)
+ {
+     m_ccPrevRunning = m_ccRunning; m_ccRunning = ccRunning;
+-    if (!ccRunning && m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelStatusQueries(); m_control->cancelInhibitions(); }
++    if (!ccRunning && m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelStatusQueries(); m_control->cancelMessageUpdates(); m_control->cancelInhibitions(); }
+ }
+ 
+ void Control::setCCHalted(bool ccHalted)
+ {
+     m_ccHalted = ccHalted;
+-    if (ccHalted && m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelStatusQueries(); m_control->cancelInhibitions(); }
++    if (ccHalted && m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelStatusQueries(); m_control->cancelMessageUpdates(); m_control->cancelInhibitions(); }
+ }
+ 
+ /* Updates the processor. */
+@@ -1120,7 +1120,7 @@
+     if (!m_authoritative) retryPermitReleases();
+     uint32_t ms = m_interval.elapsed();
+     m_interval.start();
+-    if (m_control != nullptr) { m_control->clockInhibitions(ms); m_control->clockRadioChecks(ms); m_control->clockStatusQueries(); }
++    if (m_control != nullptr) { m_control->clockInhibitions(ms); m_control->clockRadioChecks(ms); m_control->clockStatusQueries(); m_control->clockMessageUpdates(); }
+     clockDispatch();
+ 
+     if (m_network != nullptr) {
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -321,6 +321,7 @@
+         friend struct DispatchGrantTestAccess;
+         friend struct RadioCheckTestAccess;
+         friend struct StatusQueryTestAccess;
++        friend struct MessageUpdateTestAccess;
+         friend struct InhibitProcedureTestAccess;
+         friend struct MultiSiteTestAccess;
+         friend struct NIDReceiveTestAccess;
+diff --git a/src/host/p25/TxFrameQueue.h b/src/host/p25/TxFrameQueue.h
+--- a/src/host/p25/TxFrameQueue.h
++++ b/src/host/p25/TxFrameQueue.h
+@@ -94,6 +94,7 @@
+ private:
+ #if defined(CATCH2_TEST_COMPILATION)
+     friend struct StatusQueryTestAccess;
++        friend struct MessageUpdateTestAccess;
+ #endif
+     struct Frame { std::vector<uint8_t> data; TxFrameOwnership owner; std::chrono::steady_clock::time_point expiresAt; };
+     void discardInactive() {
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -521,6 +521,20 @@
+             break;
+             case TSBKO::IOSP_ACK_RSP:
+             {
++                auto* messageAck = static_cast<IOSP_ACK_RSP*>(tsbk.get());
++                if (messageAck->getService() == TSBKO::IOSP_MSG_UPDT && dstId == WUID_FNE) {
++                    // AABD-B 10.2.4-5: this FNE is the originator. Only its
++                    // issued, in-window procedure can turn ACK into an outcome.
++                    if (!acceptMessageUpdateResponse(srcId, dstId, tsbk->getMFId(),
++                            messageAck->getService(), messageAck->getAIV(), messageAck->getEX())) {
++                        m_inbound = false; m_p25->m_rfState = prevRfState; return false;
++                    }
++                    // AABD-B 6.6.1: this correlated, acknowledged SU
++                    // transaction refreshes that SU's existing WUID only.
++                    markValidatedWUID(srcId);
++                    refreshAcknowledgedWUID();
++                    break;
++                }
+                 // validate the source RID
+                 VALID_SRCID(tsbk->toString(true), TSBKO::IOSP_ACK_RSP, srcId);
+ 
+diff --git a/src/host/p25/packet/ControlSignaling.h b/src/host/p25/packet/ControlSignaling.h
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -41,6 +41,7 @@
+     struct DispatchGrantTestAccess;
+     struct RadioCheckTestAccess;
+     struct StatusQueryTestAccess;
++    struct MessageUpdateTestAccess;
+     struct InhibitProcedureTestAccess;
+     struct AMBTIngressTestAccess;
+     // ---------------------------------------------------------------------------
+@@ -127,6 +128,10 @@
+             bool requestStatusQuery(uint32_t target, uint32_t waitMs = 750U);
+             StatusQueryState statusQueryState(uint32_t target);
+             void cancelStatusQueries();
++            enum class MessageUpdateState { None, Queued, Awaiting, Acknowledged, NoResponse, Cancelled };
++            bool requestMessageUpdate(uint32_t target, uint16_t message, uint32_t waitMs = 750U);
++            MessageUpdateState messageUpdateState(uint32_t target);
++            void cancelMessageUpdates();
+             InhibitResult updateInhibitPolicy(const std::vector<InhibitDesired>& desired,
+                 const std::vector<InhibitRestore>& controlState = {}, bool hasControlState = false, uint32_t waitMs = 750U);
+             InhibitResult inhibitSnapshot();
+@@ -182,6 +187,7 @@
+             friend struct p25::DispatchGrantTestAccess;
+             friend struct p25::RadioCheckTestAccess;
+             friend struct p25::StatusQueryTestAccess;
++            friend struct p25::MessageUpdateTestAccess;
+             friend struct p25::InhibitProcedureTestAccess;
+             friend struct p25::AMBTIngressTestAccess;
+ #endif
+@@ -272,6 +278,20 @@
+             void clockStatusQueries();
+             bool acceptStatusQueryResponse(uint32_t source, uint32_t target, uint8_t mfid, uint16_t status, bool& firstResponse);
+             bool statusQueryTargetAvailable(uint32_t target) const;
++
++            struct MessageUpdate {
++                uint64_t serial = 0U;
++                TxFrameOwnership owner;
++                MessageUpdateState state = MessageUpdateState::Queued;
++                std::chrono::steady_clock::time_point deadline;
++                uint16_t message = 0U;
++            };
++            std::mutex m_messageUpdateMutex;
++            std::condition_variable m_messageUpdateChanged;
++            uint64_t m_messageUpdateSerial = 0U;
++            std::unordered_map<uint32_t, MessageUpdate> m_messageUpdates;
++            void clockMessageUpdates();
++            bool acceptMessageUpdateResponse(uint32_t source, uint32_t target, uint8_t mfid, uint8_t service, bool aiv, bool extended);
+ 
+             struct InhibitRecord {
+                 bool desired = false, blocked = false, pending = false, wake = false;
+diff --git a/src/host/restapi/RESTAPI.cpp b/src/host/restapi/RESTAPI.cpp
+--- a/src/host/restapi/RESTAPI.cpp
++++ b/src/host/restapi/RESTAPI.cpp
+@@ -1554,6 +1554,16 @@
+     else if (::strtolower(command) == RID_CMD_DYN_REGRP_UNLOCK) {
+         m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::DYN_REGRP_UNLOCK, 0U, dstId);
+     }
++    else if (::strtolower(command) == RID_CMD_MESSAGE) {
++        if (!req["message"].is<uint32_t>() || req["message"].get<uint32_t>() > 0xFFFFU) {
++            errorPayload(reply, "message code was not a 16-bit integer");
++            return;
++        }
++        if (!m_p25->control()->requestMessageUpdate(dstId, uint16_t(req["message"].get<uint32_t>()), 750U)) {
++            errorPayload(reply, "message update unavailable, target invalid, or already pending", HTTPPayload::SERVICE_UNAVAILABLE);
++            return;
++        }
++    }
+     else if (::strtolower(command) == RID_CMD_STATUS_QUERY) {
+         if (!m_p25->control()->requestStatusQuery(dstId,750U)) {
+             errorPayload(reply, "status query unavailable, target invalid, or already pending", HTTPPayload::SERVICE_UNAVAILABLE);
+diff --git a/src/host/restapi/RESTDefines.h b/src/host/restapi/RESTDefines.h
+--- a/src/host/restapi/RESTDefines.h
++++ b/src/host/restapi/RESTDefines.h
+@@ -54,6 +54,7 @@
+ #define RID_CMD_DYN_REGRP_LOCK          "dyn-regrp-lock"
+ #define RID_CMD_DYN_REGRP_UNLOCK        "dyn-regrp-unlock"
+ #define RID_CMD_STATUS_QUERY            "status-query"
++#define RID_CMD_MESSAGE                 "message"
+ #define RID_CMD_GAQ                     "group-aff-req"
+ #define RID_CMD_UREG                    "unit-reg"
+ #define RID_CMD_EMERG                   "emerg"
+diff --git a/src/host/p25/packet/ControlSignaling.Message.cpp b/src/host/p25/packet/ControlSignaling.Message.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/host/p25/packet/ControlSignaling.Message.cpp
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Phase 1 local-home FNE-origin short coded message. AABD-B 10.2.2/10.2.4-5
++// (PDF91-93/printed86-88); AABC-E 6.2.10.1 Fig6.2.10-1 (PDF170/printed151),
++// 6.1.1.1 Fig6.1.1-1 (PDF94/printed75), 2.3.25 (PDF38/printed19).
++// One send, 750ms enqueue and 10s response fence are project policy.
++#include "p25/packet/ControlSignaling.h"
++#include "common/p25/lc/tsbk/IOSP_MSG_UPDT.h"
++#include "p25/lookups/P25AffiliationLookup.h"
++#include "common/Log.h"
++using namespace p25;
++using namespace p25::packet;
++using namespace p25::defines;
++namespace {
++bool active(ControlSignaling::MessageUpdateState state) {
++    return state == ControlSignaling::MessageUpdateState::Queued || state == ControlSignaling::MessageUpdateState::Awaiting;
++}
++}
++bool ControlSignaling::requestMessageUpdate(uint32_t target, uint16_t message, uint32_t waitMs) {
++    std::unique_lock<std::mutex> lock(m_messageUpdateMutex);
++    // REST parses the address/code; the protocol owner admits actual operation.
++    if (target == 0U || target >= WUID_FNE) return false;
++    auto old = m_messageUpdates.find(target);
++    if (old != m_messageUpdates.end() && (active(old->second.state) || std::chrono::steady_clock::now() < old->second.deadline)) return false;
++    if (std::count_if(m_messageUpdates.begin(), m_messageUpdates.end(), [](const auto& row) { return active(row.second.state); }) >= 16) return false;
++    if (old == m_messageUpdates.end() && m_messageUpdates.size() >= 128U) {
++        const auto now = std::chrono::steady_clock::now();
++        auto retired = std::find_if(m_messageUpdates.begin(), m_messageUpdates.end(), [&](const auto& row) {
++            return !active(row.second.state) && now >= row.second.deadline;
++        });
++        if (retired == m_messageUpdates.end()) return false;
++        m_messageUpdates.erase(retired);
++    }
++    MessageUpdate request; request.serial = ++m_messageUpdateSerial; request.message = message;
++    request.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs ? std::min(waitMs, 750U) : 750U);
++    request.owner = std::make_shared<TxFrameOwner>(target, true, WUID_FNE, target, request.deadline, std::chrono::seconds(10));
++    m_messageUpdates[target] = request;
++    if (waitMs == 0U) return true; // test/mailbox admission only
++    const auto serial = request.serial;
++    m_messageUpdateChanged.wait_until(lock, request.deadline, [&] {
++        auto current = m_messageUpdates.find(target);
++        return current == m_messageUpdates.end() || current->second.serial != serial || current->second.state != MessageUpdateState::Queued;
++    });
++    auto current = m_messageUpdates.find(target);
++    if (current == m_messageUpdates.end() || current->second.serial != serial) return false;
++    if (current->second.state == MessageUpdateState::Queued) {
++        current->second.state = MessageUpdateState::Cancelled; current->second.owner->active.store(false);
++    }
++    return current->second.state == MessageUpdateState::Awaiting || current->second.state == MessageUpdateState::Acknowledged;
++}
++ControlSignaling::MessageUpdateState ControlSignaling::messageUpdateState(uint32_t target) {
++    std::lock_guard<std::mutex> lock(m_messageUpdateMutex); auto found = m_messageUpdates.find(target);
++    return found == m_messageUpdates.end() ? MessageUpdateState::None : found->second.state;
++}
++void ControlSignaling::cancelMessageUpdates() {
++    std::lock_guard<std::mutex> lock(m_messageUpdateMutex);
++    for (auto& row : m_messageUpdates) {
++        if (active(row.second.state)) row.second.state = MessageUpdateState::Cancelled;
++        row.second.owner->active.store(false);
++    }
++    m_messageUpdateChanged.notify_all();
++}
++void ControlSignaling::clockMessageUpdates() {
++    std::lock_guard<std::mutex> lock(m_messageUpdateMutex);
++    for (auto& row : m_messageUpdates) {
++        auto& request = row.second;
++        if (!active(request.state)) continue;
++        if (!request.owner->active.load() || !statusQueryTargetAvailable(row.first)) {
++            request.state = MessageUpdateState::Cancelled; request.owner->active.store(false); continue;
++        }
++        if (std::chrono::steady_clock::now() >= request.deadline) {
++            const bool issued = request.state == MessageUpdateState::Awaiting;
++            request.state = issued ? MessageUpdateState::NoResponse : MessageUpdateState::Cancelled;
++            request.owner->active.store(false);
++            if (issued) LogInfoEx(LOG_HOST, "P25 Message Update, no response, arg = %u, tgt = %u, message = $%04X, attempts = 1", WUID_FNE, row.first, request.message);
++            continue;
++        }
++        if (request.state == MessageUpdateState::Awaiting) continue;
++        lc::tsbk::IOSP_MSG_UPDT update; update.setMFId(MFG_STANDARD);
++        update.setSrcId(WUID_FNE); update.setDstId(row.first); update.setMessage(request.message);
++        if (!writeRF_TSDU_SBF(&update, true, true, true, false, request.owner)) {
++            request.state = MessageUpdateState::Cancelled; request.owner->active.store(false); continue;
++        }
++        request.state = MessageUpdateState::Awaiting;
++        request.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++    }
++    m_messageUpdateChanged.notify_all();
++}
++bool ControlSignaling::acceptMessageUpdateResponse(uint32_t source, uint32_t target, uint8_t mfid, uint8_t service, bool aiv, bool extended) {
++    std::lock_guard<std::mutex> lock(m_messageUpdateMutex); auto found = m_messageUpdates.find(source);
++    if (found == m_messageUpdates.end()) return false;
++    auto& request = found->second;
++    if (request.state != MessageUpdateState::Awaiting || !request.owner->active.load() ||
++        std::chrono::steady_clock::now() >= request.deadline || target != WUID_FNE || service != TSBKO::IOSP_MSG_UPDT ||
++        aiv || extended || (mfid != MFG_STANDARD && mfid != MFG_STANDARD_ALT) || !statusQueryTargetAvailable(source)) return false;
++    request.state = MessageUpdateState::Acknowledged;
++    request.owner->active.store(false); // cancel any undrained message; retain the response fence
++    LogInfoEx(LOG_HOST, "P25 Message Update, acknowledged, arg = %u, tgt = %u, message = $%04X, attempts = 1", WUID_FNE, source, request.message);
++    m_messageUpdateChanged.notify_all();
++    return true;
++}
+diff --git a/tests/p25/MessageUpdate_Tests.cpp b/tests/p25/MessageUpdate_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/MessageUpdate_Tests.cpp
+@@ -0,0 +1,320 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// TIA-102.AABD-B10.2 (PDF91-93/printed86-88), AABC-E6.2.10.1
++// Fig6.2.10-1 (PDF170/printed151),6.1.1.1 Fig6.1.1-1 (PDF94/printed75).
++// Literal expected octets are derived directly from those diagrams. CRC constants
++// are independently computed by Python binascii.crc_hqx(body,0)^0xFFFF.
++// The 750ms/one-send/10s fence and 16/128 capacities are project policy.
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/network/P25SiteRouting.h"
++#include "common/p25/acl/AccessControl.h"
++#include "common/p25/Audio.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/Log.h"
++#include "host/p25/packet/ControlSignaling.h"
++#include <iostream>
++#include <iomanip>
++#include <future>
++#include <thread>
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <sstream>
++#include <vector>
++
++namespace p25 {
++struct MessageUpdateTestAccess {
++    static void clock(Control& c) { c.control()->clockMessageUpdates(); }
++    static void expire(Control& c, uint32_t target) {
++        auto* signal=c.control(); std::lock_guard<std::mutex> lock(signal->m_messageUpdateMutex);
++        signal->m_messageUpdates.at(target).deadline = std::chrono::steady_clock::now();
++    }
++    static void addSubscriber(Control& c,uint32_t target) { c.m_dispatchSubscribers.insert(target); c.affiliations()->unitReg(target); }
++    static size_t count(Control& c) { std::lock_guard<std::mutex> lock(c.control()->m_messageUpdateMutex); return c.control()->m_messageUpdates.size(); }
++    static std::unique_lock<std::mutex> holdQueue() { return std::unique_lock<std::mutex>(Control::s_queueLock); }
++    static bool messageMutexHeld(Control& c) { auto& mutex=c.control()->m_messageUpdateMutex; if(!mutex.try_lock())return true; mutex.unlock();return false; }
++    static bool ownerActive(Control& c,uint32_t target) { auto* signal=c.control();std::lock_guard<std::mutex> lock(signal->m_messageUpdateMutex);return signal->m_messageUpdates.at(target).owner->active.load(); }
++    static void expireQueued(Control& c,uint32_t target) {
++        std::lock_guard<std::mutex> queueLock(Control::s_queueLock);
++        for(auto* queue:{&c.m_txImmQueue,&c.m_txQueue}) {
++            std::lock_guard<std::mutex> lock(queue->m_mutex);
++            for(auto& frame:queue->m_frames) if(frame.owner&&frame.owner->destination==target)
++                frame.expiresAt=std::chrono::steady_clock::now();
++        }
++    }
++    static void redundant(Control& c) { c.control()->m_redundantImmediate=true; }
++    static uint8_t lastMFId(Control& c) { return c.control()->m_lastMFID; }
++    static std::chrono::steady_clock::time_point deadlineAfter(Control& c,uint32_t target,std::chrono::milliseconds delay) {
++        auto* signal=c.control();std::lock_guard<std::mutex> lock(signal->m_messageUpdateMutex);
++        return signal->m_messageUpdates.at(target).deadline=std::chrono::steady_clock::now()+delay;
++    }
++    static void inhibit(Control& c,uint32_t target) {
++        auto* signal=c.control();std::lock_guard<std::mutex> lock(signal->m_inhibitMutex);
++        signal->m_inhibitions[target].blocked=true;signal->publishInhibitionLocked();
++    }
++};
++}
++namespace {
++using namespace p25;
++using namespace p25::defines;
++constexpr uint32_t RID = 10001U, OTHER = 10005U, APP = 10002U, TG = 1001U, NAC = 0x293U;
++using Block = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++using MessageState = packet::ControlSignaling::MessageUpdateState;
++constexpr uint32_t SECOND_SU = 10007U;
++std::ostringstream& diagnosticLog() { static std::ostringstream output; return output; }
++size_t outcomeLogs(const std::string& outcome) {
++    const auto value = diagnosticLog().str(); size_t count=0U, at=0U;
++    while ((at=value.find("P25 Message Update, " + outcome + ",", at))!=std::string::npos) { ++count; ++at; }
++    return count;
++}
++struct Fixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, true};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, true};
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U, true, true, false, false, false, false};
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-subscriber-test", false};
++    network::NetRPC* oldRPC = g_RPC;
++    std::unique_ptr<Control> controller;
++    explicit Fixture(bool cc, bool physicalInventory = true, uint32_t queueSize = 16384U) {
++        g_logDisplayLevel = 0U; g_RPC = &rpc;
++        diagnosticLog().str(""); diagnosticLog().clear();
++        log_internal::SetInternalOutputStream(diagnosticLog());
++        radios.addEntry(SECOND_SU,true,"Second physical SU"); radios.addEntry(RID, true, "Subscriber"); radios.addEntry(OTHER, false, "Disabled"); radios.addEntry(APP, true, "Console"); radios.addEntry(10006U, true, "Not physical");
++        groups.addEntry(TG, 1U, true); groups.addEntry(1002U, 1U, true);
++        controller = std::make_unique<Control>(true, NAC, 1U, queueSize, &modem, nullptr, 120U, 1U, true,
++            &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
++        yaml::Node config; std::string mode = cc ? "true" : "false";
++        const std::string inventory = physicalInventory ? "        dispatchSubscribers:\n            - 10001\n            - 10005\n            - 10007\n" : "        dispatchSubscribers: []\n";
++        REQUIRE(yaml::Parse(config, std::string("protocols:\n    p25:\n        managedSite: true\n") + inventory + "        verifyReg: true\n        verifyAff: false\n        inhibitUnauthorized: false\n        tduPreambleCount: 0\n        control:\n            enable: " + mode + "\n            dedicated: " + mode + "\n            ackRequests: false\n            disableTSDUMBF: true\n            redundantImmediate: false\nsystem:\n    config:\n        controlCh:\n            notifyEnable: false\n"));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 25U, false);
++        controller->configureIdentification(false); controller->setCCRunning(cc); controller->setZoneConnected(false);
++        controller->affiliations()->unitReg(RID);
++    }
++    ~Fixture() { controller.reset(); g_RPC = oldRPC; log_internal::SetInternalOutputStream(std::cerr); }
++    bool signal(uint8_t opcode, uint64_t value, uint8_t manufacturer = 0U, bool corruptCRC = false) {
++        Block raw{}; raw[0] = 0x80U | opcode; raw[1] = manufacturer;
++        for (unsigned i = 0U; i < 8U; ++i) raw[2U+i] = uint8_t(value >> ((7U-i)*8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        if (corruptCRC) raw.back() ^= 1U;
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES+2U> frame{}; frame[0] = modem::TAG_DATA; frame[1] = 1U;
++        Sync::addP25Sync(frame.data()+2U); NID nid(NAC); nid.encode(frame.data()+2U, DUID::TSDU);
++        std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> encoded{}; edac::Trellis trellis;
++        trellis.encode12(raw.data(), encoded.data()); P25Utils::encode(encoded.data(), frame.data()+2U, 114U, 318U);
++        P25Utils::addStatusBits(frame.data()+2U, P25_TSDU_FRAME_LENGTH_BITS, false, false);
++        return controller->processFrame(frame.data(), frame.size());
++    }
++    std::vector<Block> responses() {
++        std::array<uint8_t, 1024> frame{}; std::vector<Block> blocks;
++        while (controller->getFrame(frame.data()) != 0U) {
++            NID nid(NAC); if (!nid.decode(frame.data()+2U) || nid.getDUID()!=DUID::TSDU) continue;
++            std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{}; Block raw{}; edac::Trellis trellis;
++            P25Utils::decode(frame.data()+2U, coded.data(), 114U, 318U); REQUIRE(trellis.decode12(coded.data(), raw.data()));
++            REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); blocks.push_back(raw);
++        }
++        return blocks;
++    }
++    void age(uint32_t ms) { controller->affiliations()->clock(ms); }
++};
++}
++
++
++
++TEST_CASE("message update emits the independent literal standard frame once on the owner", "[p25][message-update]") {
++    const std::array<Block,3> expected{{
++        {{0x9C,0x00,0x00,0x00,0x00,0x27,0x11,0xFF,0xFF,0xFC,0x88,0x5F}},
++        {{0x9C,0x00,0x12,0x34,0x00,0x27,0x11,0xFF,0xFF,0xFC,0xA2,0x06}},
++        {{0x9C,0x00,0xFF,0xFF,0x00,0x27,0x11,0xFF,0xFF,0xFC,0xB9,0x61}}
++    }};
++    const std::array<uint16_t,3> codes{{0U,0x1234U,0xFFFFU}};
++    for(size_t index=0;index<codes.size();++index) {
++        Fixture f(true);auto* signal=f.controller->control();
++        signal->setLastMFId(0x90U);MessageUpdateTestAccess::redundant(*f.controller);
++        REQUIRE(signal->requestMessageUpdate(RID,codes[index],0U));
++        REQUIRE(signal->messageUpdateState(RID)==MessageState::Queued);
++        REQUIRE(f.responses().empty());
++        REQUIRE_FALSE(signal->requestMessageUpdate(RID,7U,0U));
++        MessageUpdateTestAccess::clock(*f.controller);
++        auto blocks=f.responses();REQUIRE(blocks.size()==1U);REQUIRE(blocks[0]==expected[index]);
++        REQUIRE(signal->messageUpdateState(RID)==MessageState::Awaiting);
++        REQUIRE(MessageUpdateTestAccess::lastMFId(*f.controller)==0x90U);
++        for(unsigned i=0;i<12;++i)MessageUpdateTestAccess::clock(*f.controller);
++        REQUIRE(f.responses().empty()); // no redundant or periodic copies
++    }
++}
++TEST_CASE("message acknowledgment is a matched issued service outcome with no generic echo", "[p25][message-update]") {
++    for(const uint8_t mfid:{0U,1U}) {
++        Fixture f(true);auto* signal=f.controller->control();
++        REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL,mfid));
++        REQUIRE(outcomeLogs("acknowledged")==0U);
++        REQUIRE(signal->requestMessageUpdate(RID,0x1234U,0U));
++        REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL,mfid)); // mailbox is not issued
++        MessageUpdateTestAccess::clock(*f.controller);
++        REQUIRE(f.controller->peekFrameLength()>0U); // deliberately undrained message
++        REQUIRE(f.signal(0x20U,0x1C00FFFFFC002711ULL,mfid));
++        REQUIRE(signal->messageUpdateState(RID)==MessageState::Acknowledged);
++        REQUIRE(outcomeLogs("acknowledged")==1U);
++        REQUIRE(diagnosticLog().str().find("P25 Message Update, acknowledged, arg = 16777212, tgt = 10001, message = $1234, attempts = 1")!=std::string::npos);
++        REQUIRE_FALSE(MessageUpdateTestAccess::ownerActive(*f.controller,RID));
++        REQUIRE(f.responses().empty()); // ACK cancels the undrained message
++        REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL,mfid));
++        REQUIRE(outcomeLogs("acknowledged")==1U);
++        REQUIRE_FALSE(signal->requestMessageUpdate(RID,8U,0U)); // retain original window fence
++    }
++}
++TEST_CASE("unrelated malformed and expired acknowledgments cannot complete message update", "[p25][message-update]") {
++    Fixture f(true);auto* signal=f.controller->control();
++    REQUIRE(signal->requestMessageUpdate(RID,1U,0U));MessageUpdateTestAccess::clock(*f.controller);f.responses();
++    const std::array<uint64_t,5> wrong{{
++        0x1C00FFFFFC002717ULL, // wrong source
++        0x1C00002717002711ULL, // wrong target
++        0x1F00FFFFFC002711ULL, // another service
++        0x9C00FFFFFC002711ULL, // AIV set: not abbreviated ACK_RSP_U
++        0x5C00FFFFFC002711ULL  // EX set: not abbreviated ACK_RSP_U
++    }};
++    for(const auto value:wrong) {
++        f.signal(0x20U,value);f.responses();
++        REQUIRE(signal->messageUpdateState(RID)==MessageState::Awaiting);
++        REQUIRE(outcomeLogs("acknowledged")==0U);
++    }
++    REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL,0x90U));
++    REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL,0U,true));
++    REQUIRE(signal->messageUpdateState(RID)==MessageState::Awaiting);
++    MessageUpdateTestAccess::expire(*f.controller,RID);
++    REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL)); // wall fence, no protocol tick
++    REQUIRE(outcomeLogs("acknowledged")==0U);
++    MessageUpdateTestAccess::clock(*f.controller);
++    REQUIRE(signal->messageUpdateState(RID)==MessageState::NoResponse);
++    REQUIRE(outcomeLogs("no response")==1U);
++    MessageUpdateTestAccess::clock(*f.controller);REQUIRE(outcomeLogs("no response")==1U);
++    REQUIRE(f.responses().empty());
++}
++TEST_CASE("message update cancels on unavailable physical subscriber or control owner", "[p25][message-update]") {
++    for(const auto unavailable:{OTHER,APP,10006U,SECOND_SU}) {
++        Fixture f(true);auto* signal=f.controller->control();
++        REQUIRE(signal->requestMessageUpdate(unavailable,1U,0U));MessageUpdateTestAccess::clock(*f.controller);
++        REQUIRE(signal->messageUpdateState(unavailable)==MessageState::Cancelled);REQUIRE(f.responses().empty());
++    }
++    for(const auto invalid:{0U,0xFFFFFCU,0xFFFFFFU}) {
++        Fixture f(true);REQUIRE_FALSE(f.controller->control()->requestMessageUpdate(invalid,1U,0U));
++    }
++    SECTION("not dedicated control") {
++        Fixture f(false);auto* signal=f.controller->control();REQUIRE(signal->requestMessageUpdate(RID,1U,0U));
++        MessageUpdateTestAccess::clock(*f.controller);REQUIRE(signal->messageUpdateState(RID)==MessageState::Cancelled);REQUIRE(f.responses().empty());
++    }
++    SECTION("registration removed") {
++        Fixture f(true);auto* signal=f.controller->control();REQUIRE(signal->requestMessageUpdate(RID,1U,0U));
++        MessageUpdateTestAccess::clock(*f.controller);f.controller->affiliations()->unitDereg(RID);
++        MessageUpdateTestAccess::clock(*f.controller);REQUIRE(signal->messageUpdateState(RID)==MessageState::Cancelled);REQUIRE(f.responses().empty());
++    }
++    SECTION("inhibited before handoff") {
++        Fixture f(true);auto* signal=f.controller->control();REQUIRE(signal->requestMessageUpdate(RID,1U,0U));
++        MessageUpdateTestAccess::clock(*f.controller);MessageUpdateTestAccess::inhibit(*f.controller,RID);
++        REQUIRE(f.responses().empty());REQUIRE_FALSE(MessageUpdateTestAccess::ownerActive(*f.controller,RID));
++        MessageUpdateTestAccess::clock(*f.controller);REQUIRE(signal->messageUpdateState(RID)==MessageState::Cancelled);
++    }
++}
++TEST_CASE("control stop halt reset and failed admission never replay queued messages", "[p25][message-update]") {
++    for(unsigned path=0;path<4U;++path) {
++        Fixture f(true);auto* signal=f.controller->control();REQUIRE(signal->requestMessageUpdate(RID,1U,0U));
++        MessageUpdateTestAccess::clock(*f.controller);
++        if(path==0U){f.controller->setCCRunning(false);f.controller->setCCRunning(true);}
++        if(path==1U){f.controller->setCCHalted(true);f.controller->setCCHalted(false);}
++        if(path==2U)f.controller->reset();
++        if(path==3U)signal->cancelMessageUpdates();
++        REQUIRE(signal->messageUpdateState(RID)==MessageState::Cancelled);REQUIRE(f.responses().empty());
++        MessageUpdateTestAccess::clock(*f.controller);REQUIRE(f.responses().empty());
++        REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL));
++    }
++    Fixture f(true);auto* signal=f.controller->control();
++    REQUIRE_FALSE(signal->requestMessageUpdate(RID,0xFFFFU,1U));
++    MessageUpdateTestAccess::clock(*f.controller);REQUIRE(f.responses().empty());
++    REQUIRE(signal->messageUpdateState(RID)==MessageState::Cancelled);
++}
++TEST_CASE("message first enqueue deadline remains binding across the real queue lock", "[p25][message-update][message-update-deadline]") {
++    Fixture f(true);auto* signal=f.controller->control();auto queue=MessageUpdateTestAccess::holdQueue();
++    auto request=std::async(std::launch::async,[&]{return signal->requestMessageUpdate(RID,7U,750U);});
++    const auto queuedBy=std::chrono::steady_clock::now()+std::chrono::milliseconds(500);
++    while(signal->messageUpdateState(RID)!=MessageState::Queued&&std::chrono::steady_clock::now()<queuedBy)std::this_thread::yield();
++    REQUIRE(signal->messageUpdateState(RID)==MessageState::Queued);
++    std::promise<void> started;auto entered=started.get_future();
++    auto clock=std::async(std::launch::async,[&]{started.set_value();MessageUpdateTestAccess::clock(*f.controller);});entered.wait();
++    const auto ownedBy=std::chrono::steady_clock::now()+std::chrono::milliseconds(250);
++    while(!MessageUpdateTestAccess::messageMutexHeld(*f.controller)&&std::chrono::steady_clock::now()<ownedBy)std::this_thread::yield();
++    const bool blocked=MessageUpdateTestAccess::messageMutexHeld(*f.controller);
++    std::this_thread::sleep_for(std::chrono::milliseconds(800));queue.unlock();clock.get();
++    REQUIRE(blocked);CHECK_FALSE(request.get());CHECK(signal->messageUpdateState(RID)==MessageState::Cancelled);
++    CHECK_FALSE(MessageUpdateTestAccess::ownerActive(*f.controller,RID));CHECK(f.responses().empty());
++}
++TEST_CASE("message queue expiry prevents handoff while protocol clock is stalled", "[p25][message-update][message-update-expiry]") {
++    Fixture f(true);auto* signal=f.controller->control();REQUIRE(signal->requestMessageUpdate(RID,7U,0U));MessageUpdateTestAccess::clock(*f.controller);
++    REQUIRE(f.controller->peekFrameLength()>0U);MessageUpdateTestAccess::expireQueued(*f.controller,RID);
++    std::array<uint8_t,1024> output{};REQUIRE(f.controller->getFrame(output.data())==0U);
++    REQUIRE_FALSE(MessageUpdateTestAccess::ownerActive(*f.controller,RID));
++    REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL));MessageUpdateTestAccess::clock(*f.controller);
++    REQUIRE(signal->messageUpdateState(RID)==MessageState::Cancelled);REQUIRE(f.responses().empty());
++}
++TEST_CASE("message update bounds pending requests and preserves unexpired completed fences", "[p25][message-update]") {
++    SECTION("sixteen mailboxes") {
++        Fixture f(true);auto* signal=f.controller->control();
++        for(uint32_t i=0;i<16U;++i)REQUIRE(signal->requestMessageUpdate(11000U+i,1U,0U));
++        REQUIRE_FALSE(signal->requestMessageUpdate(11016U,1U,0U));REQUIRE(MessageUpdateTestAccess::count(*f.controller)==16U);
++    }
++    SECTION("128 completed windows") {
++        Fixture f(true);auto* signal=f.controller->control();
++        for(uint32_t i=0;i<128U;++i) {
++            const uint32_t target=11000U+i;f.radios.addEntry(target,true,"Capacity SU");MessageUpdateTestAccess::addSubscriber(*f.controller,target);
++            REQUIRE(signal->requestMessageUpdate(target,uint16_t(i),0U));MessageUpdateTestAccess::clock(*f.controller);REQUIRE(f.responses().size()==1U);
++            REQUIRE(f.signal(0x20U,0x1C00FFFFFC000000ULL|target));REQUIRE(signal->messageUpdateState(target)==MessageState::Acknowledged);
++        }
++        REQUIRE(MessageUpdateTestAccess::count(*f.controller)==128U);REQUIRE_FALSE(signal->requestMessageUpdate(12000U,1U,0U));
++        for(uint32_t i=0;i<128U;++i)REQUIRE_FALSE(signal->requestMessageUpdate(11000U+i,2U,0U));
++        MessageUpdateTestAccess::expire(*f.controller,11000U);REQUIRE(signal->requestMessageUpdate(12000U,1U,0U));
++        REQUIRE(MessageUpdateTestAccess::count(*f.controller)==128U);REQUIRE(signal->messageUpdateState(11000U)==MessageState::None);
++    }
++}
++
++// AABD-B 6.6.1 (PDF59/printed54): refresh on a transaction accepted as valid,
++// not on the outbound command, an arbitrary ACK, or an expired procedure.
++TEST_CASE("only a matched message ACK refreshes its source WUID validity", "[p25][message-update][wuid-refresh]") {
++    SECTION("accepted matched ACK refreshes source and no other identity") {
++        Fixture f(true);auto* signal=f.controller->control();auto* units=f.controller->affiliations();
++        units->unitReg(WUID_FNE);units->unitReg(SECOND_SU);
++        REQUIRE(signal->requestMessageUpdate(RID,0x1234U,0U));MessageUpdateTestAccess::clock(*f.controller);f.responses();
++        f.age(43199000U);REQUIRE(units->unitRegTimer(RID)==43199U);
++        REQUIRE(f.signal(0x20U,0x1C00FFFFFC002711ULL));
++        REQUIRE(signal->messageUpdateState(RID)==MessageState::Acknowledged);
++        REQUIRE(units->unitRegTimer(RID)==0U);
++        REQUIRE(units->unitRegTimer(WUID_FNE)==43199U);REQUIRE(units->unitRegTimer(SECOND_SU)==43199U);
++        f.age(1001U);REQUIRE(units->isUnitReg(RID));
++        REQUIRE_FALSE(units->isUnitReg(WUID_FNE));REQUIRE_FALSE(units->isUnitReg(SECOND_SU));
++        f.age(43199000U);REQUIRE_FALSE(units->isUnitReg(RID));
++    }
++    SECTION("unissued or late ACK does not postpone expiry") {
++        for(unsigned state=0;state<3U;++state) {
++            Fixture f(true);auto* signal=f.controller->control();auto* units=f.controller->affiliations();
++            if(state>0U) REQUIRE(signal->requestMessageUpdate(RID,1U,0U));
++            if(state==2U) { MessageUpdateTestAccess::clock(*f.controller);f.responses();MessageUpdateTestAccess::expire(*f.controller,RID); }
++            f.age(43199000U);REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL));
++            REQUIRE(units->unitRegTimer(RID)==43199U);f.age(1001U);REQUIRE_FALSE(units->isUnitReg(RID));
++        }
++    }
++    SECTION("wrong service target flags profile or CRC does not refresh") {
++        Fixture f(true);auto* signal=f.controller->control();auto* units=f.controller->affiliations();
++        REQUIRE(signal->requestMessageUpdate(RID,1U,0U));MessageUpdateTestAccess::clock(*f.controller);f.responses();f.age(43199000U);
++        for(const auto value:{0x1F00FFFFFC002711ULL,0x1C00002717002711ULL,0x9C00FFFFFC002711ULL,0x5C00FFFFFC002711ULL}) {
++            f.signal(0x20U,value);f.responses();REQUIRE(units->unitRegTimer(RID)==43199U);
++        }
++        REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL,0x90U));REQUIRE(units->unitRegTimer(RID)==43199U);
++        REQUIRE_FALSE(f.signal(0x20U,0x1C00FFFFFC002711ULL,0U,true));REQUIRE(units->unitRegTimer(RID)==43199U);
++        REQUIRE(signal->messageUpdateState(RID)==MessageState::Awaiting);
++        f.age(1001U);REQUIRE_FALSE(units->isUnitReg(RID));
++    }
++}

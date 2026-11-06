@@ -1,0 +1,643 @@
+--- a/src/bridge/PacketCodec.cpp
++++ b/src/bridge/PacketCodec.cpp
+@@ -2,6 +2,7 @@
+ // Local, length-framed codec interface. Traffic keys are read only from a
+ // private runtime file; the wire format contains identifiers, never key bytes.
+ #include "PacketCodec.h"
++#include "PacketCodecMI.h"
+ #include "common/p25/Crypto.h"
+ #include "common/p25/P25Defines.h"
+ #include "vocoder/MBEEncoder.h"
+@@ -167,6 +168,7 @@
+     const KeyIdentity keyIdentity{algorithm, keyID};
+     if (algorithm != Clear && !keys.values.count(keyIdentity)) return reject(2);
+     if ((op == 1 && size != 320) || (op != 1 && size != 11)) return reject(1);
++    if (op != 1 && algorithm != Clear && !packetcodec::validMI(request.data() + 48)) return reject(1);
+     auto now = std::chrono::steady_clock::now();
+     for (auto it = calls.begin(); it != calls.end();) {
+         if (now - it->second.seen > std::chrono::minutes(2)) it = calls.erase(it); else ++it;
+@@ -182,8 +184,7 @@
+     if (op == 1) {
+         if (sequence <= call.encodedSequence) return reject(3);
+         if (!call.encoder) {
+-            if (algorithm != Clear && RAND_bytes(call.mi.data(), 8) != 1) return reject(5);
+-            call.mi[8] = 0; // The supported Phase 1 algorithms use a 64-bit MI.
++            if (algorithm != Clear && !packetcodec::generateMI(call.mi, RAND_bytes)) return reject(5);
+             call.encoder = std::make_unique<vocoder::MBEEncoder>(vocoder::ENCODE_88BIT_IMBE);
+             call.encoder->setGainAdjust(1.0f);
+         }
+--- a/src/bridge/HostBridge.Opaque.cpp
++++ b/src/bridge/HostBridge.Opaque.cpp
+@@ -2,6 +2,7 @@
+ // Keyless P25 media transport. Neither vocoding nor traffic-key processing runs
+ // in this Site-facing path; encrypted IMBE and its public metadata stay opaque.
+ #include "HostBridge.h"
++#include "PacketCodecMI.h"
+ #include "common/p25/dfsi/LC.h"
+ #include "common/p25/dfsi/DFSIDefines.h"
+ #include "common/Utils.h"
+@@ -90,7 +91,7 @@
+         m_opaqueRxAlgorithm=buffer[181];m_opaqueRxKey=GET_UINT16(buffer,182);
+         std::memcpy(m_opaqueRxMI,buffer+184,9);
+     }
+-    const bool known=(m_opaqueRxAlgorithm==0x80 && m_opaqueRxKey==0) || supportedSecure(m_opaqueRxAlgorithm);
++    const bool known=(m_opaqueRxAlgorithm==0x80 && m_opaqueRxKey==0) || (supportedSecure(m_opaqueRxAlgorithm) && packetcodec::validMI(m_opaqueRxMI));
+     if (known) for (unsigned i=0;i<9;i++) writeOpaqueP25(src,dst,words[i],uint8_t(i+(duid==DUID::LDU2?9:0)),false);
+     // The LDU2 encryption sync applies to the NEXT superframe, never the nine
+     // encrypted codewords just exported above.
+@@ -113,6 +114,7 @@
+         return;
+     }
+     if (length!=packetHeader+11 || !sequence || index>17 || !((algorithm==0x80 && key==0)||supportedSecure(algorithm))) return;
++    if (supportedSecure(algorithm) && !packetcodec::validMI(packet+48)) return;
+     bool fresh=!m_trafficFromUDP || std::memcmp(packet+32,m_opaqueTxToken,16)!=0 || m_udpSrcId!=src;
+     if (fresh) {
+         if (index!=0) return;
+--- /dev/null
++++ b/src/bridge/PacketCodecMI.h
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#pragma once
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++namespace packetcodec {
++// BAAC-D 2.6 and AAAD-B 3/3.1 (PDF 16/18, printed 6/8):
++// null encrypted MI is forbidden; the supported ciphers consume 64 MI bits.
++inline bool validMI(const uint8_t* mi) {
++    uint8_t effective = 0;
++    for (size_t i = 0; i < 8; i++) effective |= mi[i];
++    return effective != 0;
++}
++// Retry the reserved null value, then fail closed if the random source cannot
++// produce a usable value. The retry bound is local failure-handling policy.
++template<class RandomBytes>
++bool generateMI(std::array<uint8_t, 9>& mi, RandomBytes randomBytes) {
++    mi.fill(0);
++    for (unsigned attempt = 0; attempt < 4; attempt++) {
++        if (randomBytes(mi.data(), 8) != 1) { mi.fill(0); return false; }
++        if (validMI(mi.data())) return true;
++    }
++    mi.fill(0);
++    return false;
++}
++}
+--- a/src/common/p25/Crypto.cpp
++++ b/src/common/p25/Crypto.cpp
+@@ -455,89 +455,40 @@
+ UInt8Array P25Crypto::cryptAES_KMM_CMAC_KDF(const uint8_t* kek, const uint8_t* msg, uint16_t msgLen, bool hasMN)
+ {
+ #if defined(ENABLE_SSL)
+-    //                       O      T      A      R             M      A      C
+-    uint8_t label[8U] = { 0x4FU, 0x54U, 0x41U, 0x52U, 0x20U, 0x4DU, 0x41U, 0x43U };
+-
+-    uint8_t context[12U];
+-    ::memset(context, 0x00U, 12U);
+-
+-    uint8_t contextLen = 0U;
+-    if (hasMN) {
+-        ::memcpy(context, msg, 12U);
+-        contextLen = 12U;
+-    } else {
+-        ::memcpy(context, msg, 10U);
+-        contextLen = 10U;
+-    }
+-
+-    /** DEBUG REMOVEME */
+-    Utils::dump(2U, "KEK", kek, MAX_ENC_KEY_LENGTH_BYTES);
+-    Utils::dump(2U, "Label", label, 8U);
+-    Utils::dump(2U, "Context", context, contextLen);
+-    /** DEBUG REMOVEME */
+-
+-    size_t len;
+-    uint8_t tempBuf[TEMP_BUFFER_LEN];
+-    ::memset(tempBuf, 0x00U, TEMP_BUFFER_LEN);
+-
+-    ERR_load_crypto_strings();
+-
+-    // create a library context (required for OpenSSL 3.0+)
+-    OSSL_LIB_CTX* libCtx = OSSL_LIB_CTX_new();
+-    if (!libCtx) {
+-        LogError(LOG_P25, "OSSL_LIB_CTX_new(), failed to finalize OpenSSL: %s", ERR_error_string(ERR_get_error(), NULL));
+-        return nullptr;
+-    }
+-
+-    // load the KDF algorithm
+-    EVP_KDF* kdf = EVP_KDF_fetch(NULL, "KBKDF", NULL);
+-    if (!kdf) {
+-        LogError(LOG_P25, "EVP_KDF_fetch(), failed to load OpenSSL KDF algorithm: %s", ERR_error_string(ERR_get_error(), NULL));
+-        OSSL_LIB_CTX_free(libCtx);
+-        return nullptr;
+-    }
+-
+-    // create a context for the MAC operation
+-    EVP_KDF_CTX* ctx = EVP_KDF_CTX_new(kdf);
+-    if (!ctx) {
+-        LogError(LOG_P25, "EVP_KDF_CTX_new(), failed to create a OpenSSL KDF context: %s", ERR_error_string(ERR_get_error(), NULL));
+-        EVP_KDF_free(kdf);
+-        OSSL_LIB_CTX_free(libCtx);
+-        return nullptr;
+-    }
+-
+-    // set the cipher to AES-256-CBC and initialize the MAC operation
++    // TIA-102.AACA-D (April 2025), 13.5.2.2.2, PDF 188 / printed 170:
++    // HMAC-SHA256(TEK, 01 || "OTAR MAC" || 00 || Context || 0100).
++    // OpenSSL KBKDF defaults use different counter/length widths.
++    const size_t contextLen = hasMN ? 12U : 10U;
++    if (kek == nullptr || msg == nullptr || msgLen < contextLen + KMM_AES_MAC_LENGTH + 5U ||
++        ((uint32_t(msg[1U]) << 8U) | msg[2U]) + 3U != msgLen ||
++        ((msg[3U] >> 4U) & 0x03U) != (hasMN ? 0x02U : 0x00U))
++        return nullptr;
++
++    uint8_t input[24U] = {0x01U, 'O', 'T', 'A', 'R', ' ', 'M', 'A', 'C', 0x00U};
++    ::memcpy(input + 10U, msg, contextLen);
++    input[10U + contextLen] = 0x01U;
++    input[11U + contextLen] = 0x00U;
++
++    std::unique_ptr<EVP_MAC, decltype(&EVP_MAC_free)> algorithm(EVP_MAC_fetch(nullptr, "HMAC", nullptr), EVP_MAC_free);
++    if (!algorithm)
++        return nullptr;
++    std::unique_ptr<EVP_MAC_CTX, decltype(&EVP_MAC_CTX_free)> context(EVP_MAC_CTX_new(algorithm.get()), EVP_MAC_CTX_free);
++    if (!context)
++        return nullptr;
+     OSSL_PARAM params[] = {
+-        OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_MAC, "HMAC", 0),
+-        OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, "SHA-256", 0),
+-        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, (void*)kek, MAX_ENC_KEY_LENGTH_BYTES),
+-        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, (void*)label, 8U),
+-        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, (void*)context, contextLen),
++        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, const_cast<char*>("SHA256"), 0),
+         OSSL_PARAM_END
+     };
+-
+-    // derive MAC key
+-    if (EVP_KDF_derive(ctx, tempBuf, MAX_ENC_KEY_LENGTH_BYTES, params) <= 0) {
+-        LogError(LOG_P25, "EVP_KDF_derive(), failed to derive MAC key: %s", ERR_error_string(ERR_get_error(), NULL));
+-        EVP_KDF_CTX_free(ctx);
+-        EVP_KDF_free(kdf);
+-        OSSL_LIB_CTX_free(libCtx);
+-        return nullptr;
+-    }
+-
+-    EVP_KDF_CTX_free(ctx);
+-    EVP_KDF_free(kdf);
+-    OSSL_LIB_CTX_free(libCtx);
+-
+-    /** DEBUG REMOVEME */
+-    Utils::dump(2U, "tempBuf", tempBuf, 128U);
+-    /** DEBUG REMOVEME */
+-
+-    UInt8Array wrappedKey = std::unique_ptr<uint8_t[]>(new uint8_t[MAX_ENC_KEY_LENGTH_BYTES]);
+-    ::memset(wrappedKey.get(), 0x00U, MAX_ENC_KEY_LENGTH_BYTES);
+-    ::memcpy(wrappedKey.get(), tempBuf, MAX_ENC_KEY_LENGTH_BYTES);
+-
+-    return wrappedKey;
++    UInt8Array result = std::make_unique<uint8_t[]>(MAX_ENC_KEY_LENGTH_BYTES);
++    size_t resultLen = 0U;
++    if (EVP_MAC_init(context.get(), kek, MAX_ENC_KEY_LENGTH_BYTES, params) != 1 ||
++        EVP_MAC_update(context.get(), input, 12U + contextLen) != 1 ||
++        EVP_MAC_final(context.get(), result.get(), &resultLen, MAX_ENC_KEY_LENGTH_BYTES) != 1 ||
++        resultLen != MAX_ENC_KEY_LENGTH_BYTES) {
++        OPENSSL_cleanse(result.get(), MAX_ENC_KEY_LENGTH_BYTES);
++        return nullptr;
++    }
++    return result;
+ #else
+     LogError(LOG_P25, "No OpenSSL, CMAC generation is not supported!");
+     return nullptr;
+@@ -549,91 +500,31 @@
+ UInt8Array P25Crypto::cryptAES_KMM_CMAC(const uint8_t* macKey, const uint8_t* msg, uint16_t msgLen)
+ {
+ #if defined(ENABLE_SSL)
+-    size_t len;
+-    uint8_t tempBuf[TEMP_BUFFER_LEN];
+-    ::memset(tempBuf, 0x00U, TEMP_BUFFER_LEN);
+-
+-    uint8_t paddedMessage[TEMP_BUFFER_LEN];
+-    ::memset(paddedMessage, 0x00U, TEMP_BUFFER_LEN);
+-
+-    ::memcpy(paddedMessage, msg, msgLen - KMM_AES_MAC_LENGTH - 5U);
+-    ::memcpy(paddedMessage + msgLen - KMM_AES_MAC_LENGTH - 5U, msg + msgLen - 5U, 5U);
+-
+-    // create a library context (required for OpenSSL 3.0+)
+-    OSSL_LIB_CTX* libCtx = OSSL_LIB_CTX_new();
+-    if (!libCtx) {
+-        LogError(LOG_P25, "OSSL_LIB_CTX_new(), failed to finalize OpenSSL: %s", ERR_error_string(ERR_get_error(), NULL));
+-        return nullptr;
+-    }
+-
+-    // fetch the CMAC implementation
+-    EVP_MAC* hmac = EVP_MAC_fetch(libCtx, "CMAC", NULL);
+-    if (!hmac) {
+-        LogError(LOG_P25, "EVP_MAC_fetch(), failed to fetch OpenSSL CMAC: %s", ERR_error_string(ERR_get_error(), NULL));
+-        OSSL_LIB_CTX_free(libCtx);
+-        return nullptr;
+-    }
+-
+-    // create a context for the MAC operation
+-    EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(hmac);
+-    if (!ctx) {
+-        LogError(LOG_P25, "EVP_MAC_CTX_new(), failed to create a OpenSSL CMAC context: %s", ERR_error_string(ERR_get_error(), NULL));
+-        EVP_MAC_free(hmac);
+-        OSSL_LIB_CTX_free(libCtx);
+-        return nullptr;
+-    }
+-
+-    // set the cipher to AES-256-CBC and initialize the MAC operation
++    // AACA-D 13.5.2.3.2: authenticate the KMM excluding only its MAC octets.
++    // Stream both spans so malformed lengths cannot underflow a stack copy.
++    if (macKey == nullptr || msg == nullptr || msgLen < 10U + KMM_AES_MAC_LENGTH + 5U ||
++        ((uint32_t(msg[1U]) << 8U) | msg[2U]) + 3U != msgLen)
++        return nullptr;
++    std::unique_ptr<EVP_MAC, decltype(&EVP_MAC_free)> algorithm(EVP_MAC_fetch(nullptr, "CMAC", nullptr), EVP_MAC_free);
++    if (!algorithm)
++        return nullptr;
++    std::unique_ptr<EVP_MAC_CTX, decltype(&EVP_MAC_CTX_free)> context(EVP_MAC_CTX_new(algorithm.get()), EVP_MAC_CTX_free);
++    if (!context)
++        return nullptr;
+     OSSL_PARAM params[] = {
+-        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, "AES-256-CBC", 0),
++        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, const_cast<char*>("AES-256-CBC"), 0),
+         OSSL_PARAM_END
+     };
+-
+-    // initialize the MAC operation
+-    if (!EVP_MAC_init(ctx, macKey, MAX_ENC_KEY_LENGTH_BYTES, params)) {
+-        LogError(LOG_P25, "EVP_MAC_init(), failed to initialize the AES-256-CBC MAC operation: %s", ERR_error_string(ERR_get_error(), NULL));
+-        EVP_MAC_CTX_free(ctx);
+-        EVP_MAC_free(hmac);
+-        OSSL_LIB_CTX_free(libCtx);
+-        return nullptr;
+-    }
+-
+-    // provide the message data to be authenticated
+-    if (!EVP_MAC_update(ctx, paddedMessage, msgLen - KMM_AES_MAC_LENGTH)) {
+-        LogError(LOG_P25, "EVP_MAC_update(), failed to set message data to authenticate: %s", ERR_error_string(ERR_get_error(), NULL));
+-        EVP_MAC_CTX_free(ctx);
+-        EVP_MAC_free(hmac);
+-        OSSL_LIB_CTX_free(libCtx);
+-        return nullptr;
+-    }
+-
+-    // get the length of the MAC
+-    if (!EVP_MAC_final(ctx, NULL, &len, 0)) {
+-        LogError(LOG_P25, "EVP_MAC_final(), failed to get MAC length: %s", ERR_error_string(ERR_get_error(), NULL));
+-        EVP_MAC_CTX_free(ctx);
+-        EVP_MAC_free(hmac);
+-        OSSL_LIB_CTX_free(libCtx);
+-        return nullptr;
+-    }
+-
+-    // generate the MAC
+-    if (!EVP_MAC_final(ctx, tempBuf, &len, len)) {
+-        LogError(LOG_P25, "EVP_MAC_final(), failed to get MAC length: %s", ERR_error_string(ERR_get_error(), NULL));
+-        EVP_MAC_CTX_free(ctx);
+-        EVP_MAC_free(hmac);
+-        OSSL_LIB_CTX_free(libCtx);
+-        return nullptr;
+-    }
+-
+-    EVP_MAC_CTX_free(ctx);
+-    EVP_MAC_free(hmac);
+-    OSSL_LIB_CTX_free(libCtx);
+-
+-    UInt8Array wrappedKey = std::unique_ptr<uint8_t[]>(new uint8_t[len]);
+-    ::memset(wrappedKey.get(), 0x00U, len);
+-    ::memcpy(wrappedKey.get(), tempBuf, len);
+-
+-    return wrappedKey;
++    UInt8Array result = std::make_unique<uint8_t[]>(16U);
++    size_t resultLen = 0U;
++    if (EVP_MAC_init(context.get(), macKey, MAX_ENC_KEY_LENGTH_BYTES, params) != 1 ||
++        EVP_MAC_update(context.get(), msg, msgLen - KMM_AES_MAC_LENGTH - 5U) != 1 ||
++        EVP_MAC_update(context.get(), msg + msgLen - 5U, 5U) != 1 ||
++        EVP_MAC_final(context.get(), result.get(), &resultLen, 16U) != 1 || resultLen != 16U) {
++        OPENSSL_cleanse(result.get(), 16U);
++        return nullptr;
++    }
++    return result;
+ #else
+     LogError(LOG_P25, "No OpenSSL, CMAC generation is not supported!");
+     return nullptr;
+--- a/src/common/p25/kmm/KMMFrame.cpp
++++ b/src/common/p25/kmm/KMMFrame.cpp
+@@ -111,8 +111,12 @@
+                     // generate intermediate derived key
+                     UInt8Array macKey = crypto.cryptAES_KMM_CMAC_KDF(kek, data, m_messageFullLength, m_messageNumber > 0U);
+ 
++                    if (!macKey)
++                        return;
+                     // generate MAC
+                     UInt8Array mac = crypto.cryptAES_KMM_CMAC(macKey.get(), data, m_messageFullLength);
++                    if (!mac)
++                        return;
+ 
+                     ::memset(data + m_messageFullLength - (macLength + 5U), 0x00U, macLength);
+                     ::memcpy(data + m_messageFullLength - (macLength + 5U), mac.get(), macLength);
+--- a/src/common/p25/kmm/KMMRekeyCommand.cpp
++++ b/src/common/p25/kmm/KMMRekeyCommand.cpp
+@@ -164,8 +164,6 @@
+             DECLARE_UINT8_ARRAY(keyPayload, keysetItem.keyLength());
+             key.getKey(keyPayload);
+ 
+-            Utils::dump(2U, "keyPayload", keyPayload, keysetItem.keyLength());
+-
+             ::memcpy(data + (25U + (m_bodyOffset + offset)), keyPayload, keysetItem.keyLength());
+ 
+             offset += 5U + keyNameLen + keysetItem.keyLength();
+--- a/src/fne/network/P25OTARService.cpp
++++ b/src/fne/network/P25OTARService.cpp
+@@ -82,9 +82,6 @@
+ {
+     m_packetData->write_PDU_Ack_Response(PDUAckClass::ACK, PDUAckType::ACK, n, llId, false);
+ 
+-    if (m_debug)
+-        Utils::dump(1U, "P25OTARService::processDLD(), KMM Network Message", data, len);
+-
+     uint32_t payloadSize = 0U;
+     UInt8Array pduUserData = processKMM(data, len, llId, encrypted, &payloadSize);
+     if (pduUserData == nullptr)
+@@ -126,9 +123,6 @@
+         // read message
+         UInt8Array buffer = m_frameQueue->read(length, address, addrLen);
+         if (length > 0) {
+-            if (m_debug)
+-                Utils::dump(1U, "P25OTARService::clock(), KMM Network Message", buffer.get(), length);
+-
+             OTARPacketRequest* req = new OTARPacketRequest();
+             req->obj = this;
+ 
+@@ -290,7 +284,6 @@
+ 
+         if (m_network->m_debug) {
+             LogDebugEx(LOG_P25, "P25OTARService::cryptKMM()", "keyLength = %u", keyLength);
+-            Utils::dump(1U, "P25OTARService::cryptKMM(), Key", key, P25DEF::MAX_ENC_KEY_LENGTH_BYTES);
+         }
+ 
+         LogInfoEx(LOG_P25, P25_KMM_STR ", algId = $%02X, kID = $%04X", algoId, kid);
+@@ -340,8 +333,6 @@
+             return nullptr;
+         }
+ 
+-        if (m_debug)
+-            Utils::dump(1U, "P25OTARService::processKMM(), (Decrypted) KMM Network Message", buffer.get(), len);
+     }
+ 
+     std::unique_ptr<KMMFrame> frame = KMMFactory::create(buffer.get());
+@@ -504,7 +495,6 @@
+ 
+         if (m_network->m_debug) {
+             LogDebugEx(LOG_P25, "P25OTARService::cryptKMM()", "keyLength = %u", keyLength);
+-            Utils::dump(1U, "P25OTARService::cryptKMM(), Key", kekKey, P25DEF::MAX_ENC_KEY_LENGTH_BYTES);
+         }
+     }
+     else {
+--- a/src/fne/network/TrafficNetwork.cpp
++++ b/src/fne/network/TrafficNetwork.cpp
+@@ -1739,7 +1739,6 @@
+ 
+                                                 if (network->m_debug) {
+                                                     LogDebugEx(LOG_HOST, "TrafficNetwork::threadedNetworkRx()", "keyLength = %u", keyLength);
+-                                                    Utils::dump(1U, "TrafficNetwork::taskNetworkRx(), Key", key, P25DEF::MAX_ENC_KEY_LENGTH_BYTES);
+                                                 }
+ 
+                                                 LogInfoEx(LOG_MASTER, "PEER %u (%s) local enc. key, algId = $%02X, kID = $%04X", peerId, connection->identWithQualifier().c_str(),
+@@ -3404,7 +3403,6 @@
+ 
+             if (m_debug) {
+                 LogDebugEx(LOG_HOST, "TrafficNetwork::processTEKResponse()", "keyLength = %u", keyLength);
+-                Utils::dump(1U, "TrafficNetwork::processTEKResponse(), Key", key, P25DEF::MAX_ENC_KEY_LENGTH_BYTES);
+             }
+ 
+             // build response buffer
+--- a/tests/crypto/P25_MAC_CMAC_Test.cpp
++++ b/tests/crypto/P25_MAC_CMAC_Test.cpp
+@@ -7,127 +7,62 @@
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
+  */
+-#include "host/Defines.h"
+-#include "common/p25/P25Defines.h"
+ #include "common/p25/Crypto.h"
+-#include "common/Log.h"
+-#include "common/Utils.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <cstring>
++#include <vector>
+ 
+-using namespace p25::defines;
++namespace {
++std::vector<uint8_t> publicHex(const char* text) {
++    std::vector<uint8_t> out;
++    auto nibble = [](char c) { return c <= '9' ? c - '0' : c - 'A' + 10; };
++    for (size_t i = 0; text[i]; i += 2)
++        out.push_back(uint8_t((nibble(text[i]) << 4) | nibble(text[i + 1])));
++    return out;
++}
++}
+ 
+-#include <catch2/catch_test_macros.hpp>
+-#include <stdlib.h>
+-#include <time.h>
+-
+-TEST_CASE("AES MAC CMAC Test", "[aes][mac_cmac]") {
+-    bool failed = false;
+-
+-    INFO("P25 AES256 MAC CMAC Test");
+-
+-    srand((unsigned int)time(NULL));
+-
+-    // example data taken from TIA-102.AACA-C-2023 Section 14.3.5.1
+-
+-    // MAC TEK
+-    uint8_t macTek[] =
+-    {
+-        0x16, 0x85, 0x62, 0x45, 0x3B, 0x3E, 0x7F, 0x61, 0x8D, 0x68, 0xB3, 0x87, 0xE0, 0xB9, 0x97, 0xE1,
+-        0xFB, 0x0F, 0x26, 0x4F, 0xA8, 0x3B, 0x74, 0xE4, 0x3B, 0x17, 0x29, 0x17, 0xBD, 0x39, 0x33, 0x9F
++// TIA-102.AACA-D, April 2025, 13.5.2.2.2 / 14.3.5.1 / 14.3.5.2,
++// PDF 188 / 207-209, printed 170 / 189-191; p25_2cc930b78d55ee64.
++// Public standard vectors, independently reproduced with Python HMAC-SHA256
++// and cryptography CMAC. Operational keys must never be added to fixtures.
++TEST_CASE("AES MAC CMAC matches AACA-D Rekey and Hello examples", "[p25][aes][mac_cmac]") {
++    const auto tek = publicHex("168562453B3E7F618D68B387E0B997E1FB0F264FA83B74E43B172917BD39339F");
++    struct Example { const char* message; const char* derived; const char* mac; bool hasMN; };
++    const Example examples[] = {
++        {"1E004DA8643BA8712B1D1772008450BC010001842801000000498380289CF635FB68D345D34F62EF063BA4E05CAE4756E7D30446D1F07C6EB4E9E0840945372372FB80A2C1CCD14201738C08842F6241",
++         "C24C24E41A89DB2DC18EB88A17E1A8F1FB554676ADE244052A1F5BAA6D6FDADF", "A2C1CCD14201738C", true},
++        {"0C001508643BA8712B1D0018216AD91E3ED5AC08842F6241",
++         "407177CBC982A9D8FAA662B79399C62C9AD64458DF834A3EE3040B9E300553B1", "18216AD91E3ED5AC", false}
+     };
+-
+-    // expected CMAC key
+-    uint8_t expectedCMAC[] =
+-    {
+-        0x5F, 0xB2, 0x91, 0xD0, 0x9E, 0xE3, 0x99, 0x1E, 0x13, 0x1A, 0x04, 0xB0, 0xE3, 0xA0, 0xBF, 0x58,
+-        0xB4, 0xA1, 0xCE, 0x46, 0x10, 0x48, 0xEB, 0x14, 0xB4, 0x97, 0xAE, 0x95, 0x22, 0xD0, 0x0D, 0x31
+-    };
+-
+-    // data block
+-    uint8_t dataBlock[] = 
+-    {
+-        0x1E, 0x00, 0x4D, 0xA8, 0x64, 0x3B, 0xA8, 0x71, 0x2B, 0x1D, 0x17, 0x72, 0x00, 0x84, 0x50, 0xBC,
+-        0x01, 0x00, 0x01, 0x84, 0x28, 0x01, 0x00, 0x00, 0x00, 0x49, 0x83, 0x80, 0x28, 0x9C, 0xF6, 0x35,
+-        0xFB, 0x68, 0xD3, 0x45, 0xD3, 0x4F, 0x62, 0xEF, 0x06, 0x3B, 0xA4, 0xE0, 0x5C, 0xAE, 0x47, 0x56,
+-        0xE7, 0xD3, 0x04, 0x46, 0xD1, 0xF0, 0x7C, 0x6E, 0xB4, 0xE9, 0xE0, 0x84, 0x09, 0x45, 0x37, 0x23,
+-        0x72, 0xFB, 0x80, 0x21, 0x85, 0x22, 0x33, 0x41, 0xD9, 0x8A, 0x97, 0x08, 0x84, 0x2F, 0x62, 0x41
+-    };
+-
+-    uint8_t expectedMAC[8U];
+-
+-    Utils::dump(2U, "P25_MAC_CMAC_Crypto_Test, TEK", macTek, 32U);
+-    Utils::dump(2U, "P25_MAC_CMAC_Crypto_Test, DataBlock", dataBlock, 80U);
+-    Utils::dump(2U, "P25_MAC_CMAC_Crypto_Test, Expected CMAC Key", expectedCMAC, 32U);
+-
+-    uint16_t fullLength = 0U;
+-    uint16_t messageLength = GET_UINT16(dataBlock, 1U);
+-    fullLength = messageLength + 3U;
+-    bool hasMN = ((dataBlock[3U] >> 4U) & 0x03U) == 0x02U;
+-    uint8_t macType = (dataBlock[3U] >> 2U) & 0x03U;
+-
+-    ::LogInfoEx("T", "P25_MAC_CMAC_Crypto_Test, messageLength = %u, hasMN = %u, macType = $%02X", messageLength, hasMN, macType);
+-
+-    switch (macType) {
+-    case KMM_MAC::DES_MAC:
+-        {
+-            uint8_t macLength = 4U;
+-            ::memset(expectedMAC, 0x00U, macLength);
+-
+-            uint8_t macAlgId = dataBlock[fullLength - 4U];
+-            uint16_t macKId = GET_UINT16(dataBlock, fullLength - 3U);
+-            uint8_t macFormat = dataBlock[fullLength - 1U];
+-
+-            ::memcpy(expectedMAC, dataBlock + fullLength - (macLength + 5U), macLength);
+-
+-            ::LogInfoEx("T", "P25_MAC_CMAC_Crypto_Test, macAlgId = $%02X, macKId = $%04X, macFormat = $%02X", macAlgId, macKId, macFormat);
+-            Utils::dump(2U, "P25_MAC_CMAC_Crypto_Test, Expected MAC", expectedMAC, macLength);
++    p25::crypto::P25Crypto crypto;
++    for (const auto& example : examples) {
++        auto message = publicHex(example.message);
++        const auto derived = publicHex(example.derived), expected = publicHex(example.mac);
++        auto key = crypto.cryptAES_KMM_CMAC_KDF(tek.data(), message.data(), uint16_t(message.size()), example.hasMN);
++        REQUIRE(key != nullptr);
++        REQUIRE(std::memcmp(key.get(), derived.data(), derived.size()) == 0);
++        auto mac = crypto.cryptAES_KMM_CMAC(key.get(), message.data(), uint16_t(message.size()));
++        REQUIRE(mac != nullptr);
++        REQUIRE(std::memcmp(mac.get(), expected.data(), expected.size()) == 0);
++        // The MAC field is omitted, while all five trailer bytes are covered.
++        message[message.size() - 13] ^= 1;
++        auto same = crypto.cryptAES_KMM_CMAC(key.get(), message.data(), uint16_t(message.size()));
++        REQUIRE(same != nullptr);
++        REQUIRE(std::memcmp(same.get(), expected.data(), expected.size()) == 0);
++        message.back() ^= 1;
++        auto changed = crypto.cryptAES_KMM_CMAC(key.get(), message.data(), uint16_t(message.size()));
++        REQUIRE(changed != nullptr);
++        REQUIRE(std::memcmp(changed.get(), expected.data(), expected.size()) != 0);
++        REQUIRE(crypto.cryptAES_KMM_CMAC_KDF(tek.data(), message.data(), uint16_t(message.size()), !example.hasMN) == nullptr);
++        for (uint16_t length = 0; length < message.size(); length++) {
++            REQUIRE(crypto.cryptAES_KMM_CMAC_KDF(tek.data(), message.data(), length, example.hasMN) == nullptr);
++            REQUIRE(crypto.cryptAES_KMM_CMAC(key.get(), message.data(), length) == nullptr);
+         }
+-        break;
+-
+-    case KMM_MAC::ENH_MAC:
+-        {
+-            uint8_t macLength = 8U;
+-            ::memset(expectedMAC, 0x00U, macLength);
+-
+-            uint8_t macAlgId = dataBlock[fullLength - 4U];
+-            uint16_t macKId = GET_UINT16(dataBlock, fullLength - 3U);
+-            uint8_t macFormat = dataBlock[fullLength - 1U];
+-
+-            ::memcpy(expectedMAC, dataBlock + fullLength - (macLength + 5U), macLength);
+-
+-            ::LogInfoEx("T", "P25_MAC_CMAC_Crypto_Test, macAlgId = $%02X, macKId = $%04X, macFormat = $%02X", macAlgId, macKId, macFormat);
+-            Utils::dump(2U, "P25_MAC_CMAC_Crypto_Test, Expected MAC", expectedMAC, macLength);
+-        }
+-        break;
+-
+-    case KMM_MAC::NO_MAC:
+-        break;
+-
+-    default:
+-        ::LogError(LOG_P25, "P25_MAC_CMAC_Crypto_Test, unknown KMM MAC inventory type value, macType = $%02X", macType);
+-        break;
++        REQUIRE(crypto.cryptAES_KMM_CMAC_KDF(nullptr, message.data(), uint16_t(message.size()), example.hasMN) == nullptr);
++        REQUIRE(crypto.cryptAES_KMM_CMAC_KDF(tek.data(), nullptr, uint16_t(message.size()), example.hasMN) == nullptr);
++        REQUIRE(crypto.cryptAES_KMM_CMAC(nullptr, message.data(), uint16_t(message.size())) == nullptr);
++        REQUIRE(crypto.cryptAES_KMM_CMAC(key.get(), nullptr, uint16_t(message.size())) == nullptr);
+     }
+-
+-    p25::crypto::P25Crypto crypto;
+-
+-    UInt8Array macKey = crypto.cryptAES_KMM_CMAC_KDF(macTek, dataBlock, fullLength, true);
+-    Utils::dump(2U, "P25_MAC_CMAC_Crypto_Test, CMAC MAC Key", macKey.get(), 32U);
+-
+-    for (uint32_t i = 0; i < 32U; i++) {
+-        if (macKey[i] != expectedCMAC[i]) {
+-            ::LogError("T", "P25_MAC_CMAC_Crypto_Test, INVALID AT IDX %d", i);
+-            failed = true;
+-        }
+-    }
+-
+-    UInt8Array mac = crypto.cryptAES_KMM_CMAC(expectedCMAC/* macKey.get()*/, dataBlock, fullLength);
+-    Utils::dump(2U, "P25_MAC_CMAC_Crypto_Test, MAC", mac.get(), 8U);
+-
+-    for (uint32_t i = 0; i < 8U; i++) {
+-        if (mac[i] != expectedMAC[i]) {
+-            ::LogError("T", "P25_MAC_CMAC_Crypto_Test, INVALID AT IDX %d", i);
+-            failed = true;
+-        }
+-    }
+-
+-    REQUIRE(failed==false);
+ }
+--- a/tests/p25/KMM_Rekey_CMAC_Test.cpp
++++ b/tests/p25/KMM_Rekey_CMAC_Test.cpp
+@@ -35,6 +35,8 @@
+         0xFB, 0x0F, 0x26, 0x4F, 0xA8, 0x3B, 0x74, 0xE4, 0x3B, 0x17, 0x29, 0x17, 0xBD, 0x39, 0x33, 0x9F
+     };
+ 
++    // TIA-102.AACA-D 14.3.5.1, PDF 207-208 / printed 189-190.
++    // The old fixture used another KDF serialization and was not this vector.
+     // data block
+     uint8_t dataBlock[] = 
+     {
+@@ -42,7 +44,7 @@
+         0x01, 0x00, 0x01, 0x84, 0x28, 0x01, 0x00, 0x00, 0x00, 0x49, 0x83, 0x80, 0x28, 0x9C, 0xF6, 0x35,
+         0xFB, 0x68, 0xD3, 0x45, 0xD3, 0x4F, 0x62, 0xEF, 0x06, 0x3B, 0xA4, 0xE0, 0x5C, 0xAE, 0x47, 0x56,
+         0xE7, 0xD3, 0x04, 0x46, 0xD1, 0xF0, 0x7C, 0x6E, 0xB4, 0xE9, 0xE0, 0x84, 0x09, 0x45, 0x37, 0x23,
+-        0x72, 0xFB, 0x80, 0x21, 0x85, 0x22, 0x33, 0x41, 0xD9, 0x8A, 0x97, 0x08, 0x84, 0x2F, 0x62, 0x41
++        0x72, 0xFB, 0x80, 0xA2, 0xC1, 0xCC, 0xD1, 0x42, 0x01, 0x73, 0x8C, 0x08, 0x84, 0x2F, 0x62, 0x41
+     };
+ 
+     // Encrypted Key Frame
+--- /dev/null
++++ b/tests/p25/PacketCodec_MI_Test.cpp
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "bridge/PacketCodecMI.h"
++#include <catch2/catch_test_macros.hpp>
++
++TEST_CASE("Packet codec retries null MI and fails closed on RNG failure", "[p25][packet-mi]") {
++    std::array<uint8_t, 9> mi{};
++    unsigned calls = 0;
++    REQUIRE(packetcodec::generateMI(mi, [&](uint8_t* out, int length) {
++        REQUIRE(length == 8);
++        if (++calls == 2) out[7] = 1;
++        return 1;
++    }));
++    REQUIRE(calls == 2);
++    REQUIRE(mi[7] == 1);
++    REQUIRE(mi[8] == 0);
++    REQUIRE(packetcodec::validMI(mi.data()));
++    calls = 0;
++    REQUIRE_FALSE(packetcodec::generateMI(mi, [&](uint8_t*, int) { ++calls; return 1; }));
++    REQUIRE(calls == 4);
++    REQUIRE_FALSE(packetcodec::validMI(mi.data()));
++    REQUIRE_FALSE(packetcodec::generateMI(mi, [](uint8_t* out, int) { out[0] = 1; return 0; }));
++    REQUIRE_FALSE(packetcodec::validMI(mi.data()));
++    mi[8] = 1;
++    REQUIRE_FALSE(packetcodec::validMI(mi.data()));
++}

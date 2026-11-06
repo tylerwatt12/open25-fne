@@ -1,0 +1,266 @@
+--- a/src/host/modem/port/ModemNullPort.cpp
++++ b/src/host/modem/port/ModemNullPort.cpp
+@@ -23,7 +23,10 @@
+ /* Initializes a new instance of the ModemNullPort class. */
+ 
+ ModemNullPort::ModemNullPort() :
+-    m_buffer(200U, "Null Controller Buffer")
++    m_buffer(200U, "Null Controller Buffer"),
++    m_protocolFlags(0U),
++    m_mode(STATE_IDLE),
++    m_p25Capacity(522U)
+ {
+     /* stub */
+ }
+@@ -36,6 +39,7 @@
+ 
+ bool ModemNullPort::open()
+ {
++    m_buffer.clear();
+     return true;
+ }
+ 
+@@ -59,17 +63,69 @@
+ 
+ int ModemNullPort::write(const uint8_t* buffer, uint32_t length)
+ {
+-    switch (buffer[2U]) {
++    if (buffer == nullptr || length < 3U)
++        return 0;
++    uint32_t commandOffset = 2U;
++    if (buffer[0U] == DVM_SHORT_FRAME_START) {
++        if (buffer[1U] != length)
++            return 0;
++    }
++    else if (buffer[0U] == DVM_LONG_FRAME_START) {
++        if (length < 4U || ((uint32_t(buffer[1U]) << 8) | buffer[2U]) != length || buffer[3U] != CMD_P25_DATA)
++            return 0;
++        commandOffset = 3U;
++    }
++    else {
++        return 0;
++    }
++    switch (buffer[commandOffset]) {
+     case CMD_GET_VERSION:
++        if (length != 3U)
++            return 0;
+         getVersion();
+         break;
+     case CMD_GET_STATUS:
++        if (length != 3U)
++            return 0;
+         getStatus();
+         break;
+     case CMD_SET_CONFIG:
++        if (length != 24U)
++            return 0;
++        m_protocolFlags = buffer[4U] & 0x1AU;
++        m_mode = buffer[6U];
++        writeAck(CMD_SET_CONFIG);
++        break;
+     case CMD_SET_MODE:
+-        writeAck(buffer[2U]);
+-        break;
++        if (length != 4U)
++            return 0;
++        m_mode = buffer[3U];
++        writeAck(CMD_SET_MODE);
++        break;
++    case CMD_SET_BUFFERS:
++    {
++        // Match the paired protocol4 fixed allocation. The Null sink consumes
++        // accepted data immediately; its advertised free window never grows
++        // beyond the physical profile's conservative522-byte P25 allocation.
++        if (length != 9U) {
++            writeNAK(CMD_SET_BUFFERS, RSN_ILLEGAL_LENGTH);
++            break;
++        }
++        const uint16_t dmr = (uint16_t(buffer[3U]) << 8) | buffer[4U];
++        const uint16_t p25 = (uint16_t(buffer[5U]) << 8) | buffer[6U];
++        const uint16_t nxdn = (uint16_t(buffer[7U]) << 8) | buffer[8U];
++        if (m_mode != STATE_IDLE) {
++            writeNAK(CMD_SET_BUFFERS, RSN_INVALID_MODE);
++            break;
++        }
++        if (dmr > 505U || p25 > 522U || nxdn > 538U) {
++            writeNAK(CMD_SET_BUFFERS, RSN_ILLEGAL_LENGTH);
++            break;
++        }
++        m_p25Capacity = p25;
++        writeAck(CMD_SET_BUFFERS);
++        break;
++    }
+     case CMD_FLSH_READ:
+         writeNAK(CMD_FLSH_READ, RSN_NO_INTERNAL_FLASH);
+         break;
+@@ -84,7 +140,7 @@
+ 
+ void ModemNullPort::close()
+ {
+-    /* stub */
++    m_buffer.clear();
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -101,7 +157,9 @@
+     reply[1U] = 0U;
+     reply[2U] = CMD_GET_VERSION;
+ 
+-    reply[3U] = 3U;
++    // Public software-only CPU class0F has no physical UDID. Keep all16
++    // reserved identity bytes zero rather than impersonating a real board.
++    reply[3U] = 4U;
+     reply[4U] = 15U;
+ 
+     // Reserve 16 bytes for the UDID
+@@ -120,29 +178,25 @@
+ 
+ void ModemNullPort::getStatus()
+ {
+-    unsigned char reply[15U];
++    unsigned char reply[12U] = {0U};
+ 
+     // Send all sorts of interesting internal values
+     reply[0U] = DVM_SHORT_FRAME_START;
+-    reply[1U] = 11U;
++    reply[1U] = 12U;
+     reply[2U] = CMD_GET_STATUS;
+ 
+-    reply[3U] = 0U;
+-
+-    reply[4U] = 0x00U;
++    reply[3U] = 0x80U | m_protocolFlags;
++
++    reply[4U] = m_mode;
+ 
+     reply[5U] = 0x00U;
+ 
+-    reply[6U] = 20U;
+-
+-    reply[7U] = 20U;
+-    reply[8U] = 20U;
+-
+-    reply[9U] = 0U;
+-
+-    reply[10U] = 20U;
+-
+-    m_buffer.addData(reply, 11U);
++    reply[7U] = (m_protocolFlags & 0x02U) != 0U ? 20U : 0U;
++    reply[8U] = reply[7U];
++    reply[10U] = (m_protocolFlags & 0x08U) != 0U ? m_p25Capacity / 16U : 0U;
++    reply[11U] = (m_protocolFlags & 0x10U) != 0U ? 20U : 0U;
++
++    m_buffer.addData(reply, 12U);
+ }
+ 
+ /* Helper to write a faked modem acknowledge. */
+@@ -172,4 +226,4 @@
+     reply[4U] = err;
+ 
+     m_buffer.addData(reply, 5U);
+-}
+\ No newline at end of file
++}
+--- a/src/host/modem/port/ModemNullPort.h
++++ b/src/host/modem/port/ModemNullPort.h
+@@ -74,6 +74,9 @@
+ 
+         private:
+             RingBuffer<unsigned char> m_buffer;
++            uint8_t m_protocolFlags;
++            uint8_t m_mode;
++            uint16_t m_p25Capacity;
+ 
+             /**
+              * @brief Helper to return a faked modem version.
+--- /dev/null
++++ b/tests/p25/ModemNullProtocol4_Tests.cpp
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Current paired protocol4 is a product serial contract, not a CAI packet.
++#include "host/modem/port/ModemNullPort.h"
++#include "host/modem/Modem.h"
++#include "common/Log.h"
++#include <catch2/catch_test_macros.hpp>
++#include <algorithm>
++#include <vector>
++
++namespace {
++using modem::port::ModemNullPort;
++std::vector<uint8_t> readAll(ModemNullPort& port) {
++    std::vector<uint8_t> result;
++    uint8_t pair[2];
++    for (;;) { const int n=port.read(pair,sizeof(pair)); if(n==0)break; REQUIRE(n>0);result.insert(result.end(),pair,pair+n); }
++    return result;
++}
++std::vector<uint8_t> send(ModemNullPort& port,const std::vector<uint8_t>& wire) {
++    REQUIRE(port.write(wire.data(),wire.size())==int(wire.size()));return readAll(port);
++}
++void p25Config(ModemNullPort& port,bool enabled=true) {
++    std::vector<uint8_t> wire(24,0);wire[0]=0xFE;wire[1]=24;wire[2]=2;wire[4]=enabled?8:0;
++    REQUIRE(send(port,wire)==std::vector<uint8_t>{0xFE,4,0x70,2});
++}
++class ClockedNullModem:public modem::Modem {
++public:
++    ModemNullPort* port;
++    ClockedNullModem():ClockedNullModem(new ModemNullPort()){}
++    explicit ClockedNullModem(ModemNullPort* p):Modem(p,true,false,false,false,false,false,0,0,0,8192,8192,8192,true,true,false,false,false,false),port(p) {
++        m_protoVer=4;m_p25Enabled=true;m_boundedCWOperation.store(true);p25Config(*port);
++    }
++    bool poll(){return getStatus();}
++    uint32_t credits()const{return m_p25Space;}
++    bool pending()const{return m_p25StatusPending;}
++};
++}
++
++TEST_CASE("Null modem reports current public protocol4 identity without physical UID", "[p25][null-protocol4]") {
++    g_logDisplayLevel=0;ModemNullPort port;REQUIRE(port.open());
++    auto version=send(port,{0xFE,3,0});
++    REQUIRE(version.size()==42); // 21-byte public header +21-byte Null class label
++    REQUIRE(std::vector<uint8_t>(version.begin(),version.begin()+5)==std::vector<uint8_t>{0xFE,42,0,4,15});
++    REQUIRE(std::all_of(version.begin()+5,version.begin()+21,[](uint8_t v){return v==0;}));
++    REQUIRE(std::string(version.begin()+21,version.end())=="Null Modem Controller");
++}
++
++TEST_CASE("Null status is exact12-byte requested P25 block-credit current contract", "[p25][null-protocol4]") {
++    ModemNullPort port;REQUIRE(port.open());p25Config(port);
++    REQUIRE(send(port,{0xFE,4,3,2})==std::vector<uint8_t>{0xFE,4,0x70,3});
++    const std::vector<uint8_t> expected{0xFE,12,1,0x88,2,0,0,0,0,0,32,0};
++    REQUIRE(send(port,{0xFE,3,1})==expected);
++    p25Config(port,false);
++    REQUIRE(send(port,{0xFE,3,1})==std::vector<uint8_t>{0xFE,12,1,0x80,0,0,0,0,0,0,0,0});
++}
++
++TEST_CASE("Null P25 FIFO resize is atomic bounded and advertises conservative16-byte credits", "[p25][null-protocol4]") {
++    ModemNullPort port;REQUIRE(port.open());p25Config(port);
++    for(unsigned size:{0U,15U,16U,511U,512U,522U}) {
++        CAPTURE(size);REQUIRE(send(port,{0xFE,9,15,0,0,uint8_t(size>>8),uint8_t(size),0,0})==std::vector<uint8_t>{0xFE,4,0x70,15});
++        const auto status=send(port,{0xFE,3,1});REQUIRE(status.size()==12);REQUIRE(status[10]==size/16);
++    }
++    REQUIRE(send(port,{0xFE,9,15,0,0,2,11,0,0})==std::vector<uint8_t>{0xFE,5,0x7F,15,2}); //523 exceeds522
++    REQUIRE(send(port,{0xFE,3,1})[10]==32);
++    REQUIRE(send(port,{0xFE,4,3,2})==std::vector<uint8_t>{0xFE,4,0x70,3});
++    REQUIRE(send(port,{0xFE,9,15,0,0,0,0,0,0})==std::vector<uint8_t>{0xFE,5,0x7F,15,11}); // active mode
++    REQUIRE(send(port,{0xFE,3,1})[10]==32);
++}
++
++TEST_CASE("Null modem rejects malformed serial requests before reading or changing current state", "[p25][null-protocol4][null-bounds]") {
++    ModemNullPort port;REQUIRE(port.open());p25Config(port);
++    const uint8_t tiny=0;REQUIRE(port.write(nullptr,0)==0);REQUIRE(port.write(&tiny,1)==0);
++    for(const auto& bad:std::vector<std::vector<uint8_t>>{{0xFE,2},{0xFE,4,1},{0xFE,4,1,0},{0xFE,3,2},{0xFE,3,3},{0xFD,0,3},{0xFD,0,4,1},{0x00,3,1}}) {
++        CAPTURE(bad.size());REQUIRE(port.write(bad.data(),bad.size())==0);REQUIRE(readAll(port).empty());
++    }
++    REQUIRE(send(port,{0xFE,3,1})==std::vector<uint8_t>{0xFE,12,1,0x88,0,0,0,0,0,0,32,0});
++    REQUIRE(port.write(std::vector<uint8_t>{0xFE,3,1}.data(),3)==3);port.close();REQUIRE(port.open());REQUIRE(readAll(port).empty());
++}
++
++TEST_CASE("Actual Modem consumes Null status and preserves pending-write credit ownership", "[p25][null-protocol4]") {
++    ClockedNullModem instance;REQUIRE(instance.open());REQUIRE(instance.poll());REQUIRE(instance.pending());instance.clock(0);
++    REQUIRE(instance.gotModemStatus());REQUIRE_FALSE(instance.pending());REQUIRE(instance.credits()==512);
++    std::vector<uint8_t> voice(218,0);voice[0]=modem::TAG_DATA;
++    REQUIRE(instance.poll());REQUIRE(instance.writeP25Frame(voice.data(),voice.size()));instance.clock(0);
++    REQUIRE(instance.credits()==294); // requested snapshot minus218 accepted later FIFO bytes
++    REQUIRE(instance.writeP25Frame(voice.data(),voice.size()));REQUIRE(instance.credits()==76);REQUIRE_FALSE(instance.writeP25Frame(voice.data(),voice.size()));
++    for(unsigned second=0;second<10;++second){instance.clock(1000);REQUIRE_FALSE(instance.hasError());REQUIRE(instance.gotModemStatus());}
++    REQUIRE(instance.credits()==512); // Null sink consumed data; a fresh requested poll replenished
++}

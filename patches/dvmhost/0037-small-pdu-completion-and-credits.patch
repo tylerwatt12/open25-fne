@@ -1,0 +1,603 @@
+--- /dev/null
++++ b/src/common/p25/PDUHeaderCodec.h
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Phase1 primary packet header FEC and fixed-window frame bounds.
++// BAAA-B6/Tables11-14,8.2/Table20;7.2/7.2.4/Fig35. See pdu-completion-plan.md.
++#ifndef P25_PDU_HEADER_CODEC_H
++#define P25_PDU_HEADER_CODEC_H
++#include <stdint.h>
++#include <stddef.h>
++namespace p25pdu {
++static const uint16_t HEADER_AIR_END_BITS=316U;
++static const uint16_t MAX_AIR_BYTES=512U;
++static const uint8_t MAX_FOLLOWING_BLOCKS=18U;
++inline uint32_t completeBits(uint32_t logicalBits) {
++    if(logicalBits==0U) return 0U;
++    const uint64_t raw=((uint64_t(logicalBits)+69U)/70U)*72U;
++    return raw<=uint64_t(MAX_AIR_BYTES)*8U?uint32_t(raw):0U;
++}
++inline bool bit(const uint8_t* p,uint32_t n){return (p[n/8U]&(0x80U>>(n%8U)))!=0U;}
++inline uint16_t headerCRC(const uint8_t* bytes) {
++    uint16_t crc=0U;
++    for(uint8_t n=0;n<10U;++n)for(uint8_t b=0;b<8U;++b){const bool carry=((crc&0x8000U)!=0U)^((bytes[n]&(0x80U>>b))!=0U);crc=uint16_t(crc<<1U);if(carry)crc^=0x1021U;}
++    return uint16_t(crc^0xFFFFU);
++}
++// Minimum Hamming-distance terminated four-state Viterbi decoder.49 stages
++// include the required zero flush dibit. CRC validation is a separate step.
++inline bool decodeCoded(const uint8_t* coded,size_t size,uint8_t* header,uint8_t* corrected=nullptr) {
++    if(coded==nullptr||header==nullptr||size<25U)return false;
++    // Tables12/13/20 combined into four transmitted bits per transition.
++    static const uint8_t expected[4][4]={{2,12,1,15},{14,0,13,3},{9,7,10,4},{5,11,6,8}};
++    static const uint8_t pop[16]={0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4};
++    static const uint8_t offsets[4]={0,26,50,74};
++    uint8_t trace[49][4];uint8_t metric[4]={0,254,254,254};
++    for(uint8_t stage=0;stage<49U;++stage){
++        // Inverse Table14 maps constellation pair stage to its air dibits.
++        const uint16_t at=uint16_t(offsets[stage%4U]+2U*(stage/4U))*2U;
++        uint8_t received=0U;for(uint8_t b=0;b<4U;++b)received=uint8_t((received<<1U)|(bit(coded,at+b)?1U:0U));
++        uint8_t next[4]={254,254,254,254};
++        for(uint8_t to=0;to<4U;++to)for(uint8_t from=0;from<4U;++from){
++            const uint16_t cost=uint16_t(metric[from])+pop[received^expected[from][to]];
++            if(cost<next[to]){next[to]=uint8_t(cost);trace[stage][to]=from;}
++        }
++        for(uint8_t n=0;n<4U;++n)metric[n]=next[n];
++    }
++    if(metric[0]>=254U)return false;
++    for(uint8_t n=0;n<12U;++n)header[n]=0U;
++    uint8_t state=0U;
++    for(int stage=48;stage>=0;--stage){if(stage<48)header[stage/4]|=uint8_t(state<<(6U-2U*(stage%4)));state=trace[stage][state];}
++    if(state!=0U)return false;
++    if(corrected!=nullptr)*corrected=metric[0];
++    return true;
++}
++struct Header {uint8_t bytes[12];uint16_t airBits;uint8_t following;uint8_t corrected;};
++inline bool inspect(const uint8_t* header,size_t size,Header& out) {
++    if(header==nullptr||size<12U||headerCRC(header)!=(uint16_t(header[10])<<8U|header[11]))return false;
++    const uint8_t format=header[0]&0x1FU,count=header[6]&0x7FU;
++    if(format==0x03U){if(count!=0U)return false;}
++    else {
++        if((format!=0x15U&&format!=0x16U&&format!=0x17U)||count==0U||count>MAX_FOLLOWING_BLOCKS)return false;
++        if(format!=0x17U){const uint16_t capacity=uint16_t(count)*(format==0x16U?16U:12U);const uint8_t pad=header[7]&0x1FU;if(capacity<4U||pad>capacity-4U)return false;
++            if(format==0x16U&&(header[9]&0x3FU)>capacity-4U-pad)return false;}
++    }
++    const uint32_t span=completeBits(112U+196U*(uint32_t(count)+1U));if(span==0U)return false;
++    for(uint8_t n=0;n<12U;++n)out.bytes[n]=header[n];out.airBits=uint16_t(span);out.following=count;out.corrected=0U;return true;
++}
++inline bool decodeAir(const uint8_t* air,uint32_t availableBits,Header& out) {
++    if(air==nullptr||availableBits<HEADER_AIR_END_BITS)return false;
++    uint8_t coded[25]={0U},header[12];uint8_t corrected=0U;
++    for(uint16_t n=0;n<196U;++n){const uint16_t logical=112U+n,raw=logical+2U*(logical/70U);if(bit(air,raw))coded[n/8U]|=uint8_t(0x80U>>(n%8U));}
++    if(!decodeCoded(coded,sizeof(coded),header,&corrected)||!inspect(header,sizeof(header),out))return false;
++    out.corrected=corrected;return true;
++}
++}
++#endif
+--- a/src/common/p25/data/DataHeader.cpp
++++ b/src/common/p25/data/DataHeader.cpp
+@@ -9,6 +9,7 @@
+  */
+ #include "Defines.h"
+ #include "p25/P25Defines.h"
++#include "p25/PDUHeaderCodec.h"
+ #include "p25/data/DataHeader.h"
+ #include "edac/CRC.h"
+ #include "Log.h"
+@@ -124,7 +125,7 @@
+         ::memcpy(m_data, data, P25_PDU_HEADER_LENGTH_BYTES);
+     }
+     else {
+-        valid = m_trellis.decode12(data, m_data);
++        valid = p25pdu::decodeCoded(data, P25_PDU_FEC_LENGTH_BYTES, m_data);
+     }
+ 
+     if (valid) {
+--- a/src/host/Host.P25.cpp
++++ b/src/host/Host.P25.cpp
+@@ -260,7 +260,7 @@
+                     // if there is read frames from the P25 controller and write it
+                     // to the modem
+                     if (host->m_p25 != nullptr) {
+-                        uint8_t nextLen = host->m_p25->peekFrameLength();
++                        uint32_t nextLen = host->m_p25->peekFrameLength();
+                         if (host->m_p25CtrlChannel) {
+                             if (host->m_p25DedicatedTxTestTimer.hasExpired() && !host->m_p25DedicatedTxTestTimer.isPaused()) {
+                                 host->m_p25DedicatedTxTestTimer.pause();
+--- a/src/host/modem/Modem.cpp
++++ b/src/host/modem/Modem.cpp
+@@ -147,6 +147,8 @@
+     m_dmrSpace1(0U),
+     m_dmrSpace2(0U),
+     m_p25Space(0U),
++    m_p25StatusPending(false),
++    m_p25StatusWrites(0U),
+     m_nxdnSpace(0U),
+     m_tx(false),
+     m_cd(false),
+@@ -452,6 +454,9 @@
+ 
+ bool Modem::open()
+ {
++    m_p25Space = 0U;
++    m_p25StatusPending = false;
++    m_p25StatusWrites = 0U;
+     LogInfoEx(LOG_MODEM, "Initializing modem");
+     m_gotModemStatus = false;
+ 
+@@ -746,6 +751,11 @@
+         /** General */
+         case CMD_GET_STATUS:
+         {
++            // This paired protocol4 profile has one12-byte requested status.
++            // A malformed or unsolicited packet cannot grant FIFO credits,
++            // retire the pending poll, or keep an unresponsive modem alive.
++            if (m_rspDoubleLength || m_length != 12U || !m_p25StatusPending)
++                break;
+             m_isHotspot = (m_buffer[3U] & 0x01U) == 0x01U;
+ 
+             // override hotspot flag if we're forcing hotspot
+@@ -835,10 +845,12 @@
+             m_nxdnSpace = m_buffer[11U] * (NXDDEF::NXDN_FRAME_LENGTH_BYTES);
+ 
+             // P25 free space can be reported as 16-byte blocks or frames based on the flag above
+-            if (spaceInBlocks)
+-                m_p25Space = m_buffer[10U] * P25_BUFFER_BLOCK_SIZE;
+-            else
+-                m_p25Space = m_buffer[10U] * (P25DEF::P25_LDU_FRAME_LENGTH_BYTES);
++            const uint32_t reportedP25Space = m_buffer[10U] * (spaceInBlocks ?
++                P25_BUFFER_BLOCK_SIZE : P25DEF::P25_LDU_FRAME_LENGTH_BYTES);
++            m_p25Space = m_p25StatusWrites < reportedP25Space ?
++                reportedP25Space - uint32_t(m_p25StatusWrites) : 0U;
++            m_p25StatusPending = false;
++            m_p25StatusWrites = 0U;
+ 
+             if (m_dumpModemStatus) {
+                 LogDebugEx(LOG_MODEM, "Modem::clock()", "CMD_GET_STATUS, isHotspot = %u, dmr = %u / %u, p25 = %u / %u, nxdn = %u / %u, modemState = %u, tx = %u, adcOverflow = %u, rxOverflow = %u, txOverflow = %u, dacOverflow = %u, dmrSpace1 = %u, dmrSpace2 = %u, p25Space = %u, nxdnSpace = %u",
+@@ -935,6 +947,9 @@
+ 
+ void Modem::close()
+ {
++    m_p25Space = 0U;
++    m_p25StatusPending = false;
++    m_p25StatusWrites = 0U;
+     LogInfoEx(LOG_MODEM, "Closing the modem");
+     m_port->close();
+ 
+@@ -1188,7 +1203,9 @@
+ 
+ bool Modem::hasP25Space(uint32_t length) const
+ {
+-    return m_p25Space >= length;
++    if (length <= 2U || length > P25DEF::P25_PDU_FRAME_LENGTH_BYTES + 2U)
++        return false;
++    return m_p25Space >= length + (length > 256U ? 1U : 0U);
+ }
+ 
+ /* Helper to test if the NXDN ring buffer has free space. */
+@@ -1524,72 +1541,45 @@
+ 
+ bool Modem::writeP25Frame(const uint8_t* data, uint32_t length, bool imm)
+ {
+-    assert(data != nullptr);
+-    assert(length > 0U);
+-
+-    if (m_p25Enabled) {
+-        uint16_t MAX_LENGTH = 520U;
+-        if (m_protoVer <= 3U) {
+-            MAX_LENGTH = 251U; // for older firmware always ensure frames are shorter then 252 bytes
+-        }
+-
+-        if (data[0U] != TAG_DATA && data[0U] != TAG_EOT)
+-            return false;
+-        if (length > MAX_LENGTH) {
+-            LogError(LOG_MODEM, "Modem::writeP25Frame(); request data to write >%u?, len = %u", MAX_LENGTH, length);
+-            Utils::dump(1U, "Modem::writeP25Frame(), Attempted Data", data, length);
+-            return false;
+-        }
+-
+-        DECLARE_UINT8_ARRAY(buffer, MAX_LENGTH);
+-
+-        if (length < 252U) {
+-            buffer[0U] = DVM_SHORT_FRAME_START;
+-            buffer[1U] = length + 2U;
+-            buffer[2U] = CMD_P25_DATA;
+-            ::memcpy(buffer + 3U, data + 1U, length - 1U);
+-        } else {
+-            length += 3U;
+-            buffer[0U] = DVM_LONG_FRAME_START;
+-            buffer[1U] = (length >> 8U) & 0xFFU;
+-            buffer[2U] = (length & 0xFFU);
+-            buffer[3U] = CMD_P25_DATA;
+-            ::memcpy(buffer + 4U, data + 1U, length - 1U);
+-        }
+-
+-        uint32_t len = length + 2U;
+-
+-        // write or buffer P25 data to air interface
+-        // for V.24/DFSI, the modem status space value may lag call startup; do
+-        // not block initial Net->RF frames solely on stale p25Space
+-        if (m_p25Space >= length || isV24Connected()) {
+-            if (m_debug)
+-                LogDebugEx(LOG_MODEM, "Modem::writeP25Frame()", "immediate write (len %u)", length);
+-            if (m_trace)
+-                Utils::dump(1U, "Modem::writeP25Frame(), Immediate TX P25 Data", buffer + 3U, length - 3U);
+-
+-            int ret = write(buffer, len, imm);
+-            if (ret != int(len)) {
+-                LogError(LOG_MODEM, "Error writing P25 data");
+-                return false;
+-            }
+-
+-            m_p25Space -= length;
+-            if ((int32_t)m_p25Space < 0) {
+-                if (m_debug)
+-                    LogDebugEx(LOG_MODEM, "Modem::writeP25Frame()", "p25Space underflow, space = %u, length = %u", m_p25Space, length);
+-                m_p25Space = 0U;
+-            }
+-        }
+-        else {
+-            return false;
+-        }
+-
+-        return true;
+-    }
+-    else {
++    // The caller owns tag/reserved octets plus the exact RF span. Validate
++    // before reading the tag or copying a source shorter than its declaration.
++    if (data == nullptr || length <= 2U || length > P25DEF::P25_PDU_FRAME_LENGTH_BYTES + 2U)
+         return false;
+-    }
++    if (!m_p25Enabled || (data[0U] != TAG_DATA && data[0U] != TAG_EOT))
++        return false;
++    if (m_protoVer <= 3U && length >= 252U)
++        return false;
++
++    const bool shortFrame = length < 252U;
++    const uint32_t wireLength = length + (shortFrame ? 2U : 3U);
++    // P25TX records contain RF bytes, an internal marker, and one/two length
++    // octets. USB framing bytes are not FIFO samples. Its input omits our tag.
++    const uint32_t fifoCost = length + (length > 256U ? 1U : 0U);
++    if (m_p25Space < fifoCost && !isV24Connected())
++        return false;
++
++    DECLARE_UINT8_ARRAY(buffer, wireLength);
++    if (shortFrame) {
++        buffer[0U] = DVM_SHORT_FRAME_START;
++        buffer[1U] = uint8_t(wireLength);
++        buffer[2U] = CMD_P25_DATA;
++        ::memcpy(buffer + 3U, data + 1U, length - 1U);
++    } else {
++        buffer[0U] = DVM_LONG_FRAME_START;
++        buffer[1U] = uint8_t(wireLength >> 8U);
++        buffer[2U] = uint8_t(wireLength);
++        buffer[3U] = CMD_P25_DATA;
++        ::memcpy(buffer + 4U, data + 1U, length - 1U);
++    }
++    const int written = write(buffer, wireLength, imm);
++    if (written != int(wireLength)) {
++        LogError(LOG_MODEM, "Error writing P25 data");
++        return false;
++    }
++    m_p25Space = m_p25Space >= fifoCost ? m_p25Space - fifoCost : 0U;
++    if (m_p25StatusPending)
++        m_p25StatusWrites += fifoCost;
++    return true;
+ }
+ 
+ /* Writes NXDN frame data to the NXDN ring buffer. */
+@@ -1970,15 +1960,18 @@
+ 
+ bool Modem::getStatus()
+ {
+-    uint8_t buffer[3U];
+-
+-    buffer[0U] = DVM_SHORT_FRAME_START;
+-    buffer[1U] = 3U;
+-    buffer[2U] = CMD_GET_STATUS;
+-
+-    //LogDebugEx(LOG_MODEM, "Modem::getStatus()", "polling modem status");
+-
+-    return write(buffer, 3U) == 3;
++    if (m_p25StatusPending)
++        return true; // one ordered request; never overlap ambiguous snapshots
++    if (!m_inactivityTimer.isRunning())
++        m_inactivityTimer.start();
++    uint8_t buffer[3U] = {DVM_SHORT_FRAME_START, 3U, CMD_GET_STATUS};
++    m_p25StatusWrites = 0U;
++    m_p25StatusPending = true;
++    if (write(buffer, sizeof(buffer)) != int(sizeof(buffer))) {
++        m_p25StatusPending = false;
++        return false;
++    }
++    return true;
+ }
+ 
+ /* Write configuration to the air interface modem. */
+--- a/src/host/modem/Modem.h
++++ b/src/host/modem/Modem.h
+@@ -829,6 +829,8 @@
+         uint32_t m_dmrSpace1;
+         uint32_t m_dmrSpace2;
+         uint32_t m_p25Space;
++        bool m_p25StatusPending;
++        uint64_t m_p25StatusWrites;
+         uint32_t m_nxdnSpace;
+ 
+         bool m_tx;
+--- a/src/host/p25/packet/Data.cpp
++++ b/src/host/p25/packet/Data.cpp
+@@ -10,6 +10,7 @@
+  */
+ #include "Defines.h"
+ #include "common/p25/P25Defines.h"
++#include "common/p25/PDUHeaderCodec.h"
+ #include "common/p25/acl/AccessControl.h"
+ #include "common/p25/lc/tdulc/TDULCFactory.h"
+ #include "common/p25/sndcp/SNDCPFactory.h"
+@@ -77,8 +78,7 @@
+     uint8_t encoded[P25_PDU_FEC_LENGTH_BYTES] = {0U};
+     uint8_t decoded[P25_PDU_HEADER_LENGTH_BYTES] = {0U};
+     Utils::getBitRange(stripped, encoded, P25_PREAMBLE_LENGTH_BITS, P25_PDU_FEC_LENGTH_BITS);
+-    edac::Trellis trellis;
+-    if (!trellis.decode12(encoded, decoded) || !edac::CRC::checkCCITT162(decoded, sizeof(decoded))) return false;
++    if (!p25pdu::decodeCoded(encoded, sizeof(encoded), decoded) || !edac::CRC::checkCCITT162(decoded, sizeof(decoded))) return false;
+     data::DataHeader header;
+     if (!header.decode(decoded, true)) return false;
+     const uint32_t count = header.getBlocksToFollow();
+@@ -106,8 +106,8 @@
+         if (secondary > packetLength) return false;
+     }
+     const uint32_t bits = P25_PREAMBLE_LENGTH_BITS + (count + 1U) * P25_PDU_FEC_LENGTH_BITS;
+-    const uint32_t rawBits = 72U * ((bits + 69U) / 70U);
+-    if (available < bits || (len - 2U) * 8U < rawBits) return false;
++    const uint32_t rawBits = p25pdu::completeBits(bits);
++    if (rawBits == 0U || available < bits || (len - 2U) * 8U != rawBits) return false;
+     // Verify body FEC/CRC in a local assembler before any CC/session effects.
+     if (format == PDUFormatType::RSP) return true;
+     data::Assembler probe;
+@@ -1020,12 +1020,8 @@
+ 
+ bool Data::fitsRFOutput(uint32_t bitLength)
+ {
+-    if (bitLength == 0U) return false;
+-    // BAAA-B6/Table11: each70 data bits is followed by two status bits.
+-    // No following status symbol is inserted after the final data bit. Use
+-    // widened arithmetic before touching the fixed512-byte RF output window.
+-    const uint64_t rawBits = uint64_t(bitLength) + 2U * ((uint64_t(bitLength) - 1U) / 70U);
+-    return (rawBits + 7U) / 8U <= P25_PDU_FRAME_LENGTH_BYTES;
++    // BAAA-B7.2/7.2.4: complete the final70-bit interval and its status dibit.
++    return p25pdu::completeBits(bitLength) != 0U;
+ }
+ 
+ void Data::writeRF_PDU(const uint8_t* pdu, uint32_t bitLength, bool imm, bool ackRetry)
+@@ -1061,7 +1057,8 @@
+     ::memset(data, 0x00U, P25_PDU_FRAME_LENGTH_BYTES + 2U);
+ 
+     // add the data
+-    uint32_t newBitLength = P25Utils::encodeByLength(pdu, data + 2U, bitLength);
++    const uint32_t newBitLength = p25pdu::completeBits(bitLength);
++    P25Utils::encodeByLength(pdu, data + 2U, bitLength);
+     uint32_t newByteLength = newBitLength / 8U;
+     if ((newBitLength % 8U) > 0U)
+         newByteLength++;
+--- a/tests/CWIDModem_Tests.cpp
++++ b/tests/CWIDModem_Tests.cpp
+@@ -83,6 +83,7 @@
+         // Represents the protocol already established by ordinary open().
+         m_protoVer = 4U;
+     }
++    bool pollStatus() { return getStatus(); }
+ };
+ 
+ std::vector<uint8_t> versionReply(uint8_t protocol = 4U, size_t size = 21U) {
+@@ -162,6 +163,7 @@
+ TEST_CASE("Serial barrier observes preceding packets and waits for a complete framed reply", "[modem][cwid][serial-barrier]") {
+     auto* port = new FeedModemPort;
+     BarrierModem modem(port);
++    REQUIRE(modem.pollStatus());
+     REQUIRE(modem.requestSerialBarrier());
+     port->feed(idleStatus());
+     port->feed({0xFEU, 21U, 0x00U, 4U});
+@@ -179,6 +181,7 @@
+     port->feed(versionReply());
+     modem.clock(0U);
+     REQUIRE(modem.serialBarrierGeneration() == 1U);
++    REQUIRE(modem.pollStatus());
+     port->feed(idleStatus());
+     modem.clock(0U);
+     REQUIRE(modem.statusGeneration() == 2U);
+@@ -221,11 +224,12 @@
+     modem.clock(0U);
+     REQUIRE(modem.p25WriteRejectGeneration() == rejected);
+     REQUIRE_FALSE(modem.hasError());
++    REQUIRE(modem.pollStatus());
+     port->feed(idleStatus());
+     modem.clock(0U);
+     REQUIRE(modem.p25WriteRejectGeneration() == rejected);
+     REQUIRE(modem.statusGeneration() == 1U);
+-    REQUIRE(port->writes.empty()); // No retry or reopen was triggered.
++    REQUIRE(port->writes == std::vector<std::vector<uint8_t>>{{0xFEU,3U,0x01U}}); // Only the explicit status poll.
+     REQUIRE(port->opens == 0U);
+     REQUIRE(port->closes == 0U);
+ }
+--- a/tests/p25/AMBTIngress_Tests.cpp
++++ b/tests/p25/AMBTIngress_Tests.cpp
+@@ -23,6 +23,7 @@
+  static std::array<uint32_t,4> state(const Control& c) { return {{uint32_t(c.m_rfState.load()),uint32_t(c.m_ccHalted),c.m_rfLossWatchdog.getTimer(),uint32_t(c.m_affiliations->unitRegSize())}}; }
+  static std::unique_ptr<lc::TSBK> typed(Control& c,const data::DataHeader& h,const data::DataBlock* b) { return c.m_control->decodeMBTForSite(h,b); }
+  static bool packet(Control& c,uint8_t* p,unsigned n) { return c.m_data->process(p,n); }
++ static void clockChecks(Control& c,uint32_t ms){c.m_control->clockRadioChecks(ms);}
+  static bool fits(uint32_t bits){return packet::Data::fitsRFOutput(bits);}
+  static void output(Control& c,const uint8_t* p,uint32_t bits){c.m_data->writeRF_PDU(p,bits);}
+  static void outputUser(Control& c,data::DataHeader& h,uint8_t* p){c.m_data->writeRF_PDU_User(h,false,false,p);}
+@@ -138,13 +139,13 @@
+ }
+ 
+ TEST_CASE("packet output capacity and exact source length are checked before effects", "[p25][ambt-ingress][packet-length]") {
+- // Independent RF budget:512*8 raw bits contain56 status pairs and3984
+- // data bits;3985 data bits would require4097 raw bits. Valid coded PDU
+- // lengths fit18 following blocks (3836 data bits) but not19 (4032).
+- REQUIRE_FALSE(AMBTIngressTestAccess::fits(0));REQUIRE(AMBTIngressTestAccess::fits(3984));REQUIRE_FALSE(AMBTIngressTestAccess::fits(3985));REQUIRE_FALSE(AMBTIngressTestAccess::fits(0xFFFFFFFFU));
++ // Complete RF intervals require final nulls and status.3920logical bits
++ // occupy4032raw bits;3921require4104 and exceed512bytes. Valid coded
++ // PDU lengths fit18 following blocks (3836logical), not19 (4032logical).
++ REQUIRE_FALSE(AMBTIngressTestAccess::fits(0));REQUIRE(AMBTIngressTestAccess::fits(3920));REQUIRE_FALSE(AMBTIngressTestAccess::fits(3921));REQUIRE_FALSE(AMBTIngressTestAccess::fits(3984));REQUIRE_FALSE(AMBTIngressTestAccess::fits(3985));REQUIRE_FALSE(AMBTIngressTestAccess::fits(0xFFFFFFFFU));
+  Fixture f;data::DataHeader h;h.setFormat(PDUFormatType::CONFIRMED);h.setAckNeeded(true);h.setSAP(PDUSAP::USER_DATA);h.setOutbound(true);h.setLLId(RID);REQUIRE(h.calculateLength(284));REQUIRE(h.getBlocksToFollow()==18);
+  std::unique_ptr<uint8_t[]> user(new uint8_t[284]{});AMBTIngressTestAccess::outputUser(*f.controller,h,user.get());
+- unsigned packets=0;std::array<uint8_t,1024> queued{};while(auto n=f.controller->getFrame(queued.data())){NID nid(NAC);if(nid.decode(queued.data()+2)&&nid.getDUID()==DUID::PDU){++packets;REQUIRE(n==495);}}
++ unsigned packets=0;std::array<uint8_t,1024> queued{};while(auto n=f.controller->getFrame(queued.data())){NID nid(NAC);if(nid.decode(queued.data()+2)&&nid.getDUID()==DUID::PDU){++packets;REQUIRE(n==497);}}
+  REQUIRE(packets==1);const auto state=AMBTIngressTestAccess::state(*f.controller);const auto retry=AMBTIngressTestAccess::retry(*f.controller);
+  REQUIRE(retry.first==3836);REQUIRE(h.calculateLength(300));REQUIRE(h.getBlocksToFollow()==19);std::unique_ptr<uint8_t[]> oversized(new uint8_t[300]{});AMBTIngressTestAccess::outputUser(*f.controller,h,oversized.get());
+  const uint8_t tiny=0;for(uint32_t bits:{3985U,4032U,0xFFFFFFFFU})AMBTIngressTestAccess::output(*f.controller,&tiny,bits);
+@@ -153,3 +154,32 @@
+  // octet merely because63 is not divisible by8; replacement frees its array.
+  std::unique_ptr<uint8_t[]> exact(new uint8_t[63]{});AMBTIngressTestAccess::output(*f.controller,exact.get(),504);REQUIRE(AMBTIngressTestAccess::retry(*f.controller).first==504);
+ }
++
++TEST_CASE("issued radio CHECK accepts only its actual AMBT response and retires queued command", "[p25][ambt-radio-check]") {
++ using CheckState=packet::ControlSignaling::RadioCheckState;
++ for(uint8_t mfid:{0U,1U}) {
++  CAPTURE(unsigned(mfid));Fixture f;auto* signal=f.controller->control();
++  f.controller->affiliations()->unitReg(TARGET);f.controller->affiliations()->clock(5000);
++  REQUIRE(signal->requestRadioCheck(RID));AMBTIngressTestAccess::clockChecks(*f.controller,0);
++  REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);REQUIRE(f.controller->peekFrameLength()!=0);
++  const auto otherAge=f.controller->affiliations()->unitRegTimer(TARGET);REQUIRE(otherAge!=0);
++  auto p=request(0x24);p.header[2]=mfid;p.seal();REQUIRE(f.input(p));
++  REQUIRE(signal->radioCheckState(RID)==CheckState::Available);
++  REQUIRE(f.controller->affiliations()->unitRegTimer(RID)==0);REQUIRE(f.controller->affiliations()->unitRegTimer(TARGET)==otherAge);
++  // No queue drain occurred before the response. A consumed CHECK_ACK does
++  // not echo on RF, and its still-queued original generation must disappear.
++  REQUIRE(f.controller->peekFrameLength()==0);REQUIRE(f.replies().empty());
++  AMBTIngressTestAccess::clockChecks(*f.controller,20000);REQUIRE(f.replies().empty());REQUIRE(signal->radioCheckState(RID)==CheckState::Available);
++ }
++ for(unsigned mode:{0U,1U})for(uint8_t mfid:{0U,1U}) {
++  CAPTURE(mode,unsigned(mfid));Fixture f;auto* signal=f.controller->control();
++  f.controller->affiliations()->unitReg(TARGET);f.controller->affiliations()->clock(5000);
++  const auto beforeRID=f.controller->affiliations()->unitRegTimer(RID),beforeOther=f.controller->affiliations()->unitRegTimer(TARGET);
++  REQUIRE(signal->requestRadioCheck(RID));AMBTIngressTestAccess::clockChecks(*f.controller,0);REQUIRE(f.controller->peekFrameLength()!=0);
++  auto p=request(0x24);p.header[2]=mfid;if(mode==0)p.body[6]^=1;else p.header[5]=0x13;p.seal();
++  REQUIRE(f.input(p)); // Complete valid packet transport; procedure is unmatched.
++  REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);REQUIRE(signal->radioCheckState(TARGET)==CheckState::None);
++  REQUIRE(f.controller->affiliations()->unitRegTimer(RID)==beforeRID);REQUIRE(f.controller->affiliations()->unitRegTimer(TARGET)==beforeOther);
++  const auto frames=f.replies();REQUIRE(frames.size()==1);REQUIRE((frames[0][0]&0x3F)==0x24);REQUIRE(frames[0][2]==0);REQUIRE(frames[0][3]==0); // queued CHECK, not ACK
++ }
++}
+--- /dev/null
++++ b/tests/p25/ModemPacketTransport_Tests.cpp
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Protocol4 lengths and FIFO credits are pinned implementation contracts;
++// packet RF lengths derive from BAAA-B7.2/7.2.4, documented in the plan.
++#include "PacketTransportFixture.h"
++#include "common/Log.h"
++#include <catch2/catch_test_macros.hpp>
++#include <memory>
++using packettest::OfflineModem;
++namespace {
++std::vector<uint8_t> status(uint8_t blocks=32){return {0xFE,12,1,0x89,2,0,0,0,0,0,blocks,0};}
++void ready(OfflineModem& m){REQUIRE(m.poll());m.receive(status());REQUIRE(m.credits()==512);}
++}
++TEST_CASE("protocol4 P25 writer preserves exact source and declared wire lengths", "[p25][pdu-transport]") {
++ g_logDisplayLevel=0;
++ for(unsigned n:{20U,218U,251U,252U,256U,257U,497U}) {
++  CAPTURE(n);OfflineModem m;ready(m);std::unique_ptr<uint8_t[]> source(new uint8_t[n]);for(unsigned i=0;i<n;++i)source[i]=uint8_t(i);source[0]=modem::TAG_DATA;
++  const auto before=m.credits();REQUIRE(m.hasP25Space(n));REQUIRE(m.writeP25Frame(source.get(),n));const auto& wire=m.memory->output.back();const unsigned header=n<252?3:4;
++  REQUIRE(wire.size()==n+header-1);REQUIRE(wire[0]==(n<252?0xFE:0xFD));REQUIRE((n<252?wire[1]:unsigned(wire[1])*256+wire[2])==wire.size());REQUIRE(wire[header-1]==0x31);
++  REQUIRE(std::equal(wire.begin()+header,wire.end(),source.get()+1));REQUIRE(m.credits()==before-n-(n>256?1:0));
++ }
++ OfflineModem m;ready(m);const uint8_t tiny=0;for(unsigned n:{0U,1U,2U,515U,0xFFFFFFFFU}){REQUIRE_FALSE(m.hasP25Space(n));REQUIRE_FALSE(m.writeP25Frame(&tiny,n));}REQUIRE(m.memory->output.size()==1);
++}
++TEST_CASE("one pending status conservatively accounts later P25 records", "[p25][pdu-transport]") {
++ OfflineModem m;ready(m);REQUIRE(m.poll());const auto requests=m.memory->output.size();REQUIRE(m.pending());REQUIRE(m.poll());REQUIRE(m.memory->output.size()==requests);
++ std::vector<uint8_t> voice(218,0);voice[0]=modem::TAG_DATA;REQUIRE(m.writeP25Frame(voice.data(),voice.size()));REQUIRE(m.writeP25Frame(voice.data(),voice.size()));REQUIRE_FALSE(m.writeP25Frame(voice.data(),voice.size()));REQUIRE(m.credits()==76);REQUIRE(m.afterRequest()==436);
++ m.receive(status());REQUIRE_FALSE(m.pending());REQUIRE(m.credits()==76); // delayed empty-FIFO snapshot cannot double-credit
++ m.receive(status());REQUIRE(m.credits()==76); // unsolicited reply cannot replenish
++ REQUIRE(m.poll());m.receive(status(19));REQUIRE(m.credits()==304); // fresh reply after one actual216-byte RF record dequeues
++ REQUIRE(m.writeP25Frame(voice.data(),voice.size()));REQUIRE(m.credits()==86);
++ REQUIRE(m.poll());m.close();REQUIRE_FALSE(m.pending());REQUIRE(m.credits()==0);m.receive(status());REQUIRE(m.credits()==0); // retired epoch
++}
++TEST_CASE("malformed status cannot retire its poll and first poll starts timeout", "[p25][pdu-transport]") {
++ OfflineModem m;REQUIRE_FALSE(m.timeoutRunning());REQUIRE(m.poll());REQUIRE(m.timeoutRunning());
++ for(const auto& bad:std::vector<std::vector<uint8_t>>{{0xFE,3,1},{0xFE,11,1,0x89,2,0,0,0,0,0,32},{0xFD,0,12,1,0x89,2,0,0,0,0,32,0},{0xFE,13,1,0x89,2,0,0,0,0,0,32,0,0}}){m.receive(bad);REQUIRE(m.pending());REQUIRE(m.credits()==0);}
++ m.receive(status());REQUIRE_FALSE(m.pending());REQUIRE(m.credits()==512);
++}
++
++TEST_CASE("unanswered first status faults within existing timeout without overlapping polls", "[p25][pdu-transport]") {
++ OfflineModem m;REQUIRE(m.poll());REQUIRE(m.memory->output.size()==1);m.boundedTimeout();REQUIRE(m.hasError());REQUIRE(m.memory->output.size()==1);REQUIRE(m.pending());m.close();REQUIRE_FALSE(m.pending());REQUIRE(m.credits()==0);
++}
+--- /dev/null
++++ b/tests/p25/PDUCompletion_Tests.cpp
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Literal full on-air vectors: BAAB-B B.8/B.9 PDF142-145, printed130-133.
++// The independent original-PDF transcription and oracle are in
++// tools/pi/firmware/pdu-baab-vectors.json and pdu_oracle.py.
++#include "common/p25/data/DataHeader.h"
++#include "common/p25/PDUHeaderCodec.h"
++#include "host/p25/packet/Data.h"
++#include <catch2/catch_test_macros.hpp>
++#include <vector>
++#include <memory>
++#include <array>
++#include <string>
++namespace {
++struct Vector {const char* header;const char* raw;};
++const Vector vectors[]={
++{"0308000000018000000010A6","5575F5FF77FF293CD482F80AECDC894888B42222192222229222C88848888888B9FE4888C22222D00000000000"},
++{"036F00000001800000005928","5575F5FF77FF293CD482F80AECDC8AD488B4222CE22D22229222004908888888B6BE0888C22227900000000000"},
++{"2308000000018000000029AB","5575F5FF77FF293CD582F80AECDC894888B52222D5122222922219A448888888AABE4889C22227400000000001"},
++{"236F00000001800000006025","5575F5FF77FF293CD582F80AECDC8AD488B5222C2E1D22229222D16508888888A5FE0889C22222000000000001"},
++{"15C0000000018100000048AF","5575F5FF77FF293CD482F80AECDC88C888B4E22C15C522229222E8808888888885008888CC222982EB06D8365C68887B66959F1E8A7071AF430D9CF0374B88028800000000000000"},
++{"15C00000000182000000D373","5575F5FF77FF293CD482F80AECDC88C888B4922FB5C522229222B0C088888888B9408888C1222FF2EB06D835E8C1487B6695887B4A7071AF429C7CF0374B8C3C0C760D7AC23E1BA4A5621ED86591AF429C1EE871D2E33C0F9100"},
++{"15C000000001820B00002382","5575F5FF77FF293CD482F80AECDC88C888B4952269C522229222184088888848A4808888C1422F12EB06D835E088887B669588888A7071AF42222CF0374B8C08888888888B2EF3882222222033D22222208B95A48888888BFE70"},
++{"35C0000000018100000071A2","5575F5FF77FF293CD582F80AECDC88C888B5E22CD9F52222922239AC8888888896408889CC222C12EB06D8365D68887B66959F1E8A7171AF430D9CF0374B89028800000000000001"},
++{"35C00000000182000000EA7E","5575F5FF77FF293CD582F80AECDC88C888B5922F79F52222922261EC88888888AA008889C1222A62EB06D835E9C1487B6695887B4A7171AF429C7CF0374B8D3C0C760D7AC23E1BA5A5621ED86591AF429D1EE871D2E33C0F9101"},
++};
++std::vector<uint8_t> bytes(const char* s){std::vector<uint8_t> v;for(unsigned n=0;s[n];n+=2)v.push_back(uint8_t(std::stoul(std::string(s+n,2),nullptr,16)));return v;}
++std::vector<uint8_t> tagged(const std::vector<uint8_t>& raw){std::vector<uint8_t> v{0U,1U};v.insert(v.end(),raw.begin(),raw.end());return v;}
++std::array<uint8_t,25> coded(const std::vector<uint8_t>& raw){std::array<uint8_t,25> v{};for(unsigned n=0;n<196;++n){unsigned logical=112+n,at=logical+2*(logical/70);if(raw[at/8]&(0x80U>>(at%8)))v[n/8]|=0x80U>>(n%8);}return v;}
++}
++TEST_CASE("published complete packets and corrected headers traverse actual Host ingress bounds", "[p25][pdu-completion]") {
++ for(const auto& v:vectors){auto raw=bytes(v.raw),expected=bytes(v.header),frame=tagged(raw);REQUIRE(p25::packet::Data::validRFFrame(frame.data(),frame.size()));
++  for(unsigned n=0;n<frame.size();++n){CAPTURE(n);std::unique_ptr<uint8_t[]> exact(new uint8_t[n]);std::copy(frame.begin(),frame.begin()+n,exact.get());REQUIRE_FALSE(p25::packet::Data::validRFFrame(exact.get(),n));}
++  frame.push_back(0);REQUIRE_FALSE(p25::packet::Data::validRFFrame(frame.data(),frame.size()));
++  for(unsigned bit=0;bit<196;++bit){auto bad=raw;unsigned logical=112+bit,at=logical+2*(logical/70);bad[at/8]^=0x80U>>(at%8);auto block=coded(bad);p25::data::DataHeader h;REQUIRE(h.decode(block.data()));std::array<uint8_t,12> recovered{};h.getData(recovered.data());REQUIRE(std::equal(recovered.begin(),recovered.end(),expected.begin()));auto input=tagged(bad);REQUIRE(p25::packet::Data::validRFFrame(input.data(),input.size()));}
++ }
++}
++TEST_CASE("packet primary codec checks available spans before any read", "[p25][pdu-completion]") {
++ uint8_t tiny=0;std::array<uint8_t,12> out{};p25pdu::Header h{};REQUIRE_FALSE(p25pdu::decodeCoded(&tiny,24,out.data()));REQUIRE_FALSE(p25pdu::decodeCoded(nullptr,25,out.data()));REQUIRE_FALSE(p25pdu::decodeCoded(&tiny,25,nullptr));REQUIRE_FALSE(p25pdu::decodeAir(&tiny,315,h));REQUIRE_FALSE(p25pdu::decodeAir(nullptr,316,h));REQUIRE_FALSE(p25pdu::inspect(&tiny,11,h));
++ REQUIRE(p25pdu::completeBits(308)==360);REQUIRE(p25pdu::completeBits(504)==576);REQUIRE(p25pdu::completeBits(700)==720);REQUIRE(p25pdu::completeBits(3836)==3960);REQUIRE(p25pdu::completeBits(4032)==0);REQUIRE(p25pdu::completeBits(3984)==0);REQUIRE(p25pdu::completeBits(0xFFFFFFFFU)==0);
++}
+--- /dev/null
++++ b/tests/p25/PacketTransportFixture.h
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Memory-only serial endpoint: actual Modem parser/writer methods run unchanged.
++#pragma once
++#include "host/modem/Modem.h"
++#include <algorithm>
++#include <deque>
++#include <vector>
++namespace packettest {
++struct MemoryPort : modem::port::IModemPort {
++    std::deque<uint8_t> input;
++    std::vector<std::vector<uint8_t>> output;
++    bool open() override { return true; }
++    void close() override {}
++    int read(uint8_t* p,uint32_t n) override {unsigned i=0;while(i<n&&!input.empty()){p[i++]=input.front();input.pop_front();}return int(i);}
++    int write(const uint8_t* p,uint32_t n) override {output.emplace_back(p,p+n);return int(n);}
++};
++class OfflineModem : public modem::Modem {
++public:
++    MemoryPort* memory;
++    OfflineModem():OfflineModem(new MemoryPort()){}
++    explicit OfflineModem(MemoryPort* p):Modem(p,true,false,false,false,false,false,0,0,0,8192,8192,8192,true,true,false,false,false,false),memory(p) {m_protoVer=4U;m_p25Enabled=true;}
++    bool poll(){return getStatus();}
++    bool pending()const{return m_p25StatusPending;}
++    uint64_t afterRequest()const{return m_p25StatusWrites;}
++    uint32_t credits()const{return m_p25Space;}
++    void boundedTimeout(){m_boundedCWOperation.store(true);clock(8000U);}
++    bool timeoutRunning()const{return m_inactivityTimer.isRunning();}
++    void receive(const std::vector<uint8_t>& wire){memory->input.insert(memory->input.end(),wire.begin(),wire.end());clock(0);}
++};
++}

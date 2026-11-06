@@ -1,0 +1,1374 @@
+--- a/src/common/lookups/RadioIdLookup.cpp
++++ b/src/common/lookups/RadioIdLookup.cpp
+@@ -20,6 +20,34 @@
+ #include <vector>
+ #include <fstream>
+ 
++namespace {
++bool csvRecord(const std::string& line, std::vector<std::string>& fields)
++{
++    std::string field;
++    bool quoted = false;
++    for (size_t i = 0U; i < line.size(); ++i) {
++        const char c = line[i];
++        if (c == '"') {
++            if (quoted && i + 1U < line.size() && line[i + 1U] == '"') {
++                field += '"'; ++i;
++            } else quoted = !quoted;
++        } else if (c == ',' && !quoted) {
++            fields.push_back(field); field.clear();
++        } else if (c != '\r' || quoted) field += c;
++    }
++    fields.push_back(field);
++    return !quoted;
++}
++
++std::string csvField(const std::string& value)
++{
++    if (value.find_first_of(",\"\r\n") == std::string::npos) return value;
++    std::string encoded = "\"";
++    for (char c : value) { encoded += c; if (c == '"') encoded += '"'; }
++    return encoded + '"';
++}
++}
++
+ // ---------------------------------------------------------------------------
+ //  Static Class Members
+ // ---------------------------------------------------------------------------
+@@ -135,7 +163,7 @@
+         return RadioId(true, false);
+     }
+ 
+-    __SPINLOCK();
++    std::lock_guard<std::mutex> lock(s_mutex);
+ 
+     try {
+         entry = m_table.at(id);
+@@ -144,6 +172,17 @@
+     }
+ 
+     return entry;
++}
++
++void RadioIdLookup::replaceAliases(const std::unordered_map<uint32_t, std::string>& aliases)
++{
++    std::lock_guard<std::mutex> lock(s_mutex);
++    for (auto& row : m_table) {
++        const auto alias = aliases.find(row.first);
++        auto& radio = row.second;
++        radio.set(radio.radioEnabled(), radio.radioDefault(),
++            alias == aliases.end() ? "" : alias->second, radio.radioIPAddress());
++    }
+ }
+ 
+ /* Saves loaded talkgroup rules. */
+@@ -193,15 +232,8 @@
+ 
+             // tokenize line
+             std::vector<std::string> parsed;
+-            std::stringstream ss(line);
+-            std::string field;
+-            char delim = ',';
+-
+-            while (std::getline(ss, field, delim))
+-                parsed.push_back(field);
+-
+             // ensure we have at least 2 fields
+-            if (parsed.size() < 2) {
++            if (!csvRecord(line, parsed) || parsed.size() < 2) {
+                 LogError(LOG_HOST, "Invalid entry in radio ID lookup table - %s", line.c_str());
+                 continue;
+             }
+@@ -276,21 +308,8 @@
+         std::string ipAddress = entry.second.radioIPAddress();
+ 
+         // format into a string
+-        line = std::to_string(rid) + "," + std::to_string(enabled) + ",";
+-
+-        // add the alias if we have one
+-        if (alias.length() > 0) {
+-            line += alias;
+-            line += ",";
+-        }
+-
+-        // add the IP address if we have one
+-        if (ipAddress.length() > 0) {
+-            line += ipAddress;
+-            line += ",";
+-        }
+-
+-        line += "\n";
++        line = std::to_string(rid) + "," + std::to_string(enabled) + "," +
++            csvField(alias) + "," + csvField(ipAddress) + ",\n";
+         file << line;
+         lines++;
+     }
+--- a/src/common/lookups/RadioIdLookup.h
++++ b/src/common/lookups/RadioIdLookup.h
+@@ -176,6 +176,9 @@
+          */
+         void eraseEntry(uint32_t id);
+ 
++        // Replace display names only. Unknown IDs cannot create admissions.
++        void replaceAliases(const std::unordered_map<uint32_t, std::string>& aliases);
++
+         /**
+          * @brief Helper to return the lookup table.
+          * @returns std::unordered_map<uint32_t, RadioId> Table.
+--- a/src/common/p25/P25Defines.h
++++ b/src/common/p25/P25Defines.h
+@@ -779,10 +779,10 @@
+                 HARRIS_PTT_PA_EVEN = 0x2CU,           //!< HARRIS PTT PA EVEN - Harris PTT Position and Altitude Even
+                 HARRIS_PTT_PB_EVEN = 0x2DU,           //!< HARRIS PTT PB EVEN - Harris PTT Position and Bearing Even
+ 
+-                HARRIS_USER_ALIAS_PA_ODD = 0x32U,      //!< HARRIS USER ALIAS PA ODD - Harris User Alias Position and Altitude Odd
+-                HARRIS_USER_ALIAS_PB_ODD = 0x33U,      //!< HARRIS USER ALIAS PB ODD - Harris User Alias Position and Bearing Odd
+-                HARRIS_USER_ALIAS_PA_EVEN = 0x34U,     //!< HARRIS USER ALIAS PA EVEN - Harris User Alias Position and Altitude Even
+-                HARRIS_USER_ALIAS_PB_EVEN = 0x35U,     //!< HARRIS USER ALIAS PB EVEN - Harris User Alias Position and Bearing Even
++                HARRIS_USER_ALIAS_PA_ODD = 0x32U,      //!< User Alias Part A, odd conveyance (TIA-102.AABF-D-2; explicit MFID A4).
++                HARRIS_USER_ALIAS_PB_ODD = 0x33U,      //!< User Alias Part B, odd conveyance.
++                HARRIS_USER_ALIAS_PA_EVEN = 0x34U,     //!< User Alias Part A, even conveyance.
++                HARRIS_USER_ALIAS_PB_EVEN = 0x35U,     //!< User Alias Part B, even conveyance.
+             };
+         }
+ 
+--- a/src/common/p25/lc/LC.cpp
++++ b/src/common/p25/lc/LC.cpp
+@@ -26,6 +26,7 @@
+ #include <cstdio>
+ #include <cassert>
+ #include <cstring>
++#include <algorithm>
+ 
+ // ---------------------------------------------------------------------------
+ //  Static Class Members
+@@ -85,6 +86,7 @@
+     m_mi(nullptr),
+     m_userAlias(nullptr),
+     m_gotUserAliasPartA(false),
++    m_userAliasEven(false),
+     m_gotUserAlias(false)
+ {
+     m_mi = new uint8_t[MI_LENGTH_BYTES];
+@@ -807,6 +809,7 @@
+ bool LC::decodeLC(const uint8_t* rs, bool rawOnly)
+ {
+     assert(rs != nullptr);
++    const uint32_t previousSource = m_srcId, previousDestination = m_dstId;
+ 
+     ulong64_t rsValue = 0U;
+ 
+@@ -839,26 +842,29 @@
+         //Utils::dump(1U, "P25, LC::decodeLC(), Decoded P25 Non-Standard RS", rs, P25_LDU_LC_FEC_LENGTH_BYTES);
+         // Harris
+         if (m_mfId == MFG_HARRIS) {
+-            // Harris P25 opcodes
++            // TIA-102.AABF-D-2 7.3.35/36: complete matching conveyances only.
+             switch (m_lco) {
+             case LCO::HARRIS_USER_ALIAS_PA_ODD:
+             case LCO::HARRIS_USER_ALIAS_PA_EVEN:
+-                m_gotUserAliasPartA = true;
++                m_gotUserAliasPartA = !m_protect;
++                m_userAliasEven = m_lco == LCO::HARRIS_USER_ALIAS_PA_EVEN;
+                 m_gotUserAlias = false;
+ 
+-                if (m_userAlias != nullptr) {
++                if (!m_protect && m_userAlias != nullptr) {
+                     ::memset(m_userAlias, 0x00U, HARRIS_USER_ALIAS_LENGTH_BYTES);
+                     ::memcpy(m_userAlias, rs + 2U, 7U);
+-                    m_gotUserAlias = true;
+                 }
+                 break;
+ 
+             case LCO::HARRIS_USER_ALIAS_PB_ODD:
+             case LCO::HARRIS_USER_ALIAS_PB_EVEN:
+-                if (m_gotUserAliasPartA && (m_userAlias != nullptr)) {
++                if (!m_protect && m_gotUserAliasPartA && m_userAliasEven == (m_lco == LCO::HARRIS_USER_ALIAS_PB_EVEN) && (m_userAlias != nullptr)) {
+                     ::memcpy(m_userAlias + 7U, rs + 2U, 7U);
+                     m_gotUserAlias = true;
+                 }
++                // Any Part B consumes the pending A, including an unmatched
++                // or protected B. Never join fragments across conveyances.
++                m_gotUserAliasPartA = false;
+                 break;
+ 
+             default:
+@@ -922,7 +928,6 @@
+         }
+         m_priority = (rs[2U] & 0x07U);
+         m_serviceReserved = rs[2U] & 0x38U;                                              // Priority
+-        m_explicitId = (rs[3U] & 0x01U) == 0x01U;                                   // Explicit Source ID Flag
+         m_dstId = (uint32_t)((rsValue >> 24) & 0xFFFFFFU);                          // Target Radio Address
+         m_srcId = (uint32_t)(rsValue & 0xFFFFFFU);                                  // Source Radio Address
+         break;
+@@ -932,6 +937,11 @@
+     }
+ 
+     // sanity check priority (per TIA-102.AABC-B) it should never be 0, if its 0, default to 4
++    if (m_srcId != previousSource || m_dstId != previousDestination) {
++        m_gotUserAlias = false;
++        m_gotUserAliasPartA = false;
++    }
++
+     if (m_priority == 0) {
+         m_priority = 4U;
+     }
+@@ -1331,25 +1341,35 @@
+ 
+ std::string LC::getUserAlias() const
+ {
+-    std::string alias;
+-    if (m_gotUserAlias) {
+-        for (uint32_t i = 0; i < HARRIS_USER_ALIAS_LENGTH_BYTES; i++)
+-            alias[i] = m_userAlias[i];
+-    }
+-
+-    return alias;
++    if (!m_gotUserAlias || m_userAlias == nullptr)
++        return std::string();
++    uint32_t length = 0U;
++    while (length < HARRIS_USER_ALIAS_LENGTH_BYTES && m_userAlias[length] != 0U)
++        ++length;
++    return std::string(reinterpret_cast<const char*>(m_userAlias), length);
+ }
+ 
+ /* Sets the user alias. */
+ 
+-void LC::setUserAlias(std::string alias)
++bool LC::setUserAlias(const std::string& alias)
+ {
+     if (m_userAlias == nullptr)
+         m_userAlias = new uint8_t[HARRIS_USER_ALIAS_LENGTH_BYTES];
+ 
+     ::memset(m_userAlias, 0x00U, HARRIS_USER_ALIAS_LENGTH_BYTES);
+-    for (uint32_t i = 0; i < HARRIS_USER_ALIAS_LENGTH_BYTES; i++)
+-        m_userAlias[i] = alias[i];
++    m_gotUserAlias = false;
++    m_gotUserAliasPartA = false;
++    if (!isValidUserAlias(alias))
++        return false;
++    ::memcpy(m_userAlias, alias.data(), alias.size());
++    m_gotUserAlias = true;
++    return true;
++}
++
++bool LC::isValidUserAlias(const std::string& alias)
++{
++    return !alias.empty() && alias.size() <= HARRIS_USER_ALIAS_LENGTH_BYTES &&
++        std::none_of(alias.begin(), alias.end(), [](unsigned char ch) { return ch < 0x20U || ch > 0x7EU; });
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -1428,18 +1448,22 @@
+     }
+ 
+     // do we have user alias data to copy?
+-    if (data.m_gotUserAlias && data.m_userAlias != nullptr) {
++    if (data.m_userAlias != nullptr) {
+         delete[] m_userAlias;
+ 
+         m_userAlias = new uint8_t[HARRIS_USER_ALIAS_LENGTH_BYTES];
+         ::memcpy(m_userAlias, data.m_userAlias, HARRIS_USER_ALIAS_LENGTH_BYTES);
+         m_gotUserAlias = data.m_gotUserAlias;
++        m_gotUserAliasPartA = data.m_gotUserAliasPartA;
++        m_userAliasEven = data.m_userAliasEven;
+     } else {
+         delete[] m_userAlias;
+ 
+         m_userAlias = new uint8_t[HARRIS_USER_ALIAS_LENGTH_BYTES];
+         ::memset(m_userAlias, 0x00U, HARRIS_USER_ALIAS_LENGTH_BYTES);
+         m_gotUserAlias = false;
++        m_gotUserAliasPartA = false;
++        m_userAliasEven = false;
+     }
+ 
+     // do we have Phase 2 MCO data to copy?
+--- a/src/common/p25/lc/LC.h
++++ b/src/common/p25/lc/LC.h
+@@ -190,7 +190,8 @@
+              * @brief Sets the user alias.
+              * @param alias User alias.
+              */
+-            void setUserAlias(std::string alias);
++            bool setUserAlias(const std::string& alias);
++            static bool isValidUserAlias(const std::string& alias);
+ 
+             /** @name Local Site data */
+             /**
+@@ -366,6 +367,7 @@
+             // User Alias data
+             uint8_t* m_userAlias;
+             bool m_gotUserAliasPartA;
++            bool m_userAliasEven;
+             bool m_gotUserAlias;
+ 
+             static bool s_warnCRC;
+--- a/src/common/restapi/http/RequestAssembler.h
++++ b/src/common/restapi/http/RequestAssembler.h
+@@ -16,7 +16,7 @@
+ class RequestAssembler {
+ public:
+     enum { HeaderLimit = 16 * 1024, HeaderCountLimit = 128, BodyLimit = 64 * 1024,
+-        MetadataLimit = 16 * 1024, ChunkLineLimit = 1024 };
++        AliasBodyLimit = 4 * 1024 * 1024, MetadataLimit = 16 * 1024, ChunkLineLimit = 1024 };
+     enum Result { More, Complete, BadRequest, HeaderTooLarge, BodyTooLarge,
+         UnsupportedTransfer, UnsupportedExpectation };
+ 
+@@ -27,6 +27,7 @@
+         m_lexer.reset(); m_request = HTTPPayload(); m_header.clear(); m_line.clear();
+         m_state = Headers; m_result = More; m_remaining = 0U; m_metadata = 0U;
+         m_trailers = 0U; m_lineCR = false; m_input = false;
++        m_bodyLimit = BodyLimit;
+     }
+ 
+     HTTPPayload& request() { return m_request; }
+@@ -93,7 +94,7 @@
+     std::string m_header, m_line;
+     State m_state;
+     Result m_result;
+-    size_t m_remaining, m_metadata, m_trailers;
++    size_t m_remaining, m_metadata, m_trailers, m_bodyLimit;
+     bool m_lineCR, m_input;
+ 
+     Result fail(Result value) { m_state = Failed; return m_result = value; }
+@@ -135,6 +136,7 @@
+         const std::string version=m_header.substr(versionAt+1U,end-versionAt-1U);
+         // Bounds the legacy lexer's integer version accumulation as well.
+         if (version!="HTTP/1.0" && version!="HTTP/1.1") { fail(BadRequest); return; }
++        if (m_header.substr(0U,versionAt)=="PUT /p25/aliases") m_bodyLimit=AliasBodyLimit;
+         std::string normalized=m_header.substr(0U,end)+"\r\n";
+         size_t at=end+2U,count=0U,cl=0U,te=0U,hosts=0U;
+         std::string lengthValue,transferValue;
+@@ -174,7 +176,7 @@
+             if (lengthValue.empty() || !std::all_of(lengthValue.begin(),lengthValue.end(),[](unsigned char c){return c>='0'&&c<='9';})) { fail(BadRequest); return; }
+             for (char ch:lengthValue) {
+                 const size_t digit=static_cast<size_t>(ch-'0');
+-                if (body>(BodyLimit-digit)/10U) { fail(BodyTooLarge); return; }
++                if (body>(m_bodyLimit-digit)/10U) { fail(BodyTooLarge); return; }
+                 body=body*10U+digit;
+             }
+         }
+@@ -231,11 +233,11 @@
+             else if (ch>='a'&&ch<='f') digit=ch-'a'+10U;
+             else if (ch>='A'&&ch<='F') digit=ch-'A'+10U;
+             else break;
+-            if (size>(BodyLimit-digit)/16U) { fail(BodyTooLarge); return; }
++            if (size>(m_bodyLimit-digit)/16U) { fail(BodyTooLarge); return; }
+             size=size*16U+digit;++at;
+         }
+         if (at==0U || (at<m_line.size() && !chunkExtensions(at))) { fail(BadRequest); return; }
+-        if (size>BodyLimit-m_request.content.size()) { fail(BodyTooLarge); return; }
++        if (size>m_bodyLimit-m_request.content.size()) { fail(BodyTooLarge); return; }
+         m_remaining=size;m_state=size==0U?Trailers:ChunkData;
+     }
+ 
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -326,6 +326,7 @@
+         friend struct MultiSiteTestAccess;
+         friend struct NIDReceiveTestAccess;
+         friend struct AMBTIngressTestAccess;
++        friend struct UserAliasTestAccess;
+ #endif
+         friend class packet::Voice;
+         packet::Voice* m_voice;
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -50,6 +50,7 @@
+ 
+ void Voice::resetRF()
+ {
++    m_rfUserAlias = UserAliasState{};
+     m_rfFullRate=fullrate::Batch{};m_rfHeaderPending=false;
+     m_rfErrorRate=0.0;m_rfSuperframe=0;m_rfServiceOptions=0;m_rfServiceOptionsValid=false; // One decoder/source epoch, not each LDU.
+ 
+@@ -60,6 +61,7 @@
+     //m_rfLastHDU = lc;
+     m_rfLastHDUValid = false;
+     m_rfSecurityKnown = false;
++    m_rfExplicitSourceKnown = false;
+     m_rfLastLDU1 = lc;
+     m_rfLastLDU2 = lc;
+     m_rfFirstLDU2 = true;
+@@ -79,6 +81,7 @@
+ 
+ void Voice::resetNet()
+ {
++    m_netUserAlias = UserAliasState{};
+     m_netFullRate1=fullrate::Batch{};m_netFullRate2=fullrate::Batch{};
+     m_netControl1=lc::LC();m_netControl2=lc::LC();m_netSyncControl=lc::LC();
+     m_netPendingReceived={};m_netPendingAt={};m_netSecurityKnown=false;
+@@ -685,6 +688,15 @@
+             rsValue = m_rfLC.getRS();
+             // Capture the actual decoded voice service before periodic LC substitution.
+             const auto sourceOpcode = m_rfLC.getLCO();
++            const bool explicitSourceRequired = sourceOpcode == LCO::PRIVATE_EXT || sourceOpcode == LCO::EXPLICIT_SOURCE_ID ||
++                (sourceOpcode == LCO::GROUP && m_rfLC.getExplicitId());
++            if (m_rfUserAlias.source != m_rfLC.getSrcId() || m_rfUserAlias.destination != m_rfLC.getDstId())
++                m_rfExplicitSourceKnown = false;
++            if (m_rfLC.isStandardMFId()) {
++                if (sourceOpcode == LCO::EXPLICIT_SOURCE_ID) m_rfExplicitSourceKnown = true;
++                else if (!explicitSourceRequired && (sourceOpcode == LCO::GROUP || sourceOpcode == LCO::PRIVATE))
++                    m_rfExplicitSourceKnown = false;
++            }
+             if (m_rfLC.isStandardMFId() && (sourceOpcode == LCO::GROUP || sourceOpcode == LCO::PRIVATE ||
+                 sourceOpcode == LCO::PRIVATE_EXT || sourceOpcode == LCO::TEL_INT_VCH_USER)) {
+                 m_rfServiceOptions = uint8_t(rsValue >> 48U);
+@@ -701,29 +713,52 @@
+                 m_p25->notifyCC_TouchGrant(m_rfLC.getDstId());
+             }
+ 
+-            // are we swapping the LC out for the RFSS_STS_BCAST or LC_GROUP_UPDT?
+-            m_pktLDU1Count++;
+-            if (m_pktLDU1Count > PKT_LDU1_COUNT) {
+-                m_pktLDU1Count = 0U;
+-
+-                // conventional registration or DVRS support?
+-                if ((m_p25->m_enableControl && !m_p25->m_dedicatedControl) || m_p25->m_voiceOnControl) {
+-                    // per TIA-102.AABD-B transmit RFSS_STS_BCAST every 3 superframes (e.g. every 3 LDU1s)
+-                    m_rfLC.setMFId(MFG_STANDARD);
+-                    m_rfLC.setLCO(LCO::RFSS_STS_BCAST);
+-                }
+-                else {
+-                    std::lock_guard<std::mutex> lock(m_p25->s_activeTGLock);
+-                    if (!m_p25->m_activeTG.empty() && m_rfLC.getGroup()) {
+-                        // The active list has no channel assignments. Only
+-                        // advertise this call on this configured voice channel.
++            UserAliasState nextAlias = m_rfUserAlias;
++            if (explicitSourceRequired && !m_rfExplicitSourceKnown) {
++                nextAlias = UserAliasState{};
++                nextAlias.source = m_rfLC.getSrcId();
++                nextAlias.destination = m_rfLC.getDstId();
++                nextAlias.slot = 1U; // Preserve the following received extension.
++            }
++            if (sourceOpcode == LCO::EXPLICIT_SOURCE_ID && nextAlias.alias.empty())
++                nextAlias.slot = 1U;
++            lc::LC outboundLC;
++            // Implicit source identity means this Site's WACN/System, not
++            // the LC object's constructor defaults. Wait for an actual
++            // Source ID Extension before using an explicit source identity.
++            const bool aliasScheduled = (!explicitSourceRequired || m_rfExplicitSourceKnown) &&
++                selectUserAliasLC(m_rfLC, nextAlias, outboundLC,
++                    explicitSourceRequired ? m_rfLC.getNetId() : m_p25->m_siteData.netId(),
++                    explicitSourceRequired ? m_rfLC.getSysId() : m_p25->m_siteData.sysId());
++            if (!aliasScheduled) m_rfUserAlias = nextAlias;
++
++            // Preserve the existing schedule when no usable alias is associated.
++            if (!aliasScheduled) {
++                // are we swapping the LC out for the RFSS_STS_BCAST or LC_GROUP_UPDT?
++                m_pktLDU1Count++;
++                if (m_pktLDU1Count > PKT_LDU1_COUNT) {
++                    m_pktLDU1Count = 0U;
++
++                    // conventional registration or DVRS support?
++                    if ((m_p25->m_enableControl && !m_p25->m_dedicatedControl) || m_p25->m_voiceOnControl) {
++                        // per TIA-102.AABD-B transmit RFSS_STS_BCAST every 3 superframes (e.g. every 3 LDU1s)
+                         m_rfLC.setMFId(MFG_STANDARD);
+-                        m_rfLC.setLCO(LCO::GROUP_UPDT);
+-                        m_rfLC.setGrpVchNo(m_p25->m_siteData.channelNo());
+-                        m_rfLC.setDstIdB(0U);
+-                        m_rfLC.setGrpVchNoB(0U);
++                        m_rfLC.setLCO(LCO::RFSS_STS_BCAST);
+                     }
+-                }
++                    else {
++                        std::lock_guard<std::mutex> lock(m_p25->s_activeTGLock);
++                        if (!m_p25->m_activeTG.empty() && m_rfLC.getGroup()) {
++                            // The active list has no channel assignments. Only
++                            // advertise this call on this configured voice channel.
++                            m_rfLC.setMFId(MFG_STANDARD);
++                            m_rfLC.setLCO(LCO::GROUP_UPDT);
++                            m_rfLC.setGrpVchNo(m_p25->m_siteData.channelNo());
++                            m_rfLC.setDstIdB(0U);
++                            m_rfLC.setGrpVchNoB(0U);
++                        }
++                    }
++                }
++
+             }
+ 
+             // generate Sync
+@@ -740,7 +775,8 @@
+                 m_rfLC.setRS(rsValue);
+             }
+ 
+-            m_rfLC.encodeLDU1(data + 2U);
++            if (aliasScheduled) outboundLC.encodeLDU1(data + 2U);
++            else m_rfLC.encodeLDU1(data + 2U);
+ 
+             // generate Low Speed Data
+             const uint8_t lsdStatus=m_rfLSD.process(data + 2U);
+@@ -793,7 +829,8 @@
+                 data[0U] = modem::TAG_DATA;
+                 data[1U] = 0x00U;
+ 
+-                m_p25->addFrame(data, P25_LDU_FRAME_LENGTH_BYTES + 2U, false, false, m_p25->serviceFrameOwner(m_rfLC.getSrcId(), m_rfLC.getGroup() ? 0U : m_rfLC.getDstId()));
++                if (m_p25->addFrame(data, P25_LDU_FRAME_LENGTH_BYTES + 2U, false, false, m_p25->serviceFrameOwner(m_rfLC.getSrcId(), m_rfLC.getGroup() ? 0U : m_rfLC.getDstId())) && aliasScheduled)
++                    m_rfUserAlias = nextAlias;
+             }
+ 
+             if (m_verbose) {
+@@ -1418,6 +1455,103 @@
+ {
+ }
+ 
++// TIA-102.AABD-B-2 7.9.3: at least one alias part per voice-user LC.
++// AABD-B 7.1.5/7.3.7 and Table 17-1: voice-user LC at least every 3 LC.
++// This selects an LC inside the existing LDU; it never adds or paces voice.
++bool Voice::selectUserAliasLC(const lc::LC& user, UserAliasState& next, lc::LC& output,
++    uint32_t netId, uint32_t sysId)
++{
++    const auto opcode = user.getLCO();
++    if (!m_p25->m_managedSite || !user.isStandardMFId() || user.getSrcId() == 0U ||
++        (opcode != LCO::GROUP && opcode != LCO::PRIVATE && opcode != LCO::PRIVATE_EXT && opcode != LCO::EXPLICIT_SOURCE_ID))
++        return false;
++    if (next.source != user.getSrcId() || next.destination != user.getDstId()) {
++        next = UserAliasState{};
++        next.source = user.getSrcId();
++        next.destination = user.getDstId();
++    }
++
++    // The directory holds local-System RIDs, not foreign SUID associations.
++    // Never borrow a local name for a foreign caller with the same number.
++    if (netId != lc::LC::getSiteData().netId() || sysId != lc::LC::getSiteData().sysId()) {
++        if (!next.warned)
++            LogWarning(LOG_P25, "User Alias omitted for RID %u: no managed name association for WACN %05X System %03X", user.getSrcId(), netId, sysId);
++        next.warned = true;
++        next.alias.clear();
++        next.part = next.slot = 0U;
++        return false;
++    }
++
++    // Keep the selected name until Part B, even when the directory changes.
++    if ((next.part & 1U) == 0U) {
++        const std::string alias = m_p25->m_ridLookup->find(user.getSrcId()).radioAlias();
++        if (!lc::LC::isValidUserAlias(alias)) {
++            if (!alias.empty() && !next.warned) {
++                LogWarning(LOG_P25, "User Alias omitted for RID %u: name requires 1 to 14 printable ASCII characters", user.getSrcId());
++                next.warned = true;
++            }
++            next.alias.clear();
++            return false;
++        }
++        next.alias = alias;
++    }
++
++    const bool sourceExtension = (opcode == LCO::GROUP && user.getExplicitId()) ||
++        opcode == LCO::PRIVATE_EXT || opcode == LCO::EXPLICIT_SOURCE_ID;
++    const bool rfssRequired = (m_p25->m_enableControl && !m_p25->m_dedicatedControl) || m_p25->m_voiceOnControl;
++    if (sourceExtension && (!m_p25->m_allowExplicitSourceId || rfssRequired)) {
++        if (!next.warned) {
++            LogWarning(LOG_P25, "User Alias omitted for RID %u: extended source requires dedicated traffic channel and explicit source identity", user.getSrcId());
++            next.warned = true;
++        }
++        return false;
++    }
++
++    output = user;
++    output.setServiceOptions(user.getServiceOptions());
++    output.setProtect(false);
++    output.setNetId(netId);
++    output.setSysId(sysId);
++
++    if (next.slot == 0U) {
++        output.setLCO(user.getGroup() ? LCO::GROUP : (sourceExtension ? LCO::PRIVATE_EXT : LCO::PRIVATE));
++        output.setExplicitId(sourceExtension);
++    } else if (sourceExtension && next.slot == 1U) {
++        // The extension immediately follows its voice-user LC.
++        output.setMFId(MFG_STANDARD);
++        output.setLCO(LCO::EXPLICIT_SOURCE_ID);
++    } else {
++        bool maintenance = false;
++        if (!sourceExtension && next.slot == 2U) {
++            if (rfssRequired) {
++                output.setMFId(MFG_STANDARD);
++                output.setLCO(LCO::RFSS_STS_BCAST);
++                maintenance = true;
++            } else if (user.getGroup()) {
++                std::lock_guard<std::mutex> lock(m_p25->s_activeTGLock);
++                if (!m_p25->m_activeTG.empty()) {
++                    output.setMFId(MFG_STANDARD);
++                    output.setLCO(LCO::GROUP_UPDT);
++                    output.setGrpVchNo(m_p25->m_siteData.channelNo());
++                    output.setDstIdB(0U);
++                    output.setGrpVchNoB(0U);
++                    maintenance = true;
++                }
++            }
++        }
++        if (!maintenance) {
++            static const uint8_t opcodes[4U] = {LCO::HARRIS_USER_ALIAS_PA_ODD, LCO::HARRIS_USER_ALIAS_PB_ODD,
++                LCO::HARRIS_USER_ALIAS_PA_EVEN, LCO::HARRIS_USER_ALIAS_PB_EVEN};
++            output.setMFId(MFG_HARRIS); // AABF-D-2 requires explicit MFID $A4.
++            output.setLCO(opcodes[next.part]);
++            output.setUserAlias(next.alias);
++            next.part = uint8_t((next.part + 1U) & 3U);
++        }
++    }
++    next.slot = uint8_t((next.slot + 1U) % 3U);
++    return true;
++}
++
+ // The existing source threshold marks these recovered words Mute, without
+ // examining encrypted pitch bits or replacing the exported ciphertext.
+ void Voice::captureFullRate(const Audio::Result& audio,bool ldu2,uint8_t lsdStatus)
+@@ -2007,51 +2141,59 @@
+     if (sysId == 0U)
+         sysId = lc::LC::getSiteData().sysId();
+ 
+-    // is the network peer a different WACN or system ID?
+-    if (m_p25->m_allowExplicitSourceId) {
+-        if (sysId != lc::LC::getSiteData().sysId()) {
+-            // per TIA-102.AABD-D transmit EXPLICIT_SOURCE_ID every other frame (e.g. every other LDU1)
+-            m_roamLDU1Count++;
+-            if (m_roamLDU1Count > ROAM_LDU1_COUNT) {
+-                m_roamLDU1Count = 0U;
+-                m_netLC.setNetId(netId);
+-                m_netLC.setSysId(sysId);
+-                m_netLC.setLCO(LCO::EXPLICIT_SOURCE_ID);
++    UserAliasState nextAlias = m_netUserAlias;
++    lc::LC outboundLC;
++    const bool aliasScheduled = selectUserAliasLC(m_netLC, nextAlias, outboundLC, netId, sysId);
++    if (!aliasScheduled) m_netUserAlias = nextAlias;
++
++    if (!aliasScheduled) {
++        // is the network peer a different WACN or system ID?
++        if (m_p25->m_allowExplicitSourceId) {
++            if (sysId != lc::LC::getSiteData().sysId()) {
++                // per TIA-102.AABD-D transmit EXPLICIT_SOURCE_ID every other frame (e.g. every other LDU1)
++                m_roamLDU1Count++;
++                if (m_roamLDU1Count > ROAM_LDU1_COUNT) {
++                    m_roamLDU1Count = 0U;
++                    m_netLC.setNetId(netId);
++                    m_netLC.setSysId(sysId);
++                    m_netLC.setLCO(LCO::EXPLICIT_SOURCE_ID);
++                }
++                else {
++                    // flag explicit block to follow in next LDU1
++                    m_netLC.setExplicitId(true);
++
++                    if (m_netLC.getLCO() == LCO::PRIVATE) {
++                        m_netLC.setLCO(LCO::PRIVATE_EXT);
++                    }
++                }
++            }
++        }
++
++        // are we swapping the LC out for the RFSS_STS_BCAST or LC_GROUP_UPDT?
++        m_pktLDU1Count++;
++        if (m_pktLDU1Count > PKT_LDU1_COUNT) {
++            m_pktLDU1Count = 0U;
++
++            // conventional registration or DVRS support?
++            if ((m_p25->m_enableControl && !m_p25->m_dedicatedControl) || m_p25->m_voiceOnControl) {
++                // per TIA-102.AABD-B transmit RFSS_STS_BCAST every 3 superframes (e.g. every 3 LDU1s)
++                m_netLC.setMFId(MFG_STANDARD);
++                m_netLC.setLCO(LCO::RFSS_STS_BCAST);
+             }
+             else {
+-                // flag explicit block to follow in next LDU1
+-                m_netLC.setExplicitId(true);
+-
+-                if (m_netLC.getLCO() == LCO::PRIVATE) {
+-                    m_netLC.setLCO(LCO::PRIVATE_EXT);
+-                }
+-            }
+-        }
+-    }
+-
+-    // are we swapping the LC out for the RFSS_STS_BCAST or LC_GROUP_UPDT?
+-    m_pktLDU1Count++;
+-    if (m_pktLDU1Count > PKT_LDU1_COUNT) {
+-        m_pktLDU1Count = 0U;
+-
+-        // conventional registration or DVRS support?
+-        if ((m_p25->m_enableControl && !m_p25->m_dedicatedControl) || m_p25->m_voiceOnControl) {
+-            // per TIA-102.AABD-B transmit RFSS_STS_BCAST every 3 superframes (e.g. every 3 LDU1s)
+-            m_netLC.setMFId(MFG_STANDARD);
+-            m_netLC.setLCO(LCO::RFSS_STS_BCAST);
+-        }
+-        else {
+-            std::lock_guard<std::mutex> lock(m_p25->s_activeTGLock);
+-            if (!m_p25->m_activeTG.empty() && m_netLC.getGroup()) {
+-                // The active list has no channel assignments. Only advertise
+-                // this call, rather than inventing mappings for other groups.
+-                m_netLC.setMFId(MFG_STANDARD);
+-                m_netLC.setLCO(LCO::GROUP_UPDT);
+-                m_netLC.setGrpVchNo(m_p25->m_siteData.channelNo());
+-                m_netLC.setDstIdB(0U);
+-                m_netLC.setGrpVchNoB(0U);
+-            }
+-        }
++                std::lock_guard<std::mutex> lock(m_p25->s_activeTGLock);
++                if (!m_p25->m_activeTG.empty() && m_netLC.getGroup()) {
++                    // The active list has no channel assignments. Only advertise
++                    // this call, rather than inventing mappings for other groups.
++                    m_netLC.setMFId(MFG_STANDARD);
++                    m_netLC.setLCO(LCO::GROUP_UPDT);
++                    m_netLC.setGrpVchNo(m_p25->m_siteData.channelNo());
++                    m_netLC.setDstIdB(0U);
++                    m_netLC.setGrpVchNoB(0U);
++                }
++            }
++        }
++
+     }
+ 
+     uint8_t buffer[P25_LDU_FRAME_LENGTH_BYTES + 2U];
+@@ -2071,7 +2213,8 @@
+         m_netLC.setRS(rsValue);
+     }
+ 
+-    m_netLC.encodeLDU1(buffer + 2U);
++    if (aliasScheduled) outboundLC.encodeLDU1(buffer + 2U);
++    else m_netLC.encodeLDU1(buffer + 2U);
+ 
+     if(!fullRateToCAI(buffer+2U,m_netFullRate1,false))return false;
+     m_netLSD.setLSD1(m_netFullRate1.voice[8].bytes[14]);
+@@ -2084,6 +2227,7 @@
+     buffer[1U] = 0x00U;
+ 
+     if(!m_p25->addFrame(buffer, P25_LDU_FRAME_LENGTH_BYTES + 2U, true, false, m_p25->serviceFrameOwner(m_netLC.getSrcId(), m_netLC.getGroup() ? 0U : m_netLC.getDstId())))return false;
++    if (aliasScheduled) m_netUserAlias = nextAlias;
+ 
+     if (m_verbose) {
+         LogInfoEx(LOG_NET, P25_LDU1_STR " audio, mfId = $%02X, srcId = %u, dstId = %u, group = %u, emerg = %u, encrypt = %u, prio = %u, sysId = $%03X, netId = $%05X",
+--- a/src/host/p25/packet/Voice.h
++++ b/src/host/p25/packet/Voice.h
+@@ -30,6 +30,9 @@
+ 
+ namespace p25
+ {
++#if defined(CATCH2_TEST_COMPILATION)
++    struct UserAliasTestAccess;
++#endif
+     // ---------------------------------------------------------------------------
+     //  Class Prototypes
+     // ---------------------------------------------------------------------------
+@@ -80,6 +83,9 @@
+             /** @} */
+ 
+         protected:
++#if defined(CATCH2_TEST_COMPILATION)
++            friend struct p25::UserAliasTestAccess;
++#endif
+             friend class packet::ControlSignaling;
+             friend class p25::Control;
+             Control* m_p25;
+@@ -108,6 +114,7 @@
+             lc::LC m_rfLastHDU;
+             bool m_rfLastHDUValid;
+             bool m_rfSecurityKnown = false;
++            bool m_rfExplicitSourceKnown = false;
+             lc::LC m_rfLastLDU1;
+             lc::LC m_rfLastLDU2;
+             bool m_rfFirstLDU2;
+@@ -116,6 +123,16 @@
+             lc::LC m_netLC;
+             lc::LC m_netLastLDU1;
+             defines::FrameType::E m_netLastFrameType;
++
++            struct UserAliasState {
++                uint32_t source = 0U, destination = 0U;
++                std::string alias;
++                uint8_t slot = 0U, part = 0U;
++                bool warned = false;
++            };
++            UserAliasState m_rfUserAlias, m_netUserAlias;
++            bool selectUserAliasLC(const lc::LC& user, UserAliasState& next, lc::LC& output,
++                uint32_t netId = 0U, uint32_t sysId = 0U);
+ 
+             data::LowSpeedData m_rfLSD;
+             data::LowSpeedData m_netLSD;
+--- a/src/host/restapi/RESTAPI.cpp
++++ b/src/host/restapi/RESTAPI.cpp
+@@ -13,6 +13,7 @@
+ #include "common/json/json.h"
+ #include "common/Log.h"
+ #include "common/Utils.h"
++#include "common/p25/lc/LC.h"
+ #include "dmr/Control.h"
+ #include "p25/Control.h"
+ #include "nxdn/Control.h"
+@@ -324,6 +325,7 @@
+     m_dispatcher.match(GET_P25_DUMP_TSBK, true).get(REST_API_BIND(RESTAPI::restAPI_GetP25DumpTSBK, this));
+     m_dispatcher.match("/p25/site-state").put(REST_API_BIND(RESTAPI::restAPI_PutP25SiteState, this));
+     m_dispatcher.match(PUT_P25_RID).put(REST_API_BIND(RESTAPI::restAPI_PutP25RID, this));
++    m_dispatcher.match(PUT_P25_ALIASES).put(REST_API_BIND(RESTAPI::restAPI_PutP25Aliases, this));
+     m_dispatcher.match(P25_INHIBIT_POLICY).get(REST_API_BIND(RESTAPI::restAPI_GetP25InhibitPolicy, this)).put(REST_API_BIND(RESTAPI::restAPI_PutP25InhibitPolicy, this));
+     m_dispatcher.match(GET_P25_CC_DEDICATED).get(REST_API_BIND(RESTAPI::restAPI_GetP25CCEnable, this));
+     m_dispatcher.match(GET_P25_CC_BCAST).get(REST_API_BIND(RESTAPI::restAPI_GetP25CCBroadcast, this));
+@@ -1462,6 +1464,32 @@
+         }
+     }
+     inhibitResponse(reply, m_p25->control()->updateInhibitPolicy(desired,mirror,hasMirror,750U));
++}
++
++// Site-owned display metadata. This is a table receipt, not an RF acknowledgment.
++void RESTAPI::restAPI_PutP25Aliases(const HTTPPayload& request, HTTPPayload& reply, const RequestMatch&)
++{
++    if (!validateAuth(request, reply)) return;
++    if (m_ridLookup == nullptr) { errorPayload(reply, "Radio directory is unavailable", HTTPPayload::SERVICE_UNAVAILABLE); return; }
++    if (request.content.size() > 4U * 1024U * 1024U) { errorPayload(reply, "Alias directory exceeds 4 MiB"); return; }
++    json::object req;
++    if (!parseRequestBody(request, reply, req)) return;
++    if (req.size() != 1U || !req["aliases"].is<json::array>()) { errorPayload(reply, "aliases must be the complete name array"); return; }
++    std::unordered_map<uint32_t, std::string> aliases;
++    for (const auto& value : req["aliases"].get<json::array>()) {
++        if (!value.is<json::object>()) { errorPayload(reply, "each alias must be an object"); return; }
++        auto row = value.get<json::object>();
++        uint32_t id = 0U;
++        if (row.size() != 2U || !inhibitRadioId(row["rid"], id) || !row["alias"].is<std::string>()) {
++            errorPayload(reply, "each alias requires rid and alias"); return;
++        }
++        auto name = row["alias"].get<std::string>();
++        if (!p25::lc::LC::isValidUserAlias(name)) { errorPayload(reply, "User Alias requires 1-14 printable ASCII characters"); return; }
++        aliases[id] = name;
++    }
++    m_ridLookup->replaceAliases(aliases);
++    json::object response; setResponseDefaultStatus(response);
++    reply.payload(response);
+ }
+ 
+ /* REST API endpoint; implements P25 RID operation request. */
+--- a/src/host/restapi/RESTAPI.h
++++ b/src/host/restapi/RESTAPI.h
+@@ -36,7 +36,7 @@
+ 
+ class HOST_SW_API Host;
+ namespace dmr { class HOST_SW_API Control; }
+-namespace p25 { class HOST_SW_API Control; struct InhibitProcedureTestAccess; }
++namespace p25 { class HOST_SW_API Control; struct InhibitProcedureTestAccess; struct UserAliasTableTestAccess; }
+ namespace nxdn { class HOST_SW_API Control; }
+ 
+ // ---------------------------------------------------------------------------
+@@ -50,6 +50,7 @@
+ class HOST_SW_API RESTAPI : private Thread {
+ #if defined(CATCH2_TEST_COMPILATION)
+     friend struct p25::InhibitProcedureTestAccess;
++    friend struct p25::UserAliasTableTestAccess;
+ #endif
+ public:
+     /**
+@@ -341,6 +342,7 @@
+     void restAPI_GetP25InhibitPolicy(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+     void restAPI_PutP25InhibitPolicy(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+     void restAPI_PutP25RID(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
++    void restAPI_PutP25Aliases(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+     /**
+      * @brief REST API endpoint; implements toggle P25 CC request.
+      * @param request HTTP request.
+--- a/src/host/restapi/RESTDefines.h
++++ b/src/host/restapi/RESTDefines.h
+@@ -94,6 +94,7 @@
+ #define GET_P25_DUMP_TSBK_BASE          "/p25/dump-tsbk/"
+ #define GET_P25_DUMP_TSBK               GET_P25_DUMP_TSBK_BASE"(\\d+)"
+ #define PUT_P25_RID                     "/p25/rid"
++#define PUT_P25_ALIASES                 "/p25/aliases"
+ #define P25_INHIBIT_POLICY              "/p25/inhibit-policy"
+ #define GET_P25_CC_DEDICATED            "/p25/cc-enable"
+ #define GET_P25_CC_BCAST                "/p25/cc-broadcast"
+--- /dev/null
++++ b/tests/p25/UserAliasTable_Tests.cpp
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Managed names are display metadata; updates cannot change radio admission.
++#include "common/lookups/RadioIdLookup.h"
++#include "common/restapi/http/RequestAssembler.h"
++#include "host/restapi/RESTAPI.h"
++#include <catch2/catch_test_macros.hpp>
++#include <fstream>
++#include <thread>
++#include <atomic>
++#include <unistd.h>
++
++namespace p25 {
++struct UserAliasTableTestAccess {
++    static restapi::http::HTTPPayload put(RESTAPI& api, const std::string& body, bool authorized = true)
++    {
++        api.m_authTokens["alias-fixture"] = 1U;
++        restapi::http::HTTPPayload request, reply;
++        request.content = body;
++        request.headers.add("Content-Type", "application/json");
++        request.headers.add("RemoteHost", "alias-fixture");
++        if (authorized) request.headers.add("X-DVM-Auth-Token", "1");
++        restapi::RequestMatch match(std::smatch{}, body);
++        api.restAPI_PutP25Aliases(request, reply, match);
++        return reply;
++    }
++};
++}
++
++namespace {
++unsigned status(const restapi::http::HTTPPayload& response)
++{
++    json::value decoded;
++    REQUIRE(json::parse(decoded, response.content).empty());
++    return static_cast<unsigned>(decoded.get<json::object>()["status"].get<double>());
++}
++
++struct CSVFile {
++    char name[64] = "/tmp/p25-user-alias-XXXXXX";
++    CSVFile() { const int fd = mkstemp(name); REQUIRE(fd >= 0); close(fd); }
++    ~CSVFile() { std::remove(name); }
++};
++
++restapi::http::RequestAssembler::Result parse(restapi::http::RequestAssembler& parser, const std::string& wire)
++{
++    size_t at = 0U;
++    while (at < wire.size() && parser.result() == restapi::http::RequestAssembler::More) {
++        size_t used = 0U;
++        parser.append(wire.data() + at, std::min(size_t(8192U), wire.size() - at), used);
++        at += used;
++    }
++    return parser.result();
++}
++}
++
++TEST_CASE("managed alias CSV preserves comma quote space and radio flags", "[p25][user-alias][alias-table]")
++{
++    CSVFile file;
++    {
++        std::ofstream out(file.name);
++        out << "# RID,Enabled,Alias,IP Address,\n"
++            << "10001,1,\"Engine, 12\",192.0.2.1,\n"
++            << "10002,0,\"Desk \"\"A\"\"\",192.0.2.2,\n"
++            << "10003,1,\" Leading\",,\n"
++            << "10004,1,,,\n";
++    }
++    lookups::RadioIdLookup radios(file.name, 0U, true);
++    REQUIRE(radios.read());
++    REQUIRE(radios.find(10001U).radioAlias() == "Engine, 12");
++    REQUIRE(radios.find(10002U).radioAlias() == "Desk \"A\"");
++    REQUIRE_FALSE(radios.find(10002U).radioEnabled());
++    REQUIRE(radios.find(10003U).radioAlias() == " Leading");
++    REQUIRE(radios.find(10004U).radioAlias().empty());
++    REQUIRE(radios.find(10001U).radioIPAddress() == "192.0.2.1");
++    radios.commit(true);
++    lookups::RadioIdLookup again(file.name, 0U, true);
++    REQUIRE(again.read());
++    REQUIRE(again.find(10001U).radioAlias() == "Engine, 12");
++    REQUIRE(again.find(10002U).radioAlias() == "Desk \"A\"");
++    REQUIRE(again.find(10002U).radioIPAddress() == "192.0.2.2");
++    REQUIRE(again.find(10004U).radioAlias().empty());
++}
++
++TEST_CASE("alias snapshots preserve admissions and omit unknown identities", "[p25][user-alias][alias-table]")
++{
++    lookups::RadioIdLookup radios("", 0U, true);
++    radios.addEntry(10001U, true, "Old", "192.0.2.1");
++    radios.addEntry(10002U, false, "Disabled", "192.0.2.2");
++    radios.replaceAliases({{10001U, "Engine, 12"}, {19999U, "Unknown"}});
++    REQUIRE(radios.table().size() == 2U);
++    REQUIRE(radios.find(10001U).radioAlias() == "Engine, 12");
++    REQUIRE(radios.find(10001U).radioEnabled());
++    REQUIRE_FALSE(radios.find(10001U).radioDefault());
++    REQUIRE(radios.find(10001U).radioIPAddress() == "192.0.2.1");
++    REQUIRE(radios.find(10002U).radioAlias().empty());
++    REQUIRE_FALSE(radios.find(10002U).radioEnabled());
++    REQUIRE(radios.find(10002U).radioIPAddress() == "192.0.2.2");
++    REQUIRE(radios.find(19999U).radioDefault());
++    radios.replaceAliases({});
++    REQUIRE(radios.find(10001U).radioAlias().empty());
++    REQUIRE(radios.find(10001U).radioEnabled());
++}
++
++TEST_CASE("alias replacement and frame-time lookups share a mutex", "[p25][user-alias][alias-table]")
++{
++    lookups::RadioIdLookup radios("", 0U, true);
++    radios.addEntry(10001U, true, "Old", "192.0.2.1");
++    std::atomic<bool> done{false}, failed{false};
++    std::thread reader([&] {
++        while (!done) {
++            const auto radio = radios.find(10001U);
++            if (!radio.radioEnabled() || radio.radioDefault() || radio.radioIPAddress() != "192.0.2.1") failed = true;
++        }
++    });
++    for (unsigned i = 0U; i < 1000U; ++i) radios.replaceAliases({{10001U, i % 2U ? "Old" : "New"}});
++    done = true; reader.join();
++    REQUIRE_FALSE(failed.load());
++}
++
++TEST_CASE("alias endpoint authenticates and rejects malformed snapshots atomically", "[p25][user-alias][alias-table]")
++{
++    lookups::RadioIdLookup radios("", 0U, true);
++    radios.addEntry(10001U, true, "Original", "192.0.2.1");
++    radios.addEntry(10002U, false, "Disabled");
++    RESTAPI api("127.0.0.1", 49991U, "unopened-alias-test", "", "", false, nullptr, false);
++    api.setLookups(&radios, nullptr);
++    using Access = p25::UserAliasTableTestAccess;
++    REQUIRE(status(Access::put(api, R"({"aliases":[]})", false)) == 401U);
++    REQUIRE(radios.find(10001U).radioAlias() == "Original");
++    for (const std::string bad : {
++        R"({"aliases":null})", R"({"aliases":[{"rid":10001,"alias":"New"},17]})",
++        R"({"aliases":[{"rid":10001,"alias":"123456789012345"}]})",
++        R"({"aliases":[{"rid":10001,"alias":"Bad\nname"}]})",
++        R"({"aliases":[{"rid":10001,"alias":""}]})",
++        R"({"aliases":[{"rid":10001,"alias":"New","enabled":false}]})",
++        R"({"aliases":[{"rid":0,"alias":"New"}]})", R"({"aliases":[],"enabled":false})"}) {
++        REQUIRE(status(Access::put(api, bad)) == 400U);
++        REQUIRE(radios.find(10001U).radioAlias() == "Original");
++        REQUIRE(radios.find(10001U).radioEnabled());
++    }
++    REQUIRE(status(Access::put(api, R"({"aliases":[{"rid":10001,"alias":"Engine, 12"},{"rid":19999,"alias":"Unknown"}]})")) == 200U);
++    REQUIRE(radios.find(10001U).radioAlias() == "Engine, 12");
++    REQUIRE_FALSE(radios.find(10002U).radioEnabled());
++    REQUIRE(radios.find(10002U).radioAlias().empty());
++    REQUIRE(radios.find(19999U).radioDefault());
++    REQUIRE(status(Access::put(api, R"({"aliases":[]})")) == 200U);
++    REQUIRE(radios.find(10001U).radioAlias().empty());
++}
++
++TEST_CASE("large alias directory framing has an endpoint-specific budget", "[p25][user-alias][alias-table][http]")
++{
++    using Parser = restapi::http::RequestAssembler;
++    Parser parser;
++    const std::string body(Parser::AliasBodyLimit, 'x');
++    REQUIRE(parse(parser, "PUT /p25/aliases HTTP/1.0\r\nContent-Length: 4194304\r\n\r\n" + body) == Parser::Complete);
++    REQUIRE(parser.request().content.size() == body.size());
++    parser.reset();
++    REQUIRE(parse(parser, "PUT /p25/aliases HTTP/1.0\r\nContent-Length: 4194305\r\n\r\n") == Parser::BodyTooLarge);
++    parser.reset();
++    REQUIRE(parse(parser, "PUT /p25/rid HTTP/1.0\r\nContent-Length: 65537\r\n\r\n") == Parser::BodyTooLarge);
++    parser.reset();
++    REQUIRE(parse(parser, "POST /p25/aliases HTTP/1.0\r\nContent-Length: 65537\r\n\r\n") == Parser::BodyTooLarge);
++    parser.reset();
++    REQUIRE(parse(parser, "PUT /p25/aliases HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n400000\r\n" + body + "\r\n0\r\n\r\n") == Parser::Complete);
++    parser.reset();
++    REQUIRE(parse(parser, "PUT /p25/aliases HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n\r\n400000\r\n" + body + "\r\n1\r\nx\r\n0\r\n\r\n") == Parser::BodyTooLarge);
++}
+--- /dev/null
++++ b/tests/p25/UserAlias_Tests.cpp
+@@ -0,0 +1,332 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Phase 1 FNE outbound User Alias: AABD-B-2 7.9 (PDF11-12, pp1-2),
++// AABF-D-2 7.3.35/36 and Table3 (PDF10-12, pp2-4), July2023 addenda.
++// Raw LC vectors transcribe the published ASCII example independently.
++// All modem and network ports remain memory-only or unopened.
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/p25/packet/Voice.h"
++#include "host/p25/packet/FullRateCAI.h"
++#include "common/p25/FullRateGenerate.h"
++#include "common/p25/NID.h"
++#include "common/p25/Sync.h"
++#include "common/Log.h"
++#include "PacketTransportFixture.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <fstream>
++#include <cstdlib>
++#include <chrono>
++
++namespace p25 {
++struct UserAliasTestAccess {
++    static lc::LC select(Control& c, const lc::LC& user, bool commit = true,
++        uint32_t network = 1U, uint32_t system = 1U) {
++        auto next = c.m_voice->m_netUserAlias; lc::LC out;
++        REQUIRE(c.m_voice->selectUserAliasLC(user,next,out,network,system));
++        if (commit) c.m_voice->m_netUserAlias = next;
++        return out;
++    }
++    static bool selected(Control& c, const lc::LC& user, uint32_t system = 1U, uint32_t network = 1U) {
++        auto next = c.m_voice->m_netUserAlias; lc::LC out;
++        const bool ok=c.m_voice->selectUserAliasLC(user,next,out,network,system);
++        c.m_voice->m_netUserAlias=next; return ok;
++    }
++    static void configure(Control& c, bool maintenance = false) {
++        c.m_managedSite=true; c.m_allowExplicitSourceId=true;
++        c.m_enableControl=maintenance; c.m_dedicatedControl=false; c.m_voiceOnControl=false;
++    }
++    static void active(Control& c) { c.m_activeTG={1001U}; }
++    static void enroll(Control& c,uint32_t source) { c.m_dispatchSubscribers.insert(source); }
++    static void reset(Control& c) { c.m_voice->resetRF(); c.m_voice->resetNet(); }
++    static void seed(Control& c, const lc::LC& control) {
++        c.m_netState=RS_NET_AUDIO; c.m_voice->m_netLC=control;
++    }
++    static bool write(Control& c, const lc::LC& control, const fullrate::Batch& voice, bool ldu2 = false) {
++        if (ldu2) {
++            c.m_voice->m_netControl2=control; c.m_voice->m_netFullRate2=voice;
++            return c.m_voice->writeNet_LDU2();
++        }
++        c.m_voice->m_netControl1=control; c.m_voice->m_netFullRate1=voice;
++        return c.m_voice->writeNet_LDU1();
++    }
++    static lc::LC context(Control& c) { return c.m_voice->m_netLC; }
++    static void fill(Control& c) {
++        std::array<uint8_t,218U> bytes{};
++        while(c.addFrame(bytes.data(),bytes.size(),true)) {}
++    }
++};
++}
++namespace {
++using namespace p25;
++using namespace p25::defines;
++constexpr uint32_t Source=10001U, Group=1001U;
++using RawLC=std::array<uint8_t,9U>;
++RawLC raw(lc::LC value) {
++    uint8_t bytes[18U]{}; value.encodeLC(bytes);
++    RawLC result{}; std::copy_n(bytes,9U,result.begin()); return result;
++}
++const RawLC AliasA{{0x32,0xA4,0x31,0x32,0x33,0x34,0x35,0x36,0x37}};
++const RawLC AliasB{{0x33,0xA4,0x38,0x39,0x61,0x62,0x63,0x64,0x65}};
++lc::LC user(bool group=true, uint8_t algorithm=ALGO_UNENCRYPT) {
++    lc::LC value; value.setMFId(MFG_STANDARD); value.setLCO(group?LCO::GROUP:LCO::PRIVATE);
++    value.setGroup(group); value.setSrcId(Source); value.setDstId(Group);
++    value.setNetId(1U); value.setSysId(1U);
++    value.setServiceOptions(algorithm==ALGO_UNENCRYPT?4U:0x44U);
++    value.setAlgId(algorithm); value.setKId(algorithm==ALGO_UNENCRYPT?0U:123U);
++    const uint8_t mi[9U]={1,2,3,4,5,6,7,8,9}; value.setMI(mi); return value;
++}
++struct Fixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"",0U,false};
++    ::lookups::TalkgroupRulesLookup groups{"",0U,false};
++    ::lookups::IdenTableLookup identities{"",0U};
++    ::lookups::RSSIInterpolator rssi;
++    packettest::OfflineModem modem;
++    network::Network network{"127.0.0.1",49991U,0U,100101001U,"unopened-alias-test",true,false,
++        false,true,false,false,false,false,false,false,false,false};
++    network::NetRPC rpc{"127.0.0.1",48991U,0U,"unopened-alias-test",false};
++    network::NetRPC* previous=g_RPC;
++    std::unique_ptr<Control> control;
++    Fixture() {
++        g_logDisplayLevel=0U; g_RPC=&rpc; radios.addEntry(Source,true,"123456789abcde");
++        control=std::make_unique<Control>(true,0x293U,1U,16384U,&modem,&network,120U,1U,true,
++            &channels,&radios,&groups,&identities,&rssi,false,false,false,false,false);
++        yaml::Node configuration;
++        REQUIRE(yaml::Parse(configuration,std::string("protocols:\n    p25:\n        managedSite: true\n        dispatchSubscribers:\n            - 10001\n        verifyReg: false\n        verifyAff: false\n        tduPreambleCount: 0\n        control:\n            enable: false\n            dedicated: false\n")));
++        control->setOptions(configuration,false,"TEST",::lookups::VoiceChData(),1U,1U,1U,1U,2U,25U,false);
++        control->configureIdentification(false); UserAliasTestAccess::configure(*control);
++    }
++    ~Fixture() { control.reset(); g_RPC=previous; }
++    std::vector<uint8_t> frame(int wanted=-1) {
++        std::array<uint8_t,1024U> bytes{}; uint32_t n;
++        while((n=control->getFrame(bytes.data()))!=0U) {
++            if(wanted>=0) { NID nid(0x293U); if(!nid.decode(bytes.data()+2U) || nid.getDUID()!=wanted) continue; }
++            return {bytes.begin(),bytes.begin()+n};
++        }
++        REQUIRE(n!=0U); return {};
++    }
++    void drain() { std::array<uint8_t,1024U> bytes{}; while(control->getFrame(bytes.data())) {} }
++};
++fullrate::Batch voice(const lc::LC& value, bool ldu2=false) {
++    uint8_t mi[9U]{}; value.getMI(mi); fullrate::Batch result;
++    for(unsigned i=0;i<9U;++i)
++        result.voice[i]=fullrate::generatedVoice(NULL_IMBE,uint8_t(i+(ldu2?9U:0U)),0U,mi,value.getAlgId(),value.getKId());
++    if(ldu2) {
++        uint8_t ess[18U]{}; std::copy_n(mi,9U,ess); ess[9]=value.getAlgId();
++        ess[10]=uint8_t(value.getKId()>>8U); ess[11]=uint8_t(value.getKId());
++        edac::RS634717 fec; fec.encode24169(ess);
++        for(unsigned i=0;i<6U;++i) std::copy_n(ess+i*3U,3U,result.voice[i+2U].bytes.data()+14U);
++    }
++    return result;
++}
++std::vector<uint8_t> rfFrame(lc::LC value, DUID::E duid) {
++    const auto n=duid==DUID::HDU?P25_HDU_FRAME_LENGTH_BYTES:P25_LDU_FRAME_LENGTH_BYTES;
++    std::vector<uint8_t> bytes(n+2U); bytes[0]=modem::TAG_DATA; bytes[1]=1U;
++    if(duid!=DUID::HDU) { Audio audio; for(unsigned i=0;i<9U;++i) audio.encode(bytes.data()+2U,NULL_IMBE,i); }
++    if(duid==DUID::HDU) value.encodeHDU(bytes.data()+2U);
++    else if(duid==DUID::LDU1) value.encodeLDU1(bytes.data()+2U);
++    else value.encodeLDU2(bytes.data()+2U);
++    Sync::addP25Sync(bytes.data()+2U); NID nid(0x293U); nid.encode(bytes.data()+2U,duid);
++    P25Utils::addStatusBits(bytes.data()+2U,n*8U,true,false); return bytes;
++}
++std::string hex(const uint8_t* bytes,size_t length) {
++    static const char digits[]="0123456789abcdef"; std::string out;
++    for(size_t i=0;i<length;++i) { out+=digits[bytes[i]>>4U]; out+=digits[bytes[i]&15U]; }
++    return out;
++}
++void evidence(const std::string& kind,unsigned index,const std::vector<uint8_t>& frame,uint8_t opcode,bool secure) {
++    const char* dir=std::getenv("TRUNKSYSTEM_USER_ALIAS_EVIDENCE"); if(dir==nullptr || *dir==0) return;
++    REQUIRE(frame.size()==218U);
++    RawLC expected{{0,0,uint8_t(secure?0x44U:4U),0,3,0xE9,0,0x27,0x11}};
++    if(opcode!=LCO::GROUP) { expected=(opcode==0x32U || opcode==0x34U)?AliasA:AliasB; expected[0]=opcode; }
++    const auto label=kind+"-"+std::to_string(index); const auto filename=label+".rf.bin";
++    std::ofstream binary(std::string(dir)+"/"+filename,std::ios::binary); REQUIRE(binary.good());
++    binary.write(reinterpret_cast<const char*>(frame.data()+2U),216U); REQUIRE(binary.good());
++    static bool first=true; const auto mode=first?std::ios::trunc:std::ios::app;
++    std::ofstream tsv(std::string(dir)+"/frames.tsv",mode); REQUIRE(tsv.good());
++    tsv<<label<<'\t'<<hex(expected.data(),expected.size())<<'\t'<<hex(frame.data()+2U,216U)<<'\n';
++    json::object info; info["case"].set<std::string>(label); info["file"].set<std::string>(filename);
++    info["source_rid"].set<uint32_t>(Source); info["talkgroup"].set<uint32_t>(Group);
++    info["alias"].set<std::string>("123456789abcde"); info["expected_lc_hex"].set<std::string>(hex(expected.data(),9U));
++    const bool observed=false; const uint32_t nac=0x293U, algorithm=secure?ALGO_AES_256:ALGO_UNENCRYPT;
++    info["actual_rf_transmission"].set<bool>(observed); info["actual_usb_device"].set<bool>(observed);
++    info["realtime_pacing"].set<bool>(observed); info["nac"].set<uint32_t>(nac);
++    info["admission"].set<std::string>(kind=="net"?"preaccepted native fixture state":"synthetic RF frames admitted by native controller");
++    info["input_algorithm"].set<uint32_t>(algorithm);
++    info["observation_utc_ns"].set<std::string>(std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
++    std::ofstream jsonl(std::string(dir)+"/frames.jsonl",mode); REQUIRE(jsonl.good()); jsonl<<json::value(info).serialize()<<'\n';
++    first=false;
++}
++}
++
++TEST_CASE("User Alias matches independent published ASCII LC examples and null padding", "[p25][user-alias]") {
++    lc::LC value; value.setMFId(MFG_HARRIS); REQUIRE(value.setUserAlias("123456789abcde"));
++    value.setLCO(0x32U); REQUIRE(raw(value)==AliasA);
++    value.setLCO(0x33U); REQUIRE(raw(value)==AliasB);
++    auto evenA=AliasA,evenB=AliasB; evenA[0]=0x34; evenB[0]=0x35;
++    value.setLCO(0x34U); REQUIRE(raw(value)==evenA);
++    value.setLCO(0x35U); REQUIRE(raw(value)==evenB);
++    REQUIRE(value.setUserAlias("A,\"B")); value.setLCO(0x32U);
++    const RawLC padded{{0x32,0xA4,0x41,0x2C,0x22,0x42,0,0,0}};
++    REQUIRE(raw(value)==padded);
++    for(const auto& invalid : {std::string(),std::string(15U,'x'),std::string("a\nb"),std::string("\x80")}) {
++        REQUIRE_FALSE(value.setUserAlias(invalid)); REQUIRE(value.getUserAlias().empty());
++    }
++}
++TEST_CASE("User Alias receiver completes matching conveyances only and copies partial state safely", "[p25][user-alias]") {
++    lc::LC value; REQUIRE(value.decodeLC(AliasA.data())); REQUIRE(value.getUserAlias().empty());
++    lc::LC copy=value; REQUIRE(copy.decodeLC(AliasB.data())); REQUIRE(copy.getUserAlias()=="123456789abcde");
++    REQUIRE(value.getUserAlias().empty());
++    auto wrong=AliasB; wrong[0]=0x35U;
++    REQUIRE(value.decodeLC(wrong.data())); REQUIRE(value.getUserAlias().empty());
++    // A1 odd, B2 even with missing A2, B3 odd with missing A3 cannot combine.
++    REQUIRE(value.decodeLC(AliasB.data())); REQUIRE(value.getUserAlias().empty());
++    lc::LC orphan; REQUIRE(orphan.decodeLC(AliasB.data())); REQUIRE(orphan.getUserAlias().empty());
++    auto protectedA=AliasA; protectedA[0]|=0x80U;
++    REQUIRE(orphan.decodeLC(protectedA.data())); REQUIRE(orphan.decodeLC(AliasB.data())); REQUIRE(orphan.getUserAlias().empty());
++    REQUIRE(orphan.decodeLC(AliasA.data())); auto protectedB=AliasB; protectedB[0]|=0x80U;
++    REQUIRE(orphan.decodeLC(protectedB.data())); REQUIRE(orphan.decodeLC(AliasB.data())); REQUIRE(orphan.getUserAlias().empty());
++}
++TEST_CASE("User Alias uses existing LC slots with mandatory user and RFSS cadence", "[p25][user-alias]") {
++    for(bool maintenance : {false,true}) {
++        Fixture f; UserAliasTestAccess::configure(*f.control,maintenance);
++        const std::array<uint8_t,12U> expected=maintenance ?
++            std::array<uint8_t,12U>{{0,0x32,0x23,0,0x33,0x23,0,0x34,0x23,0,0x35,0x23}} :
++            std::array<uint8_t,12U>{{0,0x32,0x33,0,0x34,0x35,0,0x32,0x33,0,0x34,0x35}};
++        for(unsigned i=0;i<expected.size();++i) {
++            const auto out=UserAliasTestAccess::select(*f.control,user()); CAPTURE(i,maintenance);
++            REQUIRE(out.getLCO()==expected[i]);
++            REQUIRE(out.getMFId()==(expected[i]>=0x32U && expected[i]<=0x35U ? 0xA4U : 0U));
++        }
++    }
++    Fixture f; UserAliasTestAccess::active(*f.control);
++    for(uint8_t expected : {uint8_t(0),uint8_t(0x32),uint8_t(2),uint8_t(0),uint8_t(0x33),uint8_t(2)})
++        REQUIRE(UserAliasTestAccess::select(*f.control,user()).getLCO()==expected);
++}
++TEST_CASE("User Alias preserves home explicit source extension and bounds unsupported combination", "[p25][user-alias]") {
++    Fixture f;
++    for(bool group : {true,false}) {
++        UserAliasTestAccess::reset(*f.control);
++        auto value=user(group); if(group) value.setExplicitId(true); else value.setLCO(LCO::PRIVATE_EXT);
++        const auto first=UserAliasTestAccess::select(*f.control,value);
++        REQUIRE(first.getLCO()==(group?LCO::GROUP:LCO::PRIVATE_EXT)); REQUIRE(first.getExplicitId());
++        const auto encoded=raw(first); lc::LC decoded; REQUIRE(decoded.decodeLC(encoded.data())); REQUIRE(decoded.getExplicitId());
++        const auto extension=UserAliasTestAccess::select(*f.control,value);
++        REQUIRE(extension.getLCO()==LCO::EXPLICIT_SOURCE_ID); REQUIRE(extension.getSysId()==1U);
++        REQUIRE(UserAliasTestAccess::select(*f.control,value).getLCO()==0x32U);
++    }
++    UserAliasTestAccess::configure(*f.control,true);
++    auto extended=user(); extended.setExplicitId(true);
++    REQUIRE_FALSE(UserAliasTestAccess::selected(*f.control,extended));
++}
++TEST_CASE("Foreign numeric RID collision cannot borrow a local name or pending alias half", "[p25][user-alias]") {
++    Fixture f;
++    for(const auto& identity : {std::pair<uint32_t,uint32_t>{1U,2U},{2U,1U},{0U,0U}}) {
++        UserAliasTestAccess::reset(*f.control);
++        UserAliasTestAccess::select(*f.control,user());
++        REQUIRE(raw(UserAliasTestAccess::select(*f.control,user()))==AliasA);
++        const auto caller=user(); const auto before=raw(caller);
++        REQUIRE_FALSE(UserAliasTestAccess::selected(*f.control,caller,identity.second,identity.first));
++        REQUIRE(raw(caller)==before);
++        REQUIRE(UserAliasTestAccess::select(*f.control,user()).getLCO()==LCO::GROUP);
++        REQUIRE(raw(UserAliasTestAccess::select(*f.control,user()))==AliasA);
++    }
++}
++TEST_CASE("User Alias snapshots each name and resets on source and call retirement", "[p25][user-alias]") {
++    Fixture f; UserAliasTestAccess::select(*f.control,user());
++    REQUIRE(raw(UserAliasTestAccess::select(*f.control,user()))==AliasA);
++    f.radios.addEntry(Source,true,"CHANGED NAME");
++    REQUIRE(raw(UserAliasTestAccess::select(*f.control,user()))==AliasB);
++    UserAliasTestAccess::select(*f.control,user());
++    REQUIRE(UserAliasTestAccess::select(*f.control,user()).getUserAlias()=="CHANGED NAME");
++    auto other=user(); other.setSrcId(10002U); f.radios.addEntry(10002U,true,"SECOND");
++    REQUIRE(UserAliasTestAccess::select(*f.control,other).getLCO()==0U);
++    REQUIRE(UserAliasTestAccess::select(*f.control,other).getLCO()==0x32U);
++    UserAliasTestAccess::reset(*f.control);
++    REQUIRE(UserAliasTestAccess::select(*f.control,user()).getLCO()==0U);
++    f.radios.addEntry(Source,true,"invalid long old name");
++    REQUIRE_FALSE(UserAliasTestAccess::selected(*f.control,user()));
++}
++TEST_CASE("User Alias outgoing LDU survives USB framing without altering voice or crypto", "[p25][user-alias]") {
++    Fixture f; const auto value=user(true,ALGO_AES_256); const auto batch=voice(value);
++    UserAliasTestAccess::seed(*f.control,value);
++    const uint8_t opcodes[]={0,0x32,0x33,0,0x34,0x35};
++    for(unsigned i=0;i<6U;++i) {
++        REQUIRE(UserAliasTestAccess::write(*f.control,value,batch)); auto frame=f.frame();
++        REQUIRE(frame.size()==218U); lc::LC decoded; REQUIRE(decoded.decodeLDU1(frame.data()+2U));
++        REQUIRE(decoded.getLCO()==opcodes[i]); evidence("net",i,frame,opcodes[i],true);
++        Audio audio; const auto recovered=audio.process(frame.data()+2U);
++        for(unsigned n=0;n<9U;++n)
++            REQUIRE(std::equal(recovered.words[n].begin(),recovered.words[n].end(),batch.voice[n].bytes.data()+1U));
++        const auto context=UserAliasTestAccess::context(*f.control);
++        REQUIRE(context.getMFId()==0U); REQUIRE(context.getSrcId()==Source); REQUIRE(context.getDstId()==Group);
++        REQUIRE(context.getAlgId()==ALGO_AES_256); REQUIRE(context.getKId()==123U);
++        REQUIRE(f.modem.poll()); f.modem.receive({0xFE,12,1,0x89,2,0,0,0,0,0,32,0});
++        REQUIRE(f.modem.writeP25Frame(frame.data(),frame.size()));
++        const auto& usb=f.modem.memory->output.back(); REQUIRE(usb[2U]==0x31U);
++        REQUIRE(std::equal(usb.begin()+4U,usb.end(),frame.begin()+2U));
++    }
++    const auto ess=voice(value,true);
++    REQUIRE(UserAliasTestAccess::write(*f.control,value,ess,true)); const auto first=f.frame();
++    UserAliasTestAccess::select(*f.control,value);
++    REQUIRE(UserAliasTestAccess::write(*f.control,value,ess,true)); REQUIRE(f.frame()==first);
++}
++TEST_CASE("User Alias enqueue failure does not lose a conveyance part", "[p25][user-alias]") {
++    Fixture f; const auto value=user(); const auto batch=voice(value);
++    UserAliasTestAccess::seed(*f.control,value);
++    REQUIRE(UserAliasTestAccess::write(*f.control,value,batch)); f.drain();
++    UserAliasTestAccess::fill(*f.control);
++    REQUIRE_FALSE(UserAliasTestAccess::write(*f.control,value,batch)); f.drain();
++    REQUIRE(UserAliasTestAccess::write(*f.control,value,batch)); const auto frame=f.frame();
++    lc::LC decoded; REQUIRE(decoded.decodeLDU1(frame.data()+2U)); REQUIRE(decoded.getLCO()==0x32U);
++}
++TEST_CASE("User Alias is inserted on local RF repeat without changing caller LC", "[p25][user-alias]") {
++    Fixture f; const auto value=user(); auto hdu=rfFrame(value,DUID::HDU);
++    REQUIRE(f.control->processFrame(hdu.data(),hdu.size())); f.drain();
++    unsigned index=0U;
++    for(uint8_t opcode : {uint8_t(0),uint8_t(0x32),uint8_t(0x33),uint8_t(0),uint8_t(0x34),uint8_t(0x35)}) {
++        auto ldu1=rfFrame(value,DUID::LDU1); REQUIRE(f.control->processFrame(ldu1.data(),ldu1.size()));
++        const auto sent=f.frame(DUID::LDU1); lc::LC observed; REQUIRE(observed.decodeLDU1(sent.data()+2U)); REQUIRE(observed.getLCO()==opcode);
++        evidence("rf",index++,sent,opcode,false);
++        auto ldu2=rfFrame(value,DUID::LDU2); REQUIRE(f.control->processFrame(ldu2.data(),ldu2.size())); f.drain();
++    }
++}
++TEST_CASE("RF User Alias waits for actual source extension and preserves its adjacency", "[p25][user-alias]") {
++    for(uint32_t identity : {1U,2U,0U}) {
++        Fixture f; auto value=user(); value.setExplicitId(true); value.setNetId(identity); value.setSysId(identity);
++        auto hdu=rfFrame(value,DUID::HDU); REQUIRE(f.control->processFrame(hdu.data(),hdu.size()));
++        const std::array<uint8_t,6U> expected=identity==1U ?
++            std::array<uint8_t,6U>{{0,9,0x32,0,9,0x33}} : std::array<uint8_t,6U>{{0,9,0,9,0,9}};
++        for(unsigned i=0;i<6U;++i) {
++            auto input=value; if((i&1U)!=0U) input.setLCO(LCO::EXPLICIT_SOURCE_ID);
++            auto bytes=rfFrame(input,DUID::LDU1); REQUIRE(f.control->processFrame(bytes.data(),bytes.size()));
++            const auto sent=f.frame(DUID::LDU1); lc::LC observed; REQUIRE(observed.decodeLDU1(sent.data()+2U));
++            REQUIRE(observed.getLCO()==expected[i]);
++            if(observed.getLCO()==LCO::GROUP) REQUIRE(observed.getExplicitId());
++            if(observed.getLCO()==LCO::EXPLICIT_SOURCE_ID) { REQUIRE(observed.getNetId()==identity); REQUIRE(observed.getSysId()==identity); }
++            auto ldu2=rfFrame(value,DUID::LDU2); REQUIRE(f.control->processFrame(ldu2.data(),ldu2.size())); f.drain();
++        }
++    }
++}
++TEST_CASE("RF caller handover cannot reuse a previous source extension", "[p25][user-alias]") {
++    Fixture f; UserAliasTestAccess::enroll(*f.control,10002U); f.radios.addEntry(10002U,true,"SECOND");
++    auto old=user(); old.setExplicitId(true);
++    auto next=old; next.setSrcId(10002U);
++    auto oldExtension=old; oldExtension.setLCO(LCO::EXPLICIT_SOURCE_ID);
++    auto nextExtension=next; nextExtension.setLCO(LCO::EXPLICIT_SOURCE_ID);
++    auto hdu=rfFrame(old,DUID::HDU); REQUIRE(f.control->processFrame(hdu.data(),hdu.size()));
++    const std::vector<lc::LC> incoming{old,oldExtension,old,next,next,nextExtension,next};
++    const uint8_t expected[]={0,9,0x32,0,0,9,0x32};
++    for(unsigned i=0;i<incoming.size();++i) {
++        auto bytes=rfFrame(incoming[i],DUID::LDU1); REQUIRE(f.control->processFrame(bytes.data(),bytes.size()));
++        const auto sent=f.frame(DUID::LDU1); lc::LC observed; REQUIRE(observed.decodeLDU1(sent.data()+2U));
++        REQUIRE(observed.getLCO()==expected[i]);
++        if(i==5U) { REQUIRE(observed.getNetId()==1U); REQUIRE(observed.getSysId()==1U); }
++        auto ldu2=rfFrame(incoming[i],DUID::LDU2); REQUIRE(f.control->processFrame(ldu2.data(),ldu2.size())); f.drain();
++    }
++    UserAliasTestAccess::reset(*f.control); auto ordinaryPrivate=user(false); ordinaryPrivate.setExplicitId(true);
++    REQUIRE(UserAliasTestAccess::select(*f.control,ordinaryPrivate).getLCO()==LCO::PRIVATE);
++    REQUIRE(UserAliasTestAccess::select(*f.control,ordinaryPrivate).getLCO()==0x32U);
++}

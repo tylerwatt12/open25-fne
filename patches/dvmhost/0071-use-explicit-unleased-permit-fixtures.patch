@@ -1,0 +1,18 @@
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -832,6 +832,7 @@
+     json::object permit, response;
+     setJSON<uint32_t>(permit, "dstId", GROUP);
+         setJSON<uint32_t>(permit, "srcId", SOURCE);
++    setJSON<uint32_t>(permit, "leaseMs", 0U);
+     permit["permitToken"].set<std::string>("abc:2");
+     permit = wireObject(permit);
+     REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, permit, response));
+@@ -941,6 +942,7 @@
+     json::object request, reply;
+     setJSON<uint32_t>(request, "dstId", GROUP);
+         setJSON<uint32_t>(request, "srcId", SOURCE);
++    setJSON<uint32_t>(request, "leaseMs", 0U);
+     request["permitToken"].set<std::string>("abcdef:1");
+     request = wireObject(request);
+     REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));

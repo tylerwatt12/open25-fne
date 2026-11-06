@@ -1,0 +1,63 @@
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -1533,10 +1533,7 @@
+     osp->setSrcId(WUID_FNE);
+     osp->setDstId(dstId);
+ 
+-    if (m_lastMFID != MFG_STANDARD) {
+-        osp->setMFId(m_lastMFID);
+-        m_lastMFID = MFG_STANDARD;
+-    }
++    osp->setMFId(MFG_STANDARD);
+ 
+     VERBOSE_LOG_TSBK_DST(osp->toString(), dstId);
+     ::ActivityLog("P25", true, "group affiliation query command from %u to %u", WUID_FNE, dstId);
+@@ -1552,10 +1549,7 @@
+     osp->setSrcId(WUID_FNE);
+     osp->setDstId(dstId);
+ 
+-    if (m_lastMFID != MFG_STANDARD) {
+-        osp->setMFId(m_lastMFID);
+-        m_lastMFID = MFG_STANDARD;
+-    }
++    osp->setMFId(MFG_STANDARD);
+ 
+     VERBOSE_LOG_TSBK_DST(osp->toString(), dstId);
+     ::ActivityLog("P25", true, "unit registration command from %u to %u", WUID_FNE, dstId);
+--- a/tests/p25/RadioCheckProcedure_Tests.cpp
++++ b/tests/p25/RadioCheckProcedure_Tests.cpp
+@@ -38,6 +38,7 @@
+         body(); signal->s_wuidTransaction=old;
+     }
+     static void redundantImmediate(Control& c) { c.control()->m_redundantImmediate = true; }
++    static uint8_t lastMFID(Control& c) { return c.control()->m_lastMFID; }
+     static void expireRFTimeout(Control& c) { c.m_rfTimeout.start(); c.m_rfTimeout.clock(121000U); }
+ };
+ }
+@@ -444,3 +445,26 @@
+     for(unsigned i=1U;i<=250U;++i) REQUIRE(normal[i-1U]==marker(i));
+     REQUIRE(rawFrames(*f.controller).empty());
+ }
++
++
++// AABC-E2.1/PDF25 printed6 sets MFID00 unless the message overrides it.
++// Figures6.2.7-1/PDF163 printed144 and6.2.20-1/PDF192 printed173 supply
++// these literal ten payload octets; the fixture supplies FEC/CRC framing only.
++TEST_CASE("standard affiliation and registration commands own their MFID without changing another service profile", "[p25][control-profile][mfid][standard-admin-command]") {
++    const std::array<uint8_t,10U> query{{0xAAU,0x00U,0x00U,0x00U,0x00U,0x27U,0x11U,0xFFU,0xFFU,0xFCU}};
++    const std::array<uint8_t,10U> registration{{0xADU,0x00U,0x00U,0x00U,0x00U,0x27U,0x11U,0xFFU,0xFFU,0xFCU}};
++    for (uint8_t previous : {0U,1U,0x90U,0x9CU}) {
++        for (bool demand : {false,true}) {
++            CAPTURE(previous,demand);
++            Fixture f(true); auto* signal=f.controller->control();
++            signal->setLastMFId(previous);
++            if (demand) signal->writeRF_TSDU_U_Reg_Cmd(RID);
++            else signal->writeRF_TSDU_Grp_Aff_Q(RID);
++            const auto blocks=f.responses(); REQUIRE(blocks.size()==1U);
++            CAPTURE(blocks[0]);
++            const auto& expected=demand?registration:query;
++            for (size_t i=0U;i<expected.size();++i) CHECK(blocks[0][i]==expected[i]);
++            CHECK(RadioCheckTestAccess::lastMFID(*f.controller)==previous);
++        }
++    }
++}

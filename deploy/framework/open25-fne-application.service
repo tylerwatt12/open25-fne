@@ -1,0 +1,16 @@
+[Unit]
+Description=Open25 FNE - Application Server
+
+[Service]
+Type=simple
+WorkingDirectory=%h/open25-fne
+ExecStart=%h/open25-fne/open25-fne application --config %h/.local/state/open25-fne/application/service.json
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=15
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

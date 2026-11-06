@@ -1,0 +1,1551 @@
+--- a/src/host/CWIDPolicy.h
++++ b/src/host/CWIDPolicy.h
+@@ -14,17 +14,33 @@
+ 
+ class Policy {
+ public:
+-    Policy() : m_enabled(false), m_startup(false), m_pending(false),
+-        m_dirty(false), m_previousRF(false), m_intervalMs(0U), m_completedAt(0U), m_activityAt(0U) {}
+-
+-    void configure(bool enabled, uint32_t intervalSeconds) {
++    Policy() : m_enabled(false), m_startup(false), m_dirty(false),
++        m_previousRF(false), m_quiet(false), m_draining(false), m_periodicDrain(false),
++        m_controlChannel(false), m_intervalMs(0U), m_quietMs(0U), m_drainMs(0U),
++        m_completedAt(0U), m_activityAt(0U), m_quietAt(0U) {}
++
++    void configure(bool enabled, uint32_t intervalSeconds, uint32_t quietSeconds,
++        uint32_t drainSeconds, bool controlChannel) {
+         m_enabled = enabled;
+         m_startup = enabled;
+-        m_pending = m_dirty = m_previousRF = false;
++        m_dirty = m_previousRF = m_quiet = m_draining = m_periodicDrain = false;
++        m_controlChannel = controlChannel;
+         m_intervalMs = uint64_t(intervalSeconds) * 1000U;
+-        m_completedAt = m_activityAt = 0U;
++        m_quietMs = uint64_t(quietSeconds) * 1000U;
++        m_drainMs = uint64_t(std::min(drainSeconds, intervalSeconds)) * 1000U;
++        m_completedAt = m_activityAt = m_quietAt = 0U;
+     }
+     bool enabled() const { return m_enabled; }
++
++    // Successful non-ID modem writes retain first-activity evidence even if a
++    // short hardware TX status pulse falls between Host observations. Repeated
++    // frames do not slide the periodic clock or manufacture a new quiet period.
++    void noteActivity(uint64_t nowMs) {
++        if (!m_enabled || m_dirty)
++            return;
++        m_activityAt = std::max(nowMs, m_completedAt);
++        m_dirty = true;
++    }
+ 
+     // The caller excludes the identification transmission itself. Only real
+     // non-ID RF activity creates a new periodic/final identification obligation.
+@@ -34,43 +50,75 @@
+         if (tx) {
+             // Silence does not consume a communication's identification interval.
+             // After an ID, anchor the next period to its first real RF activity.
+-            if (!m_dirty)
+-                m_activityAt = std::max(nowMs, m_completedAt);
+-            m_dirty = true;
+-        }
+-        if (m_previousRF && !tx)
+-            m_pending = true;
++            noteActivity(nowMs);
++            m_quiet = false;
++        }
++        if (m_previousRF && !tx) {
++            m_quiet = true;
++            m_quietAt = nowMs;
++        }
+         m_previousRF = tx;
+     }
+-    void noteVoiceEnd() {
+-        if (!m_enabled)
+-            return;
+-        m_dirty = m_pending = true;
++    void noteVoiceEnd(uint64_t nowMs, bool transmittedFrames) {
++        // The P25 layer emits this once for a matching real call ending and
++        // rejects stale/duplicate endings. Retain written-frame evidence if a
++        // short modem TX status pulse was missed; a bare permit is insufficient.
++        if (!m_enabled || (!m_dirty && !transmittedFrames))
++            return;
++        if (!m_dirty)
++            m_activityAt = std::max(nowMs, m_completedAt);
++        m_dirty = true;
++        m_quiet = true;
++        m_quietAt = nowMs;
++    }
++    bool periodicDrainDue(uint64_t nowMs) const {
++        return m_enabled && m_dirty && nowMs >= m_activityAt && nowMs - m_activityAt >= m_drainMs;
++    }
++    bool quietDue(uint64_t nowMs) const {
++        return m_enabled && !m_controlChannel && m_dirty && m_quiet && !m_previousRF &&
++            nowMs >= m_quietAt && nowMs - m_quietAt >= m_quietMs;
++    }
++    bool drainDue(uint64_t nowMs) const {
++        return m_enabled && (m_startup || m_draining || periodicDrainDue(nowMs) || quietDue(nowMs));
++    }
++    // Called only after the controller has atomically closed new admission.
++    // A quiet-time grant winning that boundary leaves this policy untouched.
++    void beginDrain(uint64_t nowMs) {
++        if (!drainDue(nowMs))
++            return;
++        m_periodicDrain = periodicDrainDue(nowMs);
++        m_draining = true;
+     }
+     bool due(uint64_t nowMs) const {
+-        return m_enabled && (m_startup || m_pending ||
+-            (m_dirty && nowMs >= m_activityAt && nowMs - m_activityAt >= m_intervalMs));
++        // Continuous control data requires an intentional pause; voice Morse
++        // must never preempt an RF transmission. Host also checks the actual
++        // P25 call/permit state so inter-frame modem gaps are not mistaken idle.
++        return drainDue(nowMs) && (m_startup || m_controlChannel || !m_previousRF);
+     }
+     const char* reason(uint64_t nowMs) const {
+         if (!due(nowMs))
+             return "";
+         if (m_startup)
+             return "startup";
+-        if (m_pending)
+-            return "voice-end";
+-        return "periodic";
+-    }
+-    bool finalDue() const { return m_enabled && (m_startup || m_pending || m_dirty); }
++        return m_periodicDrain || periodicDrainDue(nowMs) ? "periodic" : "voice-end";
++    }
++    bool draining() const { return m_enabled && m_draining; }
++    bool quiet() const { return m_enabled && !m_startup && !m_draining && m_dirty && m_quiet && !m_previousRF; }
++    bool overdue(uint64_t nowMs) const {
++        return m_enabled && m_dirty && nowMs >= m_activityAt && nowMs - m_activityAt >= m_intervalMs;
++    }
++    bool finalDue() const { return m_enabled && (m_startup || m_dirty); }
+     void complete(uint64_t nowMs) {
+         if (!m_enabled)
+             return;
+-        m_startup = m_pending = m_dirty = m_previousRF = false;
++        m_startup = m_dirty = m_previousRF = m_quiet = m_draining = m_periodicDrain = false;
+         m_completedAt = m_activityAt = nowMs;
++        m_quietAt = 0U;
+     }
+ 
+ private:
+-    bool m_enabled, m_startup, m_pending, m_dirty, m_previousRF;
+-    uint64_t m_intervalMs, m_completedAt, m_activityAt;
++    bool m_enabled, m_startup, m_dirty, m_previousRF, m_quiet, m_draining, m_periodicDrain, m_controlChannel;
++    uint64_t m_intervalMs, m_quietMs, m_drainMs, m_completedAt, m_activityAt, m_quietAt;
+ };
+ 
+ // Shared by the actual P25 reader/site updater and the CW quiesce path.
+--- a/src/host/Host.cpp
++++ b/src/host/Host.cpp
+@@ -359,9 +359,14 @@
+ 
+     // Callsign source also serves digital trunked station identification.
+     m_cwCallsign = systemConf["cwId"]["callsign"].as<std::string>();
++    const std::string identificationMode = systemConf["cwId"]["mode"].as<std::string>();
++    if (identificationMode != "ham" && identificationMode != "bsi") {
++        LogError(LOG_HOST, "Identification mode must be ham or bsi");
++        return EXIT_FAILURE;
++    }
+     // set CW parameters
+     if (systemConf["cwId"]["enable"].as<bool>(false)) {
+-        uint32_t time = systemConf["cwId"]["time"].as<uint32_t>(10U);
++        uint32_t time = systemConf["cwId"]["time"].as<uint32_t>(0U);
+         m_cwCallsign = systemConf["cwId"]["callsign"].as<std::string>();
+ 
+         LogInfo("CW Id Parameters");
+@@ -370,13 +375,18 @@
+ 
+         m_cwIdTime = time * 60U;
+ 
+-        if (!m_p25Enabled || m_dmrEnabled || m_nxdnEnabled || time < 1U || time > 9U ||
++        const uint32_t quietSeconds = systemConf["cwId"]["quietSeconds"].as<uint32_t>(0U);
++        const uint32_t drainSeconds = systemConf["cwId"]["drainSeconds"].as<uint32_t>(0U);
++        if (identificationMode != "ham" || !m_p25Enabled || m_dmrEnabled || m_nxdnEnabled || time < 1U || time > 10U ||
++            quietSeconds == 0U || quietSeconds > 600U || drainSeconds == 0U || drainSeconds > m_cwIdTime ||
+             m_cwCallsign.empty() || m_cwCallsign.size() > 6U ||
+             m_cwCallsign.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != std::string::npos) {
+-            LogError(LOG_HOST, "CW identification requires the P25-only profile, interval 1-9 minutes and an uppercase callsign of 1-6 characters");
++            LogError(LOG_HOST, "CW identification requires Ham P25-only mode, a 1-10 minute interval, bounded quiet/drain settings and an uppercase callsign of 1-6 characters");
+             return EXIT_FAILURE;
+         }
+-        m_identification.configure(true, m_cwIdTime);
++        const bool controlChannel = m_conf["protocols"]["p25"]["control"]["enable"].as<bool>(false) &&
++            m_conf["protocols"]["p25"]["control"]["dedicated"].as<bool>(false);
++        m_identification.configure(true, m_cwIdTime, quietSeconds, drainSeconds, controlChannel);
+     }
+ 
+     // for all modes we handle RSSI
+@@ -1011,11 +1021,27 @@
+         if (m_identification.enabled() && !g_killed) {
+             const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch()).count();
+-            m_identification.observeRF(m_modem->hasTX(), uint64_t(now));
+-            if (m_p25 != nullptr && m_p25->identificationPending())
+-                m_identification.noteVoiceEnd();
+-            if (m_identification.due(uint64_t(now)))
+-                sendIdentification(m_identification.reason(uint64_t(now)), true);
++            const uint64_t nowMs = uint64_t(now);
++            if (m_nonIdentificationFrames.load())
++                m_identification.noteActivity(nowMs);
++            m_identification.observeRF(m_modem->hasTX(), nowMs);
++            if (m_p25 != nullptr && m_p25->consumeIdentificationEnd())
++                m_identification.noteVoiceEnd(nowMs, m_nonIdentificationFrames.load());
++            reportIdentificationOverdue(nowMs);
++            if (m_identification.drainDue(nowMs) && !m_identification.draining()) {
++                // An ordinary quiet-time boundary yields to a previously
++                // committed call. Near the periodic target, close admission
++                // while that accepted call finishes without interruption.
++                const bool requireIdle = !m_identification.periodicDrainDue(nowMs);
++                if (m_p25 == nullptr || m_p25->beginIdentificationDrain(requireIdle))
++                    m_identification.beginDrain(nowMs);
++            }
++            reportIdentificationState(m_identification.draining() ? "draining" :
++                (m_identification.quiet() ? "quiet" : "idle"));
++            if (m_identification.due(nowMs) &&
++                (m_p25 == nullptr || m_p25->identificationIdle()) &&
++                (m_p25CtrlChannel || !m_modem->hasTX()))
++                sendIdentification(m_identification.reason(nowMs), true);
+         }
+ 
+         m_mainLoopStage = 10U; // intentional magic number
+@@ -1278,8 +1304,12 @@
+     // SIGINT is the explicit orderly operator-stop contract. TERM/internal
+     // faults never begin a new autonomous firmware CW transmission.
+     if (!m_identificationFailed && (g_signal == SIGINT || g_signal == SIGHUP) && m_identification.enabled() &&
+-        (m_identification.finalDue() || m_nonIdentificationFrames.load()))
+-        sendIdentification("shutdown", false);
++        (m_identification.finalDue() || m_nonIdentificationFrames.load())) {
++        if ((m_p25 == nullptr || m_p25->identificationIdle()) && (m_p25CtrlChannel || !m_modem->hasTX()))
++            sendIdentification("shutdown", false);
++        else
++            LogWarning(LOG_HOST, "CW, final identification incomplete: channel is not idle");
++    }
+     setState(HOST_STATE_QUIT);
+     return m_identificationFailed ? EXIT_FAILURE : EXIT_SUCCESS;
+ }
+@@ -1708,14 +1738,45 @@
+ };
+ }
+ 
++void Host::reportIdentificationState(const char* state)
++{
++    if (!m_identification.enabled() || m_identificationState == state)
++        return;
++    m_identificationState = state;
++    LogInfoEx(LOG_HOST, "CW, state %s", state);
++}
++
++void Host::reportIdentificationOverdue(uint64_t nowMs)
++{
++    const bool overdue = m_identification.overdue(nowMs);
++    if (!m_identification.enabled() || m_identificationOverdue == overdue)
++        return;
++    m_identificationOverdue = overdue;
++    LogInfoEx(LOG_HOST, "CW, overdue %s", overdue ? "true" : "false");
++}
++
+ bool Host::sendIdentification(const char* reason, bool resume)
+ {
+     if (!m_identification.enabled())
+         return true;
++    // This atomic admission check happens before CW ownership, timeout or
++    // quiescence. A committed PTT winning a quiet-time race simply defers ID;
++    // it must not spend ten seconds waiting and then fault/cut the call off.
++    if (m_p25 != nullptr && !m_p25->tryBeginIdentification()) {
++        if (std::string(reason) == "startup") {
++            LogError(LOG_HOST, "CW, startup identification could not obtain an idle channel");
++            m_identificationFailed = true;
++            return false;
++        }
++        if (std::string(reason) == "shutdown")
++            LogWarning(LOG_HOST, "CW, final identification incomplete: channel is not idle");
++        return true;
++    }
+     const uint64_t operationStarted = identificationNow();
+     const uint64_t operationDeadline = operationStarted + 10000U;
+     m_isTxCW.store(true);
+     m_modem->suppressCWResets(true); // Atomic only; descriptor changes wait for ownership.
++    reportIdentificationState("identifying");
+     LogInfoEx(LOG_HOST, "CW, identification reason %s", reason);
+     LogInfoEx(LOG_HOST, "CW, start transmitting");
+     auto healthy = [this]() {
+@@ -1739,9 +1800,6 @@
+         LogError(LOG_HOST, "CW, identification failed");
+         return false;
+     };
+-    if (!identification::acquireUntil([this]() { return m_p25 == nullptr || m_p25->tryBeginIdentification(); },
+-            operationDeadline, identificationNow, wait, healthy))
+-        return fault();
+     auto readerBarrier = m_p25Processing.quiesce(0U);
+     if (!identification::acquireUntil([&readerBarrier]() { return readerBarrier.owns_lock() || readerBarrier.try_lock(); },
+             std::min(operationDeadline, operationStarted + 1000U), identificationNow, wait, healthy))
+@@ -1758,8 +1816,7 @@
+     if (!m_modem->boundedCWOperation(true)) return fault(true);
+     const bool wasControlRunning = m_p25 != nullptr && m_p25->getCCRunning();
+     m_p25DedicatedTxTestTimer.stop();
+-    const bool normalVoiceEnd = !m_p25CtrlChannel &&
+-        (std::string(reason) == "voice-end" || std::string(reason) == "shutdown");
++    const bool normalVoiceEnd = !m_p25CtrlChannel && std::string(reason) != "startup";
+     if (normalVoiceEnd && m_p25 != nullptr) {
+         if (!m_modem->setState(modem::STATE_P25)) return fault(true);
+         m_p25->queueIdentificationTail();
+@@ -1795,6 +1852,7 @@
+         return fault(true);
+     }
+     m_identification.complete(identificationNow());
++    reportIdentificationOverdue(identificationNow());
+     m_nonIdentificationFrames.store(false);
+     m_modem->clearP25Receive();
+     if (m_p25 != nullptr) {
+@@ -1803,6 +1861,7 @@
+         m_p25->setCCHalted(false);
+     }
+     if (resume && !g_killed && m_p25 != nullptr) {
++        reportIdentificationState("restoring");
+         if (!m_modem->setState(modem::STATE_P25)) return fault(true);
+         CWVoiceDrainTransport resumeTransport(*m_p25, *m_modem, [this]() { m_mainLoopWatchdogTimer.start(); });
+         const uint64_t now = identificationNow();
+@@ -1825,6 +1884,7 @@
+         setState(STATE_P25);
+         if (m_p25 != nullptr)
+             m_p25->completeIdentification();
++        reportIdentificationState("idle");
+     }
+     m_mainLoopWatchdogTimer.start();
+     LogInfoEx(LOG_HOST, "CW, finished transmitting");
+@@ -1911,9 +1971,6 @@
+             m_modem->clearDMRFrame1();
+             m_modem->clearDMRFrame2();
+             m_modem->clearP25Frame();
+-
+-            if (m_state == HOST_STATE_ERROR && m_identification.enabled())
+-                m_identification.noteVoiceEnd();
+ 
+             m_modeTimer.stop();
+ 
+--- a/src/host/Host.h
++++ b/src/host/Host.h
+@@ -120,10 +120,14 @@
+     std::atomic<bool> m_isTxCW;
+     identification::Policy m_identification;
+     bool m_identificationFailed = false;
++    std::string m_identificationState;
++    bool m_identificationOverdue = false;
+     std::recursive_mutex m_stateMutex;
+     identification::ActivityBarrier m_p25Processing;
+     std::atomic<bool> m_nonIdentificationFrames{false};
+     bool sendIdentification(const char* reason, bool resume);
++    void reportIdentificationState(const char* state);
++    void reportIdentificationOverdue(uint64_t nowMs);
+ 
+     Timer m_modeTimer;
+     Timer m_dmrTXTimer;
+--- a/src/host/p25/Control.Dispatch.cpp
++++ b/src/host/p25/Control.Dispatch.cpp
+@@ -72,11 +72,11 @@
+     return result;
+ }
+ 
+-bool Control::dispatchReady() const
++bool Control::dispatchReady(bool admitNew) const
+ {
+     return m_dispatchEnabled && !m_dispatchClosing.load() && m_authoritative && m_supervisor &&
+         m_enableControl && m_dedicatedControl && m_duplex && m_ccRunning && !m_ccHalted &&
+-        !identificationUnavailable() && m_modem != nullptr && !m_modem->hasError() &&
++        !identificationActive() && (!admitNew || !identificationUnavailable()) && m_modem != nullptr && !m_modem->hasError() &&
+         !m_modem->hasLockout() && m_modem->statusGeneration() != 0U &&
+         m_modem->getState() == modem::DVM_STATE::STATE_P25 && g_RPC != nullptr &&
+         (m_network == nullptr || m_network->getStatus() == network::NET_STAT_RUNNING);
+@@ -116,7 +116,7 @@
+             m_dispatchLease.channelNo, m_dispatchLease.epoch);
+         if (!owned) endDispatch("lost");
+         else if (Clock::now() >= m_dispatchExpires) endDispatch("expired");
+-        else if (!dispatchReady()) endDispatch("unavailable");
++        else if (!dispatchReady(false)) endDispatch("unavailable");
+     }
+     std::shared_ptr<DispatchOperation> operation;
+     {
+@@ -179,7 +179,7 @@
+             endDispatch("released");
+             auto result = m_dispatchHistory.at(request.leaseId); result.accepted = true; return result;
+         }
+-        if (!dispatchReady()) { endDispatch("unavailable"); rejected.message = "dispatch owner unavailable"; return rejected; }
++        if (!dispatchReady(false)) { endDispatch("unavailable"); rejected.message = "dispatch owner unavailable"; return rejected; }
+         const auto lease = m_dispatchLease;
+         std::string permitToken;
+         ::lookups::VoiceChData channel;
+@@ -201,7 +201,7 @@
+                     response["permitToken"].is<std::string>() && response["permitToken"].get<std::string>() == permitToken);
+             }, channel.address(), channel.port(), true);
+         auto guard = m_affiliations->lockGrants();
+-        if (!replied || !accepted->load() || !dispatchReady() || Clock::now() >= m_dispatchExpires ||
++        if (!replied || !accepted->load() || !dispatchReady(false) || Clock::now() >= m_dispatchExpires ||
+             Clock::now() >= operation->deadline || operation->phase.load() == DispatchOperation::Cancelled ||
+             !m_affiliations->ownsGrant(lease.dstId, lease.srcId, lease.channelNo, lease.epoch)) {
+             endDispatch("lost"); rejected.message = "voice permit renewal not accepted"; return rejected;
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -235,14 +235,39 @@
+     m_txQueue.clear();
+ }
+ 
+-/* Pending latching and permit commits share a total order. */
++/* A real call ending is an event, not an immediate withdrawal. */
+ void Control::requestIdentification()
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
+     if (m_identificationEnabled.load()) {
+         m_identificationPending.store(true);
+-        m_identificationUnavailable.store(true);
+-    }
++    }
++}
++
++bool Control::identificationIdle()
++{
++    std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
++    if (m_rfState.load() != RS_RF_LISTENING || m_netState.load() != RS_NET_IDLE)
++        return false;
++    if (!m_authoritative) {
++        std::lock_guard<std::mutex> releases(m_permitReleases->mutex);
++        return m_permittedDstId.load() == 0U && m_permitReleases->pending.empty() && !m_permitReleases->overflow;
++    }
++    auto grants = m_affiliations->lockGrants();
++    return m_affiliations->getGrantedRFChCnt() == 0U;
++}
++
++/* Withdrawal and permit commits share a total order; an accepted call drains. */
++bool Control::beginIdentificationDrain(bool requireIdle)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
++    // RF allocation commit holds this same guard through grant enqueue.
++    // A concurrent withdrawal either wins before commit or drains that grant.
++    auto grants = m_affiliations->lockGrants();
++    if (!m_identificationEnabled.load() || (requireIdle && !identificationIdle()))
++        return false;
++    m_identificationUnavailable.store(true);
++    return true;
+ }
+ 
+ bool Control::tryBeginIdentification()
+@@ -251,7 +276,8 @@
+     if (!lock.owns_lock())
+         return false;
+     if (m_identificationEnabled.load()) {
+-        m_identificationPending.store(true);
++        if (!identificationIdle())
++            return false;
+         m_identificationUnavailable.store(true);
+         m_identificationActive.store(true);
+     }
+@@ -308,9 +334,8 @@
+     yaml::Node systemConf = conf["system"];
+     yaml::Node p25Protocol = conf["protocols"]["p25"];
+ 
+-    // The one identification switch gates both modem Morse and digital
+-    // Motorola control-channel station identification.
+-    m_control->m_ctrlStationId = systemConf["cwId"]["enable"].as<bool>(false);
++    // Digital BSI is independent of the Ham Morse scheduler.
++    m_control->m_ctrlStationId = systemConf["bsi"]["enable"].as<bool>(false);
+ 
+     if (m_isModemDFSI) {
+         yaml::Node modemConf = systemConf["modem"];
+@@ -697,6 +722,8 @@
+ 
+ bool Control::processFrame(uint8_t* data, uint32_t len)
+ {
++    std::unique_lock<std::recursive_mutex> permitLock(m_permitMutex, std::defer_lock);
++    if (!m_authoritative) permitLock.lock();
+     if (identificationActive()) return false;
+     assert(data != nullptr);
+ 
+@@ -799,7 +826,7 @@
+     }
+ 
+     if (m_debug) {
+-        LogDebug(LOG_RF, "P25, rfState = %u, netState = %u, DUID = %u, lastDUID = %u", m_rfState, m_netState, duid, m_voice->m_lastDUID);
++        LogDebug(LOG_RF, "P25, rfState = %u, netState = %u, DUID = %u, lastDUID = %u", m_rfState.load(), m_netState.load(), duid, m_voice->m_lastDUID);
+     }
+ 
+     // are we interrupting a running CC?
+@@ -989,6 +1016,9 @@
+ 
+ void Control::clock()
+ {
++    std::unique_lock<std::recursive_mutex> permitLock(m_permitMutex, std::defer_lock);
++    if (!m_authoritative) permitLock.lock();
++    if (!m_authoritative) retryPermitReleases();
+     clockDispatch();
+     uint32_t ms = m_interval.elapsed();
+     m_interval.start();
+@@ -1540,6 +1570,8 @@
+ 
+ void Control::processNetwork()
+ {
++    std::unique_lock<std::recursive_mutex> permitLock(m_permitMutex, std::defer_lock);
++    if (!m_authoritative) permitLock.lock();
+     uint32_t length = 0U;
+     bool ret = false;
+     UInt8Array buffer = m_network->readP25(ret, length);
+@@ -1915,60 +1947,69 @@
+ 
+ void Control::notifyCC_ReleaseGrant(uint32_t dstId)
+ {
+-    if (dstId == 0U)
+-        return;
+-    // Latch before notifying/releasing the CC so the next permit cannot race
+-    // the end-of-transmission identification obligation on this VC.
+-    if (!m_authoritative && dstId != 0U)
+-        requestIdentification();
+-    if (m_controlChData.address().empty()) {
+-        return;
+-    }
+-
+-    if (m_controlChData.port() == 0) {
+-        return;
+-    }
+-
+-    if (!m_notifyCC) {
+-        return;
+-    }
+-
+-    if (m_verbose) {
+-        LogInfoEx(LOG_P25, "CC %s:%u, notifying CC of call termination, dstId = %u", m_controlChData.address().c_str(), m_controlChData.port(), dstId);
+-    }
+-
+-    // callback REST API to release the granted TG on the specified control channel
+-    json::object req = json::object();
+-    req["dstId"].set<uint32_t>(dstId);
+-
+-    g_RPC->req(RPC_RELEASE_P25_TG, req, [=](json::object& req, json::object& reply) {
+-        if (!req["status"].is<int>()) {
+-            ::LogError(LOG_P25, "failed to notify the CC %s:%u of the release of, dstId = %u, invalid RPC response", m_controlChData.address().c_str(), m_controlChData.port(), dstId);
+-            return;
+-        }
+-
+-        int status = req["status"].get<int>();
+-        if (status != network::NetRPC::OK) {
+-            ::LogError(LOG_P25, "failed to notify the CC %s:%u of the release of, dstId = %u", m_controlChData.address().c_str(), m_controlChData.port(), dstId);
+-            if (req["message"].is<std::string>()) {
+-                std::string retMsg = req["message"].get<std::string>();
+-                ::LogError(LOG_P25, "RPC failed, %s", retMsg.c_str());
+-            }
+-        } 
+-        else
+-            ::LogInfoEx(LOG_P25, "CC %s:%u, released grant, dstId = %u", m_controlChData.address().c_str(), m_controlChData.port(), dstId);
+-    }, m_controlChData.address(), m_controlChData.port());
+-
++    std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
++    if (dstId == 0U || m_authoritative || m_permittedDstId.load() != dstId)
++        return;
++    const std::string endedPermit = m_permitToken;
++    // The local call ended, but the CC may still advertise this allocation.
++    // Keep CW blocked until it confirms retirement of this exact token.
++    if (m_notifyCC && !m_controlChData.address().empty() && m_controlChData.port() != 0U && !endedPermit.empty()) {
++        std::lock_guard<std::mutex> releases(m_permitReleases->mutex);
++        if (m_permitReleases->pending.size() < 256U)
++            m_permitReleases->pending.emplace(endedPermit, dstId);
++        else {
++            m_permitReleases->overflow = true; // Bound memory and fail closed for CW.
++            LogError(LOG_P25, "voice release acknowledgement queue is full; identification remains blocked");
++        }
++    }
++    requestIdentification();
++    m_permittedDstId.store(0U);
++    m_permitToken.clear();
++    m_nextPermitRelease = std::chrono::steady_clock::time_point();
++    retryPermitReleases();
+     m_rfLastDstId = 0U;
+     m_rfLastSrcId = 0U;
+     m_netLastDstId = 0U;
+     m_netLastSrcId = 0U;
+ }
+ 
++/* Retry one conditional retirement without blocking RF or permit ownership. */
++void Control::retryPermitReleases()
++{
++    if (g_RPC == nullptr || m_authoritative || std::chrono::steady_clock::now() < m_nextPermitRelease)
++        return;
++    const auto barrier = m_permitReleases;
++    std::string token;
++    uint32_t destination = 0U;
++    {
++        std::lock_guard<std::mutex> releases(barrier->mutex);
++        if (barrier->pending.empty())
++            return;
++        token = barrier->pending.begin()->first;
++        destination = barrier->pending.begin()->second;
++    }
++    m_nextPermitRelease = std::chrono::steady_clock::now() + std::chrono::milliseconds(500U);
++    json::object request;
++    request["dstId"].set<uint32_t>(destination);
++    request["permitToken"].set<std::string>(token);
++    g_RPC->req(RPC_RELEASE_P25_TG, request, [barrier, token, destination](json::object& response, json::object&) {
++        if (!response["status"].is<int>() || response["status"].get<int>() != network::NetRPC::OK ||
++            !response["dstId"].is<int>() || response["dstId"].get<uint32_t>() != destination ||
++            !response["permitToken"].is<std::string>() || response["permitToken"].get<std::string>() != token ||
++            !response["allocationRetired"].is<bool>() || !response["allocationRetired"].get<bool>())
++            return;
++        std::lock_guard<std::mutex> releases(barrier->mutex);
++        barrier->pending.erase(token);
++    }, m_controlChData.address(), m_controlChData.port());
++}
++
+ /* Helper to send a REST API request to the CC to "touch" a channel grant to refresh grant timers. */
+ 
+ void Control::notifyCC_TouchGrant(uint32_t dstId)
+ {
++    std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
++    if (m_permittedDstId.load() != dstId || m_permitToken.empty())
++        return;
+     if (m_controlChData.address().empty()) {
+         return;
+     }
+@@ -1984,6 +2025,7 @@
+     // callback REST API to touch the granted TG on the specified control channel
+     json::object req = json::object();
+     req["dstId"].set<uint32_t>(dstId);
++    req["permitToken"].set<std::string>(m_permitToken);
+ 
+     g_RPC->req(RPC_TOUCH_P25_TG, req, [=](json::object& req, json::object& reply) {
+         if (!req["status"].is<int>()) {
+@@ -2159,27 +2201,29 @@
+         return;
+     }
+     const uint32_t dstId = req["dstId"].get<uint32_t>();
++    std::string token;
++    if (!req["permitToken"].is<std::string>() || req["permitToken"].get<std::string>().empty() ||
++        req["permitToken"].get<std::string>().size() > 64U) {
++        g_RPC->defaultResponse(reply, "permitToken was not a bounded string", network::NetRPC::INVALID_ARGS);
++        return;
++    }
++    token = req["permitToken"].get<std::string>();
++    if (dstId == 0U && token != m_permitToken) {
++        g_RPC->defaultResponse(reply, "permit is no longer owned by that allocation", network::NetRPC::BAD_REQUEST);
++        return;
++    }
++    reply["permitToken"].set<std::string>(token);
++    reply["dstId"].set<uint32_t>(dstId);
+     if (dstId != 0U && identificationUnavailable()) {
+-        g_RPC->defaultResponse(reply, "voice channel is identifying", network::NetRPC::BAD_REQUEST);
+-        return;
+-    }
+-    const bool correlated = req.find("permitToken") != req.end();
+-    std::string token;
+-    if (correlated) {
+-        if (!req["permitToken"].is<std::string>() || req["permitToken"].get<std::string>().empty() ||
+-            req["permitToken"].get<std::string>().size() > 64U) {
+-            g_RPC->defaultResponse(reply, "permitToken was not a bounded string", network::NetRPC::INVALID_ARGS);
++        // A repeat of an already committed permit remains owned while the
++        // channel drains. New tokens must use another voice resource.
++        if (dstId == m_permittedDstId.load() && token == m_permitToken)
+             return;
+-        }
+-        token = req["permitToken"].get<std::string>();
+-        if (dstId == 0U && token != m_permitToken) {
+-            g_RPC->defaultResponse(reply, "permit is no longer owned by that allocation", network::NetRPC::BAD_REQUEST);
+-            return;
+-        }
++        g_RPC->defaultResponse(reply, "voice channel is draining or identifying", network::NetRPC::BAD_REQUEST);
+         reply["permitToken"].set<std::string>(token);
+         reply["dstId"].set<uint32_t>(dstId);
+-    } else if (!m_permitSession.empty()) {
+-        g_RPC->defaultResponse(reply, "correlated permit requires correlated cleanup", network::NetRPC::BAD_REQUEST);
++        const bool unavailable = true;
++        reply["identificationUnavailable"].set<bool>(unavailable);
+         return;
+     }
+     const bool dataPermit = req["dataPermit"].is<bool>() && req["dataPermit"].get<bool>();
+@@ -2187,7 +2231,7 @@
+         g_RPC->defaultResponse(reply, "voice channel does not support SNDCP", network::NetRPC::BAD_REQUEST);
+         return;
+     }
+-    if (correlated && dstId != 0U) {
++    if (dstId != 0U) {
+         const size_t separator = token.find(':');
+         const auto hex = [](const std::string& value) {
+             return !value.empty() && value.size() <= 16U &&
+@@ -2294,6 +2338,20 @@
+         return;
+     }
+ 
++    if (!req["permitToken"].is<std::string>() || req["permitToken"].get<std::string>().empty() ||
++        req["permitToken"].get<std::string>().size() > 64U) {
++        g_RPC->defaultResponse(reply, "release requires a bounded permitToken", network::NetRPC::INVALID_ARGS);
++        return;
++    }
++    const std::string token = req["permitToken"].get<std::string>();
++    auto grant = m_affiliations->lockGrants();
++    reply["dstId"].set<uint32_t>(dstId);
++    reply["permitToken"].set<std::string>(token);
++    const bool retired = true;
++    reply["allocationRetired"].set<bool>(retired);
++    if (token != m_affiliations->grantPermitToken(dstId))
++        return; // Already retired. A stale repeat never touches its replacement.
++
+     // LogDebugEx(LOG_P25, "Control::RPC_releaseGrantTG()", "callback, dstId = %u", dstId);
+ 
+     if (m_verbose) {
+@@ -2334,6 +2392,13 @@
+ 
+     if (dstId == 0U) {
+         g_RPC->defaultResponse(reply, "destination ID is an illegal TGID");
++        return;
++    }
++
++    auto grant = m_affiliations->lockGrants();
++    if (!req["permitToken"].is<std::string>() || req["permitToken"].get<std::string>().empty() ||
++        req["permitToken"].get<std::string>() != m_affiliations->grantPermitToken(dstId)) {
++        g_RPC->defaultResponse(reply, "touch no longer owns that allocation", network::NetRPC::BAD_REQUEST);
+         return;
+     }
+ 
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -208,6 +208,9 @@
+         void setSupervisor(bool supervisor) { m_supervisor = supervisor; }
+         void configureIdentification(bool enabled) { m_identificationEnabled.store(enabled); if (!enabled) completeIdentification(); }
+         void requestIdentification();
++        bool consumeIdentificationEnd() { return m_identificationEnabled.load() && m_identificationPending.exchange(false); }
++        bool beginIdentificationDrain(bool requireIdle = false);
++        bool identificationIdle();
+         bool tryBeginIdentification();
+         void clearIdentificationTraffic();
+         void queueIdentificationTail();
+@@ -311,8 +314,9 @@
+         void shutdownDispatch();
+         DispatchResult executeDispatch(const std::shared_ptr<DispatchOperation>& operation);
+         void endDispatch(const std::string& state);
+-        bool dispatchReady() const;
++        bool dispatchReady(bool admitNew = true) const;
+         void rememberDispatch(const DispatchResult& result);
++        void retryPermitReleases();
+         bool m_dispatchEnabled = false;
+         std::atomic<bool> m_dispatchClosing{false};
+         std::mutex m_dispatchQueueMutex;
+@@ -375,10 +379,10 @@
+         RingBuffer<uint8_t> m_txQueue;
+         static std::mutex s_queueLock;
+ 
+-        RPT_RF_STATE m_rfState;
++        std::atomic<RPT_RF_STATE> m_rfState;
+         uint32_t m_rfLastDstId;
+         uint32_t m_rfLastSrcId;
+-        RPT_NET_STATE m_netState;
++        std::atomic<RPT_NET_STATE> m_netState;
+         uint32_t m_netLastDstId;
+         uint32_t m_netLastSrcId;
+ 
+@@ -388,6 +392,14 @@
+         std::atomic<bool> m_identificationUnavailable{false};
+         std::atomic<bool> m_identificationActive{false};
+         std::string m_permitToken;
++        struct PermitReleaseBarrier {
++            std::mutex mutex;
++            std::unordered_map<std::string, uint32_t> pending;
++            bool overflow = false;
++        };
++        // RPC callbacks retain only this state, never a destroyed Control.
++        std::shared_ptr<PermitReleaseBarrier> m_permitReleases{std::make_shared<PermitReleaseBarrier>()};
++        std::chrono::steady_clock::time_point m_nextPermitRelease{};
+         std::string m_permitSession;
+         uint64_t m_permitSequence = 0U;
+         std::set<std::string> m_retiredPermitSessions;
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -38,6 +38,8 @@
+ #include <atomic>
+ #include <memory>
+ #include <sstream>
++#include <set>
++#include <chrono>
+ 
+ // ---------------------------------------------------------------------------
+ //  Macros
+@@ -2356,7 +2358,7 @@
+ 
+         std::unique_lock<std::recursive_mutex> grantGuard;
+         if (grp) {
+-            if (!permitTrafficChannel(voiceChData, dstId, srcId, chNo, false, grantGuard)) {
++            if (!permitAvailableTrafficChannel(voiceChData, dstId, srcId, chNo, true, net, false, grantGuard)) {
+                 if (!net) {
+                     writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_PTT_BONK, TSBKO::IOSP_GRP_VCH, true, true);
+                     m_p25->m_rfState = RS_RF_REJECTED;
+@@ -2435,7 +2437,7 @@
+             }
+         }
+         else {
+-            if (!permitTrafficChannel(voiceChData, dstId, srcId, chNo, false, grantGuard)) {
++            if (!permitAvailableTrafficChannel(voiceChData, dstId, srcId, chNo, false, net, false, grantGuard)) {
+                 if (!net) {
+                     writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_PTT_BONK, TSBKO::IOSP_UU_VCH, false, true);
+                     m_p25->m_rfState = RS_RF_REJECTED;
+@@ -2516,6 +2518,10 @@
+     if (m_p25->m_voiceOnControl)
+         return;
+ 
++    // Retirement ACKs and periodic updates share one winner. A copied table
++    // must not regenerate an old grant after its release was acknowledged.
++    auto grantGuard = m_p25->m_affiliations->lockGrants();
++
+     // write group voice grant update
+     if (m_p25->m_affiliations->grantSize() > 0) {
+         if (m_mbfGrpGrntCnt >= m_p25->m_affiliations->grantSize())
+@@ -2651,13 +2657,16 @@
+         ::lookups::VoiceChData voiceChData = m_p25->m_affiliations->rfCh()->getRFChData(chNo);
+ 
+         std::unique_lock<std::recursive_mutex> grantGuard;
+-        if (!permitTrafficChannel(voiceChData, srcId, srcId, chNo, true, grantGuard)) {
++        if (!permitAvailableTrafficChannel(voiceChData, srcId, srcId, chNo, false, false, true, grantGuard)) {
+             writeRF_TSDU_Deny(srcId, srcId, ReasonCode::DENY_PTT_BONK, TSBKO::ISP_SNDCP_CH_REQ, false, true);
+             m_p25->m_rfState = RS_RF_REJECTED;
+             LogError(LOG_RF, "P25 data channel permit failed, chNo = %u-%u, srcId = %u", voiceChData.chId(), chNo, srcId);
+             return false;
+         }
+ 
++        osp->setGrpVchId(voiceChData.chId());
++        osp->setGrpVchNo(chNo);
++        osp->setDataChnNo(chNo);
+         ::ActivityLog("P25", true, "SNDCP grant request from %u", srcId);
+ 
+         if (m_verbose) {
+@@ -2679,8 +2688,11 @@
+ /* Require a correlated positive VC permit before emitting a supervised grant. */
+ 
+ bool ControlSignaling::permitTrafficChannel(const ::lookups::VoiceChData& channel, uint32_t dstId,
+-    uint32_t srcId, uint32_t chNo, bool dataPermit, std::unique_lock<std::recursive_mutex>& grantGuard)
+-{
++    uint32_t srcId, uint32_t chNo, bool dataPermit, std::unique_lock<std::recursive_mutex>& grantGuard,
++    bool* identificationUnavailable)
++{
++    if (identificationUnavailable != nullptr)
++        *identificationUnavailable = false;
+     if (!m_p25->m_authoritative || !m_p25->m_supervisor)
+         return true;
+ 
+@@ -2701,9 +2713,15 @@
+     static std::atomic<uint64_t> nextToken{0U};
+     std::ostringstream tokenText;
+     tokenText << std::hex << nonce << ':' << ++nextToken;
+-    const std::string token = tokenText.str();
+-    allocations->setGrantPermitToken(dstId, epoch, token);
++    // A repeated grant for the same allocation reaffirms its committed permit.
++    // In particular, entering Draining must not revoke an already accepted call.
++    std::string token = allocations->grantPermitToken(dstId);
++    if (token.empty()) {
++        token = tokenText.str();
++        allocations->setGrantPermitToken(dstId, epoch, token);
++    }
+     auto accepted = std::make_shared<std::atomic<bool>>(false);
++    auto unavailable = std::make_shared<std::atomic<bool>>(false);
+     json::object request;
+     request["dstId"].set<uint32_t>(dstId);
+     request["permitToken"].set<std::string>(token);
+@@ -2715,14 +2733,21 @@
+     }
+     grantGuard.unlock(); // never hold the allocation lock across an RPC wait
+     const bool replied = g_RPC->req(RPC_PERMIT_P25_TG, request,
+-        [accepted, token, dstId](json::object& response, json::object&) {
++        [accepted, unavailable, token, dstId](json::object& response, json::object&) {
++            const bool correlated = response["dstId"].is<int>() && response["dstId"].get<uint32_t>() == dstId &&
++                response["permitToken"].is<std::string>() && response["permitToken"].get<std::string>() == token;
+             accepted->store(response["status"].is<int>() && response["status"].get<int>() == network::NetRPC::OK &&
+-                response["dstId"].is<int>() && response["dstId"].get<uint32_t>() == dstId &&
+-                response["permitToken"].is<std::string>() && response["permitToken"].get<std::string>() == token);
++                correlated);
++            unavailable->store(correlated && response["status"].is<int>() &&
++                response["status"].get<int>() == network::NetRPC::BAD_REQUEST &&
++                response["identificationUnavailable"].is<bool>() && response["identificationUnavailable"].get<bool>());
+         }, channel.address(), channel.port(), true);
+     grantGuard.lock();
+     if (replied && accepted->load() && !m_p25->identificationUnavailable() && allocations->ownsGrant(dstId, srcId, chNo, epoch))
+         return true; // keep the guard until the RF grant has been enqueued
++
++    if (identificationUnavailable != nullptr)
++        *identificationUnavailable = replied && unavailable->load() && !m_p25->identificationUnavailable();
+ 
+     // Only this epoch can be rolled back. A late cleanup must not revoke a
+     // different allocation that has already taken over this physical VC.
+@@ -2736,6 +2761,40 @@
+     return false;
+ }
+ 
++/* Retry only a correlated withdrawal response, never malformed/ACL/timeouts. */
++bool ControlSignaling::permitAvailableTrafficChannel(::lookups::VoiceChData& channel, uint32_t dstId,
++    uint32_t srcId, uint32_t& chNo, bool grp, bool net, bool dataPermit,
++    std::unique_lock<std::recursive_mutex>& grantGuard)
++{
++    std::set<uint32_t> attempted;
++    // Native RPC has its own 200ms deadline. Bound the entire candidate walk
++    // to this window plus at most one final in-flight RPC; never loop on a VC.
++    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(400U);
++    while (chNo != 0U && attempted.insert(chNo).second) {
++        bool unavailable = false;
++        if (permitTrafficChannel(channel, dstId, srcId, chNo, dataPermit, grantGuard, &unavailable))
++            return true;
++        if (!unavailable || std::chrono::steady_clock::now() >= until)
++            return false;
++        if (grantGuard.owns_lock())
++            grantGuard.unlock();
++        auto* allocations = m_p25->m_affiliations;
++        if (!allocations->grantCh(dstId, srcId, GRANT_TIMER_TIMEOUT, grp, net))
++            return false;
++        chNo = allocations->getGrantedCh(dstId);
++        channel = allocations->rfCh()->getRFChData(chNo);
++        if (attempted.count(chNo) != 0U) {
++            // The remaining free pool contains only candidates already tried.
++            auto guard = allocations->lockGrants();
++            const uint64_t epoch = allocations->grantEpoch(dstId);
++            if (allocations->ownsGrant(dstId, srcId, chNo, epoch))
++                allocations->releaseGrant(dstId, false);
++            return false;
++        }
++    }
++    return false;
++}
++
+ /* Helper to write a unit to unit answer request packet. */
+ 
+ void ControlSignaling::writeRF_TSDU_UU_Ans_Req(uint32_t srcId, uint32_t dstId)
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -244,7 +244,11 @@
+             void writeNetworkRF(lc::TDULC* tduLc, const uint8_t* data, bool autoReset);
+ 
+             bool permitTrafficChannel(const ::lookups::VoiceChData& channel, uint32_t dstId, uint32_t srcId,
+-                uint32_t chNo, bool dataPermit, std::unique_lock<std::recursive_mutex>& grantGuard);
++                uint32_t chNo, bool dataPermit, std::unique_lock<std::recursive_mutex>& grantGuard,
++                bool* identificationUnavailable = nullptr);
++            bool permitAvailableTrafficChannel(::lookups::VoiceChData& channel, uint32_t dstId, uint32_t srcId,
++                uint32_t& chNo, bool grp, bool net, bool dataPermit,
++                std::unique_lock<std::recursive_mutex>& grantGuard);
+ 
+             /*
+             ** Modem Frame Queuing
+--- a/tests/CWIDPolicy_Tests.cpp
++++ b/tests/CWIDPolicy_Tests.cpp
+@@ -61,55 +61,139 @@
+ };
+ }
+ 
+-TEST_CASE("CW policy identifies startup and real RF without self-generating idle RF", "[cwid][policy]") {
++TEST_CASE("Ham voice ID starts once and an unused resource stays silent", "[cwid][policy][policy2]") {
+     Policy policy;
+     REQUIRE_FALSE(policy.enabled());
+     REQUIRE_FALSE(policy.due(0U));
+-    policy.configure(true, 540U);
++    policy.configure(true, 600U, 60U, 540U, false);
+     REQUIRE(policy.enabled());
+     REQUIRE(policy.due(0U));
+     REQUIRE(std::string(policy.reason(0U)) == "startup");
+     REQUIRE(policy.finalDue());
+     policy.complete(100U);
+     REQUIRE_FALSE(policy.finalDue());
+-    REQUIRE_FALSE(policy.due(10000000U)); // An unused capacity channel stays silent.
+-    policy.observeRF(false, 100U);
++    REQUIRE_FALSE(policy.drainDue(10000000U));
+     REQUIRE_FALSE(policy.due(10000000U));
+-    policy.observeRF(true, 100U);
++    REQUIRE_FALSE(policy.overdue(10000000U));
++    policy.noteVoiceEnd(10000000U, false); // A grant/orphan end without RF creates no ID.
++    REQUIRE_FALSE(policy.finalDue());
++    REQUIRE_FALSE(policy.due(10000000U));
++}
++
++TEST_CASE("Ham ending identification waits sixty quiet seconds and replies restart only quiet time", "[cwid][policy][policy2]") {
++    Policy policy;
++    policy.configure(true, 600U, 60U, 540U, false);
++    policy.complete(0U);
++    policy.observeRF(true, 1000U);
++    policy.observeRF(false, 2000U);
++    policy.noteVoiceEnd(2000U, true);
++    REQUIRE(policy.quiet());
++    REQUIRE_FALSE(policy.drainDue(61999U));
++    REQUIRE(policy.quietDue(62000U));
++    REQUIRE(policy.drainDue(62000U));
++    REQUIRE(std::string(policy.reason(62000U)) == "voice-end");
++    // A previously committed reply wins the quiet boundary. No withdrawal was
++    // committed, so the real RF resets quiet waiting without resetting age.
++    policy.observeRF(true, 62000U);
++    REQUIRE_FALSE(policy.drainDue(62000U));
++    REQUIRE_FALSE(policy.quiet());
++    policy.observeRF(false, 63000U);
++    policy.noteVoiceEnd(63000U, true);
++    REQUIRE_FALSE(policy.drainDue(122999U));
++    REQUIRE(policy.drainDue(123000U));
++    // Continue short replies without a full quiet minute: the original first
++    // RF timestamp, not the most recent PTT, still controls periodic withdrawal.
++    for (uint64_t at = 123000U; at < 541000U; at += 30000U) {
++        policy.observeRF(true, at);
++        policy.observeRF(false, at + 1000U);
++    }
++    REQUIRE_FALSE(policy.periodicDrainDue(540999U));
++    REQUIRE(policy.periodicDrainDue(541000U));
++    REQUIRE_FALSE(policy.overdue(600999U));
++    REQUIRE(policy.overdue(601000U));
++}
++
++TEST_CASE("A matched written call ending resets quiet time even when a TX status pulse was missed", "[cwid][policy][policy2]") {
++    Policy policy;
++    policy.configure(true, 600U, 60U, 540U, false);
++    policy.complete(0U);
++    policy.noteVoiceEnd(1000U, false); // An unused permit creates no obligation.
++    REQUIRE_FALSE(policy.finalDue());
++    policy.noteActivity(1000U); // First successful write, no sampled TX pulse.
++    policy.noteVoiceEnd(2000U, true); // Actual written frames, no sampled TX pulse.
+     REQUIRE(policy.finalDue());
+-    REQUIRE_FALSE(policy.due(540099U));
+-    REQUIRE(policy.due(540100U));
+-    REQUIRE(std::string(policy.reason(540100U)) == "periodic");
+-    policy.complete(540100U);
+-    REQUIRE_FALSE(policy.due(540100U));
++    REQUIRE_FALSE(policy.quietDue(61999U));
++    policy.noteVoiceEnd(30000U, true); // A different real reply, also not sampled.
++    REQUIRE_FALSE(policy.quietDue(89999U));
++    REQUIRE(policy.quietDue(90000U));
++    policy.noteActivity(40000U); // Further frames cannot move the first-write time.
++    REQUIRE_FALSE(policy.periodicDrainDue(540999U));
++    REQUIRE(policy.periodicDrainDue(541000U)); // The original activity age survives.
++}
++
++TEST_CASE("Near-target draining never makes Ham Morse due during a held PTT", "[cwid][policy][policy2]") {
++    Policy policy;
++    policy.configure(true, 600U, 60U, 540U, false);
++    policy.complete(0U);
++    policy.observeRF(true, 1000U);
++    REQUIRE_FALSE(policy.drainDue(540999U));
++    REQUIRE(policy.drainDue(541000U));
++    REQUIRE_FALSE(policy.due(541000U));
++    policy.beginDrain(541000U);
++    REQUIRE(policy.draining());
++    REQUIRE_FALSE(policy.due(541000U));
++    policy.observeRF(true, 720000U); // Owner-selected policy waits even overdue.
++    REQUIRE(policy.overdue(720000U));
++    REQUIRE_FALSE(policy.due(720000U));
++    policy.observeRF(false, 720001U);
++    policy.noteVoiceEnd(720001U, true);
++    REQUIRE(policy.due(720001U)); // No additional sixty-second wait while drained.
++    REQUIRE(std::string(policy.reason(720001U)) == "periodic");
++    policy.complete(726000U);
++    REQUIRE_FALSE(policy.draining());
++    REQUIRE_FALSE(policy.overdue(726000U));
+     REQUIRE_FALSE(policy.finalDue());
+-    policy.observeRF(false, 540100U); // Completion reset the old TX edge.
+-    REQUIRE_FALSE(policy.due(540101U));
+-    policy.observeRF(true, 540101U);
+-    REQUIRE_FALSE(policy.due(540101U));
+-    policy.observeRF(false, 540102U);
+-    REQUIRE(policy.due(540102U));
+-    REQUIRE(std::string(policy.reason(540102U)) == "voice-end");
+-}
+-
+-TEST_CASE("CW policy explicit end, reset and disabled observations preserve eligibility", "[cwid][policy]") {
+-    Policy policy;
+-    policy.configure(true, 540U);
++    REQUIRE_FALSE(policy.due(9999999U));
++}
++
++TEST_CASE("Dedicated control data uses its own periodic drain and no voice quiet timer", "[cwid][policy][policy2]") {
++    Policy policy;
++    policy.configure(true, 600U, 60U, 540U, true);
++    policy.complete(0U);
++    policy.observeRF(true, 10U);
++    REQUIRE_FALSE(policy.drainDue(540009U));
++    REQUIRE(policy.drainDue(540010U));
++    policy.beginDrain(540010U);
++    // The Host separately waits for all accepted voice grants to end before
++    // intentionally pausing continuous control transmission.
++    REQUIRE(policy.due(540010U));
++    REQUIRE(std::string(policy.reason(540010U)) == "periodic");
++    policy.complete(546000U);
++    policy.observeRF(true, 546001U);
++    policy.observeRF(false, 546002U);
++    REQUIRE_FALSE(policy.quietDue(606002U));
++    REQUIRE_FALSE(policy.drainDue(606002U));
++}
++
++TEST_CASE("Ham scheduler ignores backwards time and disabling clears all pending work", "[cwid][policy][policy2]") {
++    Policy policy;
++    policy.configure(true, 600U, 60U, 540U, false);
+     policy.complete(900U);
+-    policy.noteVoiceEnd();
+-    REQUIRE(policy.due(901U));
+-    REQUIRE(policy.finalDue());
+-    REQUIRE(std::string(policy.reason(901U)) == "voice-end");
+-    policy.complete(1000U);
+     policy.observeRF(true, 1000U);
+-    REQUIRE_FALSE(policy.due(999U)); // Clock regression must not wrap elapsed time.
+-    policy.configure(false, 1U);
+-    policy.observeRF(true, 0U); policy.observeRF(false, 0U); policy.noteVoiceEnd(); policy.complete(0U);
++    REQUIRE_FALSE(policy.drainDue(999U));
++    REQUIRE_FALSE(policy.overdue(999U));
++    policy.observeRF(false, 2000U);
++    REQUIRE_FALSE(policy.quietDue(1999U));
++    policy.configure(false, 600U, 60U, 540U, false);
++    policy.observeRF(true, 0U); policy.observeRF(false, 0U);
++    policy.noteVoiceEnd(0U, true); policy.beginDrain(~uint64_t(0U)); policy.complete(0U);
+     REQUIRE_FALSE(policy.enabled());
+     REQUIRE_FALSE(policy.due(~uint64_t(0U)));
++    REQUIRE_FALSE(policy.drainDue(~uint64_t(0U)));
++    REQUIRE_FALSE(policy.overdue(~uint64_t(0U)));
+     REQUIRE_FALSE(policy.finalDue());
+     REQUIRE(std::string(policy.reason(0U)).empty());
+-    policy.configure(true, 540U);
++    policy.configure(true, 600U, 60U, 540U, false);
+     REQUIRE(std::string(policy.reason(0U)) == "startup");
+ }
+ 
+@@ -327,26 +411,24 @@
+     }
+ }
+ 
+-TEST_CASE("First RF after a long idle gets its own continuous identification interval", "[cwid][lifecycle]") {
+-    Policy policy;
+-    policy.configure(true, 540U);
++TEST_CASE("First RF after a long idle gets a fresh Ham periodic interval", "[cwid][lifecycle][policy2]") {
++    Policy policy;
++    policy.configure(true, 600U, 60U, 540U, false);
+     policy.complete(1000U);
+     const uint64_t firstRF = 29U * 60U * 1000U;
+     REQUIRE_FALSE(policy.due(firstRF));
+     policy.observeRF(true, firstRF);
+-    REQUIRE_FALSE(policy.due(firstRF));
+-    policy.observeRF(true, firstRF + 539999U);
+-    REQUIRE_FALSE(policy.due(firstRF + 539999U));
+-    REQUIRE(policy.due(firstRF + 540000U));
+-    REQUIRE(std::string(policy.reason(firstRF + 540000U)) == "periodic");
+-    policy.complete(firstRF + 545000U);
+-    policy.observeRF(true, firstRF + 545001U); // Same continuing communication after its ID.
+-    REQUIRE_FALSE(policy.due(firstRF + 545001U));
+-    REQUIRE(policy.due(firstRF + 1085001U));
+-    policy.observeRF(false, firstRF + 1085002U);
+-    REQUIRE(std::string(policy.reason(firstRF + 1085002U)) == "voice-end");
+-    policy.complete(firstRF + 1090000U);
+-    policy.observeRF(true, firstRF + 1090001U); // A rapid new communication remains eligible.
+-    policy.observeRF(false, firstRF + 1090002U);
+-    REQUIRE(std::string(policy.reason(firstRF + 1090002U)) == "voice-end");
+-}
++    REQUIRE_FALSE(policy.drainDue(firstRF));
++    REQUIRE_FALSE(policy.drainDue(firstRF + 539999U));
++    REQUIRE(policy.drainDue(firstRF + 540000U));
++    policy.beginDrain(firstRF + 540000U);
++    REQUIRE_FALSE(policy.due(firstRF + 600001U));
++    policy.observeRF(false, firstRF + 600002U);
++    REQUIRE(policy.due(firstRF + 600002U));
++    policy.complete(firstRF + 606000U);
++    policy.observeRF(true, firstRF + 606001U);
++    REQUIRE_FALSE(policy.drainDue(firstRF + 606001U));
++    policy.observeRF(false, firstRF + 606002U);
++    REQUIRE_FALSE(policy.due(firstRF + 606002U));
++    REQUIRE(policy.due(firstRF + 666002U));
++}
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -39,6 +39,11 @@
+     static void advanceHang(Control& value, uint32_t ms) { value.m_rfTGHang.clock(ms); }
+     static void advanceCallTerm(Control& value, uint32_t ms) { value.m_rfVoiceCallTermTimeout.clock(ms); }
+     static void notifyEnd(Control& value, uint32_t destination) { value.notifyCC_ReleaseGrant(destination); }
++    static void retryRelease(Control& value) {
++        auto lock = permitGuard(value);
++        value.m_nextPermitRelease = std::chrono::steady_clock::time_point();
++        value.retryPermitReleases();
++    }
+     static std::unique_lock<std::recursive_mutex> permitGuard(Control& value) { return std::unique_lock<std::recursive_mutex>(value.m_permitMutex); }
+ };
+ }
+@@ -90,27 +95,47 @@
+     PermitMode mode = PermitMode::Accepted;
+     unsigned permits = 0;
+     std::vector<uint32_t> releases;
++    std::vector<uint16_t> permitPorts;
+     std::function<void()> beforeReply;
+     RPCType late;
+     json::object lateRequest;
+     std::function<bool(uint16_t, json::object&, json::object&)> nativeHandler;
++    std::function<bool(uint16_t, uint16_t, json::object&, json::object&)> nativeChannelHandler;
++    std::function<void(const json::object&, RPCType)> releaseHandler;
+     using NetRPC::dispatchRequest;
+     PermitRPC() : NetRPC("127.0.0.1", 48991U, 0U, "offline-test", false) {}
+-    bool req(uint16_t func, const json::object& request, RPCType callback, std::string, uint16_t, bool blocking = false) override {
+-        if (func == RPC_RELEASE_P25_TG)
++    bool req(uint16_t func, const json::object& request, RPCType callback, std::string, uint16_t port, bool blocking = false) override {
++        if (func == RPC_RELEASE_P25_TG) {
+             releases.push_back(request.at("dstId").get<uint32_t>());
++            REQUIRE_FALSE(blocking);
++            REQUIRE(callback != nullptr);
++            if (releaseHandler) releaseHandler(request, callback);
++            else {
++                json::object response, ignored;
++                setJSON<int>(response, "status", OK);
++                response["dstId"] = request.at("dstId");
++                response["permitToken"] = request.at("permitToken");
++                const bool retired = true;
++                response["allocationRetired"].set<bool>(retired);
++                response = wireObject(response);
++                callback(response, ignored);
++            }
++            return true;
++        }
+         if (func != RPC_PERMIT_P25_TG || request.at("dstId").get<uint32_t>() == 0U)
+             return true; // asynchronous unpermit after rollback
+         ++permits;
++        permitPorts.push_back(port);
+         REQUIRE(blocking);
+         REQUIRE(callback != nullptr);
+         if (beforeReply) beforeReply();
+         if (mode == PermitMode::Timeout) return false;
+         if (mode == PermitMode::Late) { late = callback; lateRequest = request; return false; }
+         json::object response;
+-        if (nativeHandler) {
++        if (nativeHandler || nativeChannelHandler) {
+             json::object copied = wireObject(request);
+-            REQUIRE(nativeHandler(func, copied, response));
++            if (nativeChannelHandler) REQUIRE(nativeChannelHandler(func, port, copied, response));
++            else REQUIRE(nativeHandler(func, copied, response));
+             json::object ignored;
+             response = wireObject(response);
+             callback(response, ignored);
+@@ -664,6 +689,58 @@
+     REQUIRE(send(0U, "abc:2") == network::NetRPC::OK);
+ }
+ 
++TEST_CASE("Wire permits and clears always require a correlation token", "[p25][capacity-permit]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.permitVoice("abc:1");
++    for (uint32_t destination : {0U, GROUP, GROUP + 1U}) {
++        json::object request, reply;
++        setJSON<uint32_t>(request, "dstId", destination);
++        request = wireObject(request);
++        REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));
++        REQUIRE(reply["status"].get<int>() == network::NetRPC::INVALID_ARGS);
++    }
++    json::object clear, reply;
++    setJSON<uint32_t>(clear, "dstId", 0U);
++    clear["permitToken"].set<std::string>("abc:1");
++    clear = wireObject(clear);
++    REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, clear, reply));
++    REQUIRE(reply["status"].get<int>() == network::NetRPC::OK); // Rejections preserved its owner.
++}
++
++TEST_CASE("Late VC releases and touches cannot affect a replacement TG allocation", "[p25][capacity-permit]") {
++    ControllerFixture control(true);
++    control.registerAndAffiliate();
++    control.controller->setSupervisor(true);
++    control.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, VOICE_CHANNEL, "127.0.0.1", 48993U, "offline-test"));
++    control.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++    REQUIRE_FALSE(control.drain().empty());
++    const std::string oldToken = control.controller->affiliations()->grantPermitToken(GROUP);
++    REQUIRE_FALSE(oldToken.empty());
++    REQUIRE(control.controller->affiliations()->releaseGrant(GROUP, false));
++    control.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++    REQUIRE_FALSE(control.drain().empty());
++    const uint64_t newEpoch = control.controller->affiliations()->grantEpoch(GROUP);
++    const std::string newToken = control.controller->affiliations()->grantPermitToken(GROUP);
++    REQUIRE_FALSE(newToken.empty()); REQUIRE(newToken != oldToken);
++    auto send = [&](uint16_t function, const std::string& token) {
++        json::object request, reply;
++        setJSON<uint32_t>(request, "dstId", GROUP);
++        if (!token.empty()) request["permitToken"].set<std::string>(token);
++        request = wireObject(request);
++        REQUIRE(control.rpc.dispatchRequest(function, request, reply));
++        return reply["status"].get<int>();
++    };
++    REQUIRE(send(RPC_RELEASE_P25_TG, "") == network::NetRPC::INVALID_ARGS);
++    REQUIRE(send(RPC_RELEASE_P25_TG, oldToken) == network::NetRPC::OK); // Idempotent retirement ACK.
++    REQUIRE(control.controller->affiliations()->ownsGrant(GROUP, SOURCE, VOICE_CHANNEL, newEpoch));
++    REQUIRE(send(RPC_TOUCH_P25_TG, "") == network::NetRPC::BAD_REQUEST);
++    REQUIRE(send(RPC_TOUCH_P25_TG, oldToken) == network::NetRPC::BAD_REQUEST);
++    REQUIRE(control.controller->affiliations()->ownsGrant(GROUP, SOURCE, VOICE_CHANNEL, newEpoch));
++    REQUIRE(send(RPC_TOUCH_P25_TG, newToken) == network::NetRPC::OK);
++    REQUIRE(send(RPC_RELEASE_P25_TG, newToken) == network::NetRPC::OK);
++    REQUIRE_FALSE(control.controller->affiliations()->isGranted(GROUP));
++}
++
+ TEST_CASE("Identification closes new grants and also rechecks an outstanding permit", "[p25][cwid]") {
+     for (bool duringReply : {false, true}) {
+         DYNAMIC_SECTION("CW pending during reply " << duringReply) {
+@@ -672,8 +749,8 @@
+             fixture.controller->configureIdentification(true);
+             fixture.controller->setSupervisor(true);
+             fixture.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, VOICE_CHANNEL, "127.0.0.1", 48993U, "offline-test"));
+-            if (duringReply) fixture.rpc.beforeReply = [&]() { fixture.controller->requestIdentification(); };
+-            else fixture.controller->requestIdentification();
++            if (duringReply) fixture.rpc.beforeReply = [&]() { fixture.controller->beginIdentificationDrain(); };
++            else fixture.controller->beginIdentificationDrain();
+             fixture.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
+             REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
+             REQUIRE(fixture.rpc.permits == (duringReply ? 1U : 0U));
+@@ -682,23 +759,29 @@
+     }
+ }
+ 
+-TEST_CASE("VC end latches unavailability before release and master off bypasses it", "[p25][cwid]") {
++TEST_CASE("VC end records one event while the quiet period stays grantable", "[p25][cwid][idle-identification]") {
+     ControllerFixture voice(true, false, false, false, false);
+     voice.controller->configureIdentification(true);
++    voice.permitVoice("abc:1");
+     CapacityPermitTestAccess::notifyEnd(*voice.controller, GROUP);
+     REQUIRE(voice.controller->identificationPending());
+-    REQUIRE(voice.controller->identificationUnavailable());
++    REQUIRE_FALSE(voice.controller->identificationUnavailable());
++    REQUIRE(voice.controller->consumeIdentificationEnd());
++    REQUIRE_FALSE(voice.controller->consumeIdentificationEnd());
++    CapacityPermitTestAccess::notifyEnd(*voice.controller, GROUP);
++    REQUIRE_FALSE(voice.controller->consumeIdentificationEnd()); // duplicate end
+     json::object permit, response;
+     setJSON<uint32_t>(permit, "dstId", GROUP);
+-    permit["permitToken"].set<std::string>("abc:1");
++    permit["permitToken"].set<std::string>("abc:2");
+     permit = wireObject(permit);
+     REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, permit, response));
+-    REQUIRE(response["status"].get<int>() == network::NetRPC::BAD_REQUEST);
++    REQUIRE(response["status"].get<int>() == network::NetRPC::OK);
+     voice.controller->configureIdentification(false);
+     CapacityPermitTestAccess::notifyEnd(*voice.controller, GROUP);
+     REQUIRE_FALSE(voice.controller->identificationPending());
+     REQUIRE_FALSE(voice.controller->identificationUnavailable());
+     response.clear();
++    permit["permitToken"].set<std::string>("abc:3");
+     permit = wireObject(permit);
+     REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, permit, response));
+     REQUIRE(response["status"].get<int>() == network::NetRPC::OK);
+@@ -724,7 +807,7 @@
+     auto permit = CapacityPermitTestAccess::permitGuard(*voice.controller);
+     auto begin = std::async(std::launch::async, [&]() { return voice.controller->tryBeginIdentification(); });
+     REQUIRE_FALSE(begin.get()); // Host can honor its deadline without blocking here.
+-    auto pending = std::async(std::launch::async, [&]() { voice.controller->requestIdentification(); });
++    auto pending = std::async(std::launch::async, [&]() { voice.controller->beginIdentificationDrain(); });
+     const bool latchedDuringCommit = pending.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready;
+     permit.unlock();
+     pending.get();
+@@ -779,6 +862,158 @@
+     REQUIRE(voice.rpc.releases.back() == GROUP);
+ }
+ 
++TEST_CASE("Draining honors a committed PTT and refuses subsequent permits", "[p25][cwid][idle-identification]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.voiceMode();
++    voice.permitVoice("abcdef:1");
++    REQUIRE_FALSE(voice.controller->identificationIdle());
++    REQUIRE_FALSE(voice.controller->beginIdentificationDrain(true));
++    REQUIRE_FALSE(voice.controller->identificationUnavailable());
++    REQUIRE(voice.voiceFrame(DUID::HDU));
++    REQUIRE(voice.voiceFrame(DUID::LDU1));
++    voice.drainVoice();
++    REQUIRE(voice.controller->beginIdentificationDrain());
++    REQUIRE_FALSE(voice.controller->tryBeginIdentification());
++    REQUIRE_FALSE(voice.controller->identificationActive());
++    // The accepted speaker continues through withdrawal without an RF cut.
++    REQUIRE(voice.voiceFrame(DUID::LDU2));
++    REQUIRE_FALSE(voice.drainVoice().empty());
++    json::object request, reply;
++    setJSON<uint32_t>(request, "dstId", GROUP);
++    request["permitToken"].set<std::string>("abcdef:1");
++    request = wireObject(request);
++    REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));
++    REQUIRE(reply["status"].get<int>() == network::NetRPC::OK); // same accepted permit
++    request["permitToken"].set<std::string>("abcdef:2");
++    request = wireObject(request); // Each real request is decoded afresh; get<uint32_t> normalizes in place.
++    reply.clear();
++    REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));
++    REQUIRE(reply["status"].get<int>() == network::NetRPC::BAD_REQUEST);
++    REQUIRE(reply["identificationUnavailable"].get<bool>());
++    REQUIRE(reply["permitToken"].get<std::string>() == "abcdef:2");
++    REQUIRE(voice.voiceFrame(DUID::TDU));
++    REQUIRE(voice.controller->identificationIdle());
++    REQUIRE(voice.controller->consumeIdentificationEnd());
++    REQUIRE(voice.controller->tryBeginIdentification());
++    REQUIRE(voice.controller->identificationActive());
++    voice.controller->clearIdentificationTraffic();
++    voice.controller->reset();
++    voice.controller->completeIdentification();
++    REQUIRE_FALSE(voice.controller->identificationUnavailable());
++    voice.permitVoice("abcdef:3");
++}
++
++TEST_CASE("Voice identification waits for token-matched retirement after lost release packets", "[p25][capacity-permit][cwid][idle-identification]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.voiceMode();
++    ControllerFixture control(true);
++    control.registerAndAffiliate();
++    control.controller->setSupervisor(true);
++    control.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, VOICE_CHANNEL, "127.0.0.1", 48993U, "offline-test"));
++    control.rpc.nativeHandler = [&](uint16_t function, json::object& request, json::object& reply) {
++        return voice.rpc.dispatchRequest(function, request, reply);
++    };
++    control.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++    REQUIRE_FALSE(control.drain().empty());
++    const std::string token = control.controller->affiliations()->grantPermitToken(GROUP);
++    REQUIRE_FALSE(token.empty());
++    unsigned sends = 0U;
++    control.rpc.releaseHandler = [&](const json::object& request, network::NetRPC::RPCType callback) {
++        ++sends;
++        REQUIRE(request.at("permitToken").get<std::string>() == token);
++        if (sends == 1U) return; // The release request itself was lost.
++        json::object decoded = wireObject(request), response, ignored;
++        REQUIRE(control.rpc.dispatchRequest(RPC_RELEASE_P25_TG, decoded, response));
++        REQUIRE_FALSE(control.controller->affiliations()->isGranted(GROUP));
++        if (sends == 2U) return; // CC retired the mapping, but this reply was lost.
++        response = wireObject(response);
++        if (sends == 3U) response["permitToken"].set<std::string>("wrong:1");
++        callback(response, ignored);
++    };
++    REQUIRE(voice.voiceFrame(DUID::HDU));
++    REQUIRE(voice.voiceFrame(DUID::LDU1));
++    REQUIRE(voice.voiceFrame(DUID::TDU));
++    REQUIRE(voice.controller->consumeIdentificationEnd());
++    REQUIRE(voice.controller->beginIdentificationDrain());
++    REQUIRE(control.controller->affiliations()->isGranted(GROUP));
++    OfflineScheduler scheduler(control.controller.get());
++    scheduler.writeRF_ControlData(2U, 5U, false);
++    const auto outstanding = control.drain();
++    REQUIRE(std::any_of(outstanding.begin(), outstanding.end(), [](const std::unique_ptr<TSBK>& frame) {
++        return frame->getLCO() == TSBKO::OSP_GRP_VCH_GRANT_UPD;
++    })); // The stale announcement really exists while the first release is lost.
++    REQUIRE_FALSE(voice.controller->identificationIdle());
++    REQUIRE_FALSE(voice.controller->tryBeginIdentification());
++    for (unsigned retry = 0U; retry < 2U; ++retry) {
++        CapacityPermitTestAccess::retryRelease(*voice.controller);
++        REQUIRE_FALSE(voice.controller->identificationIdle());
++        REQUIRE_FALSE(voice.controller->tryBeginIdentification());
++        REQUIRE_FALSE(voice.controller->identificationActive());
++    }
++    CapacityPermitTestAccess::retryRelease(*voice.controller); // Already retired: correlated idempotent ACK.
++    REQUIRE(sends == 4U);
++    REQUIRE(voice.controller->identificationIdle());
++    REQUIRE(voice.controller->tryBeginIdentification());
++    REQUIRE(voice.controller->identificationActive());
++    REQUIRE_FALSE(control.controller->affiliations()->isGranted(GROUP));
++    scheduler.writeRF_ControlData(2U, 5U, false);
++    for (const auto& frame : control.drain()) REQUIRE(frame->getLCO() != TSBKO::OSP_GRP_VCH_GRANT_UPD);
++}
++
++TEST_CASE("A supervised request skips identifying channels in the same allocation", "[p25][capacity-permit][idle-identification]") {
++    for (bool allUnavailable : {false, true}) {
++        DYNAMIC_SECTION("all unavailable " << allUnavailable) {
++            ControllerFixture first(true, false, false, false, false);
++            first.voiceMode();
++            REQUIRE(first.controller->beginIdentificationDrain());
++            REQUIRE(first.controller->tryBeginIdentification());
++            ControllerFixture second(true, false, false, false, false);
++            second.voiceMode();
++            if (allUnavailable) REQUIRE(second.controller->beginIdentificationDrain());
++            ControllerFixture control(true);
++            control.registerAndAffiliate();
++            control.controller->setSupervisor(true);
++            control.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, VOICE_CHANNEL, "127.0.0.1", 48993U, "offline-test"));
++            control.channels.setRFChData(VOICE_CHANNEL + 1U, ::lookups::VoiceChData(2U, VOICE_CHANNEL + 1U, "127.0.0.1", 48994U, "offline-test"));
++            control.channels.addRFCh(VOICE_CHANNEL + 1U);
++            control.rpc.nativeChannelHandler = [&](uint16_t func, uint16_t port, json::object& req, json::object& reply) {
++                return (port == 48993U ? first.rpc : second.rpc).dispatchRequest(func, req, reply);
++            };
++            control.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++            REQUIRE(control.rpc.permitPorts == std::vector<uint16_t>{48993U, 48994U});
++            auto frames = control.drain();
++            REQUIRE_FALSE(frames.empty());
++            if (allUnavailable) {
++                REQUIRE_FALSE(control.controller->affiliations()->isGranted(GROUP));
++                REQUIRE(control.channels.rfChSize() == 2U);
++                for (const auto& frame : frames) REQUIRE(frame->getLCO() == TSBKO::OSP_DENY_RSP);
++            } else {
++                REQUIRE(control.controller->affiliations()->getGrantedCh(GROUP) == VOICE_CHANNEL + 1U);
++                for (const auto& frame : frames) {
++                    REQUIRE(frame->getLCO() == TSBKO::IOSP_GRP_VCH);
++                    REQUIRE(frame->getGrpVchId() == 2U);
++                    REQUIRE(frame->getGrpVchNo() == VOICE_CHANNEL + 1U);
++                }
++                // Now end that permit locally while leaving the CC's old TG
++                // allocation in place, then withdraw it. A repeat request must
++                // not blindly reuse the stale mapping.
++                CapacityPermitTestAccess::notifyEnd(*second.controller, GROUP);
++                REQUIRE(second.controller->beginIdentificationDrain());
++                first.controller->completeIdentification();
++                control.rpc.permitPorts.clear();
++                control.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++                REQUIRE(control.rpc.permitPorts == std::vector<uint16_t>{48994U, 48993U});
++                REQUIRE(control.controller->affiliations()->getGrantedCh(GROUP) == VOICE_CHANNEL);
++                for (const auto& frame : control.drain()) {
++                    REQUIRE(frame->getLCO() == TSBKO::IOSP_GRP_VCH);
++                    REQUIRE(frame->getGrpVchId() == 2U);
++                    REQUIRE(frame->getGrpVchNo() == VOICE_CHANNEL);
++                }
++            }
++        }
++    }
++}
++
+ TEST_CASE("Orphan ends preserve standalone LC and master-off voice behavior", "[p25][cwid][lifecycle]") {
+     ControllerFixture voice(true, false, false, false, false);
+     voice.voiceMode(false);
+@@ -806,7 +1041,9 @@
+     REQUIRE(voice.voiceFrame(DUID::LDU2));
+     REQUIRE(voice.voiceFrame(DUID::LDU1));
+     REQUIRE(voice.voiceFrame(DUID::TDU));
+-    REQUIRE(voice.controller->identificationUnavailable());
++    REQUIRE_FALSE(voice.controller->identificationUnavailable());
++    REQUIRE(voice.controller->consumeIdentificationEnd());
++    REQUIRE(voice.controller->beginIdentificationDrain(true));
+     REQUIRE(voice.controller->tryBeginIdentification());
+     voice.controller->queueIdentificationTail();
+     struct ActualQueueDrain : identification::DrainTransport {
+--- a/tests/p25/DigitalStationId_Tests.cpp
++++ b/tests/p25/DigitalStationId_Tests.cpp
+@@ -94,7 +94,7 @@
+             disableTSDUMBF: true
+             redundantImmediate: false
+ system:
+-    cwId:
++    bsi:
+         enable: )") + (enabled ? "true" : "false") + R"(
+     config:
+         controlCh:
+--- a/tests/p25/DispatchGrant_Tests.cpp
++++ b/tests/p25/DispatchGrant_Tests.cpp
+@@ -126,7 +126,7 @@
+         if (mode == 0) f.rpc.allow = false;
+         if (mode == 1) f.rpc.reply = false;
+         if (mode == 2) f.rpc.wrongToken = true;
+-        if (mode == 3) f.rpc.beforeReply = [&] { f.control->configureIdentification(true); f.control->requestIdentification(); };
++        if (mode == 3) f.rpc.beforeReply = [&] { f.control->configureIdentification(true); f.control->beginIdentificationDrain(); };
+         const auto result = f.run(f.request());
+         REQUIRE_FALSE(result.accepted); REQUIRE_FALSE(result.issued); REQUIRE(f.drain() == 0U);
+         REQUIRE_FALSE(f.control->affiliations()->isGranted(TG)); REQUIRE(f.rpc.permits == 1U);
+@@ -143,7 +143,7 @@
+         if (mode == 4) f.modem.error();
+         if (mode == 5) f.modem.stale();
+         if (mode == 6) f.control->setSupervisor(false);
+-        if (mode == 7) { f.control->configureIdentification(true); f.control->requestIdentification(); }
++        if (mode == 7) { f.control->configureIdentification(true); f.control->beginIdentificationDrain(); }
+         if (mode == 8) REQUIRE(f.control->affiliations()->grantCh(TG, 10001U, 15U, true, false));
+         const auto result = f.run(request); REQUIRE_FALSE(result.accepted); REQUIRE_FALSE(result.issued);
+         REQUIRE(f.rpc.permits == 0U); REQUIRE(f.drain() == 0U);
+@@ -197,3 +197,28 @@
+     p25::DispatchGrantTestAccess::run(*f.control);
+     REQUIRE_FALSE(result.get().accepted); REQUIRE_FALSE(f.control->affiliations()->isGranted(TG)); REQUIRE(f.drain() == 0U);
+ }
++
++TEST_CASE("dispatch drain preserves a committed lease until its caller releases", "[dispatch-grant][idle-identification]") {
++    Fixture f;
++    f.control->configureIdentification(true);
++    const auto granted = f.run(f.request());
++    REQUIRE(granted.accepted); REQUIRE(f.drain() > 0U);
++    REQUIRE_FALSE(f.control->beginIdentificationDrain(true)); // The accepted caller won the quiet race.
++    REQUIRE_FALSE(f.control->identificationUnavailable());
++    REQUIRE(f.control->beginIdentificationDrain()); // A periodic withdrawal stops subsequent calls.
++    REQUIRE_FALSE(f.control->tryBeginIdentification());
++    REQUIRE_FALSE(f.control->identificationActive());
++    f.control->clock(); // Watchdog must retain the existing lease during Draining.
++    REQUIRE(f.control->affiliations()->ownsGrant(TG, RID, VC, granted.epoch));
++    auto renew = f.request(p25::DispatchAction::Renew); renew.epoch = granted.epoch;
++    REQUIRE(f.run(renew).accepted); REQUIRE(f.rpc.permits == 2U);
++    REQUIRE(f.drain() == 0U);
++    auto next = f.request(p25::DispatchAction::Grant, LEASE2); next.dstId = TG2;
++    REQUIRE_FALSE(f.run(next).accepted); REQUIRE(f.rpc.permits == 2U);
++    REQUIRE(f.control->affiliations()->ownsGrant(TG, RID, VC, granted.epoch));
++    auto release = f.request(p25::DispatchAction::Release); release.epoch = granted.epoch;
++    REQUIRE(f.run(release).accepted);
++    REQUIRE(f.control->identificationIdle());
++    REQUIRE(f.control->tryBeginIdentification());
++    REQUIRE(f.control->identificationActive());
++}

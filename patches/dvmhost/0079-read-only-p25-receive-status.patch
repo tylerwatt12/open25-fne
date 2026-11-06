@@ -1,0 +1,17 @@
+diff --git a/src/host/Host.cpp b/src/host/Host.cpp
+--- a/src/host/Host.cpp
++++ b/src/host/Host.cpp
+@@ -1346,6 +1346,13 @@ json::object Host::getStatus()
+ 
+         response["tx"].set<bool>(m_modem->m_tx);
+ 
++        // Read the existing atomic receive state. This observation neither
++        // polls the modem nor changes receive, admission or transmit behavior.
++        if (m_p25 != nullptr) {
++            uint8_t rxState = static_cast<uint8_t>(m_p25->getRFState());
++            response["p25RxState"].set<uint8_t>(rxState);
++        }
++
+         response["channelId"].set<uint8_t>(m_channelId);
+         response["channelNo"].set<uint32_t>(m_channelNo);
+ 

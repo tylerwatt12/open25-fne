@@ -1,0 +1,333 @@
+--- a/src/host/p25/Control.RFAdmission.cpp
++++ b/src/host/p25/Control.RFAdmission.cpp
+@@ -12,7 +12,7 @@
+ using namespace p25;
+ using Clock = std::chrono::steady_clock;
+ 
+-bool Control::queueRFAdmission(uint32_t source, uint32_t destination, uint8_t serviceOptions)
++bool Control::queueRFAdmission(uint32_t source, uint32_t destination, uint8_t serviceOptions, uint8_t mfId)
+ {
+     if (isRadioInhibited(source)) return false;
+     if (!m_managedSite || !m_zoneConnected.load() || m_rfAllStartTalkgroups.count(destination) == 0U)
+@@ -39,7 +39,7 @@
+     std::ostringstream text;
+     text << std::hex << std::setfill('0') << std::setw(16) << nonce << std::setw(16) << request.epoch;
+     request.id = text.str(); request.srcId = source; request.dstId = destination;
+-    request.serviceOptions = serviceOptions; request.state = "pending";
++    request.serviceOptions = serviceOptions; request.mfId = mfId; request.state = "pending";
+     request.deadline = now + std::chrono::seconds(5);
+     request.retainedUntil = request.deadline + std::chrono::seconds(30);
+     m_rfAdmissions.emplace(request.id, request);
+@@ -124,7 +124,7 @@
+                 found->second.state != "committing" || Clock::now() >= found->second.deadline || !m_zoneConnected.load()) return false;
+             committed = true;
+             return true;
+-        });
++        }, current.mfId);
+         const auto allocation = m_affiliations->lockGrants();
+         std::lock_guard<std::mutex> lock(m_rfAdmissionMutex);
+         auto& result = m_rfAdmissions.at(current.id);
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -335,7 +335,7 @@
+         friend class lookups::P25AffiliationLookup;
+ 
+         void clockDispatch();
+-        bool queueRFAdmission(uint32_t source, uint32_t destination, uint8_t serviceOptions);
++        bool queueRFAdmission(uint32_t source, uint32_t destination, uint8_t serviceOptions, uint8_t mfId = defines::MFG_STANDARD);
+         void clockRFAdmissions();
+         std::mutex m_rfAdmissionMutex;
+         std::unordered_map<std::string, RFAdmission> m_rfAdmissions;
+--- a/src/host/p25/Dispatch.h
++++ b/src/host/p25/Dispatch.h
+@@ -15,7 +15,7 @@
+ struct RFAdmission {
+     std::string id, state = "unknown";
+     uint32_t srcId = 0U, dstId = 0U, channelNo = 0U;
+-    uint8_t serviceOptions = 0U;
++    uint8_t serviceOptions = 0U, mfId = 0U;
+     uint64_t epoch = 0U, grantEpoch = 0U;
+     bool cancel = false;
+     std::chrono::steady_clock::time_point deadline{}, retainedUntil{};
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -291,8 +291,8 @@
+                         writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_SYS_UNSUPPORTED_SVC, TSBKO::IOSP_GRP_VCH, true, true);
+                         break;
+                     }
+-                    if (!m_p25->queueRFAdmission(srcId, dstId, serviceOptions))
+-                        writeRF_TSDU_Grant(srcId, dstId, serviceOptions, true);
++                    if (!m_p25->queueRFAdmission(srcId, dstId, serviceOptions, tsbk->getMFId()))
++                        writeRF_TSDU_Grant(srcId, dstId, serviceOptions, true, false, false, 0U, nullptr, tsbk->getMFId());
+                 } else {
+                     if (m_p25->m_network != nullptr)
+                         m_p25->m_network->writeGrantReq(modem::DVM_STATE::STATE_P25, srcId, dstId, 0U, false);
+@@ -324,7 +324,7 @@
+                             (tsbk->getEncrypted() ? 0x40U : 0x00U) +                        // Encrypted Flag
+                             (tsbk->getPriority() & 0x07U);                                  // Priority
+ 
+-                        writeRF_TSDU_Grant(srcId, dstId, serviceOptions, false);
++                        writeRF_TSDU_Grant(srcId, dstId, serviceOptions, false, false, false, 0U, nullptr, tsbk->getMFId());
+                     } else {
+                         if (m_p25->m_network != nullptr)
+                             m_p25->m_network->writeGrantReq(modem::DVM_STATE::STATE_P25, srcId, dstId, 0U, true);
+@@ -356,7 +356,7 @@
+                             (tsbk->getEncrypted() ? 0x40U : 0x00U) +                        // Encrypted Flag
+                             (tsbk->getPriority() & 0x07U);                                  // Priority
+ 
+-                        writeRF_TSDU_Grant(srcId, dstId, serviceOptions, false);
++                        writeRF_TSDU_Grant(srcId, dstId, serviceOptions, false, false, false, 0U, nullptr, tsbk->getMFId());
+                     } else {
+                         if (m_p25->m_network != nullptr)
+                             m_p25->m_network->writeGrantReq(modem::DVM_STATE::STATE_P25, srcId, dstId, 0U, true);
+@@ -514,7 +514,7 @@
+                 VERBOSE_LOG_TSBK(tsbk->toString(true), srcId, dstId);
+                 ::ActivityLog("P25", true, "call alert request from %u to %u", srcId, dstId);
+ 
+-                writeRF_TSDU_Call_Alrt(srcId, dstId);
++                writeRF_TSDU_Call_Alrt(srcId, dstId, tsbk->getMFId());
+             }
+             break;
+             case TSBKO::IOSP_ACK_RSP:
+@@ -1040,7 +1040,7 @@
+                                     (tsbk->getEncrypted() ? 0x40U : 0x00U) +                        // Encrypted Flag
+                                     (tsbk->getPriority() & 0x07U);                                  // Priority
+ 
+-                                writeRF_TSDU_Grant(srcId, dstId, serviceOptions, (tsbk->getLCO() == TSBKO::IOSP_GRP_VCH), true);
++                                writeRF_TSDU_Grant(srcId, dstId, serviceOptions, (tsbk->getLCO() == TSBKO::IOSP_GRP_VCH), true, false, 0U, nullptr, tsbk->getMFId());
+                             }
+                         }
+                     }
+@@ -1283,17 +1283,14 @@
+ 
+ /* Helper to write a call alert packet. */
+ 
+-void ControlSignaling::writeRF_TSDU_Call_Alrt(uint32_t srcId, uint32_t dstId)
++void ControlSignaling::writeRF_TSDU_Call_Alrt(uint32_t srcId, uint32_t dstId, uint8_t mfId)
+ {
+     if (m_p25->isRadioInhibited(dstId)) return;
+     std::unique_ptr<IOSP_CALL_ALRT> iosp = std::make_unique<IOSP_CALL_ALRT>();
+     iosp->setSrcId(srcId);
+     iosp->setDstId(dstId);
+ 
+-    if (m_lastMFID != MFG_STANDARD) {
+-        iosp->setMFId(m_lastMFID);
+-        m_lastMFID = MFG_STANDARD;
+-    }
++    iosp->setMFId(mfId);
+ 
+     VERBOSE_LOG_TSBK(iosp->toString(), srcId, dstId);
+     ::ActivityLog("P25", true, "call alert request from %u to %u", srcId, dstId);
+@@ -2557,7 +2554,7 @@
+ 
+ /* Helper to write a grant packet. */
+ 
+-bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net, bool skip, uint32_t chNo, const std::function<bool()>& commit)
++bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net, bool skip, uint32_t chNo, const std::function<bool()>& commit, uint8_t mfId)
+ {
+     if (m_p25->isRadioInhibited(srcId) || (!grp && m_p25->isRadioInhibited(dstId))) return false;
+     if (m_p25->identificationUnavailable()) return false;
+@@ -2781,7 +2778,7 @@
+ 
+             if (voiceChData.isExplicitCh()) {
+                 std::unique_ptr<MBT_OSP_GRP_VCH_GRANT> osp = std::make_unique<MBT_OSP_GRP_VCH_GRANT>();
+-                osp->setMFId(m_lastMFID);
++                osp->setMFId(mfId);
+                 osp->setSrcId(srcId);
+                 osp->setDstId(dstId);
+                 osp->setGrpVchId(voiceChData.chId());
+@@ -2808,7 +2805,7 @@
+             }
+ 
+             std::unique_ptr<IOSP_GRP_VCH> iosp = std::make_unique<IOSP_GRP_VCH>();
+-            iosp->setMFId(m_lastMFID);
++            iosp->setMFId(mfId);
+             iosp->setSrcId(srcId);
+             iosp->setDstId(dstId);
+             iosp->setGrpVchId(voiceChData.chId());
+@@ -2851,7 +2848,7 @@
+ 
+             if (voiceChData.isExplicitCh()) {
+                 std::unique_ptr<MBT_OSP_UU_VCH_GRANT> osp = std::make_unique<MBT_OSP_UU_VCH_GRANT>();
+-                osp->setMFId(m_lastMFID);
++                osp->setMFId(mfId);
+                 osp->setSrcId(srcId);
+                 osp->setDstId(dstId);
+                 osp->setGrpVchId(voiceChData.chId());
+@@ -2878,7 +2875,7 @@
+             }
+ 
+             std::unique_ptr<IOSP_UU_VCH> iosp = std::make_unique<IOSP_UU_VCH>();
+-            iosp->setMFId(m_lastMFID);
++            iosp->setMFId(mfId);
+             iosp->setSrcId(srcId);
+             iosp->setDstId(dstId);
+             iosp->setGrpVchId(voiceChData.chId());
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -103,7 +103,7 @@
+              * @param srcId Source Radio ID.
+              * @param dstId Destination Radio ID.
+              */
+-            void writeRF_TSDU_Call_Alrt(uint32_t srcId, uint32_t dstId);
++            void writeRF_TSDU_Call_Alrt(uint32_t srcId, uint32_t dstId, uint8_t mfId = defines::MFG_STANDARD);
+             /**
+              * @brief Helper to write a radio monitor packet.
+              * @param srcId Source Radio ID.
+@@ -432,9 +432,10 @@
+              * @param net Flag indicating this grant is coming from network traffic.
+              * @param skip Flag indicating normal grant checking is skipped.
+              * @param chNo Channel Number.
++             * @param mfId Explicit request profile, or standard00 for a new local grant.
+              * @returns True, if granted, otherwise false.
+              */
+-            bool writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net = false, bool skip = false, uint32_t chNo = 0U, const std::function<bool()>& commit = nullptr);
++            bool writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net = false, bool skip = false, uint32_t chNo = 0U, const std::function<bool()>& commit = nullptr, uint8_t mfId = defines::MFG_STANDARD);
+             /**
+              * @brief Helper to write a grant update packet.
+              */
+--- a/tests/p25/DispatchGrant_Tests.cpp
++++ b/tests/p25/DispatchGrant_Tests.cpp
+@@ -9,6 +9,9 @@
+ #include "common/p25/Sync.h"
+ #include "common/p25/P25Utils.h"
+ #include "common/p25/lc/tsbk/IOSP_GRP_VCH.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/Utils.h"
+ #include <array>
+ #include <catch2/catch_test_macros.hpp>
+ #include <future>
+@@ -17,6 +20,7 @@
+ 
+ namespace p25 {
+ struct DispatchGrantTestAccess {
++    static uint8_t lastMFID(Control& c) { return c.m_control->m_lastMFID; }
+     static bool queued(Control& c) { std::lock_guard<std::mutex> lock(c.m_dispatchQueueMutex); return !c.m_dispatchQueue.empty(); }
+     static void run(Control& c) { c.clockDispatch(); }
+     static void expire(Control& c, const std::string& id = std::string(32U, 'a')) { c.m_dispatchLeases.at(id).expires = std::chrono::steady_clock::now() - std::chrono::milliseconds(1); }
+@@ -590,3 +594,93 @@
+     REQUIRE(f.rpc.permits==1U); REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
+     REQUIRE(f.control->affiliations()->isUnitReg(10001U));
+ }
++
++// AABC-E2.1/PDF25 printed6 and Figures4.2.1-1/-2/PDF58-59 printed39-40.
++// Real dispatch queue owner, correlated permit callback and queued serializers.
++TEST_CASE("local Dispatch group grant owns standard MFID in abbreviated and explicit output", "[dispatch-grant][control-profile][mfid][local-origin-mfid]") {
++    using namespace p25::defines;
++    for (uint8_t previous : {0U,1U,0x90U,0x9CU}) for (bool explicitChannel : {false,true}) for (bool secure : {false,true}) {
++        CAPTURE(previous,explicitChannel,secure); Fixture f;
++        if (explicitChannel) f.channels.setRFChData(VC,::lookups::VoiceChData(2U,VC,3U,VC+1U,"127.0.0.1",48993U,"offline-test"));
++        f.control->control()->setLastMFId(previous);
++        auto request=f.request(); request.secure=secure;
++        const auto result=f.run(request);
++        REQUIRE(result.accepted); REQUIRE(result.issued); REQUIRE(result.channelId==2U); REQUIRE(result.channelNo==VC);
++        REQUIRE(f.rpc.permits==1U); REQUIRE(f.control->affiliations()->ownsGrant(TG,RID,VC,result.epoch));
++        unsigned packets=0U, preludes=0U, nulls=0U; std::array<uint8_t,1024U> queued{};
++        while (const auto length=f.control->getFrame(queued.data())) {
++            // The existing PDU writer surrounds one packet with three TDUs
++            // and five all-zero null records; validate them separately.
++            if (explicitChannel && length==27U && queued[0]==modem::TAG_EOT &&
++                std::all_of(queued.begin()+2U,queued.begin()+length,[](uint8_t byte) { return byte==0U; })) { ++nulls; continue; }
++            p25::NID nid(0x293U); REQUIRE(nid.decode(queued.data()+2U));
++            if (explicitChannel && nid.getDUID()==DUID::TDU) { ++preludes; continue; }
++            REQUIRE(nid.getDUID()==(explicitChannel?DUID::PDU:DUID::TSDU)); ++packets;
++            std::array<uint8_t,25U> coded{}; std::array<uint8_t,12U> raw{}; edac::Trellis trellis;
++            if (!explicitChannel) {
++                p25::P25Utils::decode(queued.data()+2U,coded.data(),114U,318U);
++                REQUIRE(trellis.decode12(coded.data(),raw.data())); REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); CAPTURE(raw);
++                const std::array<uint8_t,10U> expected{{0x80U,0x00U,uint8_t(secure?0x44U:0x04U),0x20U,0x19U,0x03U,0xE9U,0x00U,0x27U,0x12U}};
++                for (size_t i=0U;i<expected.size();++i) CHECK(raw[i]==expected[i]);
++            } else {
++                std::array<uint8_t,512U> plain{}; p25::P25Utils::decode(queued.data()+2U,plain.data(),0U,(length-2U)*8U);
++                Utils::getBitRange(plain.data(),coded.data(),112U,196U);
++                REQUIRE(trellis.decode12(coded.data(),raw.data())); REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); CAPTURE(raw);
++                const std::array<uint8_t,10U> expected{{0x37U,0xFDU,0x00U,0x00U,0x27U,0x12U,0x81U,0x00U,uint8_t(secure?0x44U:0x04U),0x00U}};
++                for (size_t i=0U;i<expected.size();++i) CHECK(raw[i]==expected[i]);
++                Utils::getBitRange(plain.data(),coded.data(),308U,196U);
++                REQUIRE(trellis.decode12(coded.data(),raw.data())); REQUIRE(edac::CRC::checkCRC32(raw.data(),raw.size()));
++                const std::array<uint8_t,8U> body{{0x00U,0x00U,0x20U,0x19U,0x30U,0x1AU,0x03U,0xE9U}};
++                for (size_t i=0U;i<body.size();++i) CHECK(raw[i]==body[i]);
++            }
++        }
++        REQUIRE(packets==1U); REQUIRE(preludes==(explicitChannel?3U:0U)); REQUIRE(nulls==(explicitChannel?5U:0U)); CHECK(p25::DispatchGrantTestAccess::lastMFID(*f.control)==previous);
++    }
++}
++
++
++TEST_CASE("RF group grants retain the admitted profile through immediate and deferred ownership", "[dispatch-grant][control-profile][mfid][mfid-relay-preservation]") {
++    using namespace p25::defines;
++    for (uint8_t profile : {0U,1U,0x90U}) for (bool deferred : {false,true}) {
++        CAPTURE(profile,deferred); Fixture f;
++        if (deferred) p25::DispatchGrantTestAccess::allStart(*f.control,TG);
++        std::array<uint8_t,P25_TSDU_FRAME_LENGTH_BYTES+2U> input{}; input[0]=modem::TAG_DATA; input[1]=1U;
++        p25::lc::tsbk::IOSP_GRP_VCH request; request.setMFId(profile); request.setSrcId(10001U); request.setDstId(TG); request.setPriority(4U);
++        request.encode(input.data()+2U,false,false); p25::Sync::addP25Sync(input.data()+2U);
++        p25::NID nid(0x293U); nid.encode(input.data()+2U,DUID::TSDU);
++        p25::P25Utils::addStatusBits(input.data()+2U,P25_TSDU_FRAME_LENGTH_BITS,false,false);
++        REQUIRE(f.control->processFrame(input.data(),input.size()));
++        if (deferred) {
++            REQUIRE(f.rpc.permits==0U); const auto pending=f.control->rfAdmissions(); REQUIRE(pending.size()==1U); REQUIRE(pending[0].state=="pending"); f.drain();
++            f.control->control()->setLastMFId(0x9CU); // A different transaction arrives before Zone approval.
++            REQUIRE(f.control->decideRFAdmission(pending[0].id,pending[0].epoch,true).state=="approved");
++            p25::DispatchGrantTestAccess::run(*f.control);
++            REQUIRE(f.control->rfAdmissions()[0].state=="committed");
++        }
++        REQUIRE(f.rpc.permits==1U); unsigned packets=0U; std::array<uint8_t,1024U> queued{};
++        while (f.control->getFrame(queued.data())) {
++            ++packets; REQUIRE(nid.decode(queued.data()+2U)); REQUIRE(nid.getDUID()==DUID::TSDU);
++            std::array<uint8_t,25U> coded{}; std::array<uint8_t,12U> raw{}; edac::Trellis trellis;
++            p25::P25Utils::decode(queued.data()+2U,coded.data(),114U,318U); REQUIRE(trellis.decode12(coded.data(),raw.data())); REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); CAPTURE(raw);
++            const std::array<uint8_t,10U> expected{{0x80U,profile,0x04U,0x20U,0x19U,0x03U,0xE9U,0x00U,0x27U,0x11U}};
++            for (size_t i=0U;i<expected.size();++i) CHECK(raw[i]==expected[i]);
++        }
++        REQUIRE(packets==1U); CHECK(p25::DispatchGrantTestAccess::lastMFID(*f.control)==(deferred?0x9CU:profile));
++    }
++}
++
++TEST_CASE("local REST grant demand defaults to a standard control profile", "[dispatch-grant][control-profile][mfid][local-origin-mfid]") {
++    for (uint8_t previous : {0U,1U,0x90U,0x9CU}) {
++        CAPTURE(previous); Fixture f; f.control->control()->setLastMFId(previous);
++        f.control->grantTG(10001U,TG,true); // Actual REST grant-demand entry point.
++        REQUIRE(f.rpc.permits==1U); unsigned packets=0U; std::array<uint8_t,1024U> queued{};
++        while (f.control->getFrame(queued.data())) {
++            ++packets; p25::NID nid(0x293U); REQUIRE(nid.decode(queued.data()+2U)); REQUIRE(nid.getDUID()==p25::defines::DUID::TSDU);
++            std::array<uint8_t,25U> coded{}; std::array<uint8_t,12U> raw{}; edac::Trellis trellis;
++            p25::P25Utils::decode(queued.data()+2U,coded.data(),114U,318U); REQUIRE(trellis.decode12(coded.data(),raw.data())); REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); CAPTURE(raw);
++            const std::array<uint8_t,10U> expected{{0x80U,0x00U,0x04U,0x20U,0x19U,0x03U,0xE9U,0x00U,0x27U,0x11U}};
++            for (size_t i=0U;i<expected.size();++i) CHECK(raw[i]==expected[i]);
++        }
++        REQUIRE(packets==1U); CHECK(p25::DispatchGrantTestAccess::lastMFID(*f.control)==previous);
++    }
++}
+--- a/tests/p25/RadioCheckProcedure_Tests.cpp
++++ b/tests/p25/RadioCheckProcedure_Tests.cpp
+@@ -468,3 +468,28 @@
+         }
+     }
+ }
++
++// AABC-E2.1/PDF25 printed6; Figure6.2.4-1/PDF157 printed138.
++// Expected opcode/reserved/address octets are literal; existing helpers frame them.
++TEST_CASE("local FNE PAGE owns standard MFID without consuming the prior profile", "[p25][control-profile][mfid][local-origin-mfid]") {
++    const std::array<uint8_t,10U> expected{{0x9FU,0x00U,0x00U,0x00U,0x00U,0x27U,0x11U,0xFFU,0xFFU,0xFCU}};
++    for (uint8_t previous : {0U,1U,0x90U,0x9CU}) {
++        CAPTURE(previous); Fixture f(true); auto* signal=f.controller->control();
++        signal->setLastMFId(previous);
++        signal->writeRF_TSDU_Call_Alrt(WUID_FNE,RID); // Actual REST PAGE builder/arguments.
++        const auto blocks=f.responses(); REQUIRE(blocks.size()==1U); CAPTURE(blocks[0]);
++        for (size_t i=0U;i<expected.size();++i) CHECK(blocks[0][i]==expected[i]);
++        CHECK(RadioCheckTestAccess::lastMFID(*f.controller)==previous);
++    }
++}
++
++TEST_CASE("admitted inbound Call Alert relay preserves its explicit request profile", "[p25][control-profile][mfid][mfid-relay-preservation]") {
++    for (uint8_t profile : {0U,1U,0x90U}) {
++        CAPTURE(profile); Fixture f(true); f.controller->affiliations()->unitReg(SECOND_SU);
++        REQUIRE(f.signal(0x1FU,0x0000002711002717ULL,profile));
++        const auto blocks=f.responses(); REQUIRE(blocks.size()==1U); CAPTURE(blocks[0]);
++        const std::array<uint8_t,10U> expected{{0x9FU,profile,0x00U,0x00U,0x00U,0x27U,0x11U,0x00U,0x27U,0x17U}};
++        for (size_t i=0U;i<expected.size();++i) CHECK(blocks[0][i]==expected[i]);
++        CHECK(RadioCheckTestAccess::lastMFID(*f.controller)==profile);
++    }
++}

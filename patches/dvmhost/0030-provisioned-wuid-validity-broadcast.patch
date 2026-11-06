@@ -1,0 +1,216 @@
+--- a/src/common/lookups/AffiliationLookup.cpp
++++ b/src/common/lookups/AffiliationLookup.cpp
+@@ -18,7 +18,6 @@
+ //  Constants
+ // ---------------------------------------------------------------------------
+ 
+-const uint32_t UNIT_REG_TIMEOUT = 43200U; // 12 hours
+ 
+ // ---------------------------------------------------------------------------
+ //  Public Class Members
+@@ -71,7 +70,7 @@
+ 
+     m_unitRegTable.push_back(srcId);
+ 
+-    m_unitRegTimers[srcId] = Timer(1000U, UNIT_REG_TIMEOUT);
++    m_unitRegTimers[srcId] = Timer(1000U, defaultUnitRegTimeout());
+     m_unitRegTimers[srcId].start();
+ 
+     if (m_verbose) {
+--- a/src/common/lookups/AffiliationLookup.h
++++ b/src/common/lookups/AffiliationLookup.h
+@@ -57,6 +57,12 @@
+          * @brief Finalizes a instance of the AffiliationLookup class.
+          */
+         virtual ~AffiliationLookup();
++
++        /**
++         * @brief Current provisioned unit-registration validity, in seconds.
++         * This one policy supplies both the actual timer and P25 advertisement.
++         */
++        static constexpr uint32_t defaultUnitRegTimeout() { return 43200U; }
+ 
+         /** @name Unit Registrations */
+         /**
+--- a/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.cpp
++++ b/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.cpp
+@@ -24,6 +24,7 @@
+ /* Initializes a new instance of the OSP_SYS_SRV_BCAST class. */
+ 
+ OSP_SYS_SRV_BCAST::OSP_SYS_SRV_BCAST() : TSBK(),
++    m_wuidValidity(0U),
+     m_overrideServices(false),
+     m_servicesAvailable(0U),
+     m_servicesSupported(0U)
+@@ -31,6 +32,22 @@
+     m_lco = TSBKO::OSP_SYS_SRV_BCAST;
+ }
+ 
++/* Encode an exactly representable finite WUID validity. */
++
++bool OSP_SYS_SRV_BCAST::setWUIDValiditySeconds(uint32_t seconds)
++{
++    // TIA-102.AABC-E 6.2.19 / Figure 6.2.19-1, PDF 189 / printed 170.
++    const uint32_t minimum = 4U * 60U * 60U;
++    const uint32_t increment = 30U * 60U;
++    if (seconds < minimum || (seconds - minimum) % increment != 0U)
++        return false;
++    const uint32_t field = (seconds - minimum) / increment;
++    if (field >= 0xFFU) // 0xFF is infinity, not a finite 131.5 hours.
++        return false;
++    m_wuidValidity = uint8_t(field);
++    return true;
++}
++
+ /* Decode a trunking signalling block. */
+ 
+ bool OSP_SYS_SRV_BCAST::decode(const uint8_t* data, bool rawTSBK)
+@@ -53,7 +70,7 @@
+     ulong64_t tsbkValue = 0U;
+ 
+     if (m_overrideServices) {
+-        // Payload octet 2 is reserved; octets 3-5 carry available services,
++        // Octet 2 carries WUID validity; octets 3-5 carry available services,
+         // octets 6-8 supported services, and octet 9 request priority (zero).
+         // TSBK::fromValue emits this 64-bit value in network byte order.
+         tsbkValue = (ulong64_t(m_servicesAvailable) << 32) |
+@@ -65,6 +82,7 @@
+         tsbkValue = (tsbkValue << 24) + services;
+     }
+ 
++    tsbkValue |= ulong64_t(m_wuidValidity) << 56U;
+     std::unique_ptr<uint8_t[]> tsbk = TSBK::fromValue(tsbkValue);
+     TSBK::encode(data, tsbk.get(), rawTSBK, noTrellis);
+ }
+--- a/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h
++++ b/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h
+@@ -73,7 +73,18 @@
+                     m_overrideServices = true;
+                 }
+ 
++                /**
++                 * @brief Set the finite WUID validity from an exact timeout.
++                 * AABC-E 6.2.19: 4 hours plus half-hour increments. Values
++                 * not exactly representable are rejected without rounding.
++                 */
++                bool setWUIDValiditySeconds(uint32_t seconds);
++                /** @brief Encoded field; 0xFF means the timer is disabled. */
++                uint8_t getWUIDValidity() const { return m_wuidValidity; }
++                void setWUIDValidity(uint8_t value) { m_wuidValidity = value; }
++
+             private:
++                uint8_t m_wuidValidity;
+                 bool m_overrideServices;
+                 uint32_t m_servicesAvailable;
+                 uint32_t m_servicesSupported;
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -2135,6 +2135,10 @@
+             }
+             std::unique_ptr<OSP_SYS_SRV_BCAST> osp = std::make_unique<OSP_SYS_SRV_BCAST>();
+             osp->setServices(services, services);
++            if (!osp->setWUIDValiditySeconds(::lookups::AffiliationLookup::defaultUnitRegTimeout())) {
++                LogError(LOG_P25, "provisioned WUID validity cannot be represented in SYS_SRV_BCST");
++                return;
++            }
+             tsbk = std::move(osp);
+             DEBUG_LOG_TSBK(tsbk->toString());
+         }
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -687,8 +687,8 @@
+                 auto services = decoded.payload(frame.data() + 2U);
+                 REQUIRE(decoded.getLCO() == TSBKO::OSP_SYS_SRV_BCAST);
+                 const std::array<uint8_t, 8U> expected = capacity ?
+-                    std::array<uint8_t, 8U>{0U, 0x0CU, 0x0EU, 0U, 0x0CU, 0x0EU, 0U, 0U} :
+-                    std::array<uint8_t, 8U>{0U, 0U, 0x0EU, 0U, 0U, 0x0EU, 0U, 0U};
++                    std::array<uint8_t, 8U>{0x10U, 0x0CU, 0x0EU, 0U, 0x0CU, 0x0EU, 0U, 0U} :
++                    std::array<uint8_t, 8U>{0x10U, 0U, 0x0EU, 0U, 0U, 0x0EU, 0U, 0U};
+                 REQUIRE(services == expected);
+                 scheduler.queueRF_TSBK_Ctrl(TSBKO::OSP_SNDCP_CH_ANN);
+                 REQUIRE(fixture.controller->getFrame(frame.data()) == 0U);
+--- /dev/null
++++ b/tests/p25/WUIDValidity_Tests.cpp
+@@ -0,0 +1,63 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// TIA-102.AABC-E 6.2.19 / Figure 6.2.19-1, PDF189 / printed170:
++// octet2 is 4hours + field * 30minutes; 0xFF is infinity.
++// TIA-102.AABD-B 6.6.1-.3, PDF59-60 / printed54-55 ties the
++// broadcast to RFSS provisioning. Policy is exact representation, not rounding.
++#include "common/lookups/AffiliationLookup.h"
++#include "common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h"
++#include "common/edac/CRC.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <limits>
++
++using p25::lc::tsbk::OSP_SYS_SRV_BCAST;
++
++TEST_CASE("finite WUID validity uses the exact half-hour source definition", "[p25][wuid-validity]") {
++    struct Case { uint32_t seconds; uint8_t field; };
++    for (const auto value : {Case{4U*3600U,0x00U},Case{5U*3600U,0x02U},
++        Case{12U*3600U,0x10U},Case{24U*3600U,0x28U},Case{131U*3600U,0xFEU}}) {
++        CAPTURE(value.seconds,value.field);
++        OSP_SYS_SRV_BCAST message;
++        REQUIRE(message.setWUIDValiditySeconds(value.seconds));
++        std::array<uint8_t,12U> wire{};
++        message.encode(wire.data(),true,true);
++        REQUIRE(wire[2]==value.field);
++    }
++}
++
++TEST_CASE("nonrepresentable finite WUID validity is rejected without rounding or partial change", "[p25][wuid-validity]") {
++    OSP_SYS_SRV_BCAST message;
++    REQUIRE(message.setWUIDValiditySeconds(43200U));
++    for (const uint32_t seconds : {0U,1U,14399U,14401U,16199U,43199U,43201U,
++        471601U,473400U,std::numeric_limits<uint32_t>::max()}) {
++        CAPTURE(seconds);
++        REQUIRE_FALSE(message.setWUIDValiditySeconds(seconds));
++        REQUIRE(message.getWUIDValidity()==0x10U);
++    }
++    message.setWUIDValidity(0xFFU);
++    std::array<uint8_t,12U> wire{};
++    message.encode(wire.data(),true,true);
++    REQUIRE(wire[2]==0xFFU); // Infinity is an explicit field, not finite overflow.
++    REQUIRE_FALSE(message.setWUIDValiditySeconds(473400U));
++    REQUIRE(message.getWUIDValidity()==0xFFU);
++}
++
++TEST_CASE("actual native validity and advertised literal octets share one provisioned timeout", "[p25][wuid-validity]") {
++    ::lookups::ChannelLookup channels;
++    ::lookups::AffiliationLookup registrations("WUID offline test",&channels,false);
++    registrations.unitReg(1001U);
++    REQUIRE(registrations.unitRegTimeout(1001U)==43200U);
++    REQUIRE(registrations.unitRegTimeout(1001U)==::lookups::AffiliationLookup::defaultUnitRegTimeout());
++    OSP_SYS_SRV_BCAST message;
++    message.setLastBlock(true);
++    REQUIRE(message.setWUIDValiditySeconds(registrations.unitRegTimeout(1001U)));
++    message.setServices(0x000800U,0x000E00U);
++    std::array<uint8_t,12U> wire{};
++    message.encode(wire.data(),true,true);
++    // Literal header/field/masks/priority from the source figure. The CRC
++    // helper only checks existing framing; this is not an independent CRC test.
++    const std::array<uint8_t,10U> expected{{0xB8U,0x00U,0x10U,0x00U,0x08U,
++        0x00U,0x00U,0x0EU,0x00U,0x00U}};
++    for (size_t i=0U;i<expected.size();++i) REQUIRE(wire[i]==expected[i]);
++    REQUIRE(edac::CRC::checkCCITT162(wire.data(),wire.size()));
++}
+--- a/tests/p25/ZeroCapacity_Tests.cpp
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -344,13 +344,13 @@
+     auto services = block.payload(frame.data() + 2U);
+     if (capacity) {
+         REQUIRE(block.getLCO() == TSBKO::OSP_SYS_SRV_BCAST);
+-        const std::array<uint8_t, 8U> voiceServices{0U, 0x0CU, 0x0EU, 0U, 0x0CU, 0x0EU, 0U, 0U};
++        const std::array<uint8_t, 8U> voiceServices{0x10U, 0x0CU, 0x0EU, 0U, 0x0CU, 0x0EU, 0U, 0U};
+         REQUIRE(services == voiceServices);
+     } else {
+         REQUIRE(block.getLCO() == TSBKO::OSP_SYS_SRV_BCAST);
+-        // Full TSBK octet 2 is reserved; 3..5 are available, 6..8
++        // AABC-E 6.2.19: octet 2 is WUID validity; 3..5 available, 6..8
+         // supported and octet 9 is the request-priority field.
+-        REQUIRE(services[0U] == 0U);
++        REQUIRE(services[0U] == 0x10U); // Existing 12-hour native policy.
+         REQUIRE(services[7U] == 0U);
+         const uint32_t available = (uint32_t(services[1U]) << 16U) | (uint32_t(services[2U]) << 8U) | services[3U];
+         const uint32_t supported = (uint32_t(services[4U]) << 16U) | (uint32_t(services[5U]) << 8U) | services[6U];

@@ -1,0 +1,146 @@
+--- a/src/common/p25/lc/TSBK.cpp
++++ b/src/common/p25/lc/TSBK.cpp
+@@ -248,6 +248,11 @@
+         }
+     }
+ 
++    // Protected control arguments are unsupported by this profile. Typed
++    // callers have the same boundary as the factory; do not expose ciphertext
++    // as a decoded operational command, even when its transport CRC is valid.
++    if ((tsbk[0U] & 0x40U) != 0U) return false;
++
+     if (s_verbose) {
+         Utils::dump(2U, "P25, TSBK::decode(), TSBK Value", tsbk, P25_TSBK_LENGTH_BYTES);
+     }
+--- a/src/common/p25/lc/tsbk/TSBKFactory.cpp
++++ b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+@@ -109,6 +109,10 @@
+ 
+     uint8_t lco = tsbk[0U] & 0x3F;                                                  // LCO
+     uint8_t mfId = tsbk[1U];                                                        // Mfg Id.
++
++    // This profile has no control-channel protection decoder. A CRC over
++    // ciphertext does not authorize interpreting its arguments as plaintext.
++    if ((tsbk[0U] & 0x40U) != 0U) return nullptr;
+ 
+     // Motorola P25 vendor opcodes
+     if (mfId == MFG_MOT) {
+@@ -150,7 +154,7 @@
+     if (mfId == MFG_DVM_OCS) {
+         switch (lco) {
+         case LCO::CALL_TERM:
+-            return decode(new OSP_DVM_LC_CALL_TERM(), data, rawTSBK);
++            return direction == Direction::Outbound ? decode(new OSP_DVM_LC_CALL_TERM(), data, rawTSBK) : nullptr;
+         default:
+             mfId = MFG_STANDARD;
+             break;
+@@ -163,6 +167,12 @@
+             mfId = tsbk[1U];
+         }
+     }
++
++    // BAAC-D 2.3: 00 and01 select standard formats. Preserve the existing
++    // explicitly recognized Motorola profile above; unknown vendor fields
++    // must never fall through to emergency/access/command handlers.
++    if (mfId != MFG_STANDARD && mfId != MFG_STANDARD_ALT && mfId != MFG_MOT)
++        return nullptr;
+ 
+     // standard P25 reference opcodes
+     switch (lco) {
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -1377,7 +1377,7 @@
+     if (found == m_radioChecks.end()) return false;
+     auto& check = found->second;
+     if (check.state != RadioCheckState::UnderCheck || check.attempts == 0U ||
+-        mfid != MFG_STANDARD || function != ExtendedFunctions::CHECK_ACK ||
++        (mfid != MFG_STANDARD && mfid != MFG_STANDARD_ALT) || function != ExtendedFunctions::CHECK_ACK ||
+         check.function != ExtendedFunctions::CHECK || argument != check.requestor) return false;
+     check.state = RadioCheckState::Available;
+     return true;
+--- a/tests/p25/RadioCheckProcedure_Tests.cpp
++++ b/tests/p25/RadioCheckProcedure_Tests.cpp
+@@ -299,3 +299,21 @@
+         REQUIRE(units->unitRegTimer(RID)==0U); REQUIRE(units->unitRegTimer(SECOND_SU)==1U);
+     });
+ }
++
++TEST_CASE("both standard MFID values can acknowledge an issued radio check", "[p25][radio-check][control-profile][mfid]") {
++    for (uint8_t mfid : {0U,1U}) {
++        CAPTURE(mfid);
++        Fixture f(true); auto* signal=f.controller->control();
++        REQUIRE(signal->requestRadioCheck(RID));
++        RadioCheckTestAccess::clock(*f.controller,0U); REQUIRE(f.responses().size()==1U);
++        REQUIRE(f.signal(0x24U,0x0080FFFFFC002711ULL,mfid));
++        REQUIRE(signal->radioCheckState(RID)==CheckState::Available);
++        // The existing FNE response relay is not another CHECK attempt.
++        for (const auto& response : f.responses()) {
++            REQUIRE((response[0]&0x3FU)==0x24U);
++            REQUIRE(response[2]==0U); REQUIRE(response[3]==0x80U);
++        }
++        RadioCheckTestAccess::clock(*f.controller,20000U);
++        REQUIRE(f.responses().empty()); REQUIRE(timeoutLogs()==0U);
++    }
++}
+--- /dev/null
++++ b/tests/p25/ControlProfileBoundary_Tests.cpp
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// BAAC-D 2.3/PDF14 printed4; AABB-B5.1/PDF20-21 printed12-13.
++// Literal header fields choose the profile; CRC supplies framing integrity.
++#include "common/p25/lc/tsbk/TSBKFactory.h"
++#include "common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h"
++#include "common/p25/lc/tsbk/IOSP_GRP_VCH.h"
++#include "common/p25/lc/tsbk/OSP_DVM_LC_CALL_TERM.h"
++#include "common/edac/CRC.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++
++namespace {
++using namespace p25;
++using namespace p25::lc;
++using namespace p25::lc::tsbk;
++using namespace p25::defines;
++std::array<uint8_t,12U> packet(uint8_t mfid,uint8_t opcode,bool protect=false) {
++    std::array<uint8_t,12U> raw{{uint8_t(0x80U|opcode|(protect?0x40U:0U)),mfid,0U,0U,0U,3U,0xE9U,0U,0x27U,0x11U}};
++    edac::CRC::addCCITT162(raw.data(),raw.size()); return raw;
++}
++}
++
++TEST_CASE("only recognized manufacturer profiles can select a standard control handler", "[p25][control-profile][mfid]") {
++    for (unsigned mfid=0; mfid<256U; ++mfid) {
++        CAPTURE(mfid);
++        // Existing explicitly supported Motorola-compatible standard profile
++        // remains accepted. Neither arbitrary vendor nor DVM internal profile
++        // is an alias for standard radio-originated emergency/call arguments.
++        const bool allowed=mfid==0U || mfid==1U || mfid==0x90U;
++        for (uint8_t opcode : {0x27U,0x00U}) {
++            auto raw=packet(uint8_t(mfid),opcode);
++            auto decoded=TSBKFactory::createTSBK(raw.data(),TSBKFactory::Direction::Inbound,true);
++            REQUIRE(bool(decoded)==allowed);
++            if(decoded) REQUIRE(decoded->getMFId()==mfid);
++        }
++    }
++}
++
++TEST_CASE("protected arguments never become a plaintext operational message", "[p25][control-profile][mfid]") {
++    for (uint8_t mfid : {0U,1U,0x90U}) {
++        for (uint8_t opcode : {0x00U,0x18U,0x1CU,0x24U,0x27U,0x28U,0x2CU}) {
++            CAPTURE(mfid,opcode);
++            auto raw=packet(mfid,opcode,true);
++            for (auto direction : {TSBKFactory::Direction::Inbound,TSBKFactory::Direction::Outbound})
++                REQUIRE_FALSE(TSBKFactory::createTSBK(raw.data(),direction,true));
++        }
++        auto raw=packet(mfid,0x27U,true); ISP_EMERG_ALRM_REQ alarm;
++        REQUIRE_FALSE(alarm.decode(raw.data(),true));
++        raw=packet(mfid,0x00U,true); IOSP_GRP_VCH call;
++        REQUIRE_FALSE(call.decode(raw.data(),true));
++    }
++}
++
++TEST_CASE("internal DVM call termination keeps its explicit outbound role", "[p25][control-profile][mfid]") {
++    auto raw=packet(0x9CU,LCO::CALL_TERM);
++    auto decoded=TSBKFactory::createTSBK(raw.data(),TSBKFactory::Direction::Outbound,true);
++    REQUIRE(dynamic_cast<OSP_DVM_LC_CALL_TERM*>(decoded.get())!=nullptr);
++    REQUIRE_FALSE(TSBKFactory::createTSBK(raw.data(),TSBKFactory::Direction::Inbound,true));
++}

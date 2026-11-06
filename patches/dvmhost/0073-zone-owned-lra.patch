@@ -1,0 +1,174 @@
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -589,7 +589,8 @@
+     ** Site Data
+     */
+     int8_t lto = (int8_t)systemConf["localTimeOffset"].as<int32_t>(0);
+-    m_siteData = SiteData(netId, sysId, rfssId, siteId, 0U, channelId, channelNo, serviceClass, lto);
++    uint8_t lra = (uint8_t)rfssConfig["lra"].as<uint32_t>(0U);
++    m_siteData = SiteData(netId, sysId, rfssId, siteId, lra, channelId, channelNo, serviceClass, lto);
+     m_siteData.setCallsign(cwCallsign);
+ 
+     lc::LC::setSiteData(m_siteData);
+diff --git a/tests/p25/LocationRegistrationArea_Tests.cpp b/tests/p25/LocationRegistrationArea_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/LocationRegistrationArea_Tests.cpp
+@@ -0,0 +1,156 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Phase 1 FNE LRA: TIA-102.AABC-E April 2019, 2.3.20 PDF35/printed16;
++// 6.2.2.1 Fig6.2.2-1 PDF154/printed135; 6.2.11.1 Fig6.2.11-1
++// PDF173/printed154; 6.2.15.1 Fig6.2.15-1 PDF180/printed161.
++// Document p25_89a3b878eee70a14; exact PDF path/verification in
++// docs/implementation-plans/lra.md in the corresponding application source.
++// No modem port, socket, real-time timer or RF operation is used.
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h"
++#include "common/Log.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <cstdlib>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace {
++using namespace p25;
++using namespace p25::defines;
++using RawBlock = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++
++// Expose the existing scheduler entry rather than duplicate its encoding.
++class LRAScheduler : public packet::ControlSignaling {
++public:
++    explicit LRAScheduler(Control* controller) : ControlSignaling(controller, false, false, false) { m_ctrlTSDUMBF = false; }
++    using ControlSignaling::writeRF_ControlData;
++};
++
++struct LRAFixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, false};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, false};
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-lra-fixture", false};
++    network::NetRPC* previousRPC = g_RPC;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U,
++        true, true, false, false, false, false};
++    std::unique_ptr<Control> controller;
++
++    explicit LRAFixture(unsigned lra, const std::string& rendered = "") {
++        g_logDisplayLevel = 0U;
++        g_RPC = &rpc;
++        controller = std::make_unique<Control>(true, 0x293U, 1U, 16384U,
++            &modem, nullptr, 120U, 1U, true, &channels, &radios, &groups,
++            &identities, &rssi, false, false, false, false, false);
++        yaml::Node options;
++        if (!rendered.empty()) {
++            REQUIRE(yaml::Parse(options, rendered.c_str()));
++        } else {
++            const std::string text = R"(
++protocols:
++    p25:
++        tduPreambleCount: 0
++        sndcpSupport: false
++        control:
++            enable: true
++            dedicated: true
++            disableTSDUMBF: true
++            redundantImmediate: false
++system:
++    config:
++        lra: )" + std::to_string(lra) + R"(
++        controlCh:
++            notifyEnable: false
++)";
++            REQUIRE(yaml::Parse(options, text));
++        }
++        controller->setOptions(options, false, "N0TEST", ::lookups::VoiceChData(),
++            1U, 1U, 1U, 1U, 2U, 1U, false);
++        controller->setCCRunning(true);
++    }
++    ~LRAFixture() { controller.reset(); g_RPC = previousRPC; }
++
++    std::vector<RawBlock> drain() {
++        std::vector<RawBlock> result;
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES + 2U> frame{};
++        while (const uint32_t length = controller->getFrame(frame.data())) {
++            REQUIRE(length == frame.size());
++            std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{};
++            P25Utils::decode(frame.data() + 2U, coded.data(), 114U, 318U);
++            RawBlock raw{};
++            edac::Trellis trellis;
++            REQUIRE(trellis.decode12(coded.data(), raw.data()));
++            REQUIRE(edac::CRC::checkCCITT162(raw.data(), raw.size()));
++            result.push_back(raw);
++        }
++        return result;
++    }
++};
++}
++
++TEST_CASE("Configured LRA reaches scheduled local identity broadcasts", "[p25][lra]") {
++    for (const unsigned lra : {0U, 1U, 165U, 255U}) {
++        LRAFixture fixture(lra);
++        LRAScheduler scheduler(fixture.controller.get());
++        // n=1/2 select Network and RFSS broadcasts without a clock or Git hash.
++        scheduler.writeRF_ControlData(1U, 1U, false);
++        scheduler.writeRF_ControlData(1U, 2U, false);
++        const auto frames = fixture.drain();
++        REQUIRE(frames.size() == 2U);
++        REQUIRE((frames[0][0] & 0x3FU) == 0x3AU);
++        REQUIRE((frames[1][0] & 0x3FU) == 0x3BU);
++        for (const auto& raw : frames) {
++            REQUIRE(raw[1] == 0U);
++            REQUIRE(raw[2] == lra); // Literal octet 2 from both source figures.
++        }
++        REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
++    }
++}
++
++TEST_CASE("Neighbor rebroadcast keeps its own LRA", "[p25][lra][neighbor-identity]") {
++    LRAFixture fixture(0x22U);
++    // Source-derived neighbor vector from0057: LRA A5, SystemABC/RFSS2/Site11.
++    const RawBlock neighbor{0xBC,0x00,0xA5,0x3A,0xBC,0x02,0x11,0x53,0x45,0x7F,0x96,0xBA};
++    std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES> encoded{};
++    lc::tsbk::OSP_ADJ_STS_BCAST message;
++    REQUIRE(message.decode(neighbor.data(), true));
++    message.encode(encoded.data());
++    lc::LC control;
++    data::LowSpeedData lowSpeed;
++    DUID::E duid = DUID::TSDU;
++    LRAScheduler scheduler(fixture.controller.get());
++    REQUIRE(scheduler.processNetwork(encoded.data(), encoded.size(), control, lowSpeed, duid));
++    scheduler.writeRF_ControlData(1U, 7U, true);
++    const auto frames = fixture.drain();
++    REQUIRE(frames.size() == 1U);
++    REQUIRE((frames[0][0] & 0x3FU) == 0x3CU);
++    REQUIRE(frames[0][2] == 0xA5U);
++    REQUIRE(frames[0][2] != 0x22U);
++    REQUIRE((frames[0][3] & 0x0FU) == 0x0AU);
++    REQUIRE(frames[0][4] == 0xBCU);
++    REQUIRE(frames[0][5] == 2U);
++    REQUIRE(frames[0][6] == 0x11U);
++}
++
++TEST_CASE("Go-rendered LRA files use the real native settings owner", "[p25][lra][lra-rendered]") {
++    const char* directory = std::getenv("TRUNKSYSTEM_LRA_EVIDENCE");
++    if (directory == nullptr) {
++        SUCCEED("Set TRUNKSYSTEM_LRA_EVIDENCE to the Go renderer fixture directory to exercise rendered files");
++        return;
++    }
++    for (const unsigned lra : {0U, 1U, 165U, 255U}) {
++        for (const std::string role : {"control", "voice"}) {
++            LRAFixture fixture(lra, std::string(directory) + "/" + role + "-" + std::to_string(lra) + ".yml");
++            REQUIRE(lc::TSBK::getSiteData().lra() == lra);
++        }
++    }
++}

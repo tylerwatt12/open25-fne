@@ -1,0 +1,75 @@
+--- a/src/common/network/Network.h
++++ b/src/common/network/Network.h
+@@ -325,6 +325,7 @@
+         uint8_t* m_salt;
+ 
+         Timer m_retryTimer;
++        bool m_initialConnection;
+         uint8_t m_retryCount;
+         uint8_t m_maxRetryCount;
+         bool m_flaggedDuplicateConn;
+--- a/src/common/network/Network.cpp
++++ b/src/common/network/Network.cpp
+@@ -63,6 +63,7 @@
+     m_tidLookup(nullptr),
+     m_salt(nullptr),
+     m_retryTimer(1000U, DEFAULT_RETRY_TIME),
++    m_initialConnection(true),
+     m_retryCount(0U),
+     m_maxRetryCount(MAX_RETRY_BEFORE_RECONNECT),
+     m_flaggedDuplicateConn(false),
+@@ -1349,6 +1350,13 @@
+         return false;
+     }
+ 
++    // The first attempt is ready on the next clock tick. Retry intervals and
++    // duplicate-connection backoff retain their existing configured duration.
++    if (m_initialConnection) {
++        m_initialConnection = false;
++        m_retryTimer.clock(DEFAULT_RETRY_TIME * 1000U);
++    }
++
+     return true;
+ }
+ 
+--- /dev/null
++++ b/tests/NetworkInitialConnection_Tests.cpp
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// The open path resolves a loopback address only. No socket or RF is opened.
++#include "common/network/Network.h"
++#include <catch2/catch_test_macros.hpp>
++namespace {
++class InitialConnectionPeer : public network::Network {
++public:
++    InitialConnectionPeer() : Network("127.0.0.1",48993U,0U,12345U,"local-test",false,false,
++        false,true,false,false,false,false,false,false,false,false) {}
++    bool readyToAttempt() const { return m_retryTimer.isRunning() && m_retryTimer.hasExpired(); }
++    unsigned retrySeconds() const { return m_retryTimer.getTimeout(); }
++    void pass(unsigned ms) { m_retryTimer.clock(ms); }
++};
++}
++TEST_CASE("First FNE connection is immediate and reconnect keeps its backoff", "[network-initial-connection]") {
++    InitialConnectionPeer peer;
++    peer.enable(true);
++    REQUIRE(peer.open());
++    REQUIRE(peer.readyToAttempt());
++    REQUIRE(peer.retrySeconds()==10U);
++    peer.close();
++    REQUIRE(peer.open());
++    REQUIRE_FALSE(peer.readyToAttempt());
++    REQUIRE(peer.retrySeconds()==10U);
++    peer.pass(9999U);
++    REQUIRE_FALSE(peer.readyToAttempt());
++    peer.pass(1U);
++    REQUIRE(peer.readyToAttempt());
++    peer.close();
++}
++TEST_CASE("Disabled open does not consume the initial connection", "[network-initial-connection]") {
++    InitialConnectionPeer peer;
++    REQUIRE_FALSE(peer.open());
++    peer.enable(true);
++    REQUIRE(peer.open());
++    REQUIRE(peer.readyToAttempt());
++    peer.close();
++}

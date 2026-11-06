@@ -1,0 +1,447 @@
+diff --git a/src/bridge/HostBridge.cpp b/src/bridge/HostBridge.cpp
+index 3aa4556..ec4cd42 100644
+--- a/src/bridge/HostBridge.cpp
++++ b/src/bridge/HostBridge.cpp
+@@ -190,7 +190,7 @@ HostBridge::HostBridge(const std::string& confFile) :
+     m_voxSampleLevel(30.0f),
+     m_dropTimeMS(180U),
+     m_localDropTime(1000U, 0U, 180U),
+-    m_udpDropTime(1000U, 0U, 180U),
++    m_udpDropTime(180U),
+     m_detectAnalogMDC1200(false),
+     m_preambleLeaderTone(false),
+     m_preambleTone(2175),
+@@ -628,6 +628,9 @@ int HostBridge::run()
+                 m_networkWatchdog.clock(ms);
+ 
+                 if (m_networkWatchdog.isRunning() && m_networkWatchdog.hasExpired()) {
++                    // This RX-watchdog path also clears TX encoder/call state.
++                    // Match network callbacks' network -> audio lock order.
++                    std::lock_guard<std::mutex> audioLock(s_audioMutex);
+                     if (m_rxStartTime > 0U) {
+                         uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                         uint64_t diff = now - m_rxStartTime;
+@@ -1027,7 +1030,7 @@ bool HostBridge::readParams()
+     }
+ 
+     m_localDropTime = Timer(1000U, 0U, m_dropTimeMS);
+-    m_udpDropTime = Timer(1000U, 0U, m_dropTimeMS);
++    m_udpDropTime.setTimeout(m_dropTimeMS);
+ 
+     m_detectAnalogMDC1200 = systemConf["detectAnalogMDC1200"].as<bool>(false);
+ 
+@@ -1488,6 +1491,7 @@ void HostBridge::processUDPAudio()
+ 
+         req->dstId = m_dstId;
+ 
++        m_udpDropTime.noteEnqueue();
+         m_udpPackets.push_back(req);
+     }
+ }
+@@ -1575,6 +1579,7 @@ void HostBridge::writeUDPAudio(uint32_t srcId, uint32_t dstId, uint8_t* pcm, uin
+ 
+ void HostBridge::processInCallCtrl(network::NET_ICC::ENUM command, uint32_t dstId, uint8_t slotNo)
+ {
++    std::lock_guard<std::mutex> audioLock(s_audioMutex);
+     std::string trafficType = LOCAL_CALL;
+     if (m_trafficFromUDP) {
+         trafficType = UDP_CALL;
+@@ -2331,6 +2336,9 @@ void* HostBridge::threadUDPAudioProcess(void* arg)
+                     lastFrameTime = now;
+                 }
+                 
++                // Own the complete call-state transition and encoding, including
++                // source-change tails. The watchdog uses this same mutex.
++                std::lock_guard<std::mutex> audioLock(s_audioMutex);
+                 bridge->m_udpDropTime.start();
+ 
+                 // handle source ID management
+@@ -2414,8 +2422,7 @@ void* HostBridge::threadUDPAudioProcess(void* arg)
+                         bridge->m_udpDropTime.start();
+                 }
+ 
+-                // process the received audio frame
+-                std::lock_guard<std::mutex> lock(s_audioMutex);
++                // process the received audio frame (audioLock is already held)
+                 uint8_t pcm[AUDIO_SAMPLES_LENGTH_BYTES];
+                 ::memset(pcm, 0x00U, AUDIO_SAMPLES_LENGTH_BYTES);
+ 
+@@ -2881,58 +2888,43 @@ void* HostBridge::threadCallWatchdog(void* arg)
+             uint32_t ms = stopWatch.elapsed();
+             stopWatch.start();
+ 
+-            if (!bridge->m_trafficFromUDP) {
+-                if (bridge->m_localDropTime.isRunning())
++            // Local call state and UDP encoder/tail state share this mutex.
++            // UDP inactivity uses a monotonic accepted-frame deadline below;
++            // never apply this watchdog's elapsed interval to a worker reset.
++            {
++                std::lock_guard<std::mutex> audioLock(s_audioMutex);
++                if (!bridge->m_trafficFromUDP && bridge->m_localDropTime.isRunning())
+                     bridge->m_localDropTime.clock(ms);
+-            }
+-            else {
+-                if (bridge->m_udpDropTime.isRunning())
+-                    bridge->m_udpDropTime.clock(ms);
+-            }
+ 
+-            // Debounce RTS PTT clear using hold-off after last audio output
+-            if (bridge->m_rtsPttEnable && bridge->m_rtsPttActive) {
+-                uint64_t sinceLastOut = system_clock::hrc::diffNow(bridge->m_lastAudioOut);
+-                if (sinceLastOut >= bridge->m_rtsPttHoldoffMs) {
+-                    bridge->deassertRtsPtt();
++                if (bridge->m_rtsPttEnable && bridge->m_rtsPttActive) {
++                    uint64_t sinceLastOut = system_clock::hrc::diffNow(bridge->m_lastAudioOut);
++                    if (sinceLastOut >= bridge->m_rtsPttHoldoffMs)
++                        bridge->deassertRtsPtt();
+                 }
+-            }
+-
+-            // When CTS COR is active, the audio processing thread handles frame transmission
+-            // We don't use the watchdog thread for padding to avoid conflicts with actual audio frames
+-
+-            std::string trafficType = LOCAL_CALL;
+-            if (bridge->m_trafficFromUDP)
+-                trafficType = UDP_CALL;
+ 
+-            uint32_t srcId = bridge->m_srcId;
+-            if (bridge->m_srcIdOverride != 0 && bridge->m_overrideSrcIdFromMDC)
+-                srcId = bridge->m_srcIdOverride;
+-
+-            uint32_t dstId = bridge->m_dstId;
+-
+-            ulong64_t temp = (bridge->m_dropTimeMS) * 1000U;
+-            uint32_t dropTimeout = (uint32_t)((temp / 1000ULL + 1ULL) * 2U);
+-
+-            if (bridge->m_trafficFromUDP) {
+-                srcId = bridge->m_udpSrcId;
+-                dstId = bridge->m_udpDstId;
+-
+-                if (bridge->m_udpDropTime.isRunning() && bridge->m_udpDropTime.hasExpired()) {
+-                    bridge->callEnd(srcId, dstId);
+-                }
+-            }
+-            else {
+-                // Don't end call due to drop timeout if COR is still active
+-                if (!bridge->m_ctsCorActive) {
+-                    // if we've exceeded the drop timeout, then really drop the audio
+-                    if (bridge->m_localDropTime.isRunning() && (bridge->m_localDropTime.getTimer() >= dropTimeout)) {
+-                        LogInfoEx(LOG_HOST, "%s, terminating stuck call", trafficType.c_str());
+-                        bridge->callEnd(srcId, dstId);
++                if (!bridge->m_trafficFromUDP && !bridge->m_ctsCorActive) {
++                    ulong64_t temp = bridge->m_dropTimeMS * 1000U;
++                    uint32_t dropTimeout = (uint32_t)((temp / 1000ULL + 1ULL) * 2U);
++                    if (bridge->m_localDropTime.isRunning() && bridge->m_localDropTime.getTimer() >= dropTimeout) {
++                        uint32_t srcId = bridge->m_srcId;
++                        if (bridge->m_srcIdOverride != 0 && bridge->m_overrideSrcIdFromMDC)
++                            srcId = bridge->m_srcIdOverride;
++                        LogInfoEx(LOG_HOST, "%s, terminating stuck call", LOCAL_CALL);
++                        bridge->callEnd(srcId, bridge->m_dstId);
+                     }
+                 }
+             }
+ 
++            bridge->m_udpDropTime.expireIfIdle(s_audioMutex,
++                []() { return UDPCallDeadline::nowMs(); },
++                [bridge]() {
++                    UDPCallDeadline::State state;
++                    state.queuedFrames = bridge->m_udpPackets.size();
++                    state.p25N = bridge->m_p25N;
++                    return state;
++                },
++                [bridge]() { bridge->callEnd(bridge->m_udpSrcId, bridge->m_udpDstId); });
++
+             Thread::sleep(5U);
+         }
+ 
+diff --git a/src/bridge/HostBridge.h b/src/bridge/HostBridge.h
+index d264068..a3e2e56 100644
+--- a/src/bridge/HostBridge.h
++++ b/src/bridge/HostBridge.h
+@@ -27,6 +27,7 @@
+ #include "common/yaml/Yaml.h"
+ #include "common/RingBuffer.h"
+ #include "common/Timer.h"
++#include "UDPCallDeadline.h"
+ #include "common/Clock.h"
+ #include "vocoder/MBEDecoder.h"
+ #include "vocoder/MBEEncoder.h"
+@@ -190,7 +191,7 @@ private:
+     float m_voxSampleLevel;
+     uint16_t m_dropTimeMS;
+     Timer m_localDropTime;
+-    Timer m_udpDropTime;
++    UDPCallDeadline m_udpDropTime;
+ 
+     bool m_detectAnalogMDC1200;
+ 
+@@ -493,6 +494,7 @@ private:
+      * @param srcId 
+      * @param dstId 
+      */
++    // Caller must own s_audioMutex (also protects encoder/tail state).
+     void callEnd(uint32_t srcId, uint32_t dstId);
+ 
+     /**
+diff --git a/src/bridge/UDPCallDeadline.h b/src/bridge/UDPCallDeadline.h
+new file mode 100644
+index 0000000..ffed50b
+--- /dev/null
++++ b/src/bridge/UDPCallDeadline.h
+@@ -0,0 +1,86 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Monotonic UDP PCM inactivity deadline. No elapsed-tick attribution or I/O. */
++#ifndef __UDP_CALL_DEADLINE_H__
++#define __UDP_CALL_DEADLINE_H__
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <mutex>
++
++class UDPCallDeadline {
++public:
++    struct Expiry {
++        uint64_t count = 0U;
++        uint64_t atMs = 0U;
++        uint64_t acceptedAgeMs = 0U;
++        uint64_t enqueuedAgeMs = 0U;
++        uint64_t queuedFrames = 0U;
++        uint8_t p25N = 0U;
++    };
++    struct State {
++        uint64_t queuedFrames = 0U;
++        uint8_t p25N = 0U;
++    };
++
++    explicit UDPCallDeadline(uint32_t timeoutMs = 180U) :
++        m_timeoutMs(timeoutMs), m_acceptedMs(0U), m_enqueuedMs(0U), m_running(false) {}
++
++    static uint64_t nowMs() {
++        return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count());
++    }
++    // Configuration happens before threads start; the atomic also makes diagnostic reads safe.
++    void setTimeout(uint32_t timeoutMs) { m_timeoutMs.store(timeoutMs); stop(); }
++    void noteEnqueue() { noteEnqueueAt(nowMs()); }
++    void noteEnqueueAt(uint64_t now) { m_enqueuedMs.store(now); }
++    // The bridge calls start/stop while holding its shared audio mutex.
++    void start() { startAt(nowMs()); }
++    void startAt(uint64_t now) { m_acceptedMs.store(now); m_running.store(m_timeoutMs.load() != 0U); }
++    void stop() { m_running.store(false); }
++    bool isRunning() const { return m_running.load(); }
++    bool hasExpiredAt(uint64_t now) const {
++        if (!m_running.load()) return false;
++        const uint64_t accepted = m_acceptedMs.load();
++        const uint32_t timeout = m_timeoutMs.load();
++        return timeout != 0U && now >= accepted && now - accepted >= timeout;
++    }
++
++    // Acquiring the same lock used by the PCM encoder is part of this operation.
++    // Read time and recheck only AFTER ownership; an earlier speculative check
++    // must never terminate a frame that was accepted while we waited.
++    template<class Now, class Metadata, class End>
++    bool expireIfIdle(std::mutex& audioMutex, Now now, Metadata metadata, End end) {
++        std::lock_guard<std::mutex> audioLock(audioMutex);
++        const uint64_t at = now();
++        if (!hasExpiredAt(at)) return false;
++        const State state = metadata();
++        const uint64_t accepted = m_acceptedMs.load();
++        const uint64_t enqueued = m_enqueuedMs.load();
++        {
++            std::lock_guard<std::mutex> diagnosticsLock(m_diagnosticsMutex);
++            ++m_expiry.count;
++            m_expiry.atMs = at;
++            m_expiry.acceptedAgeMs = at >= accepted ? at - accepted : 0U;
++            m_expiry.enqueuedAgeMs = at >= enqueued ? at - enqueued : 0U;
++            m_expiry.queuedFrames = state.queuedFrames;
++            m_expiry.p25N = state.p25N;
++        }
++        stop();
++        end();
++        return true;
++    }
++    Expiry expiry() const {
++        std::lock_guard<std::mutex> lock(m_diagnosticsMutex);
++        return m_expiry;
++    }
++
++private:
++    std::atomic<uint32_t> m_timeoutMs;
++    std::atomic<uint64_t> m_acceptedMs;
++    std::atomic<uint64_t> m_enqueuedMs;
++    std::atomic<bool> m_running;
++    mutable std::mutex m_diagnosticsMutex;
++    Expiry m_expiry;
++};
++#endif
+diff --git a/tests/UDPCallDeadline_Tests.cpp b/tests/UDPCallDeadline_Tests.cpp
+new file mode 100644
+index 0000000..e3affd6
+--- /dev/null
++++ b/tests/UDPCallDeadline_Tests.cpp
+@@ -0,0 +1,164 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Actual production deadline/Timer classes; deterministic times, no RF or sockets. */
++#include "bridge/UDPCallDeadline.h"
++#include "common/Timer.h"
++#include <catch2/catch_test_macros.hpp>
++#include <atomic>
++#include <future>
++#include <mutex>
++#include <thread>
++
++namespace {
++UDPCallDeadline::State emptyState() { return {}; }
++}
++
++TEST_CASE("UDP monotonic deadline excludes time before the most recent PCM acceptance", "[bridge][udp-deadline]") {
++    // Old production algorithm: watchdog baseline t=5; its delayed tick is t=200.
++    // Worker accepts a new frame t=195, but the entire old interval is charged.
++    Timer oldTimer(1000U, 0U, 180U);
++    oldTimer.start();
++    oldTimer.clock(5U);
++    oldTimer.start();
++    oldTimer.clock(195U);
++    REQUIRE(oldTimer.hasExpired());
++
++    UDPCallDeadline deadline(180U);
++    std::mutex audio;
++    unsigned ends = 0U;
++    deadline.startAt(0U);
++    deadline.startAt(195U);
++    REQUIRE_FALSE(deadline.hasExpiredAt(200U));
++    REQUIRE_FALSE(deadline.expireIfIdle(audio, [] { return 200U; }, emptyState, [&] { ++ends; }));
++    REQUIRE(ends == 0U);
++    REQUIRE(deadline.isRunning());
++}
++
++TEST_CASE("UDP inactivity expires exactly once at the unchanged180ms boundary", "[bridge][udp-deadline]") {
++    UDPCallDeadline deadline(180U);
++    std::mutex audio;
++    unsigned ends = 0U;
++    deadline.noteEnqueueAt(97U);
++    deadline.startAt(100U);
++    REQUIRE_FALSE(deadline.hasExpiredAt(99U)); // Backward sample must not underflow.
++    REQUIRE_FALSE(deadline.expireIfIdle(audio, [] { return 279U; }, emptyState, [&] { ++ends; }));
++    REQUIRE(deadline.expireIfIdle(audio, [] { return 280U; }, [] {
++        UDPCallDeadline::State state; state.queuedFrames = 3U; state.p25N = 17U; return state;
++    }, [&] {
++        auto ownership = std::async(std::launch::async, [&] {
++            if (!audio.try_lock()) return true;
++            audio.unlock(); return false;
++        });
++        REQUIRE(ownership.get()); // Another thread cannot enter the encoder mutex.
++        ++ends;
++        deadline.stop(); // HostBridge::callEnd also stops the deadline: no recursive-lock deadlock.
++    }));
++    REQUIRE_FALSE(deadline.expireIfIdle(audio, [] { return 999U; }, emptyState, [&] { ++ends; }));
++    REQUIRE(ends == 1U);
++    const auto snapshot = deadline.expiry();
++    REQUIRE(snapshot.count == 1U);
++    REQUIRE(snapshot.atMs == 280U);
++    REQUIRE(snapshot.acceptedAgeMs == 180U);
++    REQUIRE(snapshot.enqueuedAgeMs == 183U);
++    REQUIRE(snapshot.queuedFrames == 3U);
++    REQUIRE(snapshot.p25N == 17U);
++}
++
++TEST_CASE("UDP watchdog rechecks a fresh frame accepted while waiting for encoder ownership", "[bridge][udp-deadline]") {
++    UDPCallDeadline deadline(180U);
++    std::mutex audio;
++    std::atomic<uint64_t> now{300U};
++    unsigned ends = 0U;
++    deadline.startAt(100U); // A speculative pre-lock check would say expired.
++    REQUIRE(deadline.hasExpiredAt(now.load()));
++    std::unique_lock<std::mutex> encoder(audio);
++    std::promise<void> started;
++    auto check = std::async(std::launch::async, [&] {
++        started.set_value();
++        return deadline.expireIfIdle(audio, [&] { return now.load(); }, emptyState, [&] { ++ends; });
++    });
++    started.get_future().wait();
++    deadline.startAt(295U);
++    encoder.unlock();
++    REQUIRE_FALSE(check.get());
++    REQUIRE(ends == 0U);
++    REQUIRE(deadline.isRunning());
++}
++
++TEST_CASE("UDP tail cannot overlap an unfinished encoder or emit a false TDU", "[bridge][udp-deadline]") {
++    UDPCallDeadline deadline(180U);
++    std::mutex audio;
++    unsigned p25N = 0U, tdus = 0U;
++    std::promise<void> encoding, finish, watching;
++    auto finishFuture = finish.get_future();
++    auto worker = std::async(std::launch::async, [&] {
++        std::lock_guard<std::mutex> lock(audio);
++        deadline.startAt(195U);
++        p25N = 17U; // Encoder is between its LDU2 write and counter increment.
++        encoding.set_value();
++        finishFuture.wait();
++        p25N = 0U;
++    });
++    encoding.get_future().wait();
++    auto watchdog = std::async(std::launch::async, [&] {
++        watching.set_value();
++        return deadline.expireIfIdle(audio, [] { return 200U; }, [&] {
++            UDPCallDeadline::State state; state.p25N = uint8_t(p25N); return state;
++        }, [&] { ++tdus; });
++    });
++    watching.get_future().wait();
++    finish.set_value();
++    worker.get();
++    REQUIRE_FALSE(watchdog.get());
++    REQUIRE(p25N == 0U);
++    REQUIRE(tdus == 0U);
++}
++
++TEST_CASE("Concurrent UDP expiry checks serialize a single call end", "[bridge][udp-deadline]") {
++    UDPCallDeadline deadline(180U);
++    std::mutex audio;
++    unsigned ends = 0U;
++    deadline.startAt(100U);
++    auto check = [&] { return deadline.expireIfIdle(audio, [] { return 300U; }, emptyState, [&] { ++ends; }); };
++    auto first = std::async(std::launch::async, check);
++    auto second = std::async(std::launch::async, check);
++    const unsigned expired = unsigned(first.get()) + unsigned(second.get());
++    REQUIRE(expired == 1U);
++    REQUIRE(ends == 1U);
++    REQUIRE(deadline.expiry().count == 1U);
++}
++
++TEST_CASE("Continuous20ms PCM frames do not end the call across delayed watchdog schedules", "[bridge][udp-deadline]") {
++    UDPCallDeadline deadline(180U);
++    std::mutex audio;
++    unsigned tdus = 0U;
++    uint64_t last = 0U;
++    for (uint64_t frame = 0U; frame < 1000U; ++frame) {
++        last = frame * 20U;
++        {
++            std::lock_guard<std::mutex> lock(audio);
++            deadline.noteEnqueueAt(last);
++            deadline.startAt(last);
++        }
++        // Including long intervals between watchdog visits; real frame age is5ms.
++        if (frame % 10U == 0U)
++            REQUIRE_FALSE(deadline.expireIfIdle(audio, [&] { return last + 5U; }, emptyState, [&] { ++tdus; }));
++    }
++    REQUIRE(tdus == 0U);
++    REQUIRE_FALSE(deadline.expireIfIdle(audio, [&] { return last + 179U; }, emptyState, [&] { ++tdus; }));
++    REQUIRE(deadline.expireIfIdle(audio, [&] { return last + 180U; }, emptyState, [&] { ++tdus; }));
++    REQUIRE(tdus == 1U);
++}
++
++TEST_CASE("Stopped and disabled UDP deadlines do not end a call", "[bridge][udp-deadline]") {
++    UDPCallDeadline deadline(180U);
++    std::mutex audio;
++    unsigned ends = 0U;
++    deadline.startAt(10U);
++    deadline.stop();
++    REQUIRE_FALSE(deadline.expireIfIdle(audio, [] { return 10000U; }, emptyState, [&] { ++ends; }));
++    deadline.setTimeout(0U);
++    deadline.startAt(10U);
++    REQUIRE_FALSE(deadline.isRunning());
++    REQUIRE_FALSE(deadline.expireIfIdle(audio, [] { return 10000U; }, emptyState, [&] { ++ends; }));
++    REQUIRE(ends == 0U);
++}

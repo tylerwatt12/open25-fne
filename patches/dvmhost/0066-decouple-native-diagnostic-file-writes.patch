@@ -1,0 +1,1135 @@
+--- a/src/bridge/ActivityLog.cpp
++++ b/src/bridge/ActivityLog.cpp
+@@ -46,23 +46,33 @@
+ 
+ /* Helper to open the activity log file, file handle. */
+ 
+-static bool ActivityLogOpen()
++static bool ActivityLogOpen(const std::tm* recordedDay = nullptr)
+ {
+     if (CurrentLogFileLevel() == 0U)
+         return true;
+ 
+-    time_t now;
+-    ::time(&now);
+-
+-    struct tm* tm = ::gmtime(&now);
++    std::tm day{};
++    if (recordedDay != nullptr) day = *recordedDay;
++    else {
++        time_t now;
++        ::time(&now);
++#if defined(_WIN32)
++        ::gmtime_s(&day, &now);
++#else
++        ::gmtime_r(&now, &day);
++#endif
++    }
++    const std::tm* tm = &day;
+ 
+     if (tm->tm_mday == g_actTm.tm_mday && tm->tm_mon == g_actTm.tm_mon && tm->tm_year == g_actTm.tm_year) {
+         if (g_actFpLog != nullptr)
+             return true;
+     }
+     else {
+-        if (g_actFpLog != nullptr)
++        if (g_actFpLog != nullptr) {
+             ::fclose(g_actFpLog);
++            g_actFpLog = nullptr;
++        }
+     }
+ 
+     char filename[200U];
+@@ -74,6 +84,18 @@
+     return g_actFpLog != nullptr;
+ }
+ 
++static bool WriteActivityArchive(const char* text, std::time_t recordedTime)
++{
++    std::tm day{};
++#if defined(_WIN32)
++    ::gmtime_s(&day, &recordedTime);
++#else
++    ::gmtime_r(&recordedTime, &day);
++#endif
++    return ::ActivityLogOpen(&day) && g_actFpLog != nullptr &&
++        ::fprintf(g_actFpLog, "%s\n", text) >= 0 && ::fflush(g_actFpLog) == 0;
++}
++
+ /* Initializes the activity log. */
+ 
+ bool ActivityLogInitialise(const std::string& filePath, const std::string& fileRoot)
+@@ -81,10 +103,15 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+     return true;
+ #endif
++    log_internal::StopActivityArchive();
++    if (g_actFpLog != nullptr) { ::fclose(g_actFpLog); g_actFpLog = nullptr; }
+     g_actFilePath = filePath;
+     g_actFileRoot = fileRoot;
+ 
+-    return ::ActivityLogOpen();
++    const bool opened = ::ActivityLogOpen();
++    if (opened && CurrentLogFileLevel() != 0U)
++        log_internal::SetActivityArchiveSink(WriteActivityArchive);
++    return opened;
+ }
+ 
+ /* Finalizes the activity log. */
+@@ -94,21 +121,20 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+     return;
+ #endif
+-    if (g_actFpLog != nullptr)
++    log_internal::StopActivityArchive();
++    if (g_actFpLog != nullptr) {
+         ::fclose(g_actFpLog);
++        g_actFpLog = nullptr;
++    }
+ }
+ 
+ /* Writes a new entry to the activity log. */
+ 
+-void log_internal::ActivityLogInternal(const std::string& log)
++void log_internal::ActivityLogInternal(const std::string& log, std::time_t recordedTime)
+ {
+ #if defined(CATCH2_TEST_COMPILATION)
+     return;
+ #endif
+-    bool ret = ::ActivityLogOpen();
+-    if (!ret)
+-        return;
+-
+     if (CurrentLogFileLevel() == 0U)
+         return;
+ 
+@@ -117,11 +143,9 @@
+         network->writeActLog(log.c_str());
+     }
+ 
+-    ::fprintf(g_actFpLog, "%s\n", log.c_str());
+-    ::fflush(g_actFpLog);
+-
+     if (2U >= g_logDisplayLevel && g_logDisplayLevel != 0U) {
+         ::fprintf(stdout, "%s" EOL, log.c_str());
+         ::fflush(stdout);
+     }
++    log_internal::EnqueueActivityArchive(log, recordedTime);
+ }
+--- a/src/bridge/ActivityLog.h
++++ b/src/bridge/ActivityLog.h
+@@ -25,6 +25,7 @@
+ #endif // defined(_WIN32)
+ 
+ #include <string>
++#include <ctime>
+ 
+ // ---------------------------------------------------------------------------
+ //  Global Functions
+@@ -37,7 +38,7 @@
+      * @param level Log level for entry.
+      * @param log Fully formatted log message.
+      */
+-    extern HOST_SW_API void ActivityLogInternal(const std::string& log);
++    extern HOST_SW_API void ActivityLogInternal(const std::string& log, std::time_t recordedTime = 0);
+ } // namespace log_internal
+ 
+ /**
+@@ -70,12 +71,16 @@
+     int prefixLen = 0;
+     char prefixBuf[256];
+ 
+-    time_t now;
+-    ::time(&now);
+-    struct tm* tm = ::localtime(&now);
+-
+     struct timeval nowMillis;
+     ::gettimeofday(&nowMillis, NULL);
++    const time_t now = static_cast<time_t>(nowMillis.tv_sec);
++    struct tm localTime{};
++#if defined(_WIN32)
++    ::localtime_s(&localTime, &now);
++#else
++    ::localtime_r(&now, &localTime);
++#endif
++    const struct tm* tm = &localTime;
+ 
+     prefixLen = ::sprintf(prefixBuf, "A: %04d-%02d-%02d %02d:%02d:%02d.%03lu ", 
+         tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, nowMillis.tv_usec / 1000U);
+@@ -88,7 +93,7 @@
+     std::string prefix = std::string(prefixBuf, prefixBuf + prefixLen);
+     std::string msg = std::string(buf.get(), buf.get() + size - 1);
+ 
+-    ActivityLogInternal(std::string(prefix + msg));
++    ActivityLogInternal(std::string(prefix + msg), now);
+ }
+ 
+ #endif // __ACTIVITY_LOG_H__
+--- a/src/common/Log.cpp
++++ b/src/common/Log.cpp
+@@ -25,6 +25,13 @@
+ #include <cassert>
+ #include <cstring>
+ #include <iostream>
++#include <array>
++#include <atomic>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++#include <cerrno>
++#include <system_error>
+ 
+ // ---------------------------------------------------------------------------
+ //  Constants
+@@ -56,6 +63,147 @@
+ 
+ static std::ostream g_outStream { std::cerr.rdbuf() };
+ 
++namespace {
++constexpr size_t ARCHIVE_RECORDS = 64U;
++constexpr size_t ARCHIVE_BYTES = 8192U;
++struct ArchiveRecord {
++    std::array<char, ARCHIVE_BYTES> text{};
++    std::time_t when = 0;
++    log_internal::ArchiveSink sink = nullptr;
++};
++std::array<ArchiveRecord, ARCHIVE_RECORDS> archiveRecords;
++std::mutex archiveMutex;
++std::condition_variable archiveChanged;
++size_t archiveHead = 0U, archiveCount = 0U, activityPending = 0U;
++bool archiveAccepting = false, archiveStopping = false;
++log_internal::ArchiveSink activitySink = nullptr;
++std::atomic<uint64_t> archiveEnqueued{0U}, archiveWritten{0U}, archiveFull{0U}, archiveBusy{0U};
++std::atomic<uint64_t> archiveOversize{0U}, archiveStopped{0U}, archiveErrors{0U};
++std::atomic<int> archiveErrno{0};
++uint64_t archiveReported = 0U; // Only the joined writer accesses this across reinitialization.
++
++std::tm archiveDay(std::time_t when)
++{
++    if (when == 0) ::time(&when);
++    std::tm day{};
++#if defined(_WIN32)
++    ::localtime_s(&day, &when);
++#else
++    ::localtime_r(&when, &day);
++#endif
++    return day;
++}
++
++bool writeDiagnosticArchive(const char* text, std::time_t when);
++
++void reportArchiveLoss(log_internal::ArchiveSink sink, std::time_t when)
++{
++    const uint64_t full = archiveFull.load(), busy = archiveBusy.load();
++    const uint64_t oversize = archiveOversize.load(), stopped = archiveStopped.load();
++    const uint64_t omitted = full + busy + oversize + stopped;
++    if (omitted == archiveReported) return;
++    char summary[320];
++    ::snprintf(summary, sizeof(summary), "ARCHIVE LOSS: %llu records omitted (full=%llu busy=%llu oversize=%llu stopped=%llu)",
++        static_cast<unsigned long long>(omitted), static_cast<unsigned long long>(full),
++        static_cast<unsigned long long>(busy), static_cast<unsigned long long>(oversize),
++        static_cast<unsigned long long>(stopped));
++    if (sink(summary, when)) archiveReported = omitted;
++    else { ++archiveErrors; archiveErrno.store(errno); }
++}
++
++// Only this owner writes archive files. No queue lock is held across a sink.
++class ArchiveWriter {
++public:
++    ~ArchiveWriter() { stop(); }
++    bool start()
++    {
++        std::lock_guard<std::mutex> lifetime(lifecycle);
++        std::lock_guard<std::mutex> lock(archiveMutex);
++        archiveHead = archiveCount = activityPending = 0U;
++        archiveStopping = false;
++        activitySink = nullptr;
++        finalActivity = nullptr;
++        try { worker = std::thread([this] { run(); }); }
++        catch (const std::system_error&) { return false; }
++        archiveAccepting = true;
++        return true;
++    }
++    void stop()
++    {
++        std::lock_guard<std::mutex> lifetime(lifecycle);
++        {
++            std::lock_guard<std::mutex> lock(archiveMutex);
++            archiveAccepting = false;
++            finalActivity = worker.joinable() ? activitySink : nullptr;
++            if (finalActivity != nullptr) ++activityPending; // Keep this sink alive through the final loss snapshot.
++            activitySink = nullptr;
++            archiveStopping = true;
++        }
++        archiveChanged.notify_all();
++        if (worker.joinable()) worker.join();
++    }
++private:
++    std::mutex lifecycle;
++    std::thread worker;
++    log_internal::ArchiveSink finalActivity = nullptr;
++    void run()
++    {
++        for (;;) {
++            ArchiveRecord record;
++            {
++                std::unique_lock<std::mutex> lock(archiveMutex);
++                archiveChanged.wait(lock, [] { return archiveCount != 0U || archiveStopping; });
++                if (archiveCount == 0U && archiveStopping) {
++                    lock.unlock();
++                    const std::time_t now = std::time(nullptr);
++                    if (!g_useSyslog) reportArchiveLoss(writeDiagnosticArchive, now);
++                    else if (finalActivity != nullptr) reportArchiveLoss(finalActivity, now);
++                    if (finalActivity != nullptr) {
++                        lock.lock();
++                        --activityPending;
++                        archiveChanged.notify_all();
++                    }
++                    return;
++                }
++                record = archiveRecords[archiveHead];
++                archiveHead = (archiveHead + 1U) % ARCHIVE_RECORDS;
++                --archiveCount;
++            }
++            const auto sink = record.sink == nullptr ? writeDiagnosticArchive : record.sink;
++            reportArchiveLoss(sink, record.when);
++            if (sink(record.text.data(), record.when)) ++archiveWritten;
++            else { ++archiveErrors; archiveErrno.store(errno); }
++            if (record.sink != nullptr) {
++                std::lock_guard<std::mutex> lock(archiveMutex);
++                --activityPending;
++                archiveChanged.notify_all();
++            }
++        }
++    }
++};
++ArchiveWriter archiveWriter;
++
++void enqueueArchive(const std::string& text, std::time_t when, bool activity)
++{
++    if (text.size() >= ARCHIVE_BYTES) { ++archiveOversize; return; }
++    if (when == 0) ::time(&when);
++    std::unique_lock<std::mutex> lock(archiveMutex, std::try_to_lock);
++    if (!lock.owns_lock()) { ++archiveBusy; return; }
++    if (!archiveAccepting || (activity && activitySink == nullptr)) { ++archiveStopped; return; }
++    if (archiveCount == ARCHIVE_RECORDS) { ++archiveFull; return; }
++    auto& record = archiveRecords[(archiveHead + archiveCount) % ARCHIVE_RECORDS];
++    ::memcpy(record.text.data(), text.data(), text.size());
++    record.text[text.size()] = '\0';
++    record.when = when;
++    record.sink = activity ? activitySink : nullptr;
++    ++archiveCount;
++    if (activity) ++activityPending;
++    ++archiveEnqueued;
++    lock.unlock();
++    archiveChanged.notify_one();
++}
++}
++
+ bool log_stacktrace::SignalHandling::s_foreground = false;
+ 
+ // ---------------------------------------------------------------------------
+@@ -76,7 +224,7 @@
+ 
+ /* Helper to open the detailed log file, file handle. */
+ 
+-static bool LogOpen()
++static bool LogOpen(const std::tm* recordedDay = nullptr)
+ {
+ #if defined(CATCH2_TEST_COMPILATION)
+     return true;
+@@ -85,18 +233,18 @@
+         return true;
+ 
+     if (!g_useSyslog) {
+-        time_t now;
+-        ::time(&now);
+-
+-        struct tm* tm = ::localtime(&now);
++        const std::tm day = recordedDay == nullptr ? archiveDay(0) : *recordedDay;
++        const std::tm* tm = &day;
+ 
+         if (tm->tm_mday == g_tm.tm_mday && tm->tm_mon == g_tm.tm_mon && tm->tm_year == g_tm.tm_year) {
+             if (g_fpLog != nullptr)
+                 return true;
+         }
+         else {
+-            if (g_fpLog != nullptr)
++            if (g_fpLog != nullptr) {
+                 ::fclose(g_fpLog);
++                g_fpLog = nullptr;
++            }
+         }
+ 
+         char filename[200U];
+@@ -136,6 +284,15 @@
+     }
+ }
+ 
++namespace {
++bool writeDiagnosticArchive(const char* text, std::time_t when)
++{
++    const std::tm day = archiveDay(when);
++    return ::LogOpen(&day) && g_fpLog != nullptr &&
++        ::fprintf(g_fpLog, "%s\n", text) >= 0 && ::fflush(g_fpLog) == 0;
++}
++}
++
+ /* Gets the instance of the Network class to transfer the activity log with. */
+ 
+ void* LogGetNetwork()
+@@ -160,6 +317,9 @@
+ 
+ bool LogInitialise(const std::string& filePath, const std::string& fileRoot, uint32_t fileLevel, uint32_t displayLevel, bool disableTimeDisplay, bool useSyslog)
+ {
++#if !defined(CATCH2_TEST_COMPILATION)
++    ::LogFinalise();
++#endif
+     g_filePath = filePath;
+     g_fileRoot = fileRoot;
+     g_fileLevel = fileLevel;
+@@ -171,7 +331,14 @@
+     if (!g_useSyslog)
+         g_useSyslog = useSyslog;
+ #endif // defined(_WIN32)
+-    return ::LogOpen();
++    if (!::LogOpen()) return false;
++#if !defined(CATCH2_TEST_COMPILATION)
++    if (g_fileLevel != 0U && !archiveWriter.start()) {
++        ::LogFinalise();
++        return false;
++    }
++#endif
++    return true;
+ }
+ 
+ /* Finalizes the diagnostics log. */
+@@ -181,6 +348,7 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+     return;
+ #endif
++    archiveWriter.stop();
+     if (g_fpLog != nullptr) {
+         ::fclose(g_fpLog);
+         g_fpLog = nullptr;
+@@ -200,7 +368,7 @@
+ 
+ /* Writes a new entry to the diagnostics log. */
+ 
+-void log_internal::LogInternal(uint32_t level, const std::string& log)
++void log_internal::LogInternal(uint32_t level, const std::string& log, std::time_t recordedTime)
+ {
+     if (g_outStream && g_logDisplayLevel == 0U) {
+         g_outStream << log << std::endl;
+@@ -218,17 +386,7 @@
+     return;
+ #endif
+ 
+-    if (level >= g_fileLevel && g_fileLevel != 0U) {
+-        if (!g_useSyslog) {
+-            bool ret = ::LogOpen();
+-            if (!ret)
+-                return;
+-
+-            if (g_fpLog != nullptr) {
+-                ::fprintf(g_fpLog, "%s\n", log.c_str());
+-                ::fflush(g_fpLog);
+-            }
+-        } else {
++    if (g_useSyslog && level >= g_fileLevel && g_fileLevel != 0U) {
+ #if !defined(_WIN32)
+             // convert our log level into syslog level
+             int syslogLevel = LOG_INFO;
+@@ -253,7 +411,6 @@
+ 
+             syslog(syslogLevel, "%s", log.c_str());
+ #endif // !defined(_WIN32)
+-        }
+     }
+ 
+     if (!g_useSyslog && level >= g_logDisplayLevel && g_logDisplayLevel != 0U) {
+@@ -261,14 +418,13 @@
+         ::fflush(stdout);
+     }
+ 
++    if (!g_useSyslog && level >= g_fileLevel && g_fileLevel != 0U)
++        enqueueArchive(log, recordedTime, false);
++
+     // fatal error (specially allow any log levels above 9999)
+     if (level >= 5U && level < 9999U) {
+-        if (g_fpLog != nullptr)
+-            ::fclose(g_fpLog);
+-#if !defined(_WIN32)
+-        if (g_useSyslog)
+-            ::closelog();
+-#endif // !defined(_WIN32)
++        // Fatal shutdown is a terminating path, outside the normal producer guarantee.
++        ::LogFinalise();
+         exit(1);
+     }
+ }
+@@ -287,9 +443,30 @@
+     return g_fileRoot;
+ }
+ 
+-/* Internal helper to get the log file handle pointer. */
+-
+-FILE* log_internal::GetLogFile()
+-{
+-    return g_fpLog;
+-}
++/* Register or retire the role-specific activity archive sink outside protocol work. */
++
++void log_internal::SetActivityArchiveSink(ArchiveSink sink)
++{
++    std::lock_guard<std::mutex> lock(archiveMutex);
++    activitySink = sink;
++}
++
++void log_internal::StopActivityArchive()
++{
++    std::unique_lock<std::mutex> lock(archiveMutex);
++    activitySink = nullptr;
++    archiveChanged.wait(lock, [] { return activityPending == 0U; });
++}
++
++void log_internal::EnqueueActivityArchive(const std::string& log, std::time_t recordedTime)
++{
++    enqueueArchive(log, recordedTime, true);
++}
++
++log_internal::ArchiveStats log_internal::GetArchiveStats()
++{
++    std::lock_guard<std::mutex> lock(archiveMutex);
++    return {archiveEnqueued.load(), archiveWritten.load(), archiveFull.load(), archiveBusy.load(),
++        archiveOversize.load(), archiveStopped.load(), archiveErrors.load(), archiveErrno.load(),
++        archiveCount, ARCHIVE_RECORDS, sizeof(archiveRecords)};
++}
+--- a/src/common/Log.h
++++ b/src/common/Log.h
+@@ -33,6 +33,7 @@
+ #endif
+ 
+ #include <ctime>
++#include <cstddef>
+ #include <string>
+ 
+ /**
+@@ -197,7 +198,19 @@
+      * @param level Log level for entry.
+      * @param log Fully formatted log message.
+      */
+-    extern HOST_SW_API void LogInternal(uint32_t level, const std::string& log);
++    extern HOST_SW_API void LogInternal(uint32_t level, const std::string& log, std::time_t recordedTime = 0);
++
++    // File archives only. Operational display/network observations stay on the caller.
++    using ArchiveSink = bool (*)(const char*, std::time_t);
++    struct ArchiveStats {
++        uint64_t enqueued, written, droppedFull, droppedBusy, droppedOversize, droppedStopped, writeErrors;
++        int lastError;
++        size_t queued, capacity, storageBytes;
++    };
++    extern HOST_SW_API void SetActivityArchiveSink(ArchiveSink sink);
++    extern HOST_SW_API void StopActivityArchive();
++    extern HOST_SW_API void EnqueueActivityArchive(const std::string& log, std::time_t recordedTime);
++    extern HOST_SW_API ArchiveStats GetArchiveStats();
+ 
+     /**
+      * @brief Internal helper to get the log file path.
+@@ -209,11 +222,6 @@
+      * @returns std::string Configured log file root name.
+      */
+     extern HOST_SW_API std::string GetLogFileRoot();
+-    /**
+-     * @brief Internal helper to get the log file handle pointer.
+-     * @returns FILE* Pointer to the open log file.
+-     */
+-    extern HOST_SW_API FILE* GetLogFile();
+ } // namespace log_internal
+ 
+ namespace log_stacktrace
+@@ -378,7 +386,13 @@
+             time_t now;
+             ::time(&now);
+ 
+-            struct tm* tm = ::localtime(&now);
++            struct tm localTime{};
++#if defined(_WIN32)
++            ::localtime_s(&localTime, &now);
++#else
++            ::localtime_r(&now, &localTime);
++#endif
++            const struct tm* tm = &localTime;
+ 
+             char filename[200U];
+             ::sprintf(filename, "%s/%s-%04d-%02d-%02d.stacktrace.log", filePath.c_str(), fileRoot.c_str(), tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
+@@ -386,19 +400,21 @@
+             // log stack trace to a file if we're using syslog
+             if (g_useSyslog) {
+                 FILE* stacktraceFp = ::fopen(filename, "a+t");
+-                ::fprintf(stacktraceFp, "UNRECOVERABLE FATAL ERROR!\r\n");
+-                p.print(st, stacktraceFp);
+-                ::fflush(stacktraceFp);
+-                ::fclose(stacktraceFp);
++                if (stacktraceFp != nullptr) {
++                    ::fprintf(stacktraceFp, "UNRECOVERABLE FATAL ERROR!\r\n");
++                    p.print(st, stacktraceFp);
++                    ::fflush(stacktraceFp);
++                    ::fclose(stacktraceFp);
++                }
+             } else {
+-                FILE *stacktraceFp = log_internal::GetLogFile();
+-                if (stacktraceFp == nullptr) {
+-                    stacktraceFp = ::fopen(filename, "a+t");
++                // Crash capture owns a separate file, never the archive writer's FILE.
++                FILE *stacktraceFp = ::fopen(filename, "a+t");
++                if (stacktraceFp != nullptr) {
+                     ::fprintf(stacktraceFp, "UNRECOVERABLE FATAL ERROR!\r\n");
+-                }
+-                p.print(st, stacktraceFp);
+-                ::fflush(stacktraceFp);
+-                ::fclose(stacktraceFp);
++                    p.print(st, stacktraceFp);
++                    ::fflush(stacktraceFp);
++                    ::fclose(stacktraceFp);
++                }
+             }
+ 
+             (void)info;
+@@ -697,21 +713,26 @@
+             time_t now;
+             ::time(&now);
+ 
+-            struct tm* tm = ::localtime(&now);
++            struct tm localTime{};
++#if defined(_WIN32)
++            ::localtime_s(&localTime, &now);
++#else
++            ::localtime_r(&now, &localTime);
++#endif
++            const struct tm* tm = &localTime;
+ 
+             char filename[200U];
+             ::sprintf(filename, "%s/%s-%04d-%02d-%02d.stacktrace.log", filePath.c_str(), fileRoot.c_str(), tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
+ 
+             // log stack trace to a file if we're using syslog
+-            FILE *stacktraceFp = log_internal::GetLogFile();
+-            if (stacktraceFp == nullptr) {
+-                stacktraceFp = ::fopen(filename, "a+t");
++            // Crash capture owns a separate file, never the archive writer's FILE.
++            FILE *stacktraceFp = ::fopen(filename, "a+t");
++            if (stacktraceFp != nullptr) {
+                 ::fprintf(stacktraceFp, "UNRECOVERABLE FATAL ERROR!\r\n");
+-            }
+-
+-            p.print(st, stacktraceFp);
+-            ::fflush(stacktraceFp);
+-            ::fclose(stacktraceFp);
++                p.print(st, stacktraceFp);
++                ::fflush(stacktraceFp);
++                ::fclose(stacktraceFp);
++            }
+         }
+     };
+ #endif // BACKWARD_SYSTEM_WINDOWS
+@@ -820,12 +841,15 @@
+ #endif
+     int prefixLen = 0;
+     char prefixBuf[256];
++    time_t recordedTime;
++    ::time(&recordedTime);
+ 
+     if (!g_disableTimeDisplay && !g_useSyslog) {
+         // Use one wall-clock sample so a second rollover cannot mix two times.
+         struct timeval nowMillis;
+         ::gettimeofday(&nowMillis, NULL);
+         const time_t now = static_cast<time_t>(nowMillis.tv_sec);
++        recordedTime = now;
+         struct tm localTime{};
+ #if defined(_WIN32)
+         ::localtime_s(&localTime, &now);
+@@ -954,7 +978,7 @@
+     std::string prefix = std::string(prefixBuf, prefixBuf + prefixLen);
+     std::string msg = std::string(buf.get(), buf.get() + size - 1);
+ 
+-    LogInternal(level, std::string(prefix + msg));
++    LogInternal(level, std::string(prefix + msg), recordedTime);
+ }
+ 
+ /** @} */
+--- a/src/fne/ActivityLog.cpp
++++ b/src/fne/ActivityLog.cpp
+@@ -44,23 +44,33 @@
+ 
+ /* Helper to open the activity log file, file handle. */
+ 
+-static bool ActivityLogOpen()
++static bool ActivityLogOpen(const std::tm* recordedDay = nullptr)
+ {
+     if (CurrentLogFileLevel() == 0U)
+         return true;
+ 
+-    time_t now;
+-    ::time(&now);
+-
+-    struct tm* tm = ::localtime(&now);
++    std::tm day{};
++    if (recordedDay != nullptr) day = *recordedDay;
++    else {
++        time_t now;
++        ::time(&now);
++#if defined(_WIN32)
++        ::localtime_s(&day, &now);
++#else
++        ::localtime_r(&now, &day);
++#endif
++    }
++    const std::tm* tm = &day;
+ 
+     if (tm->tm_mday == g_actTm.tm_mday && tm->tm_mon == g_actTm.tm_mon && tm->tm_year == g_actTm.tm_year) {
+         if (g_actFpLog != nullptr)
+             return true;
+     }
+     else {
+-        if (g_actFpLog != nullptr)
++        if (g_actFpLog != nullptr) {
+             ::fclose(g_actFpLog);
++            g_actFpLog = nullptr;
++        }
+     }
+ 
+     char filename[200U];
+@@ -72,6 +82,18 @@
+     return g_actFpLog != nullptr;
+ }
+ 
++static bool WriteActivityArchive(const char* text, std::time_t recordedTime)
++{
++    std::tm day{};
++#if defined(_WIN32)
++    ::localtime_s(&day, &recordedTime);
++#else
++    ::localtime_r(&recordedTime, &day);
++#endif
++    return ::ActivityLogOpen(&day) && g_actFpLog != nullptr &&
++        ::fprintf(g_actFpLog, "%s\n", text) >= 0 && ::fflush(g_actFpLog) == 0;
++}
++
+ /* Initializes the activity log. */
+ 
+ bool ActivityLogInitialise(const std::string& filePath, const std::string& fileRoot)
+@@ -79,10 +101,15 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+     return true;
+ #endif
++    log_internal::StopActivityArchive();
++    if (g_actFpLog != nullptr) { ::fclose(g_actFpLog); g_actFpLog = nullptr; }
+     g_actFilePath = filePath;
+     g_aclFileRoot = fileRoot;
+ 
+-    return ::ActivityLogOpen();
++    const bool opened = ::ActivityLogOpen();
++    if (opened && CurrentLogFileLevel() != 0U)
++        log_internal::SetActivityArchiveSink(WriteActivityArchive);
++    return opened;
+ }
+ 
+ /* Finalizes the activity log. */
+@@ -92,29 +119,26 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+     return;
+ #endif
+-    if (g_actFpLog != nullptr)
++    log_internal::StopActivityArchive();
++    if (g_actFpLog != nullptr) {
+         ::fclose(g_actFpLog);
++        g_actFpLog = nullptr;
++    }
+ }
+ 
+ /* Writes a new entry to the activity log. */
+ 
+-void log_internal::ActivityLogInternal(const std::string& log)
++void log_internal::ActivityLogInternal(const std::string& log, std::time_t recordedTime)
+ {
+ #if defined(CATCH2_TEST_COMPILATION)
+     return;
+ #endif
+-    bool ret = ::ActivityLogOpen();
+-    if (!ret)
+-        return;
+-
+     if (CurrentLogFileLevel() == 0U)
+         return;
+-
+-    ::fprintf(g_actFpLog, "%s\n", log.c_str());
+-    ::fflush(g_actFpLog);
+ 
+     if (2U >= g_logDisplayLevel && g_logDisplayLevel != 0U) {
+         ::fprintf(stdout, "%s" EOL, log.c_str());
+         ::fflush(stdout);
+     }
++    log_internal::EnqueueActivityArchive(log, recordedTime);
+ }
+--- a/src/fne/ActivityLog.h
++++ b/src/fne/ActivityLog.h
+@@ -19,6 +19,7 @@
+ #include "Defines.h"
+ 
+ #include <string>
++#include <ctime>
+ 
+ // ---------------------------------------------------------------------------
+ //  Global Functions
+@@ -31,7 +32,7 @@
+      * @param level Log level for entry.
+      * @param log Fully formatted log message.
+      */
+-    extern HOST_SW_API void ActivityLogInternal(const std::string& log);
++    extern HOST_SW_API void ActivityLogInternal(const std::string& log, std::time_t recordedTime = 0);
+ } // namespace log_internal
+ 
+ /**
+@@ -68,7 +69,7 @@
+ 
+     std::string msg = std::string(buf.get(), buf.get() + size - 1);
+ 
+-    ActivityLogInternal(std::string(msg));
++    ActivityLogInternal(std::string(msg), std::time(nullptr));
+ }
+ 
+ #endif // __ACTIVITY_LOG_H__
+--- a/src/host/ActivityLog.cpp
++++ b/src/host/ActivityLog.cpp
+@@ -46,23 +46,33 @@
+ 
+ /* Helper to open the activity log file, file handle. */
+ 
+-static bool ActivityLogOpen()
++static bool ActivityLogOpen(const std::tm* recordedDay = nullptr)
+ {
+     if (CurrentLogFileLevel() == 0U)
+         return true;
+ 
+-    time_t now;
+-    ::time(&now);
+-
+-    struct tm* tm = ::localtime(&now);
++    std::tm day{};
++    if (recordedDay != nullptr) day = *recordedDay;
++    else {
++        time_t now;
++        ::time(&now);
++#if defined(_WIN32)
++        ::localtime_s(&day, &now);
++#else
++        ::localtime_r(&now, &day);
++#endif
++    }
++    const std::tm* tm = &day;
+ 
+     if (tm->tm_mday == g_actTm.tm_mday && tm->tm_mon == g_actTm.tm_mon && tm->tm_year == g_actTm.tm_year) {
+         if (g_actFpLog != nullptr)
+             return true;
+     }
+     else {
+-        if (g_actFpLog != nullptr)
++        if (g_actFpLog != nullptr) {
+             ::fclose(g_actFpLog);
++            g_actFpLog = nullptr;
++        }
+     }
+ 
+     char filename[200U];
+@@ -74,6 +84,18 @@
+     return g_actFpLog != nullptr;
+ }
+ 
++static bool WriteActivityArchive(const char* text, std::time_t recordedTime)
++{
++    std::tm day{};
++#if defined(_WIN32)
++    ::localtime_s(&day, &recordedTime);
++#else
++    ::localtime_r(&recordedTime, &day);
++#endif
++    return ::ActivityLogOpen(&day) && g_actFpLog != nullptr &&
++        ::fprintf(g_actFpLog, "%s\n", text) >= 0 && ::fflush(g_actFpLog) == 0;
++}
++
+ /* Initializes the activity log. */
+ 
+ bool ActivityLogInitialise(const std::string& filePath, const std::string& fileRoot)
+@@ -81,10 +103,15 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+     return true;
+ #endif
++    log_internal::StopActivityArchive();
++    if (g_actFpLog != nullptr) { ::fclose(g_actFpLog); g_actFpLog = nullptr; }
+     g_actFilePath = filePath;
+     g_actFileRoot = fileRoot;
+ 
+-    return ::ActivityLogOpen();
++    const bool opened = ::ActivityLogOpen();
++    if (opened && CurrentLogFileLevel() != 0U)
++        log_internal::SetActivityArchiveSink(WriteActivityArchive);
++    return opened;
+ }
+ 
+ /* Finalizes the activity log. */
+@@ -94,21 +121,20 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+     return;
+ #endif
+-    if (g_actFpLog != nullptr)
++    log_internal::StopActivityArchive();
++    if (g_actFpLog != nullptr) {
+         ::fclose(g_actFpLog);
++        g_actFpLog = nullptr;
++    }
+ }
+ 
+ /* Writes a new entry to the activity log. */
+ 
+-void log_internal::ActivityLogInternal(const std::string& log)
++void log_internal::ActivityLogInternal(const std::string& log, std::time_t recordedTime)
+ {
+ #if defined(CATCH2_TEST_COMPILATION)
+     return;
+ #endif
+-    bool ret = ::ActivityLogOpen();
+-    if (!ret)
+-        return;
+-
+     if (CurrentLogFileLevel() == 0U)
+         return;
+ 
+@@ -117,11 +143,9 @@
+         network->writeActLog(log.c_str());
+     }
+ 
+-    ::fprintf(g_actFpLog, "%s\n", log.c_str());
+-    ::fflush(g_actFpLog);
+-
+     if (2U >= g_logDisplayLevel && g_logDisplayLevel != 0U) {
+         ::fprintf(stdout, "%s" EOL, log.c_str());
+         ::fflush(stdout);
+     }
++    log_internal::EnqueueActivityArchive(log, recordedTime);
+ }
+--- a/src/host/ActivityLog.h
++++ b/src/host/ActivityLog.h
+@@ -25,6 +25,7 @@
+ #endif // defined(_WIN32)
+ 
+ #include <string>
++#include <ctime>
+ #include <cstring>
+ 
+ // ---------------------------------------------------------------------------
+@@ -38,7 +39,7 @@
+      * @param level Log level for entry.
+      * @param log Fully formatted log message.
+      */
+-    extern HOST_SW_API void ActivityLogInternal(const std::string& log);
++    extern HOST_SW_API void ActivityLogInternal(const std::string& log, std::time_t recordedTime = 0);
+ } // namespace log_internal
+ 
+ /**
+@@ -73,12 +74,16 @@
+     int prefixLen = 0;
+     char prefixBuf[256];
+ 
+-    time_t now;
+-    ::time(&now);
+-    struct tm* tm = ::localtime(&now);
+-
+     struct timeval nowMillis;
+     ::gettimeofday(&nowMillis, NULL);
++    const time_t now = static_cast<time_t>(nowMillis.tv_sec);
++    struct tm localTime{};
++#if defined(_WIN32)
++    ::localtime_s(&localTime, &now);
++#else
++    ::localtime_r(&now, &localTime);
++#endif
++    const struct tm* tm = &localTime;
+ 
+     if (strcmp(mode, "") == 0) {
+         prefixLen = ::sprintf(prefixBuf, "A: %04d-%02d-%02d %02d:%02d:%02d.%03lu ", 
+@@ -97,7 +102,7 @@
+     std::string prefix = std::string(prefixBuf, prefixBuf + prefixLen);
+     std::string msg = std::string(buf.get(), buf.get() + size - 1);
+ 
+-    ActivityLogInternal(std::string(prefix + msg));
++    ActivityLogInternal(std::string(prefix + msg), now);
+ }
+ 
+ #endif // __ACTIVITY_LOG_H__
+--- a/src/patch/ActivityLog.cpp
++++ b/src/patch/ActivityLog.cpp
+@@ -46,23 +46,33 @@
+ 
+ /* Helper to open the activity log file, file handle. */
+ 
+-static bool ActivityLogOpen()
++static bool ActivityLogOpen(const std::tm* recordedDay = nullptr)
+ {
+     if (CurrentLogFileLevel() == 0U)
+         return true;
+ 
+-    time_t now;
+-    ::time(&now);
+-
+-    struct tm* tm = ::gmtime(&now);
++    std::tm day{};
++    if (recordedDay != nullptr) day = *recordedDay;
++    else {
++        time_t now;
++        ::time(&now);
++#if defined(_WIN32)
++        ::gmtime_s(&day, &now);
++#else
++        ::gmtime_r(&now, &day);
++#endif
++    }
++    const std::tm* tm = &day;
+ 
+     if (tm->tm_mday == g_actTm.tm_mday && tm->tm_mon == g_actTm.tm_mon && tm->tm_year == g_actTm.tm_year) {
+         if (g_actFpLog != nullptr)
+             return true;
+     }
+     else {
+-        if (g_actFpLog != nullptr)
++        if (g_actFpLog != nullptr) {
+             ::fclose(g_actFpLog);
++            g_actFpLog = nullptr;
++        }
+     }
+ 
+     char filename[200U];
+@@ -74,6 +84,18 @@
+     return g_actFpLog != nullptr;
+ }
+ 
++static bool WriteActivityArchive(const char* text, std::time_t recordedTime)
++{
++    std::tm day{};
++#if defined(_WIN32)
++    ::gmtime_s(&day, &recordedTime);
++#else
++    ::gmtime_r(&recordedTime, &day);
++#endif
++    return ::ActivityLogOpen(&day) && g_actFpLog != nullptr &&
++        ::fprintf(g_actFpLog, "%s\n", text) >= 0 && ::fflush(g_actFpLog) == 0;
++}
++
+ /* Initializes the activity log. */
+ 
+ bool ActivityLogInitialise(const std::string& filePath, const std::string& fileRoot)
+@@ -81,10 +103,15 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+     return true;
+ #endif
++    log_internal::StopActivityArchive();
++    if (g_actFpLog != nullptr) { ::fclose(g_actFpLog); g_actFpLog = nullptr; }
+     g_actFilePath = filePath;
+     g_actFileRoot = fileRoot;
+ 
+-    return ::ActivityLogOpen();
++    const bool opened = ::ActivityLogOpen();
++    if (opened && CurrentLogFileLevel() != 0U)
++        log_internal::SetActivityArchiveSink(WriteActivityArchive);
++    return opened;
+ }
+ 
+ /* Finalizes the activity log. */
+@@ -94,21 +121,20 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+     return;
+ #endif
+-    if (g_actFpLog != nullptr)
++    log_internal::StopActivityArchive();
++    if (g_actFpLog != nullptr) {
+         ::fclose(g_actFpLog);
++        g_actFpLog = nullptr;
++    }
+ }
+ 
+ /* Writes a new entry to the activity log. */
+ 
+-void log_internal::ActivityLogInternal(const std::string& log)
++void log_internal::ActivityLogInternal(const std::string& log, std::time_t recordedTime)
+ {
+ #if defined(CATCH2_TEST_COMPILATION)
+     return;
+ #endif
+-    bool ret = ::ActivityLogOpen();
+-    if (!ret)
+-        return;
+-
+     if (CurrentLogFileLevel() == 0U)
+         return;
+ 
+@@ -117,11 +143,9 @@
+         network->writeActLog(log.c_str());
+     }
+ 
+-    ::fprintf(g_actFpLog, "%s\n", log.c_str());
+-    ::fflush(g_actFpLog);
+-
+     if (2U >= g_logDisplayLevel && g_logDisplayLevel != 0U) {
+         ::fprintf(stdout, "%s" EOL, log.c_str());
+         ::fflush(stdout);
+     }
++    log_internal::EnqueueActivityArchive(log, recordedTime);
+ }
+--- a/src/patch/ActivityLog.h
++++ b/src/patch/ActivityLog.h
+@@ -25,6 +25,7 @@
+ #endif // defined(_WIN32)
+ 
+ #include <string>
++#include <ctime>
+ 
+ // ---------------------------------------------------------------------------
+ //  Global Functions
+@@ -37,7 +38,7 @@
+      * @param level Log level for entry.
+      * @param log Fully formatted log message.
+      */
+-    extern HOST_SW_API void ActivityLogInternal(const std::string& log);
++    extern HOST_SW_API void ActivityLogInternal(const std::string& log, std::time_t recordedTime = 0);
+ } // namespace log_internal
+ 
+ /**
+@@ -70,12 +71,16 @@
+     int prefixLen = 0;
+     char prefixBuf[256];
+ 
+-    time_t now;
+-    ::time(&now);
+-    struct tm* tm = ::localtime(&now);
+-
+     struct timeval nowMillis;
+     ::gettimeofday(&nowMillis, NULL);
++    const time_t now = static_cast<time_t>(nowMillis.tv_sec);
++    struct tm localTime{};
++#if defined(_WIN32)
++    ::localtime_s(&localTime, &now);
++#else
++    ::localtime_r(&now, &localTime);
++#endif
++    const struct tm* tm = &localTime;
+ 
+     prefixLen = ::sprintf(prefixBuf, "A: %04d-%02d-%02d %02d:%02d:%02d.%03lu ", 
+         tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, nowMillis.tv_usec / 1000U);
+@@ -88,7 +93,7 @@
+     std::string prefix = std::string(prefixBuf, prefixBuf + prefixLen);
+     std::string msg = std::string(buf.get(), buf.get() + size - 1);
+ 
+-    ActivityLogInternal(std::string(prefix + msg));
++    ActivityLogInternal(std::string(prefix + msg), now);
+ }
+ 
+ #endif // __ACTIVITY_LOG_H__

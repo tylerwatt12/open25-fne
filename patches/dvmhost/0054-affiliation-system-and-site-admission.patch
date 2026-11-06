@@ -1,0 +1,237 @@
+diff --git a/src/common/lookups/TalkgroupRulesLookup.h b/src/common/lookups/TalkgroupRulesLookup.h
+--- a/src/common/lookups/TalkgroupRulesLookup.h
++++ b/src/common/lookups/TalkgroupRulesLookup.h
+@@ -211,6 +211,7 @@
+          */
+         TalkgroupRuleConfig() :
+             m_active(false),
++            m_systemValid(false),
+             m_affiliated(false),
+             m_parrot(false),
+             m_inclusion(),
+@@ -231,6 +232,7 @@
+             TalkgroupRuleConfig()
+         {
+             m_active = node["active"].as<bool>(false);
++            m_systemValid = node["system_valid"].as<bool>(false);
+             m_affiliated = node["affiliated"].as<bool>(false);
+             m_parrot = node["parrot"].as<bool>(false);
+ 
+@@ -295,6 +297,7 @@
+         {
+             if (this != &data) {
+                 m_active = data.m_active;
++                m_systemValid = data.m_systemValid;
+                 m_affiliated = data.m_affiliated;
+                 m_parrot = data.m_parrot;
+                 m_inclusion = data.m_inclusion;
+@@ -354,6 +357,7 @@
+         {
+             // We have to convert the bools back to strings to pass to the yaml node
+             node["active"] = __BOOL_STR(m_active);
++            node["system_valid"] = __BOOL_STR(m_systemValid);
+             node["affiliated"] = __BOOL_STR(m_affiliated);
+             node["parrot"] = __BOOL_STR(m_parrot);
+             
+@@ -420,6 +424,10 @@
+          * @brief Flag indicating whether the rule is active.
+          */
+         DECLARE_PROPERTY_PLAIN(bool, active);
++        // Global eligibility is classification evidence only, never local admission.
++        // Every active local group is necessarily valid on its system.
++        bool validOnSystem() const { return m_active || m_systemValid; }
++        DECLARE_PROPERTY_PLAIN(bool, systemValid);
+         /**
+          * @brief Flag indicating whether this talkgroup will only repeat with affiliations.
+          */
+diff --git a/src/common/p25/acl/AccessControl.cpp b/src/common/p25/acl/AccessControl.cpp
+--- a/src/common/p25/acl/AccessControl.cpp
++++ b/src/common/p25/acl/AccessControl.cpp
+@@ -49,6 +49,16 @@
+         return false;
+ 
+     return true;
++}
++
++/* Global directory validity does not grant Site service admission. */
++
++bool AccessControl::validateSystemTGId(uint32_t id)
++{
++    if (id == 0U) return false;
++    if (!s_tidLookup->getACL()) return true;
++    const auto rule = s_tidLookup->find(id);
++    return !rule.isInvalid() && rule.config().validOnSystem();
+ }
+ 
+ /* Helper to validate a talkgroup ID. */
+diff --git a/src/common/p25/acl/AccessControl.h b/src/common/p25/acl/AccessControl.h
+--- a/src/common/p25/acl/AccessControl.h
++++ b/src/common/p25/acl/AccessControl.h
+@@ -51,7 +51,9 @@
+              * @returns bool True, if source radio ID is valid, otherwise false.
+              */
+             static bool validateSrcId(uint32_t id);
+-            /**
++            /** Global group validity for affiliation response classification only. */
++        static bool validateSystemTGId(uint32_t id);
++        /**
+              * @brief Helper to validate a talkgroup ID.
+              * @param id Talkgroup ID (TGID).
+              * @param allowZero Flag indicating whether TGID 0 is allowed or not.
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -708,11 +708,6 @@
+                 const auto response = writeRF_TSDU_Grp_Aff_Rsp(srcId, dstId);
+                 if (response == ResponseCode::ACCEPT && m_p25->m_ackTSBKRequests)
+                     writeRF_TSDU_ACK_FNE(srcId, TSBKO::IOSP_GRP_AFF, true, true);
+-                if (response == ResponseCode::REFUSED) {
+-                    if (m_p25->m_demandUnitRegForRefusedAff) {
+-                        writeRF_TSDU_U_Reg_Cmd(srcId);
+-                    }
+-                }
+             }
+             break;
+             case TSBKO::ISP_GRP_AFF_Q_RSP:
+@@ -3279,6 +3274,9 @@
+         if (m_p25->m_affiliations->groupUnaff(srcId) && m_p25->m_network != nullptr)
+             m_p25->m_network->announceGroupAffiliationRemoval(srcId);
+         writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_REQ_UNIT_NOT_VALID, TSBKO::IOSP_GRP_AFF);
++        // Registration demand follows invalid WUID admission, never AFF_REFUSED
++        // for an invalid group (which leaves valid registration unchanged).
++        if (m_p25->m_demandUnitRegForRefusedAff) writeRF_TSDU_U_Reg_Cmd(srcId);
+         return ResponseCode::REFUSED;
+     }
+ 
+@@ -3309,6 +3307,9 @@
+         if (m_p25->m_affiliations->groupUnaff(srcId) && m_p25->m_network != nullptr)
+             m_p25->m_network->announceGroupAffiliationRemoval(srcId);
+         writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_REQ_UNIT_NOT_VALID, TSBKO::IOSP_GRP_AFF);
++        // Registration demand follows invalid WUID admission, never AFF_REFUSED
++        // for an invalid group (which leaves valid registration unchanged).
++        if (m_p25->m_demandUnitRegForRefusedAff) writeRF_TSDU_U_Reg_Cmd(srcId);
+         return ResponseCode::REFUSED;
+     }
+ 
+@@ -3317,15 +3318,24 @@
+         LogWarning(LOG_RF, P25_TSDU_STR ", %s, TGID 0, dstId = %u", iosp->toString().c_str(), dstId);
+     }
+     else {
+-        if (!acl::AccessControl::validateTGId(dstId)) {
+-            LogWarning(LOG_RF, P25_TSDU_STR ", %s denial, TGID rejection, dstId = %u", iosp->toString().c_str(), dstId);
+-            ::ActivityLog("P25", true, "group affiliation request from %u to %s %u denied", srcId, "TG ", dstId);
++        // AABD-B 6.7.2.1(d/e): distinguish invalid system group from
++        // a valid group unavailable at this Site. A classification-only
++        // system_valid rule must never pass validateTGId/service admission.
++        if (!acl::AccessControl::validateSystemTGId(dstId)) {
++            LogWarning(LOG_RF, P25_TSDU_STR ", %s refusal, system TGID rejection, dstId = %u", iosp->toString().c_str(), dstId);
++            ::ActivityLog("P25", true, "group affiliation request from %u to TG %u refused", srcId, dstId);
++            iosp->setResponse(ResponseCode::REFUSED);
++            noNet = true;
++        }
++        else if (!acl::AccessControl::validateTGId(dstId)) {
++            LogWarning(LOG_RF, P25_TSDU_STR ", %s denial, Site TGID rejection, dstId = %u", iosp->toString().c_str(), dstId);
++            ::ActivityLog("P25", true, "group affiliation request from %u to TG %u denied", srcId, dstId);
+             iosp->setResponse(ResponseCode::DENY);
+             noNet = true;
+         }
+ 
+         // deny affiliation if the TG is non-preferred on this site/CC
+-        if (acl::AccessControl::tgidNonPreferred(dstId)) {
++        if (iosp->getResponse() == ResponseCode::ACCEPT && acl::AccessControl::tgidNonPreferred(dstId)) {
+             LogWarning(LOG_RF, P25_TSDU_STR ", %s non-preferred on this site, TGID rejection, dstId = %u", iosp->toString().c_str(), dstId);
+             ::ActivityLog("P25", true, "group affiliation request from %u to %s %u denied", srcId, "TG ", dstId);
+             iosp->setResponse(ResponseCode::DENY);
+diff --git a/tests/p25/SubscriberAccess_Tests.cpp b/tests/p25/SubscriberAccess_Tests.cpp
+--- a/tests/p25/SubscriberAccess_Tests.cpp
++++ b/tests/p25/SubscriberAccess_Tests.cpp
+@@ -291,7 +291,7 @@
+     bool invalidUnit=false;
+     uint8_t response=0x02U; // AFF_DENY, AABC-E 6.2.8.1, PDF165 / printed146.
+     SECTION("new group denied by per-radio policy") { f.apply(true,{},false,{}); }
+-    SECTION("new group disabled") { f.groups.addEntry(TG,1U,false); }
++    SECTION("new group disabled") { f.groups.addEntry(TG,1U,false); response=0x03U; }
+     SECTION("invalid unit receives service denial") { f.radios.addEntry(RID,false,"Disabled subscriber"); invalidUnit=true; }
+     f.signal(0x28U,(uint64_t(1U)<<40U)|(uint64_t(TG)<<24U)|RID);
+     REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,1002U));
+@@ -333,3 +333,66 @@
+         }
+     }
+ }
++
++// Normative oracle: AABD-B 6.7.2.1(d/e), PDF62 printed57; AABC-E
++// 6.2.8.1/Figure6.2.8-1, PDF165 printed146. GAV bits1..0:
++// 00=accept,10=deny Site,11=refused system. See affiliation-directory.md.
++TEST_CASE("affiliation distinguishes system-invalid from Site-excluded groups", "[p25][subscriber-access][affiliation-directory]") {
++    for (unsigned scenario = 0; scenario != 5; ++scenario) {
++        DYNAMIC_SECTION("directory scenario " << scenario) {
++            Fixture f(true);
++            f.controller->affiliations()->groupAff(RID, 1002U);
++            uint32_t target = TG;
++            uint8_t expected = 0U;
++            if (scenario != 0U) {
++                auto rule = f.groups.find(TG);
++                auto config = rule.config();
++                config.active(false);
++                config.systemValid(scenario == 1U);
++                // An invalid-system result cannot be overwritten by a Site rule.
++                config.nonPreferred(scenario == 4U);
++                rule.config(config); f.groups.addEntry(rule);
++                expected = scenario == 1U ? 2U : 3U;
++                if (scenario == 3U) target = 3001U; // absent system directory entry
++            }
++            const bool local = scenario == 0U;
++            REQUIRE(acl::AccessControl::validateTGId(target) == local);
++            REQUIRE(acl::AccessControl::validateSystemTGId(target) == (scenario < 2U));
++            // Literal request fields: system1, targetWGID, source10001.
++            f.signal(0x28U, (uint64_t(1U)<<40U)|(uint64_t(target)<<24U)|RID);
++            auto replies = f.responses(); unsigned count = 0U;
++            REQUIRE(replies.size() == 1U); // no spurious full-registration demand
++            for (auto& response : replies) if ((response[0]&0x3fU)==0x28U) {
++                ++count;
++                REQUIRE((response[2]&3U)==expected);
++                REQUIRE(((uint32_t(response[5])<<8U)|response[6])==target);
++                REQUIRE(((uint32_t(response[7])<<16U)|(uint32_t(response[8])<<8U)|response[9])==RID);
++            }
++            REQUIRE(count == 1U);
++            REQUIRE(f.controller->affiliations()->isUnitReg(RID));
++            REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,1002U));
++            REQUIRE(f.controller->affiliations()->isGroupAff(RID,target)==local);
++            REQUIRE(acl::AccessControl::validateGroupAffiliation(RID,target)==local);
++            REQUIRE(acl::AccessControl::validateGroupTransmit(RID,target)==local);
++            if (!local) {
++                f.signal(0x00U,(uint64_t(4U)<<56U)|(uint64_t(target)<<24U)|RID);
++                REQUIRE(f.controller->affiliations()->grantSize()==0U);
++                bool denied=false;
++                for(auto& response : f.responses()) if((response[0]&0x3fU)==0x27U) denied=true;
++                REQUIRE(denied);
++            }
++        }
++    }
++}
++TEST_CASE("classification-only system validity survives native YAML copies without granting access", "[p25][affiliation-directory]") {
++    auto rule=policy(true,{RID},true,{RID}); auto config=rule.config();
++    config.active(false); config.systemValid(true); rule.config(config);
++    yaml::Node saved; rule.getYaml(saved); ::lookups::TalkgroupRuleGroupVoice restored(saved);
++    REQUIRE(restored.config().systemValid()); REQUIRE(restored.config().validOnSystem());
++    REQUIRE_FALSE(restored.config().active());
++    Fixture f(true); f.groups.addEntry(restored);
++    REQUIRE(acl::AccessControl::validateSystemTGId(TG));
++    REQUIRE_FALSE(acl::AccessControl::validateTGId(TG));
++    REQUIRE_FALSE(acl::AccessControl::validateGroupAffiliation(RID,TG));
++    REQUIRE_FALSE(acl::AccessControl::validateGroupTransmit(RID,TG));
++}
+diff --git a/tests/p25/ZeroCapacity_Tests.cpp b/tests/p25/ZeroCapacity_Tests.cpp
+--- a/tests/p25/ZeroCapacity_Tests.cpp
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -401,8 +401,8 @@
+     uint32_t group = GROUP;
+     uint8_t response = ResponseCode::ACCEPT;
+     SECTION("enabled talkgroup") {}
+-    SECTION("disabled talkgroup") { group = DENIED_GROUP; response = ResponseCode::DENY; }
+-    SECTION("unknown talkgroup") { group = UNKNOWN_GROUP; response = ResponseCode::DENY; }
++    SECTION("disabled talkgroup") { group = DENIED_GROUP; response = ResponseCode::REFUSED; }
++    SECTION("unknown talkgroup") { group = UNKNOWN_GROUP; response = ResponseCode::REFUSED; }
+     fixture.receive<IOSP_GRP_AFF>(SOURCE, group);
+     fixture.requireAccessResponse(TSBKO::IOSP_GRP_AFF, response);
+     REQUIRE(fixture.controller->affiliations()->isUnitReg(SOURCE));

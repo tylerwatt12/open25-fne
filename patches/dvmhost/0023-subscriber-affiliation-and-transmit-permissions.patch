@@ -1,0 +1,1100 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -274,6 +274,13 @@
+     target_compile_definitions(dvmtests PUBLIC -DCATCH2_TEST_COMPILATION)
+     target_link_libraries(dvmtests PRIVATE Catch2::Catch2WithMain common ${OPENSSL_LIBRARIES} asio::asio Threads::Threads util)
+     target_include_directories(dvmtests PRIVATE ${OPENSSL_INCLUDE_DIR} src src/host tests)
++
++    # FNE has its own process globals. Exercise its real ingress separately
++    # from the Host controller tests, without opening network sockets.
++    add_executable(dvmfnetests ${common_INCLUDE} ${dvmfne_SRC} tests/fne/SubscriberAccessIngress_Tests.cpp)
++    target_compile_definitions(dvmfnetests PUBLIC -DCATCH2_TEST_COMPILATION)
++    target_link_libraries(dvmfnetests PRIVATE Catch2::Catch2WithMain common ${OPENSSL_LIBRARIES} ${LIBDW_LIBRARY} asio::asio Threads::Threads)
++    target_include_directories(dvmfnetests PRIVATE ${OPENSSL_INCLUDE_DIR} ${LIBDW_INCLUDE_DIR} src src/fne tests)
+ endif (ENABLE_TESTS)
+ 
+ #
+--- a/src/common/lookups/TalkgroupRulesLookup.h
++++ b/src/common/lookups/TalkgroupRulesLookup.h
+@@ -27,6 +27,7 @@
+ #include "common/Utils.h"
+ 
+ #include <string>
++#include <algorithm>
+ #include <mutex>
+ #include <unordered_map>
+ #include <vector>
+@@ -179,6 +180,30 @@
+      * @brief Represents an configuration block for a routing rule.
+      * @ingroup lookups_tgid
+      */
++    class HOST_SW_API SubscriberAccessRule {
++    public:
++        SubscriberAccessRule() = default;
++        explicit SubscriberAccessRule(yaml::Node& node) :
++            m_restricted(node["restricted"].as<bool>(false))
++        {
++            auto& radios = node["radio_ids"];
++            for (size_t i = 0U; i < radios.size(); ++i)
++                m_radioIds.push_back(radios[i].as<uint32_t>(0U));
++        }
++        bool permits(uint32_t radioId) const {
++            return !m_restricted || std::find(m_radioIds.begin(), m_radioIds.end(), radioId) != m_radioIds.end();
++        }
++        void getYaml(yaml::Node& node) const {
++            node["restricted"] = m_restricted ? "true" : "false";
++            yaml::Node radios;
++            for (auto id : m_radioIds) radios.push_back() = __INT_STR(id);
++            node["radio_ids"] = radios;
++        }
++    private:
++        bool m_restricted = false;
++        std::vector<uint32_t> m_radioIds;
++    };
++
+     class HOST_SW_API TalkgroupRuleConfig {
+     public:
+         /**
+@@ -249,6 +274,10 @@
+                 }
+             }
+ 
++            auto& subscriber = node["subscriber_access"];
++            m_subscriberAffiliation = SubscriberAccessRule(subscriber["affiliation"]);
++            m_subscriberTransmit = SubscriberAccessRule(subscriber["transmit"]);
++
+             yaml::Node& permittedRIDList = node["rid_permitted"];
+             if (permittedRIDList.size() > 0U) {
+                 for (size_t i = 0; i < permittedRIDList.size(); i++) {
+@@ -274,6 +303,8 @@
+                 m_alwaysSend = data.m_alwaysSend;
+                 m_preferred = data.m_preferred;
+                 m_permittedRIDs = data.m_permittedRIDs;
++                m_subscriberAffiliation = data.m_subscriberAffiliation;
++                m_subscriberTransmit = data.m_subscriberTransmit;
+                 m_nonPreferred = data.m_nonPreferred;
+             }
+ 
+@@ -310,6 +341,10 @@
+          * @returns uint8_t Total count of permitted RID rules.
+          */
+         uint8_t permittedRIDsSize() const { return m_permittedRIDs.size(); }
++        bool subscriberAffiliationPermitted(uint32_t radioId) const { return m_subscriberAffiliation.permits(radioId); }
++        bool subscriberTransmitPermitted(uint32_t radioId) const {
++            return subscriberAffiliationPermitted(radioId) && m_subscriberTransmit.permits(radioId);
++        }
+ 
+         /**
+          * @brief Return the YAML structure for this TalkgroupRuleConfig.
+@@ -376,6 +411,8 @@
+                 }
+             }
+             node["rid_permitted"] = permittedRIDList;
++            m_subscriberAffiliation.getYaml(node["subscriber_access"]["affiliation"]);
++            m_subscriberTransmit.getYaml(node["subscriber_access"]["transmit"]);
+         }
+ 
+     public:
+@@ -416,6 +453,9 @@
+          * @brief List of radios IDs permitted to transmit on the talkgroup.
+          */
+         DECLARE_PROPERTY_PLAIN(std::vector<uint32_t>, permittedRIDs);
++    private:
++        SubscriberAccessRule m_subscriberAffiliation;
++        SubscriberAccessRule m_subscriberTransmit;
+ 
+         /**
+          * @brief Flag indicating whether or not the talkgroup is a non-preferred.
+--- a/src/common/network/P25SiteRouting.h
++++ b/src/common/network/P25SiteRouting.h
+@@ -3,6 +3,7 @@
+ #ifndef __P25_SITE_ROUTING_H__
+ #define __P25_SITE_ROUTING_H__
+ #include "common/yaml/Yaml.h"
++#include "common/lookups/TalkgroupRulesLookup.h"
+ #include <algorithm>
+ #include <chrono>
+ #include <cstdint>
+@@ -72,6 +73,12 @@
+     bool system(uint32_t net, uint32_t sys) const { std::lock_guard<std::mutex> lock(m_mutex); return m_valid && net == m_netId && sys == m_sysId; }
+     Role role(uint32_t peer) const { std::lock_guard<std::mutex> lock(m_mutex); return roleUnlocked(peer); }
+     uint32_t controlPeer(uint32_t peer) const { std::lock_guard<std::mutex> lock(m_mutex); return controlUnlocked(peer); }
++    // Only configured local console/codec peers may carry a Go-authorized
++    // relay to a patch destination. A radio's payload cannot select this role.
++    bool subscriberTransmitPermitted(uint32_t peer, const ::lookups::TalkgroupRuleConfig& policy, uint32_t source) const {
++        const auto kind = role(peer);
++        return kind != Role::Unknown && (kind == Role::Console || policy.subscriberTransmitPermitted(source));
++    }
+     bool allowed(uint32_t peer, uint32_t group) const { std::lock_guard<std::mutex> lock(m_mutex); return allowedUnlocked(peer, group); }
+     bool sameSite(uint32_t a, uint32_t b) const { std::lock_guard<std::mutex> lock(m_mutex); return controlUnlocked(a) != 0U && controlUnlocked(a) == controlUnlocked(b); }
+     bool voiceAssociation(uint32_t cc, uint32_t vc) const { std::lock_guard<std::mutex> lock(m_mutex); return roleUnlocked(cc) == Role::Control && roleUnlocked(vc) == Role::Voice && controlUnlocked(vc) == cc; }
+--- a/src/common/p25/acl/AccessControl.cpp
++++ b/src/common/p25/acl/AccessControl.cpp
+@@ -99,3 +99,18 @@
+ 
+     return false;
+ }
++
++/* Subscriber permissions use the applied local directory, including Site Trunking. */
++bool AccessControl::validateGroupAffiliation(uint32_t source, uint32_t group)
++{
++    if (!validateSrcId(source) || !validateTGId(group)) return false;
++    const auto rule = s_tidLookup->find(group);
++    return rule.isInvalid() || rule.config().subscriberAffiliationPermitted(source);
++}
++
++bool AccessControl::validateGroupTransmit(uint32_t source, uint32_t group)
++{
++    if (!validateGroupAffiliation(source, group)) return false;
++    const auto rule = s_tidLookup->find(group);
++    return rule.isInvalid() || rule.config().subscriberTransmitPermitted(source);
++}
+--- a/src/common/p25/acl/AccessControl.h
++++ b/src/common/p25/acl/AccessControl.h
+@@ -65,6 +65,8 @@
+              * @returns bool True, if talkgroup ID is non-preferred, otherwise false.
+              */
+             static bool tgidNonPreferred(uint32_t id);
++            static bool validateGroupAffiliation(uint32_t source, uint32_t group);
++            static bool validateGroupTransmit(uint32_t source, uint32_t group);
+ 
+         private:
+             static RadioIdLookup* s_ridLookup;
+--- a/src/fne/network/callhandler/TagP25Data.cpp
++++ b/src/fne/network/callhandler/TagP25Data.cpp
+@@ -178,6 +178,32 @@
+         ::memcpy(data, buffer + 24U, frameLength);
+ 
+         tsbk = lc::tsbk::TSBKFactory::createTSBK(data);
++    }
++
++    // Subscriber policy applies to physical voice and grant-demand ingress.
++    // A configured console peer is the trusted Go relay boundary; it has
++    // already authorized the original talkgroup and current patch membership.
++    const bool subscriberVoice = control.getGroup() && (duid == DUID::LDU1 || duid == DUID::LDU2 ||
++        (duid == DUID::TDU && (controlByte & NET_CTRL_GRANT_DEMAND)));
++    if (subscriberVoice) {
++        const auto source = m_network->m_ridLookup->find(control.getSrcId());
++        const bool sourceDenied = source.radioDefault() ? m_network->m_rejectUnknownRID : !source.radioEnabled();
++        const auto rule = m_network->m_tidLookup->find(control.getDstId());
++        if (sourceDenied || rule.isInvalid() || !rule.config().active() ||
++            !m_network->m_p25Sites.subscriberTransmitPermitted(peerId, rule.config(), control.getSrcId())) {
++            if (m_network->m_p25Sites.owns(peerId, streamId, srcId, dstId)) {
++                m_network->m_p25Sites.end(peerId, streamId, dstId);
++                m_status.lock(false);
++                auto previous = m_status.find(dstId);
++                if (previous != m_status.end() && previous->second.peerId == peerId &&
++                    previous->second.streamId == streamId && previous->second.srcId == srcId)
++                    previous->second.activeCall = false;
++                m_status.unlock();
++                m_network->eraseStreamPktSeq(peerId, streamId);
++            }
++            m_network->writePeerICC(peerId, streamId, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25, NET_ICC::REJECT_TRAFFIC, control.getDstId());
++            return false;
++        }
+     }
+ 
+     // is the stream valid?
+@@ -738,6 +764,7 @@
+ 
+     // is the source ID a blacklisted ID?
+     lookups::RadioId rid = m_network->m_ridLookup->find(srcId);
++    if (rid.radioDefault() && m_network->m_rejectUnknownRID) return false;
+     if (!rid.radioDefault()) {
+         if (!rid.radioEnabled()) {
+             return false;
+@@ -755,6 +782,7 @@
+         return false;
+     } 
+ 
++    if (!m_network->m_p25Sites.subscriberTransmitPermitted(peerId, tg.config(), srcId)) return false;
+     if (unitToUnit || !m_network->m_p25Sites.begin(peerId, streamId, srcId, dstId)) return false;
+     lc::LC control; control.setLCO(LCO::GROUP); control.setGroup(true); control.setSrcId(srcId); control.setDstId(dstId);
+     data::LowSpeedData lsd;
+--- a/src/host/p25/Control.Dispatch.cpp
++++ b/src/host/p25/Control.Dispatch.cpp
+@@ -77,6 +77,11 @@
+ 
+ // Physical subscriber kinds are provisioned by the Site service. A console or
+ // mobile login can never become RF demand merely by using its own numeric ID.
++bool Control::physicalSubscriberPermitted(uint32_t source) const
++{
++    return m_dispatchSubscribers.count(source) != 0U && acl::AccessControl::validateSrcId(source);
++}
++
+ bool Control::dispatchRFInterest(uint32_t destination) const
+ {
+     if (m_affiliations == nullptr) return false;
+@@ -84,7 +89,7 @@
+     for (const auto& entry : affiliations) {
+         if (entry.second != destination || m_dispatchSubscribers.count(entry.first) == 0U) continue;
+         const auto radio = m_ridLookup->find(entry.first);
+-        if (!radio.radioDefault() && radio.radioEnabled()) return true;
++        if (!radio.radioDefault() && radio.radioEnabled() && acl::AccessControl::validateGroupAffiliation(entry.first, destination)) return true;
+     }
+     return false;
+ }
+@@ -201,6 +206,26 @@
+ {
+     // This method is called only by the protocol clock owner, never by REST.
+     std::lock_guard<std::recursive_mutex> permit(m_permitMutex);
++    // Revoke direct RF allocations against the newly applied local policy.
++    // Network/console allocations were authorized on their original groups by
++    // Go and may intentionally relay to an otherwise denied patch destination.
++    std::vector<uint32_t> revoked;
++    {
++        auto guard = m_affiliations->lockGrants();
++        for (const auto& entry : m_grantPriorities) {
++            const auto& grant = entry.second;
++            if (m_affiliations->ownsGrant(entry.first, grant.source, grant.channel, grant.epoch) &&
++                !m_affiliations->isNetGranted(entry.first) &&
++                (!physicalSubscriberPermitted(grant.source) || !acl::AccessControl::validateGroupTransmit(grant.source, entry.first)))
++                revoked.push_back(entry.first);
++        }
++        for (auto group : revoked) {
++            const auto source = m_grantPriorities.at(group).source;
++            m_affiliations->releaseGrant(group, false);
++            m_grantPriorities.erase(group);
++            LogWarning(LOG_RF, P25_TSDU_STR ", subscriber transmit denial after policy change, srcId = %u, dstId = %u", source, group);
++        }
++    }
+     clockRFAdmissions();
+     std::vector<std::pair<std::string, std::string>> ending;
+     for (const auto& entry : m_dispatchLeases) {
+--- a/src/host/p25/Control.RFAdmission.cpp
++++ b/src/host/p25/Control.RFAdmission.cpp
+@@ -113,7 +113,7 @@
+         const auto affiliations = m_affiliations->grpAffTable();
+         const auto membership = affiliations.find(current.srcId);
+         const bool permitted = !radio.radioDefault() && radio.radioEnabled() && !group.isInvalid() && group.config().active() &&
+-            acl::AccessControl::validateSrcId(current.srcId) && acl::AccessControl::validateTGId(current.dstId) &&
++            physicalSubscriberPermitted(current.srcId) && acl::AccessControl::validateGroupTransmit(current.srcId, current.dstId) &&
+             membership != affiliations.end() && membership->second == current.dstId;
+         bool committed = false;
+         const bool granted = permitted && dispatchReady() && m_control->writeRF_TSDU_Grant(current.srcId, current.dstId, current.serviceOptions, true, false, false, 0U, [&] {
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -302,6 +302,7 @@
+         void setZoneConnected(bool connected) { m_zoneConnected.store(connected); }
+         bool zoneConnected() const { return m_zoneConnected.load(); }
+         bool externalNetworkAvailable() const { return !m_managedSite || m_zoneConnected.load(); }
++        bool physicalSubscriberPermitted(uint32_t source) const;
+         // Media terminates at the Site-local FNE. Zone authority controls the
+         // wide-area advertisement and application routing, not this local path.
+         bool localMediaAvailable() const { return !m_managedSite || m_network != nullptr; }
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -213,9 +213,27 @@
+ 
+         uint32_t srcId = tsbk->getSrcId();
+         uint32_t dstId = tsbk->getDstId();
+-
++        m_lastMFID = tsbk->getMFId();
++
++        // These existing request handlers already define srcId as the SU.
++        // Do not reinterpret vendor/extended-function argument fields as IDs.
++        bool physicalSourceRequest = false;
++        switch (tsbk->getLCO()) {
++        case TSBKO::IOSP_GRP_VCH: case TSBKO::IOSP_UU_VCH: case TSBKO::IOSP_UU_ANS:
++        case TSBKO::IOSP_TELE_INT_ANS: case TSBKO::ISP_SNDCP_CH_REQ:
++        case TSBKO::IOSP_STS_UPDT: case TSBKO::IOSP_MSG_UPDT: case TSBKO::IOSP_RAD_MON:
++        case TSBKO::IOSP_CALL_ALRT: case TSBKO::IOSP_ACK_RSP: case TSBKO::ISP_GRP_AFF_Q_RSP:
++        case TSBKO::ISP_U_DEREG_REQ: case TSBKO::ISP_EMERG_ALRM_REQ: case TSBKO::ISP_CAN_SRV_REQ:
++            physicalSourceRequest = true; break;
++        default: break;
++        }
++        if (physicalSourceRequest && !m_p25->physicalSubscriberPermitted(srcId)) {
++            LogWarning(LOG_RF, P25_TSDU_STR ", physical subscriber denial, srcId = %u, dstId = %u", srcId, dstId);
++            writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_REQ_UNIT_NOT_VALID, tsbk->getLCO());
++            m_inbound = false; m_p25->m_rfState = prevRfState;
++            return false;
++        }
+         m_p25->m_affiliations->touchUnitReg(srcId);
+-        m_lastMFID = tsbk->getMFId();
+ 
+         // handle standard P25 reference opcodes
+         switch (tsbk->getLCO()) {
+@@ -229,6 +247,13 @@
+ 
+                 // validate the talkgroup ID
+                 VALID_TGID(tsbk->toString(true), TSBKO::IOSP_GRP_VCH, srcId, dstId);
++
++                if (!acl::AccessControl::validateGroupTransmit(srcId, dstId)) {
++                    LogWarning(LOG_RF, P25_TSDU_STR ", subscriber transmit denial, srcId = %u, dstId = %u", srcId, dstId);
++                    writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_TGT_GROUP_NOT_AUTH, TSBKO::IOSP_GRP_VCH, true, true);
++                    m_inbound = false; m_p25->m_rfState = prevRfState;
++                    return false;
++                }
+ 
+                 // verify the source RID is affiliated
+                 VERIFY_SRCID_AFF(tsbk->toString(true), TSBKO::IOSP_GRP_VCH, srcId, dstId);
+@@ -577,6 +602,13 @@
+                         m_p25->m_rfState = RS_RF_REJECTED;
+                         return false;
+                     }
++                }
++
++                if (dstId != 0U && !acl::AccessControl::validateGroupAffiliation(srcId, dstId)) {
++                    LogWarning(LOG_RF, P25_TSDU_STR ", subscriber affiliation denial after query response, srcId = %u, dstId = %u", srcId, dstId);
++                    writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_TGT_GROUP_NOT_AUTH, TSBKO::ISP_GRP_AFF_Q_RSP);
++                    m_inbound = false; m_p25->m_rfState = prevRfState;
++                    return false;
+                 }
+ 
+                 if (m_p25->m_ackTSBKRequests) {
+@@ -2187,6 +2219,11 @@
+ bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net, bool skip, uint32_t chNo, const std::function<bool()>& commit)
+ {
+     if (m_p25->identificationUnavailable()) return false;
++    if (grp && !net && (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateGroupTransmit(srcId, dstId))) {
++        LogWarning(LOG_RF, P25_TSDU_STR ", subscriber transmit denial, srcId = %u, dstId = %u", srcId, dstId);
++        if (!net) writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_TGT_GROUP_NOT_AUTH, TSBKO::IOSP_GRP_VCH, true, true);
++        return false;
++    }
+     bool emergency = ((serviceOptions & 0xFFU) & 0x80U) == 0x80U;           // Emergency Flag
+     bool encryption = ((serviceOptions & 0xFFU) & 0x40U) == 0x40U;          // Encryption Flag
+     uint8_t priority = ((serviceOptions & 0xFFU) & 0x07U);                  // Priority
+@@ -2377,6 +2414,17 @@
+                     m_p25->m_rfState = RS_RF_REJECTED;
+                 }
+                 LogError((net) ? LOG_NET : LOG_RF, "P25 voice channel permit failed, chNo = %u-%u, dstId = %u", voiceChData.chId(), chNo, dstId);
++                return false;
++            }
++
++            // A lookup reload can revoke access while the VC permit RPC waits.
++            // Recheck at the RF enqueue boundary before announcing the grant.
++            if (!net && (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateGroupTransmit(srcId, dstId))) {
++                const uint64_t epoch = m_p25->m_affiliations->grantEpoch(dstId);
++                if (m_p25->m_affiliations->ownsGrant(dstId, srcId, chNo, epoch))
++                    m_p25->m_affiliations->releaseGrant(dstId, false);
++                LogWarning(LOG_RF, P25_TSDU_STR ", subscriber transmit denial after policy change, srcId = %u, dstId = %u", srcId, dstId);
++                writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_TGT_GROUP_NOT_AUTH, TSBKO::IOSP_GRP_VCH, true, true);
+                 return false;
+             }
+ 
+@@ -2888,7 +2936,7 @@
+     bool noNet = false;
+ 
+     // validate the source RID
+-    if (!acl::AccessControl::validateSrcId(srcId)) {
++    if (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateSrcId(srcId)) {
+         LogWarning(LOG_RF, P25_TSDU_STR ", %s denial, RID rejection, srcId = %u", iosp->toString().c_str(), srcId);
+         ::ActivityLog("P25", true, "group affiliation request from %u to %s %u denied", srcId, "TG ", dstId);
+         iosp->setResponse(ResponseCode::REFUSED);
+@@ -2898,7 +2946,7 @@
+     // register the RID if the MFID is $90 (this is typically DVRS, and DVRS won't unit register so we'll do it for them)
+     if (!m_p25->m_affiliations->isUnitReg(srcId) && m_lastMFID == MFG_MOT) {
+         // validate the source RID
+-        if (!acl::AccessControl::validateSrcId(srcId)) {
++        if (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateSrcId(srcId)) {
+             LogWarning(LOG_RF, P25_TSDU_STR ", %s denial, RID rejection, srcId = %u", iosp->toString().c_str(), srcId);
+             ::ActivityLog("P25", true, "unit registration request from %u denied", srcId);
+             iosp->setResponse(ResponseCode::REFUSED);
+@@ -2944,6 +2992,14 @@
+         }
+     }
+ 
++    if (iosp->getResponse() == ResponseCode::ACCEPT && dstId != 0U &&
++        (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateGroupAffiliation(srcId, dstId))) {
++        iosp->setResponse(ResponseCode::DENY);
++        noNet = true;
++        LogWarning(LOG_RF, P25_TSDU_STR ", subscriber affiliation denial, srcId = %u, dstId = %u", srcId, dstId);
++        ::ActivityLog("P25", true, "group affiliation request from %u to TG %u denied by subscriber policy", srcId, dstId);
++    }
++
+     if (iosp->getResponse() == ResponseCode::ACCEPT) {
+         if (m_verbose) {
+             LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, anncId = %u, srcId = %u, dstId = %u",
+@@ -2995,7 +3051,7 @@
+     }
+ 
+     // validate the source RID
+-    if (!acl::AccessControl::validateSrcId(srcId)) {
++    if (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateSrcId(srcId)) {
+         LogWarning(LOG_RF, P25_TSDU_STR ", %s denial, RID rejection, srcId = %u", iosp->toString().c_str(), srcId);
+         ::ActivityLog("P25", true, "unit registration request from %u denied", srcId);
+         iosp->setResponse(ResponseCode::REFUSED);
+@@ -3090,7 +3146,7 @@
+     bool noNet = false;
+ 
+     // validate the source RID
+-    if (!acl::AccessControl::validateSrcId(srcId)) {
++    if (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateSrcId(srcId)) {
+         LogWarning(LOG_RF, P25_TSDU_STR ", %s denial, RID rejection, srcId = %u", osp->toString().c_str(), srcId);
+         ::ActivityLog("P25", true, "location registration request from %u denied", srcId);
+         osp->setResponse(ResponseCode::REFUSED);
+@@ -3128,6 +3184,13 @@
+         }
+     }
+ 
++    if (osp->getResponse() == ResponseCode::ACCEPT && grp && dstId != 0U &&
++        (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateGroupAffiliation(srcId, dstId))) {
++        osp->setResponse(ResponseCode::DENY);
++        noNet = true;
++        LogWarning(LOG_RF, P25_TSDU_STR ", subscriber location affiliation denial, srcId = %u, dstId = %u", srcId, dstId);
++    }
++
+     if (osp->getResponse() == ResponseCode::ACCEPT) {
+         if (m_verbose) {
+             LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, srcId = %u, dstId = %u", osp->toString().c_str(), srcId, dstId);
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -237,6 +237,7 @@
+ 
+             bool group = lc.getGroup();
+             bool encrypted = lc.getEncrypted();
++            if (!m_p25->physicalSubscriberPermitted(srcId) || (group && !acl::AccessControl::validateGroupTransmit(srcId, dstId))) return false;
+ 
+             alreadyDecoded = true;
+ 
+@@ -612,7 +613,10 @@
+             }
+ 
+             if (!alreadyDecoded) {
+-                bool ret = m_rfLC.decodeLDU1(data + 2U);
++                lc::LC candidate = m_rfLC;
++                bool ret = candidate.decodeLDU1(data + 2U);
++                if (ret && (!m_p25->physicalSubscriberPermitted(candidate.getSrcId()) || (candidate.getGroup() && !acl::AccessControl::validateGroupTransmit(candidate.getSrcId(), candidate.getDstId())))) return false;
++                if (ret) m_rfLC = candidate;
+                 if (!ret) {
+                     LogWarning(LOG_RF, P25_LDU1_STR ", undecodable LC, using last LDU1 LC");
+                     m_rfLC = m_rfLastLDU1;
+@@ -651,6 +655,7 @@
+                 m_rfLC.setEncrypted(hduEncrypt);
+             }
+ 
++            if (!m_p25->physicalSubscriberPermitted(m_rfLC.getSrcId()) || (m_rfLC.getGroup() && !acl::AccessControl::validateGroupTransmit(m_rfLC.getSrcId(), m_rfLC.getDstId()))) return false;
+             m_inbound = true;
+ 
+             rsValue = m_rfLC.getRS();
+@@ -775,6 +780,7 @@
+             return false;
+         }
+         else if (m_p25->m_rfState == RS_RF_AUDIO) {
++            if (!m_p25->physicalSubscriberPermitted(m_rfLC.getSrcId()) || (m_rfLC.getGroup() && !acl::AccessControl::validateGroupTransmit(m_rfLC.getSrcId(), m_rfLC.getDstId()))) return false;
+             lc::LC candidate = m_rfLC;
+             bool ret = candidate.decodeLDU2(data + 2U);
+             if (ret && candidate.getGroup() && !m_p25->rfSecurityPermitted(candidate.getDstId(),
+--- /dev/null
++++ b/tests/fne/SubscriberAccessIngress_Tests.cpp
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Actual FNE ingress handlers; all transports remain unopened.
++#include "fne/HostFNE.h"
++#include "fne/FNEMain.h"
++#include "fne/network/TrafficNetwork.h"
++#include "fne/network/callhandler/TagP25Data.h"
++#include "common/p25/Audio.h"
++#include "common/p25/P25Defines.h"
++#include "common/p25/lc/LC.h"
++#include "common/Log.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++
++namespace {
++using namespace p25;
++using namespace p25::defines;
++constexpr uint32_t RID=10001U, APP=10002U, DISABLED=10003U, TG=1001U, VOICE=102U, CONSOLE=103U;
++class IngressNetwork : public network::TrafficNetwork {
++public:
++    using network::TrafficNetwork::TrafficNetwork;
++    using network::BaseNetwork::createP25_LDU1Message;
++    using network::BaseNetwork::createP25_TDUMessage;
++};
++struct Fixture {
++    // The constructor creates a detached parrot worker; keep its normal stop
++    // flag set so this unopened fixture never runs a background media loop.
++    bool stopBackgroundThreads = (g_killed = true);
++    HostFNE host{"unused-test-configuration"};
++    ::lookups::RadioIdLookup radios{"",0U,true};
++    ::lookups::TalkgroupRulesLookup groups{"",0U,true};
++    IngressNetwork network{&host,"127.0.0.1",49994U,100101001U,"unopened-test-secret","Unopened test",false,false,false,false,
++        false,true,false,false,0U,false,false,false,5U,0U,1U};
++    Fixture() {
++        g_logDisplayLevel=0U; radios.addEntry(RID,true,"Subscriber"); radios.addEntry(APP,true,"Console"); radios.addEntry(DISABLED,false,"Disabled");
++        network.setLookups(&radios,&groups,nullptr,nullptr,nullptr);
++        yaml::Node config; REQUIRE(yaml::Parse(config,std::string(R"(
++rejectUnknownRID: true
++logDenials: false
++p25System:
++    netId: 1
++    sysId: 1
++p25Sites:
++    - controlPeerId: 101
++      voicePeerIds:
++        - 102
++      consolePeerIds:
++        - 103
++      talkgroups:
++        - 1001
++)")));
++        network.setOptions(config,false); deny();
++        lc::LC::setSiteData(SiteData(1U,1U,1U,1U,0U,2U,25U,0U,0));
++    }
++    void deny() {
++        yaml::Node group; REQUIRE(yaml::Parse(group,std::string(R"(
++name: TEST
++source:
++    tgid: 1001
++    slot: 1
++config:
++    active: true
++    subscriber_access:
++        affiliation:
++            restricted: true
++            radio_ids:
++                - 10001
++        transmit:
++            restricted: true
++            radio_ids: []
++)")));
++        groups.addEntry(::lookups::TalkgroupRuleGroupVoice(group));
++    }
++    void permit() {
++        yaml::Node group; REQUIRE(yaml::Parse(group,std::string(R"(
++name: TEST
++source:
++    tgid: 1001
++    slot: 1
++config:
++    active: true
++    subscriber_access:
++        affiliation:
++            restricted: true
++            radio_ids:
++                - 10001
++        transmit:
++            restricted: true
++            radio_ids:
++                - 10001
++)")));
++        groups.addEntry(::lookups::TalkgroupRuleGroupVoice(group));
++    }
++    bool frame(uint32_t peer, uint32_t source, uint32_t stream, bool demand=false) {
++        lc::LC control; control.setLCO(LCO::GROUP); control.setGroup(true); control.setSrcId(source); control.setDstId(TG);
++        control.setAlgId(ALGO_UNENCRYPT); data::LowSpeedData lsd;
++        std::array<uint8_t,P25_LDU_FRAME_LENGTH_BYTES> rf{}; Audio audio;
++        for(unsigned i=0U;i<9U;++i)audio.encode(rf.data(),NULL_IMBE,i);
++        uint32_t length=0U; UInt8Array packet;
++        if(demand)packet=network.createP25_TDUMessage(length,control,lsd,network::NET_CTRL_GRANT_DEMAND);
++        else packet=network.createP25_LDU1Message(length,control,lsd,rf.data(),FrameType::HDU_VALID,0U);
++        return network.p25TrafficHandler()->processFrame(packet.get(),length,peer,peer,1U,stream);
++    }
++};
++}
++
++TEST_CASE("raw FNE grant requests cannot reserve denied calls or impersonate applications", "[subscriber-ingress]") {
++    Fixture f;
++    REQUIRE_FALSE(f.network.p25TrafficHandler()->processGrantReq(RID,TG,false,VOICE,1U,1U));
++    REQUIRE_FALSE(f.network.p25TrafficHandler()->processGrantReq(APP,TG,false,VOICE,1U,2U));
++    // Success on a different authenticated owner proves denial reserved no call.
++    REQUIRE(f.network.p25TrafficHandler()->processGrantReq(RID,TG,false,CONSOLE,1U,3U));
++}
++
++TEST_CASE("raw FNE voice and grant demand obey policy while trusted relay can bridge a patch", "[subscriber-ingress]") {
++    for(bool demand:{false,true}) {
++        Fixture f;
++        REQUIRE_FALSE(f.frame(VOICE,RID,1U,demand));
++        REQUIRE_FALSE(f.frame(VOICE,APP,2U,demand));
++        REQUIRE(f.frame(CONSOLE,RID,3U,demand));
++    }
++}
++
++TEST_CASE("FNE drops formerly allowed physical media when its policy is revoked", "[subscriber-ingress]") {
++    Fixture f; f.permit();
++    REQUIRE_FALSE(f.network.p25TrafficHandler()->processGrantReq(APP,TG,false,VOICE,1U,99U));
++    REQUIRE_FALSE(f.frame(VOICE,APP,99U));
++    REQUIRE(f.frame(VOICE,RID,1U));
++    f.deny(); REQUIRE_FALSE(f.frame(VOICE,RID,1U));
++    REQUIRE(f.network.p25TrafficHandler()->processGrantReq(RID,TG,false,CONSOLE,1U,2U));
++}
++
++TEST_CASE("trusted relay retains global enabled identity checks without inheriting physical ACLs", "[subscriber-ingress]") {
++    for(bool demand:{false,true}) {
++        Fixture f;
++        REQUIRE_FALSE(f.frame(CONSOLE,DISABLED,1U,demand));
++        REQUIRE_FALSE(f.frame(CONSOLE,19999U,2U,demand));
++        REQUIRE(f.frame(CONSOLE,APP,3U,demand));
++    }
++    Fixture grants;
++    REQUIRE_FALSE(grants.network.p25TrafficHandler()->processGrantReq(DISABLED,TG,false,CONSOLE,1U,1U));
++    REQUIRE_FALSE(grants.network.p25TrafficHandler()->processGrantReq(19999U,TG,false,CONSOLE,1U,2U));
++    REQUIRE(grants.network.p25TrafficHandler()->processGrantReq(APP,TG,false,CONSOLE,1U,3U));
++}
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -217,6 +217,10 @@
+         const std::string configText = std::string(R"(
+ protocols:
+     p25:
++        dispatchSubscribers:
++            - 1001
++            - 1002
++            - 1003
+         unitToUnitAvailCheck: false
+         verifyReg: true
+         verifyAff: true
+@@ -251,6 +255,10 @@
+         REQUIRE(yaml::Parse(config, std::string(R"(
+ protocols:
+     p25:
++        dispatchSubscribers:
++            - 1001
++            - 1002
++            - 1003
+         verifyReg: false
+         verifyAff: false
+         immediateCallTerm: false
+@@ -1350,7 +1358,7 @@
+     REQUIRE_FALSE(cc.controller->affiliations()->isUnitReg(SOURCE));
+     cc.channels.setRFChData(targetChannel, ::lookups::VoiceChData(2U,targetChannel,"127.0.0.1",48994U,"offline-test"));
+     cc.channels.addRFCh(targetChannel);
+-    yaml::Node options; REQUIRE(yaml::Parse(options,std::string("protocols:\n    p25:\n        control:\n            enable: true\n            dedicated: true\n            disableTSDUMBF: true\n")));
++    yaml::Node options; REQUIRE(yaml::Parse(options,std::string("protocols:\n    p25:\n        dispatchSubscribers:\n            - 1001\n            - 1002\n            - 1003\n        control:\n            enable: true\n            dedicated: true\n            disableTSDUMBF: true\n")));
+     cc.controller->setOptions(options,true,"N0TEST",::lookups::VoiceChData(),1U,1U,1U,2U,2U,1U,false);
+     cc.rpc.nativeChannelHandler=[&](uint16_t func,uint16_t port,json::object& req,json::object& reply) {
+         REQUIRE(port==48994U); return target.rpc.dispatchRequest(func,req,reply);
+@@ -1442,7 +1450,7 @@
+ TEST_CASE("Positive permit replies must echo the requested source radio", "[p25][multisite][capacity-permit]") {
+     ControllerFixture cc(true);
+     cc.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U,VOICE_CHANNEL,"127.0.0.1",48994U,"offline-test"));
+-    yaml::Node options; REQUIRE(yaml::Parse(options,std::string("protocols:\n    p25:\n        control:\n            enable: true\n            dedicated: true\n            disableTSDUMBF: true\n")));
++    yaml::Node options; REQUIRE(yaml::Parse(options,std::string("protocols:\n    p25:\n        dispatchSubscribers:\n            - 1001\n            - 1002\n            - 1003\n        control:\n            enable: true\n            dedicated: true\n            disableTSDUMBF: true\n")));
+     cc.controller->setOptions(options,true,"N0TEST",::lookups::VoiceChData(),1U,1U,1U,1U,2U,1U,false);
+     cc.controller->affiliations()->unitReg(SOURCE); cc.controller->affiliations()->groupAff(SOURCE,GROUP);
+     cc.rpc.mode=PermitMode::WrongSource;
+--- a/tests/p25/DispatchGrant_Tests.cpp
++++ b/tests/p25/DispatchGrant_Tests.cpp
+@@ -5,6 +5,11 @@
+ #include "host/modem/port/ModemNullPort.h"
+ #include "host/network/RPCDefines.h"
+ #include "common/Log.h"
++#include "common/p25/NID.h"
++#include "common/p25/Sync.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/lc/tsbk/IOSP_GRP_VCH.h"
++#include <array>
+ #include <catch2/catch_test_macros.hpp>
+ #include <future>
+ #include <thread>
+@@ -461,3 +466,127 @@
+         REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, false, 7U, allowed));
+     }
+ }
++
++TEST_CASE("authenticated dispatch relay bypasses direct subscriber TX but follows listener revocation", "[dispatch-grant][subscriber-access]") {
++    Fixture f;
++    yaml::Node node;
++    REQUIRE(yaml::Parse(node, std::string(R"(
++name: TEST
++source:
++    tgid: 1001
++    slot: 1
++config:
++    active: true
++    subscriber_access:
++        affiliation:
++            restricted: true
++            radio_ids:
++                - 10001
++        transmit:
++            restricted: true
++            radio_ids: []
++)")));
++    f.groups.addEntry(::lookups::TalkgroupRuleGroupVoice(node));
++    REQUIRE_FALSE(p25::DispatchGrantTestAccess::rfGrant(*f.control, RID, TG, false));
++    REQUIRE_FALSE(p25::DispatchGrantTestAccess::rfGrant(*f.control, 10001U, TG, true));
++    REQUIRE(f.control->affiliations()->grantSize()==0U); f.drain();
++    const auto result=f.run(f.request());
++    REQUIRE(result.accepted); REQUIRE(result.issued); REQUIRE(result.status==200);
++    auto& affiliation=node["config"]["subscriber_access"]["affiliation"];
++    affiliation["radio_ids"]=yaml::Node();
++    f.groups.addEntry(::lookups::TalkgroupRuleGroupVoice(node));
++    auto renewal=f.request(p25::DispatchAction::Renew); renewal.epoch=result.epoch;
++    REQUIRE_FALSE(f.run(renewal).accepted);
++    REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
++}
++
++TEST_CASE("direct RF allocation is retired when its applied subscriber policy is revoked", "[dispatch-grant][subscriber-access]") {
++    Fixture f;
++    REQUIRE(p25::DispatchGrantTestAccess::rfGrant(*f.control, 10001U, TG, false));
++    REQUIRE(f.control->affiliations()->isGranted(TG)); f.drain();
++    yaml::Node node;
++    REQUIRE(yaml::Parse(node, std::string(R"(
++name: TEST
++source:
++    tgid: 1001
++    slot: 1
++config:
++    active: true
++    subscriber_access:
++        affiliation:
++            restricted: true
++            radio_ids:
++                - 10001
++        transmit:
++            restricted: true
++            radio_ids: []
++)")));
++    f.groups.addEntry(::lookups::TalkgroupRuleGroupVoice(node));
++    p25::DispatchGrantTestAccess::run(*f.control);
++    REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
++    REQUIRE(f.control->affiliations()->isUnitReg(10001U));
++}
++
++TEST_CASE("a denied over-air PTT immediately followed by an allowed PTT can allocate", "[dispatch-grant][subscriber-access]") {
++    Fixture f;
++    auto request = [&](uint32_t source) {
++        std::array<uint8_t,p25::defines::P25_TSDU_FRAME_LENGTH_BYTES+2U> frame{};
++        frame[0]=modem::TAG_DATA; frame[1]=1U;
++        p25::lc::tsbk::IOSP_GRP_VCH value; value.setSrcId(source); value.setDstId(TG); value.setPriority(4U);
++        value.encode(frame.data()+2U,false,false);
++        p25::Sync::addP25Sync(frame.data()+2U); p25::NID nid(0x293U); nid.encode(frame.data()+2U,p25::defines::DUID::TSDU);
++        p25::P25Utils::addStatusBits(frame.data()+2U,p25::defines::P25_TSDU_FRAME_LENGTH_BITS,false,false);
++        return f.control->processFrame(frame.data(),frame.size());
++    };
++    yaml::Node node;
++    REQUIRE(yaml::Parse(node,std::string(R"(
++name: TEST
++source:
++    tgid: 1001
++    slot: 1
++config:
++    active: true
++    subscriber_access:
++        affiliation:
++            restricted: true
++            radio_ids:
++                - 10001
++        transmit:
++            restricted: true
++            radio_ids: []
++)")));
++    f.groups.addEntry(::lookups::TalkgroupRuleGroupVoice(node));
++    REQUIRE_FALSE(request(10001U)); REQUIRE(f.control->getRFState()==RS_RF_LISTENING);
++    REQUIRE_FALSE(f.control->affiliations()->isGranted(TG)); f.drain();
++    node["config"]["subscriber_access"]["transmit"]["restricted"]="false";
++    f.groups.addEntry(::lookups::TalkgroupRuleGroupVoice(node));
++    REQUIRE_FALSE(request(RID)); REQUIRE(f.control->getRFState()==RS_RF_LISTENING); f.drain();
++    REQUIRE(request(10001U)); REQUIRE(f.control->affiliations()->isGranted(TG));
++    REQUIRE(f.control->affiliations()->getGrantedSrcId(TG)==10001U);
++}
++
++TEST_CASE("subscriber permission revoked during a positive VC permit cannot emit a late RF grant", "[dispatch-grant][subscriber-access]") {
++    Fixture f;
++    f.rpc.beforeReply=[&] {
++        yaml::Node node; REQUIRE(yaml::Parse(node,std::string(R"(
++name: TEST
++source:
++    tgid: 1001
++    slot: 1
++config:
++    active: true
++    subscriber_access:
++        affiliation:
++            restricted: true
++            radio_ids:
++                - 10001
++        transmit:
++            restricted: true
++            radio_ids: []
++)")));
++        f.groups.addEntry(::lookups::TalkgroupRuleGroupVoice(node));
++    };
++    REQUIRE_FALSE(p25::DispatchGrantTestAccess::rfGrant(*f.control,10001U,TG,false));
++    REQUIRE(f.rpc.permits==1U); REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
++    REQUIRE(f.control->affiliations()->isUnitReg(10001U));
++}
+--- a/tests/p25/MultiAlgorithmVoice_Tests.cpp
++++ b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+@@ -83,6 +83,8 @@
+         REQUIRE(yaml::Parse(configuration, std::string(R"(
+ protocols:
+     p25:
++        dispatchSubscribers:
++            - 10001
+         verifyReg: false
+         verifyAff: false
+         inhibitUnauthorized: false
+--- /dev/null
++++ b/tests/p25/SubscriberAccess_Tests.cpp
+@@ -0,0 +1,239 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Actual P25 control/voice serialization and local policy. No RF or socket opens.
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/network/P25SiteRouting.h"
++#include "common/p25/acl/AccessControl.h"
++#include "common/p25/Audio.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/Log.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <sstream>
++#include <vector>
++
++namespace {
++using namespace p25;
++using namespace p25::defines;
++constexpr uint32_t RID = 10001U, OTHER = 10005U, APP = 10002U, TG = 1001U, NAC = 0x293U;
++using Block = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++::lookups::TalkgroupRuleGroupVoice policy(bool affRestricted, const std::vector<uint32_t>& aff,
++    bool txRestricted, const std::vector<uint32_t>& tx) {
++    std::ostringstream text;
++    text << "name: TEST\nsource:\n    tgid: 1001\n    slot: 1\nconfig:\n    active: true\n    subscriber_access:\n        affiliation:\n            restricted: " << (affRestricted ? "true" : "false") << "\n            radio_ids:";
++    if (aff.empty()) text << " []\n";
++    else { text << "\n"; for (auto id : aff) text << "                - " << id << "\n"; }
++    text << "        transmit:\n            restricted: " << (txRestricted ? "true" : "false") << "\n            radio_ids:";
++    if (tx.empty()) text << " []\n";
++    else { text << "\n"; for (auto id : tx) text << "                - " << id << "\n"; }
++    yaml::Node node; REQUIRE(yaml::Parse(node, text.str()));
++    return ::lookups::TalkgroupRuleGroupVoice(node);
++}
++struct Fixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, true};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, true};
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U, true, true, false, false, false, false};
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-subscriber-test", false};
++    network::NetRPC* oldRPC = g_RPC;
++    std::unique_ptr<Control> controller;
++    explicit Fixture(bool cc, bool physicalInventory = true) {
++        g_logDisplayLevel = 0U; g_RPC = &rpc;
++        radios.addEntry(RID, true, "Subscriber"); radios.addEntry(OTHER, false, "Disabled"); radios.addEntry(APP, true, "Console"); radios.addEntry(10006U, true, "Not physical");
++        groups.addEntry(TG, 1U, true); groups.addEntry(1002U, 1U, true);
++        controller = std::make_unique<Control>(true, NAC, 1U, 16384U, &modem, nullptr, 120U, 1U, true,
++            &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
++        yaml::Node config; std::string mode = cc ? "true" : "false";
++        const std::string inventory = physicalInventory ? "        dispatchSubscribers:\n            - 10001\n            - 10005\n" : "        dispatchSubscribers: []\n";
++        REQUIRE(yaml::Parse(config, std::string("protocols:\n    p25:\n        managedSite: true\n") + inventory + "        verifyReg: false\n        verifyAff: false\n        inhibitUnauthorized: false\n        tduPreambleCount: 0\n        control:\n            enable: " + mode + "\n            dedicated: " + mode + "\n            ackRequests: false\n            disableTSDUMBF: true\n            redundantImmediate: false\nsystem:\n    config:\n        controlCh:\n            notifyEnable: false\n"));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 25U, false);
++        controller->configureIdentification(false); controller->setCCRunning(cc); controller->setZoneConnected(false);
++        controller->affiliations()->unitReg(RID);
++    }
++    ~Fixture() { controller.reset(); g_RPC = oldRPC; }
++    void apply(bool ar, std::vector<uint32_t> a, bool tr, std::vector<uint32_t> t) { groups.addEntry(policy(ar, a, tr, t)); }
++    bool signal(uint8_t opcode, uint64_t value, uint8_t manufacturer = 0U) {
++        Block raw{}; raw[0] = 0x80U | opcode; raw[1] = manufacturer;
++        for (unsigned i = 0U; i < 8U; ++i) raw[2U+i] = uint8_t(value >> ((7U-i)*8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES+2U> frame{}; frame[0] = modem::TAG_DATA; frame[1] = 1U;
++        Sync::addP25Sync(frame.data()+2U); NID nid(NAC); nid.encode(frame.data()+2U, DUID::TSDU);
++        std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> encoded{}; edac::Trellis trellis;
++        trellis.encode12(raw.data(), encoded.data()); P25Utils::encode(encoded.data(), frame.data()+2U, 114U, 318U);
++        P25Utils::addStatusBits(frame.data()+2U, P25_TSDU_FRAME_LENGTH_BITS, false, false);
++        return controller->processFrame(frame.data(), frame.size());
++    }
++    std::vector<Block> responses() {
++        std::array<uint8_t, 1024> frame{}; std::vector<Block> blocks;
++        while (controller->getFrame(frame.data()) != 0U) {
++            NID nid(NAC); if (!nid.decode(frame.data()+2U) || nid.getDUID()!=DUID::TSDU) continue;
++            std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{}; Block raw{}; edac::Trellis trellis;
++            P25Utils::decode(frame.data()+2U, coded.data(), 114U, 318U); REQUIRE(trellis.decode12(coded.data(), raw.data()));
++            REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); blocks.push_back(raw);
++        }
++        return blocks;
++    }
++    bool voice(DUID::E duid, uint32_t source = RID) {
++        const unsigned size = duid==DUID::HDU ? P25_HDU_FRAME_LENGTH_BYTES : P25_LDU_FRAME_LENGTH_BYTES;
++        std::vector<uint8_t> frame(size+2U); frame[0]=modem::TAG_DATA; frame[1]=1U;
++        lc::LC value; value.setSrcId(source); value.setDstId(TG); value.setLCO(LCO::GROUP); value.setGroup(true);
++        value.setAlgId(ALGO_UNENCRYPT); value.setKId(0U);
++        if (duid!=DUID::HDU) { Audio audio; for (unsigned i=0U;i<9U;++i) audio.encode(frame.data()+2U,NULL_IMBE,i); }
++        if (duid==DUID::HDU) value.encodeHDU(frame.data()+2U);
++        if (duid==DUID::LDU1) value.encodeLDU1(frame.data()+2U);
++        if (duid==DUID::LDU2) value.encodeLDU2(frame.data()+2U);
++        Sync::addP25Sync(frame.data()+2U); NID nid(NAC); nid.encode(frame.data()+2U,duid);
++        P25Utils::addStatusBits(frame.data()+2U,size*8U,true,false);
++        return controller->processFrame(frame.data(),frame.size());
++    }
++    unsigned drainVoice() { unsigned count=0U; std::array<uint8_t,1024> frame{}; while(controller->getFrame(frame.data())) ++count; return count; }
++};
++}
++
++TEST_CASE("subscriber rules distinguish unrestricted and selected empty and survive YAML copies", "[p25][subscriber-access]") {
++    auto rule=policy(true,{RID,APP},true,{}); auto config=rule.config();
++    REQUIRE(config.subscriberAffiliationPermitted(RID)); REQUIRE_FALSE(config.subscriberTransmitPermitted(RID));
++    REQUIRE_FALSE(config.subscriberAffiliationPermitted(OTHER));
++    yaml::Node encoded; rule.getYaml(encoded); ::lookups::TalkgroupRuleGroupVoice decoded(encoded);
++    REQUIRE(decoded.config().subscriberAffiliationPermitted(APP)); REQUIRE_FALSE(decoded.config().subscriberTransmitPermitted(APP));
++    auto all=policy(false,{},false,{}); REQUIRE(all.config().subscriberTransmitPermitted(RID));
++    Fixture f(false); f.groups.addEntry(rule);
++    REQUIRE(acl::AccessControl::validateGroupAffiliation(RID,TG)); REQUIRE_FALSE(acl::AccessControl::validateGroupTransmit(RID,TG));
++    REQUIRE_FALSE(acl::AccessControl::validateGroupAffiliation(OTHER,TG)); REQUIRE_FALSE(acl::AccessControl::validateGroupAffiliation(99999U,TG));
++}
++
++TEST_CASE("affiliation and PTT send independent standard policy denials in Site Trunking", "[p25][subscriber-access]") {
++    SECTION("affiliation denied even when transmit unrestricted") {
++        Fixture f(true); f.apply(true,{},false,{});
++        f.signal(TSBKO::IOSP_GRP_AFF,(uint64_t(1U)<<40U)|(uint64_t(TG)<<24U)|RID);
++        REQUIRE(f.controller->affiliations()->isUnitReg(RID)); REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,TG));
++        auto replies=f.responses(); bool denied=false;
++        for(auto& r:replies) if((r[0]&0x3fU)==TSBKO::IOSP_GRP_AFF) { REQUIRE((r[2]&3U)==ResponseCode::DENY); denied=true; }
++        REQUIRE(denied);
++        f.signal(TSBKO::ISP_LOC_REG_REQ,(uint64_t(TG)<<24U)|RID);
++        replies=f.responses(); denied=false;
++        for(auto& r:replies) if((r[0]&0x3fU)==TSBKO::OSP_LOC_REG_RSP) { REQUIRE((r[2]&3U)==ResponseCode::DENY); denied=true; }
++        REQUIRE(denied); REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,TG));
++        f.signal(TSBKO::IOSP_GRP_VCH,(uint64_t(4U)<<56U)|(uint64_t(TG)<<24U)|RID);
++        replies=f.responses(); denied=false;
++        for(auto& r:replies) if((r[0]&0x3fU)==TSBKO::OSP_DENY_RSP) { REQUIRE(r[3]==ReasonCode::DENY_TGT_GROUP_NOT_AUTH); denied=true; }
++        REQUIRE(denied); REQUIRE(f.controller->affiliations()->grantSize()==0U);
++    }
++    SECTION("affiliation accepted while transmit denied") {
++        Fixture f(true); f.apply(true,{RID,APP},true,{APP});
++        f.signal(TSBKO::IOSP_GRP_AFF,(uint64_t(1U)<<40U)|(uint64_t(TG)<<24U)|RID);
++        REQUIRE(f.controller->affiliations()->isGroupAff(RID,TG)); f.responses();
++        f.signal(TSBKO::IOSP_GRP_VCH,(uint64_t(0x84U)<<56U)|(uint64_t(TG)<<24U)|RID);
++        auto replies=f.responses(); bool denied=false;
++        for(auto& r:replies) if((r[0]&0x3fU)==TSBKO::OSP_DENY_RSP) { REQUIRE(r[3]==ReasonCode::DENY_TGT_GROUP_NOT_AUTH); denied=true; }
++        REQUIRE(denied); REQUIRE(f.controller->affiliations()->isUnitReg(RID)); REQUIRE(f.controller->affiliations()->grantSize()==0U);
++    }
++}
++
++TEST_CASE("RF late entry local repeat and active policy revocation enforce subscriber transmit", "[p25][subscriber-access]") {
++    Fixture f(false); f.apply(false,{},true,{});
++    REQUIRE(f.voice(DUID::HDU)); f.drainVoice(); REQUIRE_FALSE(f.voice(DUID::LDU1)); REQUIRE(f.drainVoice()==0U);
++    f.apply(false,{},true,{RID,APP});
++    REQUIRE(f.voice(DUID::HDU)); f.drainVoice(); REQUIRE(f.voice(DUID::LDU1)); REQUIRE(f.drainVoice()>0U);
++    f.apply(true,{},false,{});
++    REQUIRE_FALSE(f.voice(DUID::LDU2)); REQUIRE(f.drainVoice()==0U);
++    f.apply(false,{},true,{RID,APP});
++    REQUIRE(f.voice(DUID::LDU2)); REQUIRE(f.drainVoice()>0U);
++}
++
++TEST_CASE("only configured console peers bypass direct destination policy for trusted relay", "[p25][subscriber-access]") {
++    yaml::Node config; REQUIRE(yaml::Parse(config,std::string("p25System:\n    netId: 1\n    sysId: 1\np25Sites:\n    - controlPeerId: 101\n      voicePeerIds:\n        - 102\n      consolePeerIds:\n        - 103\n      talkgroups:\n        - 1001\n")));
++    network::P25SiteRouting routing; std::string error; REQUIRE(routing.configure(config,error));
++    auto denied=policy(false,{},true,{}).config();
++    REQUIRE_FALSE(routing.subscriberTransmitPermitted(101U,denied,RID));
++    REQUIRE_FALSE(routing.subscriberTransmitPermitted(102U,denied,RID));
++    REQUIRE_FALSE(routing.subscriberTransmitPermitted(999U,denied,RID));
++    REQUIRE_FALSE(routing.subscriberTransmitPermitted(999U,policy(false,{},false,{}).config(),RID));
++    REQUIRE(routing.subscriberTransmitPermitted(103U,denied,RID));
++    auto allowed=policy(true,{RID},true,{RID}).config(); REQUIRE(routing.subscriberTransmitPermitted(102U,allowed,RID));
++    REQUIRE_FALSE(routing.subscriberTransmitPermitted(102U,allowed,APP));
++}
++
++TEST_CASE("RF cannot impersonate application disabled unknown or unconfigured identities", "[p25][subscriber-access]") {
++    for (uint32_t source : {APP, OTHER, 10006U, 19999U}) {
++        CAPTURE(source);
++        Fixture cc(true); cc.apply(false, {}, false, {});
++        cc.signal(TSBKO::IOSP_U_REG, (uint64_t(1U)<<36U)|(uint64_t(1U)<<24U)|source);
++        cc.signal(TSBKO::IOSP_GRP_AFF, (uint64_t(1U)<<40U)|(uint64_t(TG)<<24U)|source);
++        cc.signal(TSBKO::IOSP_GRP_VCH, (uint64_t(4U)<<56U)|(uint64_t(TG)<<24U)|source);
++        REQUIRE_FALSE(cc.controller->affiliations()->isUnitReg(source));
++        REQUIRE_FALSE(cc.controller->affiliations()->isGroupAff(source,TG));
++        REQUIRE(cc.controller->affiliations()->grantSize()==0U);
++        auto replies=cc.responses(); unsigned denied=0U;
++        for (auto& reply:replies) {
++            const auto opcode=reply[0]&0x3fU;
++            if (opcode==TSBKO::OSP_DENY_RSP) { REQUIRE(reply[3]==ReasonCode::DENY_REQ_UNIT_NOT_VALID); ++denied; }
++            if (opcode==TSBKO::IOSP_U_REG) { REQUIRE(((reply[2]>>4U)&3U)==ResponseCode::REFUSED); ++denied; }
++            if (opcode==TSBKO::IOSP_GRP_AFF) { REQUIRE((reply[2]&3U)==ResponseCode::REFUSED); ++denied; }
++        }
++        REQUIRE(denied==3U);
++        Fixture vc(false); vc.apply(false,{},false,{});
++        REQUIRE(vc.voice(DUID::HDU,source)); vc.drainVoice();
++        REQUIRE_FALSE(vc.voice(DUID::LDU1,source)); REQUIRE(vc.drainVoice()==0U);
++    }
++}
++
++TEST_CASE("denials restore the prior CC state and use the current request manufacturer", "[p25][subscriber-access]") {
++    Fixture f(true); f.apply(false,{},true,{});
++    REQUIRE(f.signal(TSBKO::IOSP_GRP_AFF,(uint64_t(1U)<<40U)|(uint64_t(TG)<<24U)|RID,0x90U));
++    f.responses(); REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);
++    REQUIRE_FALSE(f.signal(TSBKO::IOSP_GRP_VCH,(uint64_t(4U)<<56U)|(uint64_t(TG)<<24U)|RID,0U));
++    REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);
++    auto replies=f.responses(); bool denied=false;
++    for (auto& reply:replies) if((reply[0]&0x3fU)==TSBKO::OSP_DENY_RSP) {
++        REQUIRE(reply[1]==0U); REQUIRE(reply[3]==ReasonCode::DENY_TGT_GROUP_NOT_AUTH); denied=true;
++    }
++    REQUIRE(denied);
++    // The next authorized operation is accepted without resetting the CC.
++    f.apply(false,{},false,{});
++    REQUIRE(f.signal(TSBKO::IOSP_GRP_AFF,(uint64_t(1U)<<40U)|(uint64_t(TG)<<24U)|RID));
++    REQUIRE(f.controller->affiliations()->isGroupAff(RID,TG));
++    REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);
++    REQUIRE_FALSE(f.signal(TSBKO::IOSP_GRP_VCH,(uint64_t(4U)<<56U)|(uint64_t(TG)<<24U)|APP));
++    REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);
++    REQUIRE(f.signal(TSBKO::IOSP_GRP_AFF,(uint64_t(1U)<<40U)|(uint64_t(TG)<<24U)|RID));
++    REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);
++}
++
++TEST_CASE("an empty physical inventory denies direct RF instead of falling back to application identities", "[p25][subscriber-access]") {
++    Fixture cc(true,false); cc.apply(false,{},false,{});
++    REQUIRE_FALSE(cc.controller->physicalSubscriberPermitted(RID));
++    cc.signal(TSBKO::IOSP_U_REG,(uint64_t(1U)<<36U)|(uint64_t(1U)<<24U)|APP);
++    REQUIRE_FALSE(cc.signal(TSBKO::IOSP_GRP_VCH,(uint64_t(4U)<<56U)|(uint64_t(TG)<<24U)|RID));
++    REQUIRE_FALSE(cc.controller->affiliations()->isUnitReg(APP));
++    REQUIRE(cc.controller->affiliations()->grantSize()==0U);
++    Fixture vc(false,false); vc.apply(false,{},false,{});
++    REQUIRE(vc.voice(DUID::HDU)); vc.drainVoice();
++    REQUIRE_FALSE(vc.voice(DUID::LDU1)); REQUIRE(vc.drainVoice()==0U);
++}
++
++TEST_CASE("affiliation query responses cannot recreate a denied affiliation", "[p25][subscriber-access]") {
++    Fixture f(true); f.apply(true,{},false,{});
++    REQUIRE_FALSE(f.signal(TSBKO::ISP_GRP_AFF_Q_RSP,(uint64_t(TG)<<24U)|RID));
++    REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,TG));
++    REQUIRE(f.controller->affiliations()->isUnitReg(RID));
++    REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);
++    bool denied=false;
++    for(auto& reply:f.responses()) if((reply[0]&0x3fU)==TSBKO::OSP_DENY_RSP) {
++        REQUIRE(reply[3]==ReasonCode::DENY_TGT_GROUP_NOT_AUTH); denied=true;
++    }
++    REQUIRE(denied);
++    f.apply(true,{RID},true,{});
++    REQUIRE(f.signal(TSBKO::ISP_GRP_AFF_Q_RSP,(uint64_t(TG)<<24U)|RID));
++    REQUIRE(f.controller->affiliations()->isGroupAff(RID,TG));
++    REQUIRE_FALSE(p25::acl::AccessControl::validateGroupTransmit(RID,TG));
++}
+--- a/tests/p25/ZeroCapacity_Fixtures.cpp
++++ b/tests/p25/ZeroCapacity_Fixtures.cpp
+@@ -104,6 +104,10 @@
+ protocols:
+     p25:
+         inhibitUnauthorized: false
++        dispatchSubscribers:
++            - 1001
++            - 1002
++            - 1003
+         verifyReg: true
+         verifyAff: true
+         unitToUnitAvailCheck: false
+--- a/tests/p25/ZeroCapacity_Tests.cpp
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -91,6 +91,11 @@
+ protocols:
+     p25:
+         unitToUnitAvailCheck: false
++        dispatchSubscribers:
++            - 1001
++            - 1002
++            - 1003
++            - 10001
+         verifyReg: true
+         verifyAff: true
+         inhibitUnauthorized: false
+@@ -563,9 +568,9 @@
+         source = 0U;
+         accepted = false; reason = ReasonCode::DENY_REQ_UNIT_NOT_VALID;
+     }
+-    SECTION("stock all-call RID still requires registration") {
++    SECTION("reserved all-call RID is not a configured physical subscriber") {
+         source = 0xFFFFFFU;
+-        accepted = false; needsRegistration = true; reason = ReasonCode::DENY_REQ_UNIT_NOT_AUTH;
++        accepted = false; reason = ReasonCode::DENY_REQ_UNIT_NOT_VALID;
+     }
+     SECTION("unregistered RID") {
+         fixture.controller->affiliations()->unitDereg(radio);

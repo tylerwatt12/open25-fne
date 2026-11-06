@@ -1,0 +1,91 @@
+diff --git a/src/common/p25/lc/tsbk/OSP_TSBK_RAW.cpp b/src/common/p25/lc/tsbk/OSP_TSBK_RAW.cpp
+index 62947bd..e0b66bf 100644
+--- a/src/common/p25/lc/tsbk/OSP_TSBK_RAW.cpp
++++ b/src/common/p25/lc/tsbk/OSP_TSBK_RAW.cpp
+@@ -34,7 +34,7 @@ OSP_TSBK_RAW::OSP_TSBK_RAW() : TSBK(),
+ OSP_TSBK_RAW::~OSP_TSBK_RAW()
+ {
+     if (m_tsbk != nullptr) {
+-        delete m_tsbk;
++        delete[] m_tsbk;
+     }
+ }
+ 
+@@ -64,8 +64,6 @@ void OSP_TSBK_RAW::encode(uint8_t* data, bool rawTSBK, bool noTrellis)
+     assert(data != nullptr);
+     assert(m_tsbk != nullptr);
+ 
+-    /* stub */
+-
+     TSBK::encode(data, m_tsbk, rawTSBK, noTrellis);
+ }
+ 
+@@ -79,8 +77,11 @@ void OSP_TSBK_RAW::setTSBK(const uint8_t* tsbk)
+     m_lastBlock = (tsbk[0U] & 0x80U) == 0x80U;                                      // Last Block Marker
+     m_mfId = tsbk[1U];                                                              // Mfg Id.
+ 
+-    m_tsbk = new uint8_t[P25_TSBK_LENGTH_BYTES];
+-    ::memset(m_tsbk, 0x00U, P25_TSBK_LENGTH_BYTES);
++    if (m_tsbk != nullptr)
++        delete[] m_tsbk;
++
++    m_tsbk = new uint8_t[P25_TSBK_LENGTH_BYTES - 4U];
+ 
+-    ::memcpy(m_tsbk, tsbk, P25_TSBK_LENGTH_BYTES);
++    // TSBK::encode reconstructs the header and CRC around eight payload bytes.
++    ::memcpy(m_tsbk, tsbk + 2U, P25_TSBK_LENGTH_BYTES - 4U);
+ }
+diff --git a/tests/p25/RawTSBKReplay_Tests.cpp b/tests/p25/RawTSBKReplay_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/RawTSBKReplay_Tests.cpp
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Clear Phase 1 raw-response replay regression; no modem or socket is opened. */
++#include "common/p25/lc/tsbk/OSP_TSBK_RAW.h"
++#include "common/p25/lc/tsbk/OSP_DENY_RSP.h"
++#include "common/edac/CRC.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++
++using namespace p25::defines;
++using namespace p25::lc::tsbk;
++
++namespace {
++class ReplayWireProbe : public OSP_DENY_RSP {
++public:
++    std::array<uint8_t, 8U> payload(const uint8_t* frame) {
++        std::array<uint8_t, 8U> result{};
++        REQUIRE(TSBK::decode(frame, result.data(), false));
++        return result;
++    }
++};
++}
++
++TEST_CASE("Clear raw TSBK replay preserves every header and payload octet", "[p25][raw-replay]") {
++    std::array<uint8_t, P25_TSBK_LENGTH_BYTES> input{
++        uint8_t(0x80U | TSBKO::OSP_DENY_RSP), 0x00U,
++        0x12U, 0x34U, 0x56U, 0x78U, 0x9AU, 0xBCU, 0xDEU, 0xF0U, 0U, 0U};
++    edac::CRC::addCCITT162(input.data(), input.size());
++    OSP_TSBK_RAW replay;
++    for (uint8_t iteration = 0U; iteration < 2U; iteration++) {
++        // Replacing the stored block must also replace the whole payload.
++        input[2U] ^= iteration;
++        input[9U] ^= iteration;
++        edac::CRC::addCCITT162(input.data(), input.size());
++        replay.setTSBK(input.data());
++        std::array<uint8_t, P25_TSBK_LENGTH_BYTES> raw{};
++        replay.encode(raw.data(), true, true);
++        REQUIRE(raw == input);
++        REQUIRE(edac::CRC::checkCCITT162(raw.data(), raw.size()));
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES> encoded{};
++        replay.encode(encoded.data());
++        ReplayWireProbe probe;
++        auto payload = probe.payload(encoded.data());
++        for (uint32_t i = 0U; i < payload.size(); i++)
++            REQUIRE(payload[i] == input[i + 2U]);
++        REQUIRE(probe.getLCO() == TSBKO::OSP_DENY_RSP);
++        REQUIRE(probe.getMFId() == 0U);
++        REQUIRE(probe.getLastBlock());
++    }
++}

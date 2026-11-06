@@ -1,0 +1,441 @@
+--- a/src/common/p25/Crypto.cpp
++++ b/src/common/p25/Crypto.cpp
+@@ -75,6 +75,7 @@
+ 
+ void P25Crypto::generateMI()
+ {
++    clearKeystream();
+     for (uint8_t i = 0; i < MI_LENGTH_BYTES; i++) {
+         std::uniform_int_distribution<uint32_t> dist(0x00U, 0xFFU);
+         m_mi[i] = (uint8_t)dist(m_random);
+@@ -85,6 +86,7 @@
+ 
+ void P25Crypto::generateNextMI()
+ {
++    clearKeystream();
+     uint8_t carry, i;
+     
+     uint8_t nextMI[9U];
+@@ -127,30 +129,33 @@
+ 
+ void P25Crypto::generateKeystream()
+ {
+-    if (m_tek == nullptr)
++    // A new request retires the previous stream even if its inputs are invalid.
++    // DES, AES and ARC4 have different allocation sizes; none may reuse another
++    // algorithm's allocation or leave its output usable after rejection.
++    clearKeystream();
++    if (m_tek == nullptr || m_mi == nullptr)
+         return;
+-    if (m_tekLength == 0U)
++    uint8_t keyLength = 0U;
++    switch (m_tekAlgoId) {
++    case ALGO_DES: keyLength = 8U; break;
++    case ALGO_AES_256: keyLength = 32U; break;
++    case ALGO_ARC4: keyLength = 5U; break;
++    default: return;
++    }
++    // AAAD-B A.1 / C.1 require 64-bit DES / 256-bit AES keys. ARC4's
++    // five-byte length is the existing supported vendor profile, not AAAD-B.
++    if (m_tekLength != keyLength)
+         return;
+-    if (m_mi == nullptr)
+-        return;
+-
+-    m_keystreamPos = 0U;
+ 
+     // generate keystream
+     switch (m_tekAlgoId) {
+     case ALGO_DES:
+         {
+-            if (m_keystream == nullptr)
+-                m_keystream = new uint8_t[224U];
++            m_keystream = new uint8_t[224U];
+             ::memset(m_keystream, 0x00U, 224U);
+ 
+             uint8_t desKey[8U];
+-            ::memset(desKey, 0x00U, 8U);
+-            uint8_t padLen = (uint8_t)::fmax(8 - m_tekLength, 0);
+-            for (uint8_t i = 0U; i < padLen; i++)
+-                desKey[i] = 0U;
+-            for (uint8_t i = padLen; i < 8U; i++)
+-                desKey[i] = m_tek[i - padLen];
++            ::memcpy(desKey, m_tek.get(), sizeof(desKey));
+ 
+             DES des = DES();
+ 
+@@ -168,8 +173,7 @@
+         break;
+     case ALGO_AES_256:
+         {
+-            if (m_keystream == nullptr)
+-                m_keystream = new uint8_t[240U];
++            m_keystream = new uint8_t[240U];
+             ::memset(m_keystream, 0x00U, 240U);
+ 
+             uint8_t* iv = expandMIToIV();
+@@ -192,24 +196,9 @@
+         break;
+     case ALGO_ARC4:
+         {
+-            // RC4::keystream allocates its returned buffer. Release the old
+-            // stream instead of leaking a separate 469-byte allocation.
+-            delete[] m_keystream;
+-            m_keystream = nullptr;
+-
+-            uint8_t padding = (uint8_t)::fmax(5U - m_tekLength, 0U);
+             uint8_t adpKey[13U];
+-            ::memset(adpKey, 0x00U, 13U);
+-
+-            uint8_t i = 0U;
+-            for (i = 0U; i < padding; i++)
+-                adpKey[i] = 0x00U;
+-
+-            for (; i < 5U; i++)
+-                adpKey[i] = (m_tekLength > 0U) ? m_tek[i - padding] : 0x00U;
+-
+-            for (i = 5U; i < 13U; i++)
+-                adpKey[i] = m_mi[i - 5U];
++            ::memcpy(adpKey, m_tek.get(), 5U);
++            ::memcpy(adpKey + 5U, m_mi, 8U);
+ 
+             // generate ARC4 keystream
+             RC4 rc4 = RC4();
+@@ -227,11 +216,7 @@
+ void P25Crypto::resetKeystream()
+ {
+     ::memset(m_mi, 0x00U, MI_LENGTH_BYTES);
+-    if (m_keystream != nullptr) {
+-        delete[] m_keystream;
+-        m_keystream = nullptr;
+-        m_keystreamPos = 0U;
+-    }
++    clearKeystream();
+ }
+ 
+ /* Helper to crypt a P25 TEK with the given AES-256 KEK. */
+@@ -535,7 +520,7 @@
+ 
+ void P25Crypto::cryptAES_PDU(uint8_t* frame, uint8_t frameLen)
+ {
+-    if (m_keystream == nullptr)
++    if (m_keystream == nullptr || m_tekAlgoId != ALGO_AES_256)
+         return;
+ 
+     uint32_t offset = 16U;
+@@ -553,7 +538,7 @@
+ 
+ void P25Crypto::cryptDES_IMBE(uint8_t* imbe, DUID::E duid)
+ {
+-    if (m_keystream == nullptr)
++    if (m_keystream == nullptr || m_tekAlgoId != ALGO_DES)
+         return;
+ 
+     uint32_t offset = 8U;
+@@ -573,7 +558,7 @@
+ 
+ void P25Crypto::cryptAES_IMBE(uint8_t* imbe, DUID::E duid)
+ {
+-    if (m_keystream == nullptr)
++    if (m_keystream == nullptr || m_tekAlgoId != ALGO_AES_256)
+         return;
+ 
+     uint32_t offset = 16U;
+@@ -593,7 +578,7 @@
+ 
+ void P25Crypto::cryptARC4_IMBE(uint8_t* imbe, DUID::E duid)
+ {
+-    if (m_keystream == nullptr)
++    if (m_keystream == nullptr || m_tekAlgoId != ALGO_ARC4)
+         return;
+ 
+     uint32_t offset = 0U;
+@@ -628,6 +613,7 @@
+ {
+     assert(mi != nullptr);
+ 
++    clearKeystream();
+     ::memcpy(m_mi, mi, MI_LENGTH_BYTES);
+ }
+ 
+@@ -644,6 +630,7 @@
+ 
+ void P25Crypto::clearMI()
+ {
++    clearKeystream();
+     ::memset(m_mi, 0x00U, MI_LENGTH_BYTES);
+ }
+ 
+@@ -651,8 +638,11 @@
+ 
+ void P25Crypto::setKey(const uint8_t* key, uint8_t len)
+ {
+-    assert(key != nullptr);
+-
++    clearKeystream();
++    if (key == nullptr || len == 0U) {
++        clearKey();
++        return;
++    }
+     m_tekLength = len;
+     if (m_tek != nullptr)
+         m_tek.reset();
+@@ -675,6 +665,7 @@
+ 
+ void P25Crypto::clearKey()
+ {
++    clearKeystream();
+     m_tekLength = 0U;
+     if (m_tek != nullptr)
+         m_tek.reset();
+@@ -686,6 +677,15 @@
+ // ---------------------------------------------------------------------------
+ //  Private Class Members
+ // ---------------------------------------------------------------------------
++
++/* Retire output independently of the current key and MI. */
++
++void P25Crypto::clearKeystream()
++{
++    delete[] m_keystream;
++    m_keystream = nullptr;
++    m_keystreamPos = 0U;
++}
+ 
+ /* */
+ 
+--- a/src/common/p25/Crypto.h
++++ b/src/common/p25/Crypto.h
+@@ -196,7 +196,15 @@
+             /**
+              * @brief Traffic Encryption Key Algorithm ID.
+              */
+-            DECLARE_PROPERTY(uint8_t, tekAlgoId, TEKAlgoId);
++        private:
++            uint8_t m_tekAlgoId;
++        public:
++            uint8_t getTEKAlgoId() const { return m_tekAlgoId; }
++            void setTEKAlgoId(uint8_t value) {
++                if (m_tekAlgoId != value)
++                    clearKeystream();
++                m_tekAlgoId = value;
++            }
+             /**
+              * @brief Traffic Encryption Key ID.
+              */
+@@ -208,6 +216,7 @@
+             DECLARE_RO_PROPERTY(uint8_t, tekLength, TEKLength);
+ 
+         private:
++            void clearKeystream();
+             uint8_t* m_keystream;
+             uint32_t m_keystreamPos;
+     
+--- /dev/null
++++ b/tests/crypto/P25_StreamLifetime_Test.cpp
+@@ -0,0 +1,205 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Public vector material only. No operational key material belongs in tests.
++#include "common/p25/Crypto.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <cstring>
++#include <vector>
++
++namespace {
++std::vector<uint8_t> bytes(const char* text) {
++    std::vector<uint8_t> out;
++    auto nibble = [](char c) { return c <= '9' ? c - '0' : c - 'A' + 10; };
++    for (size_t i = 0; text[i]; i += 2)
++        out.push_back(uint8_t((nibble(text[i]) << 4) | nibble(text[i+1])));
++    return out;
++}
++using Crypto = p25::crypto::P25Crypto;
++void setup(Crypto& crypto, uint8_t algorithm, const std::vector<uint8_t>& key) {
++    const auto mi = bytes("1234567890ABCDEF00");
++    crypto.setTEKAlgoId(algorithm);
++    crypto.setKey(key.data(), uint8_t(key.size()));
++    crypto.setMI(mi.data());
++    crypto.generateKeystream();
++}
++void transform(Crypto& crypto, uint8_t algorithm, uint8_t* word, unsigned index) {
++    auto duid = index < 9 ? p25::defines::DUID::LDU1 : p25::defines::DUID::LDU2;
++    switch (algorithm) {
++    case 0x81: crypto.cryptDES_IMBE(word, duid); break;
++    case 0x84: crypto.cryptAES_IMBE(word, duid); break;
++    case 0xAA: crypto.cryptARC4_IMBE(word, duid); break;
++    }
++}
++}
++
++// ANSI/TIA-102.AAAD-B-2015, A.1/A.4/C.1/C.4; PDF40-42/50-52,
++// printed30-32/40-42; p25_6b7b5e252ef69091;
++// documents/tia-library/8.3_TIA-102.AAAD-B_Final Published Document_2015_12_02.pdf.
++// Original PDF checked: DES key is64bits incl parity, AES key256bits.
++// Published plaintext frame1 is0CEE42226F6101AB31EF14. Expected ciphertexts
++// below are the first voice rows on printed32(DES) and42(AES).
++TEST_CASE("P25 reused crypto owns each algorithm stream", "[p25][crypto-lifecycle]") {
++    Crypto crypto;
++    const auto des = bytes("0123456789ABCDEF");
++    const auto aes = bytes("0123456789ABCDEF23456789ABCDEF01456789ABCDEF01236789ABCDEF012345");
++    const auto plain = bytes("0CEE42226F6101AB31EF14");
++    for (unsigned repeat = 0; repeat < 4; ++repeat) {
++        for (uint8_t algorithm : {0x81,0x84,0xAA,0x84,0x81}) {
++            const auto& key = algorithm == 0x81 ? des : aes;
++            setup(crypto, algorithm, algorithm == 0xAA ? bytes("0102030405") : key);
++            REQUIRE(crypto.hasValidKeystream());
++            if (algorithm == 0xAA) continue;
++            auto word = plain;
++            transform(crypto, algorithm, word.data(), 0);
++            const auto expected = bytes(algorithm == 0x81 ? "CFAA74B68C19F9D1BC82B1" : "F99F8920F5F2AF54AA346F");
++            REQUIRE(word == expected);
++        }
++    }
++}
++
++TEST_CASE("P25 invalid key and changed inputs retire prior stream", "[p25][crypto-lifecycle]") {
++    Crypto crypto;
++    const auto valid = bytes("0123456789ABCDEF23456789ABCDEF01456789ABCDEF01236789ABCDEF012345");
++    const std::array<uint8_t,11> plain = {1,2,3,4,5,6,7,8,9,10,11};
++    // Every API-representable key length is checked. Short allocations are
++    // real short buffers so ASan detects an overread, rather than padded arrays.
++    for (uint8_t algorithm : {0x81,0x84,0xAA}) {
++        for (unsigned size = 0; size <= 255; ++size) {
++            setup(crypto, 0x84, valid);
++            REQUIRE(crypto.hasValidKeystream());
++            crypto.setTEKAlgoId(algorithm);
++            auto key = std::vector<uint8_t>(size, 0x5A);
++            crypto.setKey(key.data(), uint8_t(size));
++            REQUIRE_FALSE(crypto.hasValidKeystream());
++            crypto.generateKeystream();
++            const bool accepted = size == (algorithm == 0x81 ? 8U : algorithm == 0x84 ? 32U : 5U);
++            REQUIRE(crypto.hasValidKeystream() == accepted);
++            if (!accepted) {
++                auto word = plain;
++                transform(crypto, algorithm, word.data(), 0);
++                REQUIRE(word == plain);
++            }
++        }
++    }
++    for (uint8_t algorithm : {0x80,0x00,0x83,0x85,0xFF}) {
++        setup(crypto, 0x84, valid);
++        crypto.setTEKAlgoId(algorithm);
++        REQUIRE_FALSE(crypto.hasValidKeystream());
++        crypto.generateKeystream();
++        REQUIRE_FALSE(crypto.hasValidKeystream());
++    }
++    for (uint8_t algorithm : {0x81,0x84,0xAA}) {
++        setup(crypto, algorithm, algorithm == 0x81 ? bytes("0123456789ABCDEF") : algorithm == 0x84 ? valid : bytes("0102030405"));
++        auto word = plain;
++        if (algorithm != 0x81) crypto.cryptDES_IMBE(word.data(), p25::defines::DUID::LDU1);
++        if (algorithm != 0x84) crypto.cryptAES_IMBE(word.data(), p25::defines::DUID::LDU1);
++        if (algorithm != 0xAA) crypto.cryptARC4_IMBE(word.data(), p25::defines::DUID::LDU1);
++        if (algorithm != 0x84) crypto.cryptAES_PDU(word.data(), uint8_t(word.size()));
++        REQUIRE(word == plain);
++    }
++    setup(crypto, 0x84, valid);
++    crypto.setKey(nullptr, 32);
++    REQUIRE_FALSE(crypto.hasValidKeystream());
++    crypto.generateKeystream();
++    REQUIRE_FALSE(crypto.hasValidKeystream());
++    setup(crypto, 0x84, valid);
++    crypto.clearKey();
++    REQUIRE_FALSE(crypto.hasValidKeystream());
++    setup(crypto, 0x84, valid);
++    crypto.clearMI();
++    REQUIRE_FALSE(crypto.hasValidKeystream());
++    setup(crypto, 0x84, valid);
++    const auto mi = bytes("AB8E0CCFB65CCCC500");
++    crypto.setMI(mi.data());
++    REQUIRE_FALSE(crypto.hasValidKeystream());
++    crypto.generateKeystream();
++    crypto.generateNextMI();
++    REQUIRE_FALSE(crypto.hasValidKeystream());
++    setup(crypto, 0x84, valid);
++    crypto.generateMI();
++    REQUIRE_FALSE(crypto.hasValidKeystream());
++    setup(crypto, 0x84, valid);
++    crypto.resetKeystream();
++    REQUIRE_FALSE(crypto.hasValidKeystream());
++}
++
++// All18 voice positions for each existing supported algorithm. Expected bytes
++// were frozen before this change from independent public module commit
++// 701d031b81b4b090f1e90c8e9697a645d8021e36, retained by TrunkSystem in
++// docs/evidence/multi-algorithm-public-vectors.json. ADP is vendor behavior,
++// not an AAAD-B algorithm. Same object is reused across every vector.
++TEST_CASE("P25 lifecycle retains independent public voice vectors", "[p25][crypto-lifecycle]") {
++    struct Vector { uint8_t algorithm; const char* key; const char* mi; unsigned index; const char* expected; };
++    const Vector vectors[] = {
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 0U, "867BEDC50BB7E5E67198B3"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 1U, "B3786B17CF3E0166DB33AA"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 2U, "D123B96F27BCC0971C5EE7"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 3U, "84BFE8867E6390CE7D1FA4"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 4U, "F5C3BB6631A96C2326841B"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 5U, "85F970590F620CD28AEB6B"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 6U, "DD07C5C58F209CCD059BAA"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 7U, "0560063F4249221116CD9D"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 8U, "FB6135763CFD8E1A32F9CB"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 9U, "DFC09075B52DF9DDCDEF19"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 10U, "6D92AB57B18AF7A2361415"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 11U, "515146B01A6A7F6AA8444A"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 12U, "07EA534869B3701EFB6522"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 13U, "30F8AF7167CBF0578A1AC3"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 14U, "545A186D7FF16ACD372F63"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 15U, "BF47BF3652AA62142638A7"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 16U, "FDC5E75B41D522C837922E"},
++        {129U, "465BA1A7F83D10C2", "AB8E0CCFB65CCCC500", 17U, "1FCB54A53B0852A49182B1"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 0U, "9BF34E8005BA171540B5B0"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 1U, "D37052B7BCBA21E05ADF3A"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 2U, "C3904A4C54EDC36346C350"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 3U, "3AD61086C9B3BBECE714E3"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 4U, "4D2B4276B20E451A7186C8"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 5U, "6C405C5BE982EAF67F6BF0"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 6U, "F6B88ED28CF361CA1C0A78"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 7U, "685F83106302122594D7A8"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 8U, "967BB9C17902B48CA12B5D"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 9U, "C76A91126E8919219F3D5F"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 10U, "1F9D0C874AD6A5A491EEA3"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 11U, "1CEB7331702E91053EAF88"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 12U, "3DC3E879BAB62F4DDD99EA"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 13U, "FB26E6CFEA045D409391F4"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 14U, "F38578F36E36AFAA4F5414"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 15U, "78195ECBAF817D71C1C4DF"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 16U, "E80FB3834574F0C7810ADC"},
++        {132U, "D59DA7112B0D0AF44544C055F381F2D3900896D1C4456078E8ABCD33B1CBADE0", "E6E63447BF74FBFD00", 17U, "7E8B33D9C7A78E9D252845"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 0U, "7BA0A29E10D93D85ABA614"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 1U, "38EDE1E57B519B0B79F447"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 2U, "9098A01C2A488CD22ADD9D"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 3U, "F337D7085E57593A2D4083"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 4U, "455D735060B3FED2989272"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 5U, "630FDF3D49C870045E5C37"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 6U, "DDEC747EA3A10E97B044CF"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 7U, "D1AE33DDE2633FEC163232"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 8U, "F2E9D6473A995FD26C816F"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 9U, "DE3726E1F861455AE1C857"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 10U, "26D78C4A3FC20915B2A735"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 11U, "8F521F8F0A95E6C60DAE3E"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 12U, "3EB5B28EFED6AE2A2117C8"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 13U, "EDD644988EF723659F8F48"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 14U, "2709A11DC1750DBD0E4916"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 15U, "3605262970ECE018BC151C"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 16U, "4EBD7C2F496858C54BF8E4"},
++        {170U, "DEADBEEF69", "A3FD5550D287CD8E00", 17U, "9C2871855711C1D1FF69C8"},
++    };
++    Crypto crypto;
++    for (const auto& vector : vectors) {
++        const auto key = bytes(vector.key), mi = bytes(vector.mi);
++        crypto.setTEKAlgoId(vector.algorithm);
++        crypto.setKey(key.data(), uint8_t(key.size()));
++        crypto.setMI(mi.data());
++        crypto.generateKeystream();
++        REQUIRE(crypto.hasValidKeystream());
++        std::array<uint8_t,11> word{};
++        for (unsigned skip = 0; skip < vector.index % 9; ++skip)
++            transform(crypto, vector.algorithm, word.data(), vector.index);
++        word.fill(0);
++        transform(crypto, vector.algorithm, word.data(), vector.index);
++        const auto expected = bytes(vector.expected);
++        REQUIRE(std::memcmp(word.data(), expected.data(), word.size()) == 0);
++    }
++}

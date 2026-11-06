@@ -1,0 +1,100 @@
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -598,13 +598,13 @@
+             {
+                 IOSP_EXT_FNCT* iosp = static_cast<IOSP_EXT_FNCT*>(tsbk.get());
+                 const uint32_t respondingSU = dstId; // AABC-E 6.1.7.1, octets 7-9
++                const uint32_t function = iosp->getExtendedFunction();
+                 if (!m_p25->physicalSubscriberPermitted(respondingSU) ||
+-                    !m_p25->m_affiliations->isUnitReg(respondingSU)) {
++                    (function != ExtendedFunctions::CHECK_ACK && !m_p25->m_affiliations->isUnitReg(respondingSU))) {
+                     LogWarning(LOG_RF, P25_TSDU_STR ", invalid extended function source, arg = %u, tgt = %u", srcId, respondingSU);
+                     m_inbound = false; m_p25->m_rfState = prevRfState;
+                     return false;
+                 }
+-                const uint32_t function = iosp->getExtendedFunction();
+                 if (function == ExtendedFunctions::INHIBIT_ACK || function == ExtendedFunctions::UNINHIBIT_ACK) {
+                     const bool accepted = acceptInhibitResponse(function, srcId, respondingSU, iosp->getMFId());
+                     m_inbound = false; m_p25->m_rfState = prevRfState; return accepted;
+diff --git a/tests/p25/RadioCheckProcedure_Tests.cpp b/tests/p25/RadioCheckProcedure_Tests.cpp
+--- a/tests/p25/RadioCheckProcedure_Tests.cpp
++++ b/tests/p25/RadioCheckProcedure_Tests.cpp
+@@ -86,6 +86,9 @@
+         Block raw{}; raw[0] = 0x80U | opcode; raw[1] = manufacturer;
+         for (unsigned i = 0U; i < 8U; ++i) raw[2U+i] = uint8_t(value >> ((7U-i)*8U));
+         edac::CRC::addCCITT162(raw.data(), raw.size());
++        return signal(raw);
++    }
++    bool signal(const Block& raw) {
+         std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES+2U> frame{}; frame[0] = modem::TAG_DATA; frame[1] = 1U;
+         Sync::addP25Sync(frame.data()+2U); NID nid(NAC); nid.encode(frame.data()+2U, DUID::TSDU);
+         std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> encoded{}; edac::Trellis trellis;
+@@ -105,6 +108,67 @@
+     }
+     void age(uint32_t ms) { controller->affiliations()->clock(ms); }
+ };
++}
++
++// AABD-B 13.2.1 (PDF118/printed113) completes an issued CHECK on its
++// matching response. This observation is not unit registration (6.6.1,
++// PDF59/printed54) or group affiliation. Construct a test ACK for the
++// fixture subscriber and validate rejection when its CRC is damaged.
++TEST_CASE("a matching CHECK ACK completes without inventing registration", "[p25][radio-check][unregistered-check]") {
++    Fixture f(true); auto* signal=f.controller->control(); auto* units=f.controller->affiliations();
++    REQUIRE(units->unitDereg(RID));
++    Block reply{{0xA4U,0x00U,0x00U,0x80U,0xFFU,0xFFU,0xFCU,uint8_t(RID>>16U),uint8_t(RID>>8U),uint8_t(RID),0U,0U}}; edac::CRC::addCCITT162(reply.data(), reply.size());
++    REQUIRE_FALSE(units->isUnitReg(RID)); REQUIRE_FALSE(units->isGroupAff(RID,TG));
++    REQUIRE_FALSE(f.signal(reply)); // no current CHECK
++    REQUIRE(signal->requestRadioCheck(RID));
++    REQUIRE_FALSE(f.signal(reply)); // still queued, not issued
++    REQUIRE(signal->radioCheckState(RID)==CheckState::Queued);
++    RadioCheckTestAccess::clock(*f.controller,0U); REQUIRE(f.responses().size()==1U);
++    for (const auto wrong : {0x0080FFFFFD002711ULL, // wrong return FNE
++                             0x0080FFFFFC002717ULL, // another allowed physical SU
++                             0x0080FFFFFC002715ULL, // disabled physical SU
++                             0x0080FFFFFC002716ULL, // application, not physical inventory
++                             0x0080FFFFFC004E1FULL, // unknown SU
++                             0x007FFFFFFC002711ULL, // command, not CHECK ACK
++                             0x00FFFFFFFC002711ULL, // unrelated INHIBIT ACK
++                             0x00FEFFFFFC002711ULL}) { // unrelated UNINHIBIT ACK
++        CAPTURE(wrong); REQUIRE_FALSE(f.signal(0x24U,wrong));
++        REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);
++    }
++    f.signal(0x24U,0x0080FFFFFC002711ULL,0x90U);
++    REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);
++    Block badCRC=reply; badCRC.back()^=1U;
++    REQUIRE_FALSE(f.signal(badCRC));
++    REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);
++    REQUIRE(f.signal(reply));
++    REQUIRE(signal->radioCheckState(RID)==CheckState::Available);
++    REQUIRE_FALSE(units->isUnitReg(RID)); REQUIRE_FALSE(units->isGroupAff(RID,TG));
++    REQUIRE_FALSE(units->isUnitReg(WUID_FNE));
++    REQUIRE_FALSE(f.signal(reply)); // completed/duplicate does not reopen it
++    RadioCheckTestAccess::clock(*f.controller,20000U);
++    REQUIRE(f.responses().empty()); REQUIRE(timeoutLogs()==0U);
++}
++
++TEST_CASE("unregistered CHECK ACK cannot revive expired withdrawn or revoked authority", "[p25][radio-check][unregistered-check]") {
++    Block reply{{0xA4U,0x00U,0x00U,0x80U,0xFFU,0xFFU,0xFCU,uint8_t(RID>>16U),uint8_t(RID>>8U),uint8_t(RID),0U,0U}}; edac::CRC::addCCITT162(reply.data(), reply.size());
++    for (unsigned mode=0U;mode<3U;++mode) {
++        CAPTURE(mode); Fixture f(true); auto* signal=f.controller->control(); auto* units=f.controller->affiliations();
++        REQUIRE(units->unitDereg(RID));
++        REQUIRE(signal->requestRadioCheck(RID));
++        RadioCheckTestAccess::clock(*f.controller,0U); f.responses();
++        if (mode==0U) {
++            for (unsigned i=0U;i<5U;++i) { RadioCheckTestAccess::clock(*f.controller,2000U); f.responses(); }
++            REQUIRE(signal->radioCheckState(RID)==CheckState::NoResponse);
++        } else {
++            if (mode==1U) { f.controller->setCCRunning(false); f.controller->setCCRunning(true); }
++            else f.radios.addEntry(RID,false,"revoked");
++            RadioCheckTestAccess::clock(*f.controller,0U);
++            REQUIRE(signal->radioCheckState(RID)==CheckState::Cancelled);
++        }
++        REQUIRE_FALSE(f.signal(reply));
++        REQUIRE_FALSE(units->isUnitReg(RID)); REQUIRE_FALSE(units->isGroupAff(RID,TG));
++        REQUIRE(f.responses().empty());
++    }
+ }
+ 
+ TEST_CASE("RFSS check records state and emits exactly five standard requests before one terminal outcome", "[p25][radio-check]") {

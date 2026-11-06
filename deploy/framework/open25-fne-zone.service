@@ -1,0 +1,16 @@
+[Unit]
+Description=Open25 FNE - Zone Controller
+
+[Service]
+Type=simple
+WorkingDirectory=%h/open25-fne
+ExecStart=%h/open25-fne/open25-fne zone --config %h/.local/state/open25-fne/zone/service.json
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=15
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

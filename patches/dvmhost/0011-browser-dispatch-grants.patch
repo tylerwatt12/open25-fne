@@ -1,0 +1,808 @@
+diff --git a/src/host/p25/Control.Dispatch.cpp b/src/host/p25/Control.Dispatch.cpp
+new file mode 100644
+index 0000000..7516a62
+--- /dev/null
++++ b/src/host/p25/Control.Dispatch.cpp
+@@ -0,0 +1,277 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Dispatch REST never writes protocol state. The normal clock owner executes
++ * bounded operations using the stock allocator and correlated VC permit. */
++#include "p25/Control.h"
++#include "Host.h"
++#include "common/p25/acl/AccessControl.h"
++#include "network/RPCDefines.h"
++#include "common/Log.h"
++#include <algorithm>
++
++using namespace p25;
++using Clock = std::chrono::steady_clock;
++namespace {
++DispatchResult resultFor(const DispatchRequest& request, int status, const std::string& message) {
++    DispatchResult result;
++    result.status = status; result.message = message;
++    result.srcId = request.srcId; result.dstId = request.dstId;
++    result.leaseId = request.leaseId; result.epoch = request.epoch;
++    return result;
++}
++bool validLease(const std::string& value) {
++    return value.size() >= 32U && value.size() <= 64U &&
++        std::all_of(value.begin(), value.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
++}
++void finish(const std::shared_ptr<DispatchOperation>& operation, const DispatchResult& result) {
++    std::lock_guard<std::mutex> lock(operation->mutex);
++    operation->result = result; operation->done = true;
++    operation->phase.store(DispatchOperation::Finished);
++    operation->changed.notify_all();
++}
++}
++
++DispatchResult Control::dispatch(const DispatchRequest& request, uint32_t waitMs)
++{
++    if (!request.leaseId.empty() && !validLease(request.leaseId))
++        return resultFor(request, 400, "leaseId must be 32-64 lowercase hexadecimal characters");
++    if (request.action != DispatchAction::Status || !request.leaseId.empty()) {
++        if (!validLease(request.leaseId) || request.srcId == 0U || request.srcId >= 0xFFFFFCU ||
++            request.dstId == 0U || request.dstId >= 0xFFFFU)
++            return resultFor(request, 400, "invalid dispatch identity or talkgroup");
++    }
++    if ((request.action == DispatchAction::Grant || request.action == DispatchAction::Renew) &&
++        (request.ttlMs < 250U || request.ttlMs > 2000U))
++        return resultFor(request, 400, "ttlMs must be 250-2000");
++    if ((request.action == DispatchAction::Renew || request.action == DispatchAction::Release) && request.epoch == 0U)
++        return resultFor(request, 400, "epoch is required");
++    auto operation = std::make_shared<DispatchOperation>();
++    operation->request = request;
++    operation->deadline = Clock::now() + std::chrono::milliseconds(std::min(waitMs, 750U));
++    {
++        std::lock_guard<std::mutex> lock(m_dispatchQueueMutex);
++        if (m_dispatchClosing.load() || m_dispatchQueue.size() >= 16U)
++            return resultFor(request, 503, "dispatch owner unavailable");
++        m_dispatchQueue.push_back(operation);
++    }
++    std::unique_lock<std::mutex> lock(operation->mutex);
++    if (operation->changed.wait_until(lock, operation->deadline, [&] { return operation->done; }))
++        return operation->result;
++    int phase = operation->phase.load();
++    while (phase == DispatchOperation::Queued || phase == DispatchOperation::Executing) {
++        if (operation->phase.compare_exchange_weak(phase, DispatchOperation::Cancelled)) {
++            auto result = resultFor(request, 504, "operation cancelled before grant commit");
++            result.state = "cancelled";
++            return result;
++        }
++    }
++    // A committed request can already have queued an RF grant. Do not claim
++    // rejection or retry: resolve using the same leaseId's status/release.
++    auto result = resultFor(request, 504, "commit began; query the same leaseId");
++    result.issued = phase == DispatchOperation::Committed;
++    result.state = result.issued ? "pending" : "cancelled";
++    return result;
++}
++
++bool Control::dispatchReady() const
++{
++    return m_dispatchEnabled && !m_dispatchClosing.load() && m_authoritative && m_supervisor &&
++        m_enableControl && m_dedicatedControl && m_duplex && m_ccRunning && !m_ccHalted &&
++        !identificationUnavailable() && m_modem != nullptr && !m_modem->hasError() &&
++        !m_modem->hasLockout() && m_modem->statusGeneration() != 0U &&
++        m_modem->getState() == modem::DVM_STATE::STATE_P25 && g_RPC != nullptr &&
++        (m_network == nullptr || m_network->getStatus() == network::NET_STAT_RUNNING);
++}
++
++void Control::rememberDispatch(const DispatchResult& result)
++{
++    if (m_dispatchHistory.find(result.leaseId) == m_dispatchHistory.end())
++        m_dispatchHistoryOrder.push_back(result.leaseId);
++    m_dispatchHistory[result.leaseId] = result;
++    while (m_dispatchHistoryOrder.size() > 128U) {
++        m_dispatchHistory.erase(m_dispatchHistoryOrder.front());
++        m_dispatchHistoryOrder.pop_front();
++    }
++}
++
++void Control::endDispatch(const std::string& state)
++{
++    if (m_dispatchLease.leaseId.empty()) return;
++    auto guard = m_affiliations->lockGrants();
++    if (m_affiliations->ownsGrant(m_dispatchLease.dstId, m_dispatchLease.srcId,
++        m_dispatchLease.channelNo, m_dispatchLease.epoch))
++        m_affiliations->releaseGrant(m_dispatchLease.dstId, false);
++    m_dispatchLease.status = 200; m_dispatchLease.accepted = false;
++    m_dispatchLease.state = state; m_dispatchLease.expiresInMs = 0U;
++    rememberDispatch(m_dispatchLease);
++    m_dispatchLease = DispatchResult();
++}
++
++void Control::clockDispatch()
++{
++    // This method is called only by the protocol clock owner, never by REST.
++    std::lock_guard<std::recursive_mutex> permit(m_permitMutex);
++    if (!m_dispatchLease.leaseId.empty()) {
++        auto guard = m_affiliations->lockGrants();
++        const bool owned = m_affiliations->ownsGrant(m_dispatchLease.dstId, m_dispatchLease.srcId,
++            m_dispatchLease.channelNo, m_dispatchLease.epoch);
++        if (!owned) endDispatch("lost");
++        else if (Clock::now() >= m_dispatchExpires) endDispatch("expired");
++        else if (!dispatchReady()) endDispatch("unavailable");
++    }
++    std::shared_ptr<DispatchOperation> operation;
++    {
++        std::lock_guard<std::mutex> lock(m_dispatchQueueMutex);
++        if (m_dispatchQueue.empty()) return;
++        operation = m_dispatchQueue.front(); m_dispatchQueue.pop_front();
++    }
++    int queued = DispatchOperation::Queued;
++    if (Clock::now() >= operation->deadline || !operation->phase.compare_exchange_strong(queued, DispatchOperation::Executing)) {
++        auto result = resultFor(operation->request, 504, "operation cancelled before execution");
++        result.state = "cancelled"; finish(operation, result); return;
++    }
++    finish(operation, executeDispatch(operation));
++}
++
++DispatchResult Control::executeDispatch(const std::shared_ptr<DispatchOperation>& operation)
++{
++    const auto& request = operation->request;
++    auto rejected = resultFor(request, 409, "dispatch allocation rejected");
++    const auto found = m_dispatchHistory.find(request.leaseId);
++    if (request.action == DispatchAction::Status) {
++        if (request.leaseId.empty()) {
++            if (m_dispatchLease.leaseId.empty()) {
++                rejected.status = 200; rejected.state = "idle"; rejected.message.clear(); return rejected;
++            }
++            auto result = m_dispatchLease;
++            result.expiresInMs = uint32_t(std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(m_dispatchExpires - Clock::now()).count()));
++            return result;
++        }
++        if (found == m_dispatchHistory.end()) { rejected.status = 404; rejected.message = "unknown leaseId"; return rejected; }
++        if (found->second.srcId != request.srcId || found->second.dstId != request.dstId) {
++            rejected.message = "lease identity mismatch"; return rejected;
++        }
++        auto result = found->second;
++        if (m_dispatchLease.leaseId == request.leaseId)
++            result.expiresInMs = uint32_t(std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(m_dispatchExpires - Clock::now()).count()));
++        return result;
++    }
++    if (request.action == DispatchAction::Grant && found != m_dispatchHistory.end()) {
++        auto result = found->second;
++        if (result.srcId != request.srcId || result.dstId != request.dstId) {
++            rejected.message = "lease identity mismatch"; return rejected;
++        }
++        if (m_dispatchLease.leaseId == request.leaseId)
++            result.expiresInMs = uint32_t(std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::milliseconds>(m_dispatchExpires - Clock::now()).count()));
++        return result; // never RF or TTL extension on duplicate submission
++    }
++    if (request.action == DispatchAction::Release || request.action == DispatchAction::Renew) {
++        if (found == m_dispatchHistory.end() || found->second.srcId != request.srcId ||
++            found->second.dstId != request.dstId || found->second.epoch != request.epoch) {
++            rejected.message = "lease identity or epoch mismatch"; return rejected;
++        }
++        if (m_dispatchLease.leaseId != request.leaseId) {
++            auto result = found->second;
++            result.status = request.action == DispatchAction::Release ? 200 : 409;
++            result.accepted = request.action == DispatchAction::Release;
++            return result; // idempotent cancellation of a completed lease
++        }
++        if (request.action == DispatchAction::Release) {
++            endDispatch("released");
++            auto result = m_dispatchHistory.at(request.leaseId); result.accepted = true; return result;
++        }
++        if (!dispatchReady()) { endDispatch("unavailable"); rejected.message = "dispatch owner unavailable"; return rejected; }
++        const auto lease = m_dispatchLease;
++        std::string permitToken;
++        ::lookups::VoiceChData channel;
++        {
++            auto guard = m_affiliations->lockGrants();
++            if (!m_affiliations->ownsGrant(lease.dstId, lease.srcId, lease.channelNo, lease.epoch)) {
++                endDispatch("lost"); return rejected;
++            }
++            permitToken = m_affiliations->grantPermitToken(lease.dstId);
++            channel = m_affiliations->rfCh()->getRFChData(lease.channelNo);
++        }
++        auto accepted = std::make_shared<std::atomic<bool>>(false);
++        json::object req;
++        req["dstId"].set<uint32_t>(lease.dstId); req["permitToken"].set<std::string>(permitToken);
++        const bool replied = !permitToken.empty() && g_RPC->req(RPC_PERMIT_P25_TG, req,
++            [accepted, permitToken, lease](json::object& response, json::object&) {
++                accepted->store(response["status"].is<int>() && response["status"].get<int>() == network::NetRPC::OK &&
++                    response["dstId"].is<int>() && response["dstId"].get<uint32_t>() == lease.dstId &&
++                    response["permitToken"].is<std::string>() && response["permitToken"].get<std::string>() == permitToken);
++            }, channel.address(), channel.port(), true);
++        auto guard = m_affiliations->lockGrants();
++        if (!replied || !accepted->load() || !dispatchReady() || Clock::now() >= m_dispatchExpires ||
++            Clock::now() >= operation->deadline || operation->phase.load() == DispatchOperation::Cancelled ||
++            !m_affiliations->ownsGrant(lease.dstId, lease.srcId, lease.channelNo, lease.epoch)) {
++            endDispatch("lost"); rejected.message = "voice permit renewal not accepted"; return rejected;
++        }
++        // Renewal and timeout have the same single winner as initial grant.
++        // A REST timeout cannot claim cancellation and then extend the lease.
++        int renewing = DispatchOperation::Executing;
++        if (!operation->phase.compare_exchange_strong(renewing, DispatchOperation::Committed)) {
++            endDispatch("lost"); rejected.message = "renewal cancelled before commit"; return rejected;
++        }
++        m_affiliations->touchGrant(lease.dstId);
++        m_dispatchExpires = Clock::now() + std::chrono::milliseconds(request.ttlMs);
++        m_dispatchLease.expiresInMs = request.ttlMs;
++        rememberDispatch(m_dispatchLease); return m_dispatchLease;
++    }
++    if (m_dispatchSeen.find(request.leaseId) != m_dispatchSeen.end()) {
++        rejected.status = 410; rejected.message = "completed leaseId has aged out; it cannot be reused"; return rejected;
++    }
++    if (m_dispatchSeen.size() >= 65536U) {
++        rejected.status = 503; rejected.message = "dispatch lease history is full"; return rejected;
++    }
++    m_dispatchSeen.insert(request.leaseId); // one attempt per lease, including rejected/uncertain requests
++    auto reject = [&](int status, const char* reason) {
++        auto result = resultFor(request, status, reason); result.issued = operation->phase.load() == DispatchOperation::Committed; rememberDispatch(result); return result;
++    };
++    if (!dispatchReady()) return reject(503, "dispatch owner unavailable or identifying");
++    const auto radio = m_ridLookup->find(request.srcId);
++    const auto group = m_tidLookup->find(request.dstId);
++    if (radio.radioDefault() || !radio.radioEnabled() || group.isInvalid() || !group.config().active() ||
++        !acl::AccessControl::validateSrcId(request.srcId) || !acl::AccessControl::validateTGId(request.dstId))
++        return reject(403, "radio or talkgroup is not enabled in the native allow lists");
++    if (!m_dispatchLease.leaseId.empty()) return reject(409, "another dispatch lease is active");
++    {
++        auto guard = m_affiliations->lockGrants();
++        if (m_affiliations->isGranted(request.dstId)) return reject(409, "talkgroup is already allocated");
++        if (!m_affiliations->rfCh()->isRFChAvailable()) return reject(409, "no voice resource is available");
++    }
++    if (m_rfState != RS_RF_LISTENING && m_rfState != RS_RF_DATA)
++        return reject(409, "RF control input is busy");
++    // Reserve only when the request still owns its pre-commit phase. The stock
++    // allocator requires a positive, token-matched VC reply before this hook.
++    const bool granted = m_control->writeRF_TSDU_Grant(request.srcId, request.dstId, 4U, true, true, false, 0U, [&] {
++        if (!dispatchReady() || Clock::now() >= operation->deadline) return false;
++        int executing = DispatchOperation::Executing;
++        return operation->phase.compare_exchange_strong(executing, DispatchOperation::Committed);
++    });
++    auto guard = m_affiliations->lockGrants();
++    const uint32_t channelNo = m_affiliations->getGrantedCh(request.dstId);
++    const uint64_t epoch = m_affiliations->grantEpoch(request.dstId);
++    if (!granted || operation->phase.load() != DispatchOperation::Committed ||
++        !m_affiliations->ownsGrant(request.dstId, request.srcId, channelNo, epoch) ||
++        m_affiliations->grantPermitToken(request.dstId).empty())
++        return reject(409, "native allocation or correlated voice permit was not accepted");
++    auto result = resultFor(request, 200, "");
++    result.accepted = true; result.issued = true; result.state = "granted";
++    result.channelNo = channelNo; result.channelId = m_affiliations->rfCh()->getRFChData(channelNo).chId();
++    result.epoch = epoch; result.expiresInMs = request.ttlMs;
++    m_dispatchLease = result;
++    m_dispatchExpires = Clock::now() + std::chrono::milliseconds(request.ttlMs);
++    rememberDispatch(result);
++    LogInfoEx(LOG_P25, "dispatch allocation accepted, srcId = %u, dstId = %u, chNo = %u-%u, epoch = %llu", result.srcId, result.dstId, result.channelId, result.channelNo, (unsigned long long)result.epoch);
++    return result;
++}
++
++void Control::shutdownDispatch()
++{
++    m_dispatchClosing.store(true);
++    std::lock_guard<std::recursive_mutex> permit(m_permitMutex);
++    endDispatch("stopped");
++    std::lock_guard<std::mutex> lock(m_dispatchQueueMutex);
++    for (const auto& operation : m_dispatchQueue) finish(operation, resultFor(operation->request, 503, "dispatch owner stopped"));
++    m_dispatchQueue.clear();
++}
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+index c070dc2..b08b5bd 100644
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -190,6 +190,7 @@ Control::Control(bool authoritative, uint32_t nac, uint32_t callHang, uint32_t q
+ 
+ Control::~Control()
+ {
++    shutdownDispatch();
+     if (m_affiliations != nullptr) {
+         delete m_affiliations;
+     }
+@@ -535,6 +536,7 @@ void Control::setOptions(yaml::Node& conf, bool supervisor, const std::string cw
+ 
+     m_controlChData = controlChData;
+ 
++    m_dispatchEnabled = p25Protocol["dispatchEnable"].as<bool>(false);
+     bool disableUnitRegTimeout = p25Protocol["disableUnitRegTimeout"].as<bool>(false);
+     m_affiliations->setDisableUnitRegTimeout(disableUnitRegTimeout);
+ 
+@@ -987,6 +989,7 @@ bool Control::writeRF_VoiceEnd(bool immediate)
+ 
+ void Control::clock()
+ {
++    clockDispatch();
+     uint32_t ms = m_interval.elapsed();
+     m_interval.start();
+ 
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+index 5c4ad1a..aece104 100644
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -26,6 +26,7 @@
+ #define __P25_CONTROL_H__
+ 
+ #include "Defines.h"
++#include "p25/Dispatch.h"
+ #include <mutex>
+ #include <atomic>
+ #include <set>
+@@ -228,6 +229,9 @@ namespace p25
+          * @param grp Flag indicating group grant.
+          */
+         void grantTG(uint32_t srcId, uint32_t dstId, bool grp);
++        // REST is an actor client: all allocation/RF mutations run on clock().
++        DispatchResult dispatch(const DispatchRequest& request, uint32_t waitMs = 750U);
++
+         /** @} */
+ 
+         /**
+@@ -293,6 +297,7 @@ namespace p25
+     private:
+ #if defined(CATCH2_TEST_COMPILATION)
+         friend struct CapacityPermitTestAccess;
++        friend struct DispatchGrantTestAccess;
+ #endif
+         friend class packet::Voice;
+         packet::Voice* m_voice;
+@@ -302,6 +307,22 @@ namespace p25
+         packet::ControlSignaling* m_control;
+         friend class lookups::P25AffiliationLookup;
+ 
++        void clockDispatch();
++        void shutdownDispatch();
++        DispatchResult executeDispatch(const std::shared_ptr<DispatchOperation>& operation);
++        void endDispatch(const std::string& state);
++        bool dispatchReady() const;
++        void rememberDispatch(const DispatchResult& result);
++        bool m_dispatchEnabled = false;
++        std::atomic<bool> m_dispatchClosing{false};
++        std::mutex m_dispatchQueueMutex;
++        std::deque<std::shared_ptr<DispatchOperation>> m_dispatchQueue;
++        std::unordered_map<std::string, DispatchResult> m_dispatchHistory;
++        std::deque<std::string> m_dispatchHistoryOrder;
++        std::set<std::string> m_dispatchSeen;
++        DispatchResult m_dispatchLease;
++        std::chrono::steady_clock::time_point m_dispatchExpires{};
++
+         bool m_authoritative;
+         bool m_supervisor;
+ 
+diff --git a/src/host/p25/Dispatch.h b/src/host/p25/Dispatch.h
+new file mode 100644
+index 0000000..9a475bc
+--- /dev/null
++++ b/src/host/p25/Dispatch.h
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Private authenticated dispatch allocation contract; no media or modem I/O. */
++#ifndef __P25_DISPATCH_H__
++#define __P25_DISPATCH_H__
++#include <atomic>
++#include <cstdint>
++#include <chrono>
++#include <condition_variable>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <string>
++
++namespace p25 {
++enum class DispatchAction { Grant, Renew, Release, Status };
++struct DispatchRequest {
++    DispatchAction action = DispatchAction::Status;
++    uint32_t srcId = 0U, dstId = 0U, ttlMs = 1000U;
++    std::string leaseId;
++    uint64_t epoch = 0U;
++};
++struct DispatchResult {
++    int status = 409;
++    bool accepted = false, issued = false;
++    std::string state = "rejected", message, leaseId;
++    uint32_t srcId = 0U, dstId = 0U, channelId = 0U, channelNo = 0U, expiresInMs = 0U;
++    uint64_t epoch = 0U;
++};
++struct DispatchOperation {
++    enum Phase { Queued, Executing, Committed, Finished, Cancelled };
++    DispatchRequest request;
++    std::atomic<int> phase{Queued};
++    std::chrono::steady_clock::time_point deadline;
++    std::mutex mutex;
++    std::condition_variable changed;
++    bool done = false;
++    DispatchResult result;
++};
++}
++#endif
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+index c75dded..d193e10 100644
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -2177,7 +2177,7 @@ void ControlSignaling::queueRF_TSBK_Ctrl(uint8_t lco)
+ 
+ /* Helper to write a grant packet. */
+ 
+-bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net, bool skip, uint32_t chNo)
++bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net, bool skip, uint32_t chNo, const std::function<bool()>& commit)
+ {
+     if (m_p25->identificationUnavailable()) return false;
+     bool emergency = ((serviceOptions & 0xFFU) & 0x80U) == 0x80U;           // Emergency Flag
+@@ -2365,6 +2365,15 @@ bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_
+                 return false;
+             }
+ 
++            // Dispatch cancellation and RF enqueue have a single commit point.
++            // The allocation guard remains held until this grant is queued.
++            if (commit && !commit()) {
++                const uint64_t epoch = m_p25->m_affiliations->grantEpoch(dstId);
++                if (m_p25->m_affiliations->ownsGrant(dstId, srcId, chNo, epoch))
++                    m_p25->m_affiliations->releaseGrant(dstId, false);
++                return false;
++            }
++
+             if (!net) {
+                 ::ActivityLog("P25", true, "group grant request from %u to TG %u", srcId, dstId);
+             }
+diff --git a/src/host/p25/packet/ControlSignaling.h b/src/host/p25/packet/ControlSignaling.h
+index b3cbc46..b03f31e 100644
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -329,7 +329,7 @@ namespace p25
+              * @param chNo Channel Number.
+              * @returns True, if granted, otherwise false.
+              */
+-            bool writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net = false, bool skip = false, uint32_t chNo = 0U);
++            bool writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net = false, bool skip = false, uint32_t chNo = 0U, const std::function<bool()>& commit = nullptr);
+             /**
+              * @brief Helper to write a grant update packet.
+              */
+diff --git a/src/host/restapi/RESTAPI.cpp b/src/host/restapi/RESTAPI.cpp
+index 4bd117e..071647d 100644
+--- a/src/host/restapi/RESTAPI.cpp
++++ b/src/host/restapi/RESTAPI.cpp
+@@ -32,6 +32,7 @@ using namespace modem;
+ #include <cstring>
+ 
+ #include <memory>
++#include <cmath>
+ #include <stdexcept>
+ #include <unordered_map>
+ 
+@@ -312,6 +313,10 @@ void RESTAPI::initializeEndpoints()
+     ** Project 25
+     */
+ 
++    m_dispatcher.match(PUT_P25_DISPATCH_GRANT).put(REST_API_BIND(RESTAPI::restAPI_PutDispatchGrant, this));
++    m_dispatcher.match(PUT_P25_DISPATCH_RENEW).put(REST_API_BIND(RESTAPI::restAPI_PutDispatchRenew, this));
++    m_dispatcher.match(PUT_P25_DISPATCH_RELEASE).put(REST_API_BIND(RESTAPI::restAPI_PutDispatchRelease, this));
++    m_dispatcher.match(GET_P25_DISPATCH_STATUS).get(REST_API_BIND(RESTAPI::restAPI_DispatchStatus, this)).put(REST_API_BIND(RESTAPI::restAPI_DispatchStatus, this));
+     m_dispatcher.match(GET_P25_CC).get(REST_API_BIND(RESTAPI::restAPI_GetP25CC, this));
+     m_dispatcher.match(GET_P25_DEBUG, true).get(REST_API_BIND(RESTAPI::restAPI_GetP25Debug, this));
+     m_dispatcher.match(GET_P25_DUMP_TSBK, true).get(REST_API_BIND(RESTAPI::restAPI_GetP25DumpTSBK, this));
+@@ -1820,3 +1825,87 @@ void RESTAPI::restAPI_GetNXDNAffList(const HTTPPayload& request, HTTPPayload& re
+     response["affiliations"].set<json::array>(affs);
+     reply.payload(response);
+ }
++
++/* Private dispatch endpoints enqueue work; they never write a modem directly. */
++void RESTAPI::restAPI_PutDispatchGrant(const HTTPPayload& req, HTTPPayload& rep, const RequestMatch&) { restAPI_Dispatch(req, rep, p25::DispatchAction::Grant); }
++void RESTAPI::restAPI_PutDispatchRenew(const HTTPPayload& req, HTTPPayload& rep, const RequestMatch&) { restAPI_Dispatch(req, rep, p25::DispatchAction::Renew); }
++void RESTAPI::restAPI_PutDispatchRelease(const HTTPPayload& req, HTTPPayload& rep, const RequestMatch&) { restAPI_Dispatch(req, rep, p25::DispatchAction::Release); }
++void RESTAPI::restAPI_DispatchStatus(const HTTPPayload& req, HTTPPayload& rep, const RequestMatch&) { restAPI_Dispatch(req, rep, p25::DispatchAction::Status); }
++
++void RESTAPI::restAPI_Dispatch(const HTTPPayload& request, HTTPPayload& reply, p25::DispatchAction action)
++{
++    // Legacy errorPayload defaults its transport status to 200. This private
++    // contract must never present an auth/parse/rejection error as HTTP success.
++    struct DispatchReplyGuard {
++        HTTPPayload& reply;
++        ~DispatchReplyGuard() {
++            json::value decoded;
++            if (!json::parse(decoded, reply.content).empty() || !decoded.is<json::object>()) return;
++            auto body = decoded.get<json::object>();
++            if (!body["status"].is<int>() || body["status"].get<int>() < 400) return;
++            const bool rejected = false;
++            if (!body["accepted"].is<bool>()) body["accepted"].set<bool>(rejected);
++            if (!body["issued"].is<bool>()) body["issued"].set<bool>(rejected);
++            if (!body["state"].is<std::string>()) body["state"].set<std::string>("rejected");
++            HTTPPayload::StatusType status = HTTPPayload::SERVICE_UNAVAILABLE;
++            const int code = body["status"].get<int>();
++            if (code == 400) status = HTTPPayload::BAD_REQUEST;
++            else if (code == 401) status = HTTPPayload::UNAUTHORIZED;
++            else if (code == 403) status = HTTPPayload::FORBIDDEN;
++            else if (code == 404) status = HTTPPayload::NOT_FOUND;
++            reply.payload(body, status);
++        }
++    } replyGuard{reply};
++    if (!validateAuth(request, reply)) return;
++    if (m_p25 == nullptr) { errorPayload(reply, "P25 is unavailable", HTTPPayload::SERVICE_UNAVAILABLE); return; }
++    p25::DispatchRequest input; input.action = action;
++    if (action != p25::DispatchAction::Status || !request.content.empty()) {
++        json::object body;
++        if (!parseRequestBody(request, reply, body)) return;
++        const auto integer = [&](const char* key, uint32_t minimum, uint32_t maximum, uint32_t& value) {
++            // Parsed JSON numbers are double. get<int>() mutates this pinned
++            // library's type, so validate once before a checked conversion.
++            if (!body[key].is<double>()) return false;
++            const double number = body[key].get<double>();
++            if (!std::isfinite(number) || number < minimum || number > maximum || std::floor(number) != number) return false;
++            value = static_cast<uint32_t>(number); return true;
++        };
++        if (!integer("srcId", 1U, 0xFFFFFBU, input.srcId) || !integer("dstId", 1U, 0xFFFEU, input.dstId) ||
++            !body["leaseId"].is<std::string>()) {
++            errorPayload(reply, "valid srcId, dstId and leaseId are required"); return;
++        }
++        input.leaseId = body["leaseId"].get<std::string>();
++        if (action == p25::DispatchAction::Grant || action == p25::DispatchAction::Renew) {
++            if (!integer("ttlMs", 250U, 2000U, input.ttlMs)) {
++                errorPayload(reply, "ttlMs must be 250-2000"); return;
++            }
++        }
++        if (action == p25::DispatchAction::Renew || action == p25::DispatchAction::Release) {
++            if (!body["epoch"].is<std::string>()) { errorPayload(reply, "epoch must be a decimal string"); return; }
++            const auto epoch = body["epoch"].get<std::string>();
++            if (epoch.empty() || epoch.size() > 20U || !std::all_of(epoch.begin(), epoch.end(), [](char c) { return c >= '0' && c <= '9'; })) {
++                errorPayload(reply, "epoch must be a decimal string"); return;
++            }
++            try { input.epoch = std::stoull(epoch); }
++            catch (const std::exception&) { errorPayload(reply, "epoch is out of range"); return; }
++        }
++    }
++    const auto result = m_p25->dispatch(input);
++    json::object body;
++    body["status"].set<int>(result.status);
++    body["accepted"].set<bool>(result.accepted); body["issued"].set<bool>(result.issued);
++    body["state"].set<std::string>(result.state); body["message"].set<std::string>(result.message);
++    body["leaseId"].set<std::string>(result.leaseId);
++    body["srcId"].set<uint32_t>(result.srcId); body["dstId"].set<uint32_t>(result.dstId);
++    body["channelId"].set<uint32_t>(result.channelId); body["channelNo"].set<uint32_t>(result.channelNo);
++    body["epoch"].set<std::string>(std::to_string(result.epoch));
++    body["expiresInMs"].set<uint32_t>(result.expiresInMs);
++    // The pinned HTTP serializer supports a limited status set. Every rejected
++    // result is non-200; the precise native reason/status remains in JSON.
++    HTTPPayload::StatusType status = HTTPPayload::SERVICE_UNAVAILABLE;
++    if (result.status == 200) status = HTTPPayload::OK;
++    else if (result.status == 400) status = HTTPPayload::BAD_REQUEST;
++    else if (result.status == 403) status = HTTPPayload::FORBIDDEN;
++    else if (result.status == 404) status = HTTPPayload::NOT_FOUND;
++    reply.payload(body, status);
++}
+diff --git a/src/host/restapi/RESTAPI.h b/src/host/restapi/RESTAPI.h
+index 40a3636..d99d55c 100644
+--- a/src/host/restapi/RESTAPI.h
++++ b/src/host/restapi/RESTAPI.h
+@@ -17,6 +17,7 @@
+ #define __REST_API_H__
+ 
+ #include "Defines.h"
++#include "p25/Dispatch.h"
+ #include "common/restapi/RequestDispatcher.h"
+ #include "common/restapi/http/HTTPServer.h"
+ #include "common/restapi/http/SecureHTTPServer.h"
+@@ -173,6 +174,12 @@ private:
+      * @param match HTTP request matcher.
+      */
+     void restAPI_GetVoiceCh(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
++    void restAPI_PutDispatchGrant(const HTTPPayload&, HTTPPayload&, const restapi::RequestMatch&);
++    void restAPI_PutDispatchRenew(const HTTPPayload&, HTTPPayload&, const restapi::RequestMatch&);
++    void restAPI_PutDispatchRelease(const HTTPPayload&, HTTPPayload&, const restapi::RequestMatch&);
++    void restAPI_DispatchStatus(const HTTPPayload&, HTTPPayload&, const restapi::RequestMatch&);
++    void restAPI_Dispatch(const HTTPPayload&, HTTPPayload&, p25::DispatchAction);
++
+ 
+     /**
+      * @brief REST API endpoint; implements put/set modem mode request.
+diff --git a/src/host/restapi/RESTDefines.h b/src/host/restapi/RESTDefines.h
+index 4659ffd..58b6343 100644
+--- a/src/host/restapi/RESTDefines.h
++++ b/src/host/restapi/RESTDefines.h
+@@ -80,6 +80,10 @@
+ #define GET_DMR_CC_BCAST                "/dmr/cc-broadcast"
+ #define GET_DMR_AFFILIATIONS            "/dmr/report-affiliations"
+ 
++#define PUT_P25_DISPATCH_GRANT          "/p25/dispatch/grant"
++#define PUT_P25_DISPATCH_RENEW          "/p25/dispatch/renew"
++#define PUT_P25_DISPATCH_RELEASE        "/p25/dispatch/release"
++#define GET_P25_DISPATCH_STATUS         "/p25/dispatch/status"
+ #define GET_P25_CC                      "/p25/cc"
+ #define GET_P25_CC_FALLBACK_BASE        "/p25/cc-fallback/"
+ #define GET_P25_CC_FALLBACK             GET_P25_CC_FALLBACK_BASE"(\\d+)"
+diff --git a/tests/p25/DispatchGrant_Tests.cpp b/tests/p25/DispatchGrant_Tests.cpp
+new file mode 100644
+index 0000000..5052899
+--- /dev/null
++++ b/tests/p25/DispatchGrant_Tests.cpp
+@@ -0,0 +1,199 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Actual allocator and RPC contract tests. No sockets, modem or RF is opened. */
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "host/network/RPCDefines.h"
++#include "common/Log.h"
++#include <catch2/catch_test_macros.hpp>
++#include <future>
++#include <thread>
++#include <functional>
++
++namespace p25 {
++struct DispatchGrantTestAccess {
++    static bool queued(Control& c) { std::lock_guard<std::mutex> lock(c.m_dispatchQueueMutex); return !c.m_dispatchQueue.empty(); }
++    static void run(Control& c) { c.clockDispatch(); }
++    static void expire(Control& c) { c.m_dispatchExpires = std::chrono::steady_clock::now() - std::chrono::milliseconds(1); }
++    static void disable(Control& c) { c.m_dispatchEnabled = false; }
++};
++}
++namespace {
++constexpr uint32_t RID = 10002U, TG = 1001U, TG2 = 1002U, VC = 25U;
++const std::string LEASE(32U, 'a'), LEASE2(32U, 'b');
++class ReadyModem : public modem::Modem {
++public:
++    ReadyModem() : Modem(new modem::port::ModemNullPort(), true, false, false, false, false, false,
++        0U, 0U, 0U, 8192U, 8192U, 8192U, true, true, false, false, false, false) { ready(); }
++    void ready() { m_modemState = modem::DVM_STATE::STATE_P25; m_statusGeneration.store(1U); m_error = m_lockout = false; }
++    void error() { m_error = true; }
++    void stale() { m_statusGeneration.store(0U); }
++};
++class DispatchRPC : public network::NetRPC {
++public:
++    unsigned permits = 0U, clears = 0U;
++    bool allow = true, reply = true, wrongToken = false;
++    std::function<void()> beforeReply;
++    DispatchRPC() : NetRPC("127.0.0.1", 48991U, 0U, "offline-test", false) {}
++    bool req(uint16_t func, const json::object& request, RPCType callback, std::string, uint16_t, bool blocking = false) override {
++        if (func != RPC_PERMIT_P25_TG) return true;
++        if (request.at("dstId").get<uint32_t>() == 0U) { ++clears; return true; }
++        ++permits; REQUIRE(blocking); REQUIRE(callback != nullptr);
++        if (beforeReply) beforeReply();
++        if (!reply) return false;
++        json::object response;
++        int status = allow ? OK : BAD_REQUEST; response["status"].set<int>(status);
++        response["dstId"] = request.at("dstId"); response["permitToken"] = request.at("permitToken");
++        if (wrongToken) response["permitToken"].set<std::string>("other:1");
++        // The real wire parser normalizes small JSON integers to int.
++        json::value parsed; REQUIRE(json::parse(parsed, json::value(response).serialize()).empty());
++        response = parsed.get<json::object>(); json::object ignored; callback(response, ignored); return true;
++    }
++};
++struct Fixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, true};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, true};
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    ReadyModem modem;
++    DispatchRPC rpc;
++    network::NetRPC* old = g_RPC;
++    std::unique_ptr<p25::Control> control;
++    Fixture() {
++        g_logDisplayLevel = 0U; g_RPC = &rpc;
++        radios.addEntry(RID, true, "Dispatch"); radios.addEntry(10001U, true, "Subscriber");
++        radios.addEntry(10003U, false, "Denied"); groups.addEntry(TG, 1U, true); groups.addEntry(TG2, 1U, true);
++        channels.setRFChData(VC, ::lookups::VoiceChData(2U, VC, "127.0.0.1", 48993U, "offline-test")); channels.addRFCh(VC);
++        control = std::make_unique<p25::Control>(true, 0x293U, 1U, 16384U, &modem, nullptr, 120U, 1U, true,
++            &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
++        yaml::Node config;
++        REQUIRE(yaml::Parse(config, std::string(R"(
++protocols:
++    p25:
++        dispatchEnable: true
++        verifyReg: true
++        verifyAff: true
++        tduPreambleCount: 0
++        control:
++            enable: true
++            dedicated: true
++            ackRequests: false
++            disableTSDUMBF: true
++            redundantImmediate: false
++system:
++    config:
++        controlCh:
++            notifyEnable: false
++)")));
++        control->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 1U, false);
++        control->setSupervisor(true); control->setCCRunning(true);
++    }
++    ~Fixture() { control.reset(); g_RPC = old; }
++    p25::DispatchRequest request(p25::DispatchAction action = p25::DispatchAction::Grant, const std::string& lease = LEASE) {
++        p25::DispatchRequest request; request.action = action; request.srcId = RID; request.dstId = TG; request.leaseId = lease; return request;
++    }
++    p25::DispatchResult run(const p25::DispatchRequest& request) {
++        auto result = std::async(std::launch::async, [&] { return control->dispatch(request); });
++        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++        while (!p25::DispatchGrantTestAccess::queued(*control) && result.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready && std::chrono::steady_clock::now() < limit) std::this_thread::yield();
++        p25::DispatchGrantTestAccess::run(*control);
++        REQUIRE(result.wait_for(std::chrono::seconds(1)) == std::future_status::ready); return result.get();
++    }
++    size_t drain() { uint8_t frame[1024U]; size_t count = 0U; while (control->getFrame(frame) != 0U) ++count; return count; }
++};
++}
++
++TEST_CASE("dispatch success requires the actual correlated permit and is idempotent", "[dispatch-grant]") {
++    Fixture f;
++    REQUIRE_FALSE(f.control->affiliations()->isUnitReg(RID));
++    auto request = f.request(); const auto result = f.run(request);
++    REQUIRE(result.status == 200); REQUIRE(result.accepted); REQUIRE(result.issued); REQUIRE(result.epoch > 0U);
++    REQUIRE(result.channelNo == VC); REQUIRE(result.channelId == 2U); REQUIRE(f.rpc.permits == 1U);
++    REQUIRE(f.control->affiliations()->ownsGrant(TG, RID, VC, result.epoch)); REQUIRE(f.drain() > 0U);
++    const auto duplicate = f.run(request); REQUIRE(duplicate.epoch == result.epoch); REQUIRE(duplicate.accepted);
++    REQUIRE(f.rpc.permits == 1U); REQUIRE(f.drain() == 0U); REQUIRE_FALSE(f.control->affiliations()->isUnitReg(RID));
++    auto renew = f.request(p25::DispatchAction::Renew); renew.epoch = result.epoch;
++    REQUIRE(f.run(renew).accepted); REQUIRE(f.rpc.permits == 2U); REQUIRE(f.drain() == 0U);
++    auto release = f.request(p25::DispatchAction::Release); release.epoch = result.epoch;
++    REQUIRE(f.run(release).accepted); REQUIRE_FALSE(f.control->affiliations()->isGranted(TG)); REQUIRE(f.rpc.clears == 1U);
++    REQUIRE(f.run(release).accepted); REQUIRE(f.rpc.clears == 1U);
++    const auto replay = f.run(request); REQUIRE_FALSE(replay.accepted); REQUIRE(replay.state == "released"); REQUIRE(f.rpc.permits == 2U);
++}
++TEST_CASE("dispatch missing rejected mismatched or late permits cannot issue RF", "[dispatch-grant]") {
++    for (int mode = 0; mode < 4; ++mode) {
++        Fixture f;
++        if (mode == 0) f.rpc.allow = false;
++        if (mode == 1) f.rpc.reply = false;
++        if (mode == 2) f.rpc.wrongToken = true;
++        if (mode == 3) f.rpc.beforeReply = [&] { f.control->configureIdentification(true); f.control->requestIdentification(); };
++        const auto result = f.run(f.request());
++        REQUIRE_FALSE(result.accepted); REQUIRE_FALSE(result.issued); REQUIRE(f.drain() == 0U);
++        REQUIRE_FALSE(f.control->affiliations()->isGranted(TG)); REQUIRE(f.rpc.permits == 1U);
++        REQUIRE_FALSE(f.run(f.request()).accepted); REQUIRE(f.rpc.permits == 1U);
++    }
++}
++TEST_CASE("dispatch rejects disabled identities unavailable CC CW and occupied talkgroups", "[dispatch-grant]") {
++    for (int mode = 0; mode < 9; ++mode) {
++        Fixture f; auto request = f.request();
++        if (mode == 0) request.srcId = 10003U;
++        if (mode == 1) request.srcId = 10004U;
++        if (mode == 2) request.dstId = 1099U;
++        if (mode == 3) f.control->setCCRunning(false);
++        if (mode == 4) f.modem.error();
++        if (mode == 5) f.modem.stale();
++        if (mode == 6) f.control->setSupervisor(false);
++        if (mode == 7) { f.control->configureIdentification(true); f.control->requestIdentification(); }
++        if (mode == 8) REQUIRE(f.control->affiliations()->grantCh(TG, 10001U, 15U, true, false));
++        const auto result = f.run(request); REQUIRE_FALSE(result.accepted); REQUIRE_FALSE(result.issued);
++        REQUIRE(f.rpc.permits == 0U); REQUIRE(f.drain() == 0U);
++        if (mode == 8) REQUIRE(f.control->affiliations()->getGrantedSrcId(TG) == 10001U);
++    }
++}
++TEST_CASE("dispatch old cancellation and expiry cannot release a replacement allocation", "[dispatch-grant]") {
++    Fixture f; const auto first = f.run(f.request()); REQUIRE(first.accepted); f.drain();
++    REQUIRE(f.control->affiliations()->releaseGrant(TG, false));
++    REQUIRE(f.control->affiliations()->grantCh(TG, 10001U, 15U, true, false));
++    const auto replacement = f.control->affiliations()->grantEpoch(TG); REQUIRE(replacement != first.epoch);
++    auto release = f.request(p25::DispatchAction::Release); release.epoch = first.epoch;
++    REQUIRE(f.run(release).accepted); REQUIRE(f.control->affiliations()->ownsGrant(TG, 10001U, VC, replacement));
++    REQUIRE(f.drain() == 0U);
++}
++TEST_CASE("dispatch lease expiry clears only its permission and terminal status stays historical", "[dispatch-grant]") {
++    Fixture f; const auto first = f.run(f.request()); REQUIRE(first.accepted); f.drain();
++    p25::DispatchGrantTestAccess::expire(*f.control); f.control->clock();
++    REQUIRE_FALSE(f.control->affiliations()->isGranted(TG)); REQUIRE(f.rpc.clears == 1U);
++    const auto state = f.run(f.request(p25::DispatchAction::Status)); REQUIRE(state.state == "expired"); REQUIRE_FALSE(state.accepted); REQUIRE(state.issued);
++    const auto second = f.run(f.request(p25::DispatchAction::Grant, LEASE2)); REQUIRE(second.accepted); REQUIRE(second.epoch != first.epoch);
++    auto old = f.request(p25::DispatchAction::Release); old.epoch = first.epoch;
++    REQUIRE(f.run(old).accepted); REQUIRE(f.control->affiliations()->ownsGrant(TG, RID, VC, second.epoch));
++}
++TEST_CASE("dispatch queued timeout cannot later emit a grant", "[dispatch-grant]") {
++    Fixture f; const auto request = f.request(); const auto result = f.control->dispatch(request, 2U);
++    REQUIRE(result.status == 504); REQUIRE_FALSE(result.issued); p25::DispatchGrantTestAccess::run(*f.control);
++    REQUIRE(f.rpc.permits == 0U); REQUIRE(f.drain() == 0U); REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
++}
++TEST_CASE("dispatch permit wait past deadline rolls back without RF", "[dispatch-grant]") {
++    Fixture f; f.rpc.beforeReply = [] { std::this_thread::sleep_for(std::chrono::milliseconds(12)); };
++    auto request = f.request(); auto result = std::async(std::launch::async, [&] { return f.control->dispatch(request, 5U); });
++    while (!p25::DispatchGrantTestAccess::queued(*f.control)) std::this_thread::yield();
++    p25::DispatchGrantTestAccess::run(*f.control);
++    REQUIRE(result.get().issued == false); REQUIRE(f.rpc.permits == 1U); REQUIRE(f.drain() == 0U); REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
++}
++TEST_CASE("dispatch renew needs a fresh matching permit and rejects stale epoch", "[dispatch-grant]") {
++    Fixture f; const auto first = f.run(f.request()); REQUIRE(first.accepted); f.drain();
++    auto renew = f.request(p25::DispatchAction::Renew); renew.epoch = first.epoch + 1U;
++    REQUIRE_FALSE(f.run(renew).accepted); REQUIRE(f.rpc.permits == 1U); REQUIRE(f.control->affiliations()->isGranted(TG));
++    renew.epoch = first.epoch; f.rpc.wrongToken = true;
++    REQUIRE_FALSE(f.run(renew).accepted); REQUIRE_FALSE(f.control->affiliations()->isGranted(TG)); REQUIRE(f.drain() == 0U);
++}
++
++TEST_CASE("dispatch renewal deadline cannot extend a cancelled lease", "[dispatch-grant]") {
++    Fixture f; const auto first = f.run(f.request()); REQUIRE(first.accepted); f.drain();
++    auto renew = f.request(p25::DispatchAction::Renew); renew.epoch = first.epoch;
++    f.rpc.beforeReply = [] { std::this_thread::sleep_for(std::chrono::milliseconds(12)); };
++    auto result = std::async(std::launch::async, [&] { return f.control->dispatch(renew, 5U); });
++    while (!p25::DispatchGrantTestAccess::queued(*f.control)) std::this_thread::yield();
++    p25::DispatchGrantTestAccess::run(*f.control);
++    REQUIRE_FALSE(result.get().accepted); REQUIRE_FALSE(f.control->affiliations()->isGranted(TG)); REQUIRE(f.drain() == 0U);
++}

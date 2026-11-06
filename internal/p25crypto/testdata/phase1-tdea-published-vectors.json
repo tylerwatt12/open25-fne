@@ -1,0 +1,134 @@
+{
+  "source": {
+    "designation": "ANSI/TIA-102.AAAD-B-2015, December2015",
+    "plaintext": "A.4, PDF42, printed32",
+    "output_registers": "B.4, PDF46, printed36",
+    "ciphertext": "B.4, PDF47, printed37",
+    "transcription": "Manually transcribed from original rendered PDF; no generated expected values"
+  },
+  "algorithm": 131,
+  "key": "0123456789ABCDEF23456789ABCDEF01456789ABCDEF0123",
+  "mi": "1234567890ABCDEF00",
+  "output_registers": [
+    "A011B07C73633375",
+    "F2EF41746B0BEB27",
+    "E18DF8D98D4AD4A9",
+    "A9AF375DA13BEEB0",
+    "36F0EAADD77B530D",
+    "04A56B6FD8035306",
+    "1645B1FB8B19686B",
+    "6FB037C12A5F1D8F",
+    "B00BF92DFC4F25C5",
+    "5CE06D1B14C48744",
+    "A42A6BEB3A5C827D",
+    "8A8ECEF96BA16E6F",
+    "F21ADA08B048F0C9",
+    "16A84F68DDFA7AFF",
+    "0EA9474775A3D6B0",
+    "A2B8865C7506C1CC",
+    "018795DCDB57B576",
+    "9BC90859894C60DE",
+    "EA0F2BCCAC109C5D",
+    "AFEF557C067C1516",
+    "3764B87E0AD24143",
+    "C2AA7FDB19DA3F04",
+    "D1676C36B919DBEE",
+    "F6D9AF8D56B0D527",
+    "E769D8D6F5DCB5D7",
+    "73FF6C82FC2DC063",
+    "26F346A0C2F0A1F4",
+    "1A214FC36F0A87F8"
+  ],
+  "voice": [
+    {
+      "index": 0,
+      "plain": "0CEE42226F6101AB31EF14",
+      "cipher": "D56308F6C6C8AE9C6C4E2F"
+    },
+    {
+      "index": 1,
+      "plain": "0CEF400078A701A8FDA9AD",
+      "cipher": "E25F76F0920AD6D3AEA4A9"
+    },
+    {
+      "index": 2,
+      "plain": "10EF4020E8A501AC5516EC",
+      "cipher": "B5842FF8EBF607BA10A717"
+    },
+    {
+      "index": 3,
+      "plain": "18F68212A84601BCF72A1F",
+      "cipher": "93EFEA79C7F6367DDD7502"
+    },
+    {
+      "index": 4,
+      "plain": "80DD87B18C800002097BBA",
+      "cipher": "0F6D8C48A17C4F27CC275A"
+    },
+    {
+      "index": 5,
+      "plain": "34F0AC16F04C00B3BE61E5",
+      "cipher": "59EBB8D27708A499D58ADF"
+    },
+    {
+      "index": 6,
+      "plain": "34E97460B7030022F0693A",
+      "cipher": "686B09EA39CDF949510755"
+    },
+    {
+      "index": 7,
+      "plain": "30DE25C408610067AE870B",
+      "cipher": "C2C4FFCCB829F0AEB82F44"
+    },
+    {
+      "index": 8,
+      "plain": "3CD286DE30A40008D7A2B4",
+      "cipher": "C6A879D099E3477D747404"
+    },
+    {
+      "index": 9,
+      "plain": "04E343E6F61F02E0C18BAB",
+      "cipher": "A65BC5BA8319C32CC00C3E"
+    },
+    {
+      "index": 10,
+      "plain": "0CEB08E9945B02522A9AD0",
+      "cipher": "D0305F5CE2C0CB5A73139C"
+    },
+    {
+      "index": 11,
+      "plain": "A0FC5D90952F88832A3CD3",
+      "cipher": "C022B79FBEE32493B6617C"
+    },
+    {
+      "index": 12,
+      "plain": "8CD91CA671ED000109FC56",
+      "cipher": "638C60A00DF816366D4428"
+    },
+    {
+      "index": 13,
+      "plain": "98DA2BA287C40000CEC96D",
+      "cipher": "92086AE1456E7FDBD71352"
+    },
+    {
+      "index": 14,
+      "plain": "30DC36C0DC9D0049B1915A",
+      "cipher": "340D51ACEA2419925F6783"
+    },
+    {
+      "index": 15,
+      "plain": "0CCFC141129F0552E6E775",
+      "cipher": "A34297F1C7B8E23B3E3180"
+    },
+    {
+      "index": 16,
+      "plain": "0CEB4839E526002B4DDDDC",
+      "cipher": "D05E9F4A1A4A82D7601DBF"
+    },
+    {
+      "index": 17,
+      "plain": "0CEE02E689DD00B3AAF185",
+      "cipher": "4A4EC01628291A92E532EA"
+    }
+  ]
+}

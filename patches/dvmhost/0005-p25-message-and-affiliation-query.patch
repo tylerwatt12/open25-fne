@@ -1,0 +1,348 @@
+diff --git a/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.cpp b/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.cpp
+--- a/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.cpp
++++ b/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.cpp
+@@ -44,7 +44,7 @@
+ 
+     ulong64_t tsbkValue = TSBK::toValue(tsbk);
+ 
+-    m_messageValue = (uint8_t)((tsbkValue >> 56) & 0xFFU);                          // Message Value
++    m_messageValue = (uint16_t)((tsbkValue >> 48) & 0xFFFFU);                       // Message Value
+     m_dstId = (uint32_t)((tsbkValue >> 24) & 0xFFFFFFU);                            // Target Radio Address
+     m_srcId = (uint32_t)(tsbkValue & 0xFFFFFFU);                                    // Source Radio Address
+ 
+diff --git a/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.h b/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.h
+--- a/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.h
++++ b/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.h
+@@ -64,9 +64,9 @@
+ 
+             public:
+                 /**
+-                 * @brief Status value.
++                 * @brief 16-bit short data message value.
+                  */
+-                DECLARE_PROPERTY(uint8_t, messageValue, Message);
++                DECLARE_PROPERTY(uint16_t, messageValue, Message);
+ 
+                 DECLARE_COPY(IOSP_MSG_UPDT);
+             };
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -392,7 +392,7 @@
+ 
+                 IOSP_MSG_UPDT* iosp = static_cast<IOSP_MSG_UPDT*>(tsbk.get());
+                 if (m_verbose) {
+-                    LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, message = $%02X, srcId = %u, dstId = %u",
++                    LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, message = $%04X, srcId = %u, dstId = %u",
+                         tsbk->toString(true).c_str(), iosp->getMessage(), srcId, dstId);
+                 }
+ 
+@@ -552,11 +552,22 @@
+                 // make sure control data is supported
+                 IS_SUPPORT_CONTROL_CHECK(tsbk->toString(true), TSBKO::ISP_GRP_AFF_Q_RSP, srcId);
+ 
+-                // validate the source RID
+-                VALID_SRCID(tsbk->toString(true), TSBKO::IOSP_ACK_RSP, srcId);
+-
+-                // validate the target RID
+-                VALID_DSTID(tsbk->toString(true), TSBKO::IOSP_ACK_RSP, srcId, dstId);
++                // The response carries a source RID and a talkgroup address,
++                // not a second RID. Apply the normal affiliation access policy.
++                VALID_SRCID(tsbk->toString(true), TSBKO::ISP_GRP_AFF_Q_RSP, srcId);
++                VERIFY_SRCID_REG(tsbk->toString(true), TSBKO::ISP_GRP_AFF_Q_RSP, srcId);
++
++                // Preserve the normal affiliation path's null-group exception.
++                if (dstId != 0U) {
++                    VALID_TGID(tsbk->toString(true), TSBKO::ISP_GRP_AFF_Q_RSP, srcId, dstId);
++                    if (acl::AccessControl::tgidNonPreferred(dstId)) {
++                        LogWarning(LOG_RF, P25_TSDU_STR ", %s non-preferred on this site, TGID rejection, dstId = %u",
++                            tsbk->toString(true).c_str(), dstId);
++                        writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_TGT_GROUP_NOT_VALID, TSBKO::ISP_GRP_AFF_Q_RSP);
++                        m_p25->m_rfState = RS_RF_REJECTED;
++                        return false;
++                    }
++                }
+ 
+                 if (m_p25->m_ackTSBKRequests) {
+                     writeRF_TSDU_ACK_FNE(srcId, TSBKO::ISP_GRP_AFF_Q_RSP, true, true);
+@@ -882,7 +893,7 @@
+ 
+                         IOSP_MSG_UPDT* iosp = static_cast<IOSP_MSG_UPDT*>(tsbk.get());
+                         if (m_verbose) {
+-                            LogInfoEx(LOG_NET, P25_TSDU_STR ", %s, message = $%02X, srcId = %u, dstId = %u",
++                            LogInfoEx(LOG_NET, P25_TSDU_STR ", %s, message = $%04X, srcId = %u, dstId = %u",
+                                 tsbk->toString(true).c_str(), iosp->getMessage(), srcId, dstId);
+                         }
+ 
+diff --git a/src/sysview/SysViewMain.cpp b/src/sysview/SysViewMain.cpp
+--- a/src/sysview/SysViewMain.cpp
++++ b/src/sysview/SysViewMain.cpp
+@@ -663,14 +663,14 @@
+                                 case P25DEF::TSBKO::IOSP_MSG_UPDT:
+                                 {
+                                     lc::tsbk::IOSP_MSG_UPDT* iosp = static_cast<lc::tsbk::IOSP_MSG_UPDT*>(tsbk.get());
+-                                    LogInfoEx(LOG_NET, P25_TSDU_STR ", %s, message = $%02X, srcId = %u (%s), dstId = %u (%s)",
++                                    LogInfoEx(LOG_NET, P25_TSDU_STR ", %s, message = $%04X, srcId = %u (%s), dstId = %u (%s)",
+                                         tsbk->toString(true).c_str(), iosp->getMessage(), 
+                                         srcId, resolveRID(srcId).c_str(), dstId, resolveTGID(dstId).c_str());
+ 
+                                     // generate a net event for this
+                                     if (g_netDataEvent != nullptr) {
+-                                        uint8_t message = iosp->getMessage();
+-                                        netEvent["message"].set<uint8_t>(message);
++                                        uint16_t message = iosp->getMessage();
++                                        netEvent["message"].set<uint16_t>(message);
+ 
+                                         std::string resolvedSrc = resolveRID(srcId);
+                                         std::string resolvedDst = resolveTGID(dstId);
+diff --git a/tests/p25/ZeroCapacity_Tests.cpp b/tests/p25/ZeroCapacity_Tests.cpp
+--- a/tests/p25/ZeroCapacity_Tests.cpp
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -5,12 +5,18 @@
+ #include "host/modem/port/ModemNullPort.h"
+ #include "common/lookups/AffiliationLookup.h"
+ #include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
+ #include "common/p25/lc/tsbk/TSBKFactory.h"
+ #include "common/Log.h"
+ 
+ #include <catch2/catch_test_macros.hpp>
+ #include <array>
+ #include <memory>
++#include <cstdlib>
++#include <fstream>
+ #include <vector>
+ 
+ using namespace p25;
+@@ -61,7 +67,7 @@
+         true, true, false, false, false, false};
+     std::unique_ptr<Control> controller;
+ 
+-    explicit ControllerFixture(bool withCapacity = false, bool sndcp = false, bool strictACL = false) :
++    explicit ControllerFixture(bool withCapacity = false, bool sndcp = false, bool strictACL = false, bool messageAck = false) :
+         radios("", 0U, strictACL), groups("", 0U, strictACL) {
+         g_logDisplayLevel = 0U;
+         g_RPC = &rpc;
+@@ -89,6 +95,7 @@
+         verifyAff: true
+         inhibitUnauthorized: false
+         sndcpSupport: )") + (sndcp ? "true" : "false") + R"(
++        noMessageAck: )" + (messageAck ? "false" : "true") + R"(
+         tduPreambleCount: 0
+         control:
+             enable: true
+@@ -118,6 +125,35 @@
+         request->setDstId(target);
+         std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES + 2U> frame{};
+         REQUIRE(controller->control()->process(frame.data(), frame.size(), std::move(request)));
++    }
++
++    using RawBlock = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++    using TaggedFrame = std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES + 2U>;
++
++    static RawBlock rawBlock(uint8_t opcode, uint64_t payload) {
++        RawBlock raw{};
++        raw[0U] = 0x80U | opcode;
++        for (uint32_t i = 0U; i < 8U; ++i)
++            raw[2U + i] = uint8_t(payload >> ((7U - i) * 8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        return raw;
++    }
++
++    // Feed real sync/NID/interleaved, trellis-coded, CRC-protected RF bytes
++    // through Control::processFrame, rather than passing a predecoded object.
++    bool receiveRaw(const RawBlock& raw) {
++        TaggedFrame frame{};
++        frame[0U] = modem::TAG_DATA;
++        frame[1U] = 1U;
++        Sync::addP25Sync(frame.data() + 2U);
++        NID nid(0x293U);
++        nid.encode(frame.data() + 2U, DUID::TSDU);
++        std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{};
++        edac::Trellis trellis;
++        trellis.encode12(raw.data(), coded.data());
++        P25Utils::encode(coded.data(), frame.data() + 2U, 114U, 318U);
++        P25Utils::addStatusBits(frame.data() + 2U, P25_TSDU_FRAME_LENGTH_BITS, false, false);
++        return controller->processFrame(frame.data(), frame.size());
+     }
+ 
+     std::vector<std::unique_ptr<TSBK>> drain() {
+@@ -396,3 +432,175 @@
+         REQUIRE(fixture.controller->affiliations()->isGroupAff(SOURCE, GROUP));
+     }
+ }
++
++
++TEST_CASE("Message update preserves the complete standardized 16-bit value", "[p25][live-signaling]") {
++    // TIA-102.AABC-B 2.3.21 and 6.1.11.1: octets 2-3 are Message,
++    // followed by a 24-bit target and 24-bit source address.
++    for (uint16_t message : {0x0000U, 0x0001U, 0x00FFU, 0x0100U, 0x1234U, 0xEFFFU, 0xFFFFU}) {
++        CAPTURE(message);
++        const auto raw = ControllerFixture::rawBlock(TSBKO::IOSP_MSG_UPDT,
++            (uint64_t(message) << 48U) | (uint64_t(0xFFFFFCU) << 24U) | 10001U);
++        IOSP_MSG_UPDT decoded;
++        REQUIRE(decoded.decode(raw.data(), true));
++        REQUIRE(decoded.getMessage() == message);
++        REQUIRE(decoded.getSrcId() == 10001U);
++        REQUIRE(decoded.getDstId() == 0xFFFFFCU);
++        ControllerFixture::RawBlock encoded{};
++        decoded.encode(encoded.data(), true, true);
++        REQUIRE(edac::CRC::checkCCITT162(encoded.data(), encoded.size()));
++        REQUIRE(encoded[2U] == uint8_t(message >> 8U));
++        REQUIRE(encoded[3U] == uint8_t(message));
++        REQUIRE(encoded == raw);
++        IOSP_MSG_UPDT copied(decoded);
++        REQUIRE(copied.getMessage() == message);
++    }
++}
++
++TEST_CASE("A real message request emits an ACK for message service to the requesting radio", "[p25][live-signaling]") {
++    ControllerFixture fixture(false, false, true, true);
++    fixture.radios.addEntry(10001U, true, "Test subscriber");
++    const auto request = ControllerFixture::rawBlock(TSBKO::IOSP_MSG_UPDT,
++        (uint64_t(1U) << 48U) | (uint64_t(0xFFFFFCU) << 24U) | 10001U);
++    REQUIRE(fixture.receiveRaw(request));
++    ControllerFixture::TaggedFrame frame{};
++    REQUIRE(fixture.controller->getFrame(frame.data()) == frame.size());
++    std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{};
++    P25Utils::decode(frame.data() + 2U, coded.data(), 114U, 318U);
++    ControllerFixture::RawBlock response{};
++    edac::Trellis trellis;
++    REQUIRE(trellis.decode12(coded.data(), response.data()));
++    REQUIRE(edac::CRC::checkCCITT162(response.data(), response.size()));
++    REQUIRE((response[0U] & 0x3FU) == TSBKO::IOSP_ACK_RSP);
++    REQUIRE(response[1U] == MFG_STANDARD);
++    REQUIRE(response[2U] == (0x80U | TSBKO::IOSP_MSG_UPDT)); // AIV=1, EX=0, service=0x1C
++    for (size_t i = 3U; i < 7U; ++i)
++        REQUIRE(response[i] == 0U);
++    REQUIRE(response[7U] == 0U);
++    REQUIRE(response[8U] == uint8_t(10001U >> 8U));
++    REQUIRE(response[9U] == uint8_t(10001U));
++    REQUIRE(fixture.drain().empty());
++    REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
++    REQUIRE(fixture.channels.rfChDataSize() == 0U);
++
++    // Optional delta proof is deliberately separate from M1's frozen exporter.
++    // Include the actual dequeued response frame, suitable for an independent framer.
++    if (const char* path = std::getenv("DVM_P25_SIGNALING_DELTA_EXPORT")) {
++        auto hex = [](const uint8_t* bytes, size_t length) {
++            static const char* digits = "0123456789ABCDEF";
++            std::string result;
++            for (size_t i = 0U; i < length; ++i) {
++                result.push_back(digits[bytes[i] >> 4U]);
++                result.push_back(digits[bytes[i] & 15U]);
++            }
++            return result;
++        };
++        fixture.radios.eraseEntry(1001U);
++        fixture.groups.addEntry(1001U, 1U, true);
++        fixture.controller->affiliations()->unitReg(10001U);
++        const auto queryResponse = ControllerFixture::rawBlock(TSBKO::ISP_GRP_AFF_Q_RSP,
++            (uint64_t(1001U) << 24U) | 10001U);
++        REQUIRE(fixture.receiveRaw(queryResponse));
++        REQUIRE(fixture.controller->affiliations()->isGroupAff(10001U, 1001U));
++        std::ofstream output(path, std::ios::trunc);
++        REQUIRE(output.good());
++        output << "{\n  \"schema\": \"dvm-p25-signaling-delta-v1\",\n"
++            << "  \"message_code\": 1,\n  \"radio_id\": 10001,\n"
++            << "  \"message_request_tsbk_hex\": \"" << hex(request.data(), request.size()) << "\",\n"
++            << "  \"message_ack_tsbk_hex\": \"" << hex(response.data(), response.size()) << "\",\n"
++            << "  \"message_ack_tagged_frame_hex\": \"" << hex(frame.data(), frame.size()) << "\",\n"
++            << "  \"gaq_response_tsbk_hex\": \"" << hex(queryResponse.data(), queryResponse.size()) << "\",\n"
++            << "  \"gaq_group_id\": 1001,\n  \"gaq_radio_1001_enabled\": false,\n"
++            << "  \"gaq_affiliation_accepted\": true\n}\n";
++        REQUIRE(output.good());
++    }
++}
++
++TEST_CASE("Message acknowledgment remains explicitly configurable and enforces the RID ACL", "[p25][live-signaling]") {
++    bool enabled = true;
++    bool permitted = true;
++    SECTION("ACK disabled") { enabled = false; }
++    SECTION("unknown radio") { permitted = false; }
++    ControllerFixture fixture(false, false, true, enabled);
++    if (permitted)
++        fixture.radios.addEntry(10001U, true, "Test subscriber");
++    const auto request = ControllerFixture::rawBlock(TSBKO::IOSP_MSG_UPDT,
++        (uint64_t(1U) << 48U) | (uint64_t(0xFFFFFCU) << 24U) | 10001U);
++    REQUIRE(fixture.receiveRaw(request) == permitted);
++    auto replies = fixture.drain();
++    if (permitted) {
++        REQUIRE(replies.empty());
++    } else {
++        REQUIRE(replies.size() == 1U);
++        REQUIRE(replies.front()->getLCO() == TSBKO::OSP_DENY_RSP);
++        REQUIRE(replies.front()->getResponse() == ReasonCode::DENY_REQ_UNIT_NOT_VALID);
++        REQUIRE(replies.front()->getService() == TSBKO::IOSP_MSG_UPDT);
++    }
++}
++
++TEST_CASE("A group-affiliation-query response applies RID and TG policy independently", "[p25][live-signaling]") {
++    constexpr uint32_t radio = 10001U, group = 1001U;
++    ControllerFixture fixture(false, false, true);
++    fixture.radios.eraseEntry(group); // TG 1001 must not need a RID 1001 whitelist entry.
++    fixture.radios.addEntry(radio, true, "Test subscriber");
++    fixture.groups.addEntry(group, 1U, true);
++    fixture.controller->affiliations()->unitReg(radio);
++    uint32_t source = radio, target = group;
++    bool accepted = true, needsRegistration = false;
++    uint8_t reason = ReasonCode::DENY_TGT_GROUP_NOT_VALID;
++    SECTION("valid different RID and TG") {}
++    SECTION("disabled RID") {
++        fixture.radios.addEntry(radio, false, "Disabled subscriber");
++        accepted = false; reason = ReasonCode::DENY_REQ_UNIT_NOT_VALID;
++    }
++    SECTION("unknown RID") {
++        source = 10002U;
++        accepted = false; reason = ReasonCode::DENY_REQ_UNIT_NOT_VALID;
++    }
++    SECTION("null RID absent from strict ACL") {
++        source = 0U;
++        accepted = false; reason = ReasonCode::DENY_REQ_UNIT_NOT_VALID;
++    }
++    SECTION("stock all-call RID still requires registration") {
++        source = 0xFFFFFFU;
++        accepted = false; needsRegistration = true; reason = ReasonCode::DENY_REQ_UNIT_NOT_AUTH;
++    }
++    SECTION("unregistered RID") {
++        fixture.controller->affiliations()->unitDereg(radio);
++        accepted = false; needsRegistration = true; reason = ReasonCode::DENY_REQ_UNIT_NOT_AUTH;
++    }
++    SECTION("disabled TG") {
++        fixture.groups.addEntry(group, 1U, false);
++        accepted = false;
++    }
++    SECTION("unknown TG") { target = 1099U; accepted = false; }
++    SECTION("nonpreferred TG") {
++        fixture.groups.addEntry(group, 1U, true, false, true);
++        accepted = false;
++    }
++    SECTION("null TG preserves stock normal-affiliation exception") { target = 0U; }
++    SECTION("unconfigured all-system group is not an ordinary allowed TG") { target = 0xFFFFU; accepted = false; }
++    REQUIRE_FALSE(fixture.radios.find(group).radioEnabled());
++    const auto response = ControllerFixture::rawBlock(TSBKO::ISP_GRP_AFF_Q_RSP,
++        (uint64_t(target) << 24U) | source);
++    REQUIRE(fixture.receiveRaw(response) == accepted);
++    REQUIRE(fixture.controller->affiliations()->isGroupAff(source, target) == accepted);
++    REQUIRE(fixture.controller->affiliations()->grpAffSize() == (accepted ? 1U : 0U));
++    REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
++    REQUIRE(fixture.channels.rfChDataSize() == 0U);
++    auto replies = fixture.drain();
++    if (accepted) {
++        REQUIRE(replies.empty());
++    } else {
++        REQUIRE(replies.size() == (needsRegistration ? 2U : 1U));
++        REQUIRE(replies.front()->getLCO() == TSBKO::OSP_DENY_RSP);
++        REQUIRE(replies.front()->getResponse() == reason);
++        REQUIRE(replies.front()->getService() == TSBKO::ISP_GRP_AFF_Q_RSP);
++        const uint8_t* raw = replies.front()->getDecodedRaw();
++        REQUIRE(edac::CRC::checkCCITT162(raw, P25_TSBK_LENGTH_BYTES));
++        REQUIRE((raw[2U] & 0x3FU) == TSBKO::ISP_GRP_AFF_Q_RSP);
++        REQUIRE(raw[3U] == reason);
++        if (needsRegistration)
++            REQUIRE(replies.back()->getLCO() == TSBKO::OSP_U_REG_CMD);
++    }
++}

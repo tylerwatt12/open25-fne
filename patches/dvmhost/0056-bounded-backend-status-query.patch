@@ -1,0 +1,679 @@
+diff --git a/src/common/p25/lc/tsbk/StatusQuery.h b/src/common/p25/lc/tsbk/StatusQuery.h
+new file mode 100644
+--- /dev/null
++++ b/src/common/p25/lc/tsbk/StatusQuery.h
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// TIA-102.AABC-E6.1.14.1/Fig6.1.14-1, PDF116/printed97;
++// 6.2.17.1/Fig6.2.17-1, PDF183/printed164. See status-query-backend.md.
++#pragma once
++#include "common/p25/lc/tsbk/IOSP_STS_UPDT.h"
++namespace p25 { namespace lc { namespace tsbk {
++class ISP_STS_Q_RSP : public IOSP_STS_UPDT {
++public:
++    ISP_STS_Q_RSP() { m_lco = defines::TSBKO::ISP_STS_Q_RSP; }
++    std::string toString(bool = false) override { return "TSBKO, ISP_STS_Q_RSP (Status Query Response)"; }
++};
++class OSP_STS_Q : public IOSP_STS_UPDT {
++public:
++    OSP_STS_Q() { m_lco = defines::TSBKO::OSP_STS_Q; }
++    void encode(uint8_t* data, bool rawTSBK = false, bool noTrellis = false) override {
++        setStatus(0U); // octets2-3 are reserved in STS_Q, emitted zero
++        IOSP_STS_UPDT::encode(data, rawTSBK, noTrellis);
++    }
++    std::string toString(bool = false) override { return "TSBKO, OSP_STS_Q (Status Query)"; }
++};
++}}}
+diff --git a/src/common/p25/lc/tsbk/TSBKFactory.cpp b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+--- a/src/common/p25/lc/tsbk/TSBKFactory.cpp
++++ b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+@@ -190,6 +190,12 @@
+         return decode(new ISP_SNDCP_CH_REQ(), data, rawTSBK);
+     case TSBKO::ISP_SNDCP_REC_REQ:
+         return decode(new ISP_SNDCP_REC_REQ(), data, rawTSBK);
++    case TSBKO::ISP_STS_Q_RSP:
++        return direction == Direction::Inbound && (mfId == MFG_STANDARD || mfId == MFG_STANDARD_ALT)
++            ? decode(new ISP_STS_Q_RSP(), data, rawTSBK) : nullptr;
++    case TSBKO::OSP_STS_Q:
++        return direction == Direction::Outbound && (mfId == MFG_STANDARD || mfId == MFG_STANDARD_ALT)
++            ? decode(new OSP_STS_Q(), data, rawTSBK) : nullptr;
+     case TSBKO::IOSP_STS_UPDT:
+         return decode(new IOSP_STS_UPDT(), data, rawTSBK);
+     case TSBKO::IOSP_MSG_UPDT:
+diff --git a/src/common/p25/lc/tsbk/TSBKFactory.h b/src/common/p25/lc/tsbk/TSBKFactory.h
+--- a/src/common/p25/lc/tsbk/TSBKFactory.h
++++ b/src/common/p25/lc/tsbk/TSBKFactory.h
+@@ -38,6 +38,7 @@
+ #include "common/p25/lc/tsbk/IOSP_MSG_UPDT.h"
+ #include "common/p25/lc/tsbk/IOSP_RAD_MON.h"
+ #include "common/p25/lc/tsbk/IOSP_STS_UPDT.h"
++#include "common/p25/lc/tsbk/StatusQuery.h"
+ #include "common/p25/lc/tsbk/IOSP_U_REG.h"
+ #include "common/p25/lc/tsbk/IOSP_UU_ANS.h"
+ #include "common/p25/lc/tsbk/IOSP_UU_VCH.h"
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -221,7 +221,7 @@
+ 
+ void Control::reset()
+ {
+-    if (m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelInhibitions(); }
++    if (m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelStatusQueries(); m_control->cancelInhibitions(); }
+     m_rfState = RS_RF_LISTENING;
+     m_ccHalted = false;
+ 
+@@ -1083,13 +1083,13 @@
+ void Control::setCCRunning(bool ccRunning)
+ {
+     m_ccPrevRunning = m_ccRunning; m_ccRunning = ccRunning;
+-    if (!ccRunning && m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelInhibitions(); }
++    if (!ccRunning && m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelStatusQueries(); m_control->cancelInhibitions(); }
+ }
+ 
+ void Control::setCCHalted(bool ccHalted)
+ {
+     m_ccHalted = ccHalted;
+-    if (ccHalted && m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelInhibitions(); }
++    if (ccHalted && m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelStatusQueries(); m_control->cancelInhibitions(); }
+ }
+ 
+ /* Updates the processor. */
+@@ -1101,7 +1101,7 @@
+     if (!m_authoritative) retryPermitReleases();
+     uint32_t ms = m_interval.elapsed();
+     m_interval.start();
+-    if (m_control != nullptr) { m_control->clockInhibitions(ms); m_control->clockRadioChecks(ms); }
++    if (m_control != nullptr) { m_control->clockInhibitions(ms); m_control->clockRadioChecks(ms); m_control->clockStatusQueries(); }
+     clockDispatch();
+ 
+     if (m_network != nullptr) {
+@@ -1603,6 +1603,9 @@
+     if ((!net && m_rfTimeout.isRunning() && m_rfTimeout.hasExpired()) ||
+         (net && m_netTimeout.isRunning() && m_netTimeout.hasExpired())) return false;
+     if (m_debug) Utils::symbols("!!! *Tx P25", data + 2U, length > 2U ? length - 2U : 0U);
++    // Enforce the originating request's deadline after any queue-lock wait.
++    // The queue repeats this check at its own push commit under its mutex.
++    if (owner && owner->admissionExpired()) { owner->active.store(false); return false; }
+     // Bounded records reject the new frame on pressure; unrelated queued
+     // responses are never cleared or resized by a failed CHECK enqueue.
+     return imm ? m_txImmQueue.push(data, length, owner) : m_txQueue.push(data, length, owner);
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -320,6 +320,7 @@
+         friend struct CapacityPermitTestAccess;
+         friend struct DispatchGrantTestAccess;
+         friend struct RadioCheckTestAccess;
++        friend struct StatusQueryTestAccess;
+         friend struct InhibitProcedureTestAccess;
+         friend struct MultiSiteTestAccess;
+         friend struct NIDReceiveTestAccess;
+diff --git a/src/host/p25/TxFrameQueue.h b/src/host/p25/TxFrameQueue.h
+--- a/src/host/p25/TxFrameQueue.h
++++ b/src/host/p25/TxFrameQueue.h
+@@ -3,6 +3,7 @@
+ // cancellation ownership exists only inside the host process.
+ #pragma once
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <deque>
+@@ -13,11 +14,20 @@
+ 
+ namespace p25 {
+ struct TxFrameOwner {
+-    explicit TxFrameOwner(uint32_t destination, bool service = false, uint32_t source = 0U, uint32_t target = 0U) :
+-        destination(destination), service(service), source(source), individualTarget(target) {}
++    explicit TxFrameOwner(uint32_t destination, bool service = false, uint32_t source = 0U, uint32_t target = 0U,
++        std::chrono::steady_clock::time_point admissionDeadline = {}, std::chrono::milliseconds maxQueueAge = {}) :
++        destination(destination), service(service), source(source), individualTarget(target), admissionDeadline(admissionDeadline), maxQueueAge(maxQueueAge) {}
+     const uint32_t destination;
+     const bool service;
+     const uint32_t source, individualTarget;
++    // Optional native enqueue deadline. It is immutable and never changes
++    // the lifetime or ordering of a frame already accepted into the queue.
++    const std::chrono::steady_clock::time_point admissionDeadline;
++    const std::chrono::milliseconds maxQueueAge;
++    bool admissionExpired() const {
++        return admissionDeadline != std::chrono::steady_clock::time_point{} &&
++            std::chrono::steady_clock::now() >= admissionDeadline;
++    }
+     std::atomic<bool> active{true};
+ };
+ using TxFrameOwnership = std::shared_ptr<TxFrameOwner>;
+@@ -30,8 +40,13 @@
+         // Account the original two-octet length prefix in the payload budget.
+         if (data == nullptr || length <= 2U || length > 0xFFFFU) return false;
+         std::lock_guard<std::mutex> lock(m_mutex);
+-        if (length + 2U > m_capacity - m_used || (owner && !owner->active.load())) return false;
+-        m_frames.push_back(Frame{std::vector<uint8_t>(data, data + length), owner});
++        if (length + 2U > m_capacity - m_used || (owner && (!owner->active.load() || owner->admissionExpired()))) return false;
++        Frame frame{std::vector<uint8_t>(data, data + length), owner, {}};
++        // A status request can expire while the protocol clock is stalled.
++        // Stamp the actual queue record after constructing its byte payload.
++        if (owner && owner->maxQueueAge.count() > 0)
++            frame.expiresAt = std::chrono::steady_clock::now() + owner->maxQueueAge;
++        m_frames.push_back(std::move(frame));
+         m_used += length + 2U;
+         return true;
+     }
+@@ -71,10 +86,18 @@
+         }
+     }
+ private:
+-    struct Frame { std::vector<uint8_t> data; TxFrameOwnership owner; };
++#if defined(CATCH2_TEST_COMPILATION)
++    friend struct StatusQueryTestAccess;
++#endif
++    struct Frame { std::vector<uint8_t> data; TxFrameOwnership owner; std::chrono::steady_clock::time_point expiresAt; };
+     void discardInactive() {
+-        while (!m_frames.empty() && m_frames.front().owner && !m_frames.front().owner->active.load()) {
+-            m_used -= uint32_t(m_frames.front().data.size()) + 2U;
++        while (!m_frames.empty()) {
++            auto& frame = m_frames.front();
++            if (frame.expiresAt != std::chrono::steady_clock::time_point{} &&
++                std::chrono::steady_clock::now() >= frame.expiresAt && frame.owner)
++                frame.owner->active.store(false);
++            if (!frame.owner || frame.owner->active.load()) break;
++            m_used -= uint32_t(frame.data.size()) + 2U;
+             m_frames.pop_front();
+         }
+     }
+diff --git a/src/host/p25/packet/ControlSignaling.Status.cpp b/src/host/p25/packet/ControlSignaling.Status.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/host/p25/packet/ControlSignaling.Status.cpp
+@@ -0,0 +1,101 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// AABD-B10.4.2/10.4.4-5; AABC-E6.1.14/6.2.17. See status-query-backend.md.
++#include "p25/packet/ControlSignaling.h"
++#include "common/p25/lc/tsbk/StatusQuery.h"
++#include "p25/lookups/P25AffiliationLookup.h"
++#include "common/Log.h"
++using namespace p25;
++using namespace p25::packet;
++using namespace p25::defines;
++namespace {
++bool active(ControlSignaling::StatusQueryState state) {
++    return state == ControlSignaling::StatusQueryState::Queued || state == ControlSignaling::StatusQueryState::Awaiting;
++}
++}
++bool ControlSignaling::statusQueryTargetAvailable(uint32_t target) const {
++    return m_p25->m_enableControl && m_p25->m_dedicatedControl && m_p25->m_ccRunning &&
++        !m_p25->m_ccHalted && !m_p25->identificationActive() && m_p25->physicalSubscriberPermitted(target) &&
++        m_p25->m_affiliations->isUnitReg(target) && !isInhibited(target) && m_p25->m_modem != nullptr &&
++        !m_p25->m_modem->hasError() && !m_p25->m_modem->hasLockout();
++}
++bool ControlSignaling::requestStatusQuery(uint32_t target, uint32_t waitMs) {
++    std::unique_lock<std::mutex> lock(m_statusQueryMutex);
++    // REST validates only the address domain. All control/registration/policy
++    // admission runs on the protocol owner before a successful return.
++    if (target == 0U || target >= WUID_FNE) return false;
++    auto old = m_statusQueries.find(target);
++    if (old != m_statusQueries.end() && (active(old->second.state) || std::chrono::steady_clock::now() < old->second.deadline)) return false;
++    if (std::count_if(m_statusQueries.begin(),m_statusQueries.end(),[](const auto& row){return active(row.second.state);}) >= 16) return false;
++    if (old == m_statusQueries.end() && m_statusQueries.size() >= 128U) {
++        const auto now = std::chrono::steady_clock::now();
++        auto retired = std::find_if(m_statusQueries.begin(),m_statusQueries.end(),[&](const auto& row){
++            return !active(row.second.state) && now >= row.second.deadline;
++        });
++        if (retired == m_statusQueries.end()) return false;
++        m_statusQueries.erase(retired);
++    }
++    StatusQuery request; request.serial = ++m_statusQuerySerial;
++    request.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs ? std::min(waitMs,750U) : 750U);
++    request.owner = std::make_shared<TxFrameOwner>(target,true,WUID_FNE,target,request.deadline,std::chrono::seconds(10));
++    m_statusQueries[target] = request;
++    if (waitMs == 0U) return true; // test/mailbox admission, never RF evidence
++    const auto serial = request.serial;
++    m_statusQueryChanged.wait_until(lock,request.deadline,[&]{
++        auto current = m_statusQueries.find(target);
++        return current == m_statusQueries.end() || current->second.serial != serial || current->second.state != StatusQueryState::Queued;
++    });
++    auto current = m_statusQueries.find(target);
++    if (current == m_statusQueries.end() || current->second.serial != serial) return false;
++    if (current->second.state == StatusQueryState::Queued) {
++        current->second.state = StatusQueryState::Cancelled; current->second.owner->active.store(false);
++    }
++    return current->second.state == StatusQueryState::Awaiting || current->second.state == StatusQueryState::Reported;
++}
++ControlSignaling::StatusQueryState ControlSignaling::statusQueryState(uint32_t target) {
++    std::lock_guard<std::mutex> lock(m_statusQueryMutex); auto found = m_statusQueries.find(target);
++    return found == m_statusQueries.end() ? StatusQueryState::None : found->second.state;
++}
++void ControlSignaling::cancelStatusQueries() {
++    std::lock_guard<std::mutex> lock(m_statusQueryMutex);
++    for (auto& row : m_statusQueries) if (active(row.second.state)) {
++        row.second.state = StatusQueryState::Cancelled; row.second.owner->active.store(false);
++    }
++    m_statusQueryChanged.notify_all();
++}
++void ControlSignaling::clockStatusQueries() {
++    std::lock_guard<std::mutex> lock(m_statusQueryMutex);
++    for (auto& row : m_statusQueries) {
++        auto& request = row.second; if (!active(request.state)) continue;
++        if (!request.owner->active.load() || !statusQueryTargetAvailable(row.first)) {
++            request.state = StatusQueryState::Cancelled; request.owner->active.store(false); continue;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (now >= request.deadline) {
++            const bool issued = request.state == StatusQueryState::Awaiting;
++            request.state = issued ? StatusQueryState::NoResponse : StatusQueryState::Cancelled;
++            request.owner->active.store(false);
++            if (issued) LogInfoEx(LOG_HOST,"P25 Status Query, no response, arg = %u, tgt = %u, attempts = 1",WUID_FNE,row.first);
++            continue;
++        }
++        if (request.state == StatusQueryState::Awaiting) continue;
++        lc::tsbk::OSP_STS_Q query; query.setMFId(MFG_STANDARD); query.setSrcId(WUID_FNE); query.setDstId(row.first);
++        if (!writeRF_TSDU_SBF(&query,true,true,true,false,request.owner)) {
++            request.state = StatusQueryState::Cancelled; request.owner->active.store(false); continue;
++        }
++        request.state = StatusQueryState::Awaiting;
++        // Project policy: one query, ten-second response deadline. Optional
++        // signaling repetitions are not enabled; this is not CHECK's Nmax.
++        request.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++    }
++    m_statusQueryChanged.notify_all();
++}
++bool ControlSignaling::acceptStatusQueryResponse(uint32_t source, uint32_t target, uint8_t mfid) {
++    std::lock_guard<std::mutex> lock(m_statusQueryMutex); auto found = m_statusQueries.find(source);
++    if (found == m_statusQueries.end()) return false;
++    auto& request = found->second;
++    if (request.state != StatusQueryState::Awaiting || !request.owner->active.load() ||
++        std::chrono::steady_clock::now() >= request.deadline || target != WUID_FNE ||
++        (mfid != MFG_STANDARD && mfid != MFG_STANDARD_ALT) || !statusQueryTargetAvailable(source)) return false;
++    request.state = StatusQueryState::Reported; request.owner->active.store(false);
++    m_statusQueryChanged.notify_all(); return true;
++}
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -225,7 +225,7 @@
+         switch (tsbk->getLCO()) {
+         case TSBKO::IOSP_GRP_VCH: case TSBKO::IOSP_UU_VCH: case TSBKO::IOSP_UU_ANS:
+         case TSBKO::IOSP_TELE_INT_ANS: case TSBKO::ISP_SNDCP_CH_REQ:
+-        case TSBKO::IOSP_STS_UPDT: case TSBKO::IOSP_MSG_UPDT: case TSBKO::IOSP_RAD_MON:
++        case TSBKO::ISP_STS_Q_RSP: case TSBKO::IOSP_STS_UPDT: case TSBKO::IOSP_MSG_UPDT: case TSBKO::IOSP_RAD_MON:
+         case TSBKO::IOSP_CALL_ALRT: case TSBKO::IOSP_ACK_RSP: case TSBKO::ISP_GRP_AFF_Q_RSP:
+         case TSBKO::ISP_U_DEREG_REQ: case TSBKO::ISP_EMERG_ALRM_REQ: case TSBKO::ISP_CAN_SRV_REQ:
+             physicalSourceRequest = true; break;
+@@ -426,6 +426,18 @@
+                 else {
+                     writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_SYS_UNSUPPORTED_SVC, TSBKO::ISP_SNDCP_REC_REQ);
+                 }
++            }
++            break;
++            case TSBKO::ISP_STS_Q_RSP:
++            {
++                auto* response = dynamic_cast<ISP_STS_Q_RSP*>(tsbk.get());
++                if (response == nullptr || !acceptStatusQueryResponse(srcId, dstId, tsbk->getMFId())) {
++                    m_inbound = false; m_p25->m_rfState = prevRfState; return false;
++                }
++                // This log is a matched response, never an unsolicited status
++                // update or a generic ACK. The FNE is the originating endpoint.
++                LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, status = $%04X, srcId = %u, dstId = %u",
++                    response->toString(true).c_str(), response->getStatus(), srcId, dstId);
+             }
+             break;
+             case TSBKO::IOSP_STS_UPDT:
+diff --git a/src/host/p25/packet/ControlSignaling.h b/src/host/p25/packet/ControlSignaling.h
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -40,6 +40,7 @@
+ {
+     struct DispatchGrantTestAccess;
+     struct RadioCheckTestAccess;
++    struct StatusQueryTestAccess;
+     struct InhibitProcedureTestAccess;
+     struct AMBTIngressTestAccess;
+     // ---------------------------------------------------------------------------
+@@ -122,6 +123,10 @@
+             bool requestRadioCheck(uint32_t dstId, uint32_t waitMs = 0U);
+             RadioCheckState radioCheckState(uint32_t dstId);
+             void cancelRadioChecks();
++            enum class StatusQueryState { None, Queued, Awaiting, Reported, NoResponse, Cancelled };
++            bool requestStatusQuery(uint32_t target, uint32_t waitMs = 750U);
++            StatusQueryState statusQueryState(uint32_t target);
++            void cancelStatusQueries();
+             InhibitResult updateInhibitPolicy(const std::vector<InhibitDesired>& desired,
+                 const std::vector<InhibitRestore>& controlState = {}, bool hasControlState = false, uint32_t waitMs = 750U);
+             InhibitResult inhibitSnapshot();
+@@ -176,6 +181,7 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+             friend struct p25::DispatchGrantTestAccess;
+             friend struct p25::RadioCheckTestAccess;
++            friend struct p25::StatusQueryTestAccess;
+             friend struct p25::InhibitProcedureTestAccess;
+             friend struct p25::AMBTIngressTestAccess;
+ #endif
+@@ -250,6 +256,20 @@
+             std::unordered_map<uint32_t, RadioCheck> m_radioChecks;
+             void clockRadioChecks(uint32_t ms);
+             bool acceptRadioCheckResponse(uint32_t function, uint32_t argument, uint32_t source, uint8_t mfid);
++
++            struct StatusQuery {
++                uint64_t serial = 0U;
++                TxFrameOwnership owner;
++                StatusQueryState state = StatusQueryState::Queued;
++                std::chrono::steady_clock::time_point deadline;
++            };
++            std::mutex m_statusQueryMutex;
++            std::condition_variable m_statusQueryChanged;
++            uint64_t m_statusQuerySerial = 0U;
++            std::unordered_map<uint32_t, StatusQuery> m_statusQueries;
++            void clockStatusQueries();
++            bool acceptStatusQueryResponse(uint32_t source, uint32_t target, uint8_t mfid);
++            bool statusQueryTargetAvailable(uint32_t target) const;
+ 
+             struct InhibitRecord {
+                 bool desired = false, blocked = false, pending = false, wake = false;
+diff --git a/src/host/restapi/RESTAPI.cpp b/src/host/restapi/RESTAPI.cpp
+--- a/src/host/restapi/RESTAPI.cpp
++++ b/src/host/restapi/RESTAPI.cpp
+@@ -1554,6 +1554,12 @@
+     else if (::strtolower(command) == RID_CMD_DYN_REGRP_UNLOCK) {
+         m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::DYN_REGRP_UNLOCK, 0U, dstId);
+     }
++    else if (::strtolower(command) == RID_CMD_STATUS_QUERY) {
++        if (!m_p25->control()->requestStatusQuery(dstId,750U)) {
++            errorPayload(reply, "status query unavailable, target invalid, or already pending", HTTPPayload::SERVICE_UNAVAILABLE);
++            return;
++        }
++    }
+     else if (::strtolower(command) == RID_CMD_GAQ) {
+         m_p25->control()->writeRF_TSDU_Grp_Aff_Q(dstId);
+     }
+diff --git a/src/host/restapi/RESTDefines.h b/src/host/restapi/RESTDefines.h
+--- a/src/host/restapi/RESTDefines.h
++++ b/src/host/restapi/RESTDefines.h
+@@ -53,6 +53,7 @@
+ #define RID_CMD_DYN_REGRP_CANCEL        "dyn-regrp-cancel"
+ #define RID_CMD_DYN_REGRP_LOCK          "dyn-regrp-lock"
+ #define RID_CMD_DYN_REGRP_UNLOCK        "dyn-regrp-unlock"
++#define RID_CMD_STATUS_QUERY            "status-query"
+ #define RID_CMD_GAQ                     "group-aff-req"
+ #define RID_CMD_UREG                    "unit-reg"
+ #define RID_CMD_EMERG                   "emerg"
+diff --git a/tests/p25/StatusQuery_Tests.cpp b/tests/p25/StatusQuery_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/StatusQuery_Tests.cpp
+@@ -0,0 +1,276 @@
++// TIA-102.AABD-B 6.6.1 (PDF59/printed54), 13.2.1 (PDF118/printed113),
++// Table17-1 (PDF138/printed133); AABC-E Table2.3.15-1 (PDF34/printed15),
++// Fig6.1.7-1 (PDF105/printed86). Literal payloads are requirements-derived;
++// existing CRC/Trellis helpers supply framing only. No socket/modem opens.
++// SPDX-License-Identifier: GPL-2.0-only
++// Actual P25 control/voice serialization and local policy. No RF or socket opens.
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/network/P25SiteRouting.h"
++#include "common/p25/acl/AccessControl.h"
++#include "common/p25/Audio.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/Log.h"
++#include "host/p25/packet/ControlSignaling.h"
++#include <iostream>
++#include <iomanip>
++#include <future>
++#include <thread>
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <sstream>
++#include <vector>
++
++namespace p25 {
++struct StatusQueryTestAccess {
++    static void clock(Control& c) { c.control()->clockStatusQueries(); }
++    static void expire(Control& c, uint32_t target) {
++        auto* signal=c.control(); std::lock_guard<std::mutex> lock(signal->m_statusQueryMutex);
++        signal->m_statusQueries.at(target).deadline = std::chrono::steady_clock::now();
++    }
++    static void addSubscriber(Control& c,uint32_t target) { c.m_dispatchSubscribers.insert(target); c.affiliations()->unitReg(target); }
++    static size_t count(Control& c) { std::lock_guard<std::mutex> lock(c.control()->m_statusQueryMutex); return c.control()->m_statusQueries.size(); }
++    static std::unique_lock<std::mutex> holdQueue() { return std::unique_lock<std::mutex>(Control::s_queueLock); }
++    static bool statusMutexHeld(Control& c) { auto& mutex=c.control()->m_statusQueryMutex; if(!mutex.try_lock())return true; mutex.unlock();return false; }
++    static bool ownerActive(Control& c,uint32_t target) { auto* signal=c.control();std::lock_guard<std::mutex> lock(signal->m_statusQueryMutex);return signal->m_statusQueries.at(target).owner->active.load(); }
++    static void expireQueued(Control& c,uint32_t target) {
++        std::lock_guard<std::mutex> queueLock(Control::s_queueLock);
++        for(auto* queue:{&c.m_txImmQueue,&c.m_txQueue}) {
++            std::lock_guard<std::mutex> lock(queue->m_mutex);
++            for(auto& frame:queue->m_frames) if(frame.owner&&frame.owner->destination==target)
++                frame.expiresAt=std::chrono::steady_clock::now();
++        }
++    }
++    static void redundant(Control& c) { c.control()->m_redundantImmediate=true; }
++};
++}
++namespace {
++using namespace p25;
++using namespace p25::defines;
++constexpr uint32_t RID = 10001U, OTHER = 10005U, APP = 10002U, TG = 1001U, NAC = 0x293U;
++using Block = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++using QueryState = packet::ControlSignaling::StatusQueryState;
++constexpr uint32_t SECOND_SU = 10007U;
++std::ostringstream& diagnosticLog() { static std::ostringstream output; return output; }
++size_t timeoutLogs() {
++    const auto value = diagnosticLog().str(); size_t count=0U, at=0U;
++    while ((at=value.find("P25 Status Query, no response,", at))!=std::string::npos) { ++count; ++at; }
++    return count;
++}
++struct Fixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, true};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, true};
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U, true, true, false, false, false, false};
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-subscriber-test", false};
++    network::NetRPC* oldRPC = g_RPC;
++    std::unique_ptr<Control> controller;
++    explicit Fixture(bool cc, bool physicalInventory = true, uint32_t queueSize = 16384U) {
++        g_logDisplayLevel = 0U; g_RPC = &rpc;
++        diagnosticLog().str(""); diagnosticLog().clear();
++        log_internal::SetInternalOutputStream(diagnosticLog());
++        radios.addEntry(SECOND_SU,true,"Second physical SU"); radios.addEntry(RID, true, "Subscriber"); radios.addEntry(OTHER, false, "Disabled"); radios.addEntry(APP, true, "Console"); radios.addEntry(10006U, true, "Not physical");
++        groups.addEntry(TG, 1U, true); groups.addEntry(1002U, 1U, true);
++        controller = std::make_unique<Control>(true, NAC, 1U, queueSize, &modem, nullptr, 120U, 1U, true,
++            &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
++        yaml::Node config; std::string mode = cc ? "true" : "false";
++        const std::string inventory = physicalInventory ? "        dispatchSubscribers:\n            - 10001\n            - 10005\n            - 10007\n" : "        dispatchSubscribers: []\n";
++        REQUIRE(yaml::Parse(config, std::string("protocols:\n    p25:\n        managedSite: true\n") + inventory + "        verifyReg: true\n        verifyAff: false\n        inhibitUnauthorized: false\n        tduPreambleCount: 0\n        control:\n            enable: " + mode + "\n            dedicated: " + mode + "\n            ackRequests: false\n            disableTSDUMBF: true\n            redundantImmediate: false\nsystem:\n    config:\n        controlCh:\n            notifyEnable: false\n"));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 25U, false);
++        controller->configureIdentification(false); controller->setCCRunning(cc); controller->setZoneConnected(false);
++        controller->affiliations()->unitReg(RID);
++    }
++    ~Fixture() { controller.reset(); g_RPC = oldRPC; log_internal::SetInternalOutputStream(std::cerr); }
++    bool signal(uint8_t opcode, uint64_t value, uint8_t manufacturer = 0U) {
++        Block raw{}; raw[0] = 0x80U | opcode; raw[1] = manufacturer;
++        for (unsigned i = 0U; i < 8U; ++i) raw[2U+i] = uint8_t(value >> ((7U-i)*8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES+2U> frame{}; frame[0] = modem::TAG_DATA; frame[1] = 1U;
++        Sync::addP25Sync(frame.data()+2U); NID nid(NAC); nid.encode(frame.data()+2U, DUID::TSDU);
++        std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> encoded{}; edac::Trellis trellis;
++        trellis.encode12(raw.data(), encoded.data()); P25Utils::encode(encoded.data(), frame.data()+2U, 114U, 318U);
++        P25Utils::addStatusBits(frame.data()+2U, P25_TSDU_FRAME_LENGTH_BITS, false, false);
++        return controller->processFrame(frame.data(), frame.size());
++    }
++    std::vector<Block> responses() {
++        std::array<uint8_t, 1024> frame{}; std::vector<Block> blocks;
++        while (controller->getFrame(frame.data()) != 0U) {
++            NID nid(NAC); if (!nid.decode(frame.data()+2U) || nid.getDUID()!=DUID::TSDU) continue;
++            std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{}; Block raw{}; edac::Trellis trellis;
++            P25Utils::decode(frame.data()+2U, coded.data(), 114U, 318U); REQUIRE(trellis.decode12(coded.data(), raw.data()));
++            REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); blocks.push_back(raw);
++        }
++        return blocks;
++    }
++    void age(uint32_t ms) { controller->affiliations()->clock(ms); }
++};
++}
++
++
++TEST_CASE("status query emits standard literal local query only on the protocol owner", "[p25][status-query]") {
++    Fixture f(true); auto* signal=f.controller->control();
++    signal->setLastMFId(0x90U); StatusQueryTestAccess::redundant(*f.controller);
++    REQUIRE(signal->requestStatusQuery(RID,0U));
++    REQUIRE(signal->statusQueryState(RID)==QueryState::Queued);
++    REQUIRE_FALSE(signal->requestStatusQuery(RID,0U));
++    REQUIRE(f.responses().empty());
++    StatusQueryTestAccess::clock(*f.controller);
++    auto blocks=f.responses(); REQUIRE(blocks.size()==1U);
++    const std::array<uint8_t,10U> expected{{0x9AU,0x00U,0x00U,0x00U,0x00U,0x27U,0x11U,0xFFU,0xFFU,0xFCU}};
++    for(size_t i=0;i<expected.size();++i) REQUIRE(blocks[0][i]==expected[i]);
++    REQUIRE(signal->statusQueryState(RID)==QueryState::Awaiting);
++    for(unsigned i=0;i<10U;++i)StatusQueryTestAccess::clock(*f.controller);
++    REQUIRE(f.responses().empty()); // no optional repeats/redundancy
++    StatusQueryTestAccess::expire(*f.controller,RID);StatusQueryTestAccess::clock(*f.controller);
++    REQUIRE(signal->statusQueryState(RID)==QueryState::NoResponse);
++    REQUIRE(timeoutLogs()==1U);
++    StatusQueryTestAccess::clock(*f.controller);REQUIRE(timeoutLogs()==1U);
++    REQUIRE(f.controller->affiliations()->isUnitReg(RID));
++}
++TEST_CASE("only solicited issued standard status query responses complete with full status", "[p25][status-query]") {
++    for(const auto status:{0U,0x0102U,0xFFFFU}) {
++        Fixture f(true); auto* signal=f.controller->control();
++        const uint64_t reply=(uint64_t(status)<<48U)|0xFFFFFC002711ULL;
++        REQUIRE_FALSE(f.signal(0x19U,reply)); // unsolicited
++        REQUIRE(signal->requestStatusQuery(RID,0U));
++        REQUIRE_FALSE(f.signal(0x19U,reply)); // accepted not issued
++        StatusQueryTestAccess::clock(*f.controller);f.responses();
++        for(const auto wrong:{0x0102002712002711ULL,0x0102FFFFFC002717ULL,0x0102FFFFFC002715ULL,0x0102FFFFFC004E1FULL}) {
++            REQUIRE_FALSE(f.signal(0x19U,wrong)); REQUIRE(signal->statusQueryState(RID)==QueryState::Awaiting);
++        }
++        f.signal(0x18U,reply);REQUIRE(signal->statusQueryState(RID)==QueryState::Awaiting);f.responses(); // update != query response
++        REQUIRE_FALSE(f.signal(0x19U,reply,0x90U));
++        REQUIRE_FALSE(f.signal(0x19U,reply,0xA4U));
++        REQUIRE(signal->statusQueryState(RID)==QueryState::Awaiting);
++        REQUIRE(f.signal(0x19U,reply,1U));
++        REQUIRE(signal->statusQueryState(RID)==QueryState::Reported);
++        std::ostringstream expected;expected<<"status = $"<<std::uppercase<<std::hex<<std::setfill('0')<<std::setw(4)<<status;
++        REQUIRE(diagnosticLog().str().find(expected.str())!=std::string::npos);
++        REQUIRE_FALSE(f.signal(0x19U,reply)); // terminal duplicate
++        REQUIRE_FALSE(signal->requestStatusQuery(RID,0U)); // original response window stays fenced
++    }
++}
++TEST_CASE("status query admission and completion require current registered physical control ownership", "[p25][status-query]") {
++    Fixture f(true);auto* signal=f.controller->control();
++    for(const auto invalid:{0U,0xFFFFFCU,0xFFFFFFU}) REQUIRE_FALSE(signal->requestStatusQuery(invalid,0U));
++    for(const auto unavailable:{OTHER,APP,10006U,SECOND_SU}) {
++        REQUIRE(signal->requestStatusQuery(unavailable,0U));StatusQueryTestAccess::clock(*f.controller);
++        REQUIRE(signal->statusQueryState(unavailable)==QueryState::Cancelled);
++    }
++    REQUIRE(signal->requestStatusQuery(RID,0U)); StatusQueryTestAccess::clock(*f.controller);f.responses();
++    f.controller->affiliations()->unitDereg(RID);
++    REQUIRE_FALSE(f.signal(0x19U,0x0102FFFFFC002711ULL));
++    StatusQueryTestAccess::clock(*f.controller);REQUIRE(signal->statusQueryState(RID)==QueryState::Cancelled);
++    Fixture conventional(false);REQUIRE(conventional.controller->control()->requestStatusQuery(RID,0U));
++    StatusQueryTestAccess::clock(*conventional.controller);
++    REQUIRE(conventional.controller->control()->statusQueryState(RID)==QueryState::Cancelled);
++}
++TEST_CASE("cancelled expired or reset status queries cannot leave owned RF frames or resume", "[p25][status-query]") {
++    SECTION("queued first admission expiry") {
++        Fixture f(true);auto* signal=f.controller->control();REQUIRE(signal->requestStatusQuery(RID,0U));
++        StatusQueryTestAccess::expire(*f.controller,RID);StatusQueryTestAccess::clock(*f.controller);
++        REQUIRE(signal->statusQueryState(RID)==QueryState::Cancelled);REQUIRE(f.responses().empty());
++    }
++    SECTION("REST deadline expires before owner gets work") {
++        Fixture f(true);auto* signal=f.controller->control();REQUIRE_FALSE(signal->requestStatusQuery(RID,1U));
++        StatusQueryTestAccess::clock(*f.controller);REQUIRE(f.responses().empty());
++        REQUIRE(signal->statusQueryState(RID)==QueryState::Cancelled);
++    }
++    SECTION("stop withdraws queued frames") {
++        Fixture f(true);auto* signal=f.controller->control();REQUIRE(signal->requestStatusQuery(RID,0U));
++        StatusQueryTestAccess::clock(*f.controller);f.controller->setCCRunning(false);f.controller->setCCRunning(true);
++        REQUIRE(f.responses().empty());REQUIRE(signal->statusQueryState(RID)==QueryState::Cancelled);
++        StatusQueryTestAccess::clock(*f.controller);REQUIRE(f.responses().empty());
++    }
++    SECTION("reply deadline rejects before next protocol tick") {
++        Fixture f(true);auto* signal=f.controller->control();REQUIRE(signal->requestStatusQuery(RID,0U));
++        StatusQueryTestAccess::clock(*f.controller);f.responses();StatusQueryTestAccess::expire(*f.controller,RID);
++        REQUIRE_FALSE(f.signal(0x19U,0x0102FFFFFC002711ULL));
++        StatusQueryTestAccess::clock(*f.controller);REQUIRE(signal->statusQueryState(RID)==QueryState::NoResponse);
++    }
++    SECTION("matched response retracts undrained query") {
++        Fixture f(true);auto* signal=f.controller->control();REQUIRE(signal->requestStatusQuery(RID,0U));
++        StatusQueryTestAccess::clock(*f.controller);REQUIRE(f.signal(0x19U,0x0102FFFFFC002711ULL));
++        REQUIRE(f.responses().empty());
++    }
++}
++
++TEST_CASE("status query bounds active requests and retains every unexpired response fence", "[p25][status-query]") {
++    SECTION("sixteen pending mailboxes") {
++        Fixture f(true);auto* signal=f.controller->control();
++        for(uint32_t i=0U;i<16U;++i)REQUIRE(signal->requestStatusQuery(11000U+i,0U));
++        REQUIRE_FALSE(signal->requestStatusQuery(11016U,0U));
++        REQUIRE(StatusQueryTestAccess::count(*f.controller)==16U);
++    }
++    SECTION("128 completed requests still fence their response windows") {
++        Fixture f(true);auto* signal=f.controller->control();
++        for(uint32_t i=0U;i<128U;++i) {
++            const auto target=11000U+i;
++            f.radios.addEntry(target,true,"Capacity subscriber");StatusQueryTestAccess::addSubscriber(*f.controller,target);
++            REQUIRE(signal->requestStatusQuery(target,0U));StatusQueryTestAccess::clock(*f.controller);
++            REQUIRE(f.responses().size()==1U);
++            REQUIRE(f.signal(0x19U,0x0102FFFFFC000000ULL|target));
++            REQUIRE(signal->statusQueryState(target)==QueryState::Reported);
++        }
++        REQUIRE(StatusQueryTestAccess::count(*f.controller)==128U);
++        // No expired slot: rejecting a new target must retain all old fences.
++        REQUIRE_FALSE(signal->requestStatusQuery(12000U,0U));
++        for(uint32_t i=0U;i<128U;++i)REQUIRE_FALSE(signal->requestStatusQuery(11000U+i,0U));
++        StatusQueryTestAccess::expire(*f.controller,11000U);
++        REQUIRE(signal->requestStatusQuery(12000U,0U));
++        REQUIRE(StatusQueryTestAccess::count(*f.controller)==128U);
++        REQUIRE(signal->statusQueryState(11000U)==QueryState::None);
++        for(uint32_t i=1U;i<128U;++i)REQUIRE(signal->statusQueryState(11000U+i)==QueryState::Reported);
++    }
++}
++
++TEST_CASE("queue lock stalls cannot admit status queries after their first enqueue deadline", "[p25][status-query][status-query-deadline]") {
++    Fixture f(true);auto* signal=f.controller->control();
++    auto queue=StatusQueryTestAccess::holdQueue();
++    auto request=std::async(std::launch::async,[&]{return signal->requestStatusQuery(RID,750U);});
++    const auto queuedBy=std::chrono::steady_clock::now()+std::chrono::milliseconds(500);
++    while(signal->statusQueryState(RID)!=QueryState::Queued&&std::chrono::steady_clock::now()<queuedBy)std::this_thread::yield();
++    REQUIRE(signal->statusQueryState(RID)==QueryState::Queued);
++    std::promise<void> started;auto entered=started.get_future();
++    auto clock=std::async(std::launch::async,[&]{started.set_value();StatusQueryTestAccess::clock(*f.controller);});
++    entered.wait();
++    const auto ownedBy=std::chrono::steady_clock::now()+std::chrono::milliseconds(250);
++    while(!StatusQueryTestAccess::statusMutexHeld(*f.controller)&&std::chrono::steady_clock::now()<ownedBy)std::this_thread::yield();
++    const bool ownerBlocked=StatusQueryTestAccess::statusMutexHeld(*f.controller);
++    std::this_thread::sleep_for(std::chrono::milliseconds(800));
++    queue.unlock();clock.get();
++    REQUIRE(ownerBlocked); // fixture actually held the clock at queue commit
++    CHECK_FALSE(request.get());
++    CHECK(signal->statusQueryState(RID)==QueryState::Cancelled);
++    CHECK_FALSE(StatusQueryTestAccess::ownerActive(*f.controller,RID));
++    const auto emitted=f.responses();
++    CHECK(emitted.empty()); // actual serialized native RF queue, no modem opens
++    CHECK(f.controller->peekFrameLength()==0U);
++}
++
++TEST_CASE("queued status query expiry prevents RF handoff without servicing the protocol clock", "[p25][status-query][status-query-expiry]") {
++    Fixture f(true);auto* signal=f.controller->control();
++    REQUIRE(signal->requestStatusQuery(RID,0U));StatusQueryTestAccess::clock(*f.controller);
++    REQUIRE(signal->statusQueryState(RID)==QueryState::Awaiting);
++    REQUIRE(f.controller->peekFrameLength()>0U);
++    StatusQueryTestAccess::expireQueued(*f.controller,RID);
++    // No protocol clock call: expiry is enforced by the real native queue pop.
++    std::array<uint8_t,1024> output{};
++    REQUIRE(f.controller->getFrame(output.data())==0U);
++    REQUIRE(signal->statusQueryState(RID)==QueryState::Awaiting);
++    REQUIRE_FALSE(StatusQueryTestAccess::ownerActive(*f.controller,RID));
++    REQUIRE_FALSE(f.signal(0x19U,0x0102FFFFFC002711ULL));
++    REQUIRE(f.controller->peekFrameLength()==0U);
++    StatusQueryTestAccess::clock(*f.controller);
++    REQUIRE(signal->statusQueryState(RID)==QueryState::Cancelled);
++    REQUIRE(f.responses().empty());
++}

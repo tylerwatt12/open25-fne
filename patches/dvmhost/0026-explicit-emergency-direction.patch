@@ -1,0 +1,458 @@
+diff --git a/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.cpp b/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.cpp
+--- a/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.cpp
++++ b/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.cpp
+@@ -23,9 +23,12 @@
+ 
+ /* Initializes a new instance of the ISP_EMERG_ALRM_REQ class. */
+ 
+-ISP_EMERG_ALRM_REQ::ISP_EMERG_ALRM_REQ() : TSBK()
++ISP_EMERG_ALRM_REQ::ISP_EMERG_ALRM_REQ() : TSBK(),
++    m_specialInformation1(0U),
++    m_specialInformation2(0U)
+ {
+     m_lco = TSBKO::ISP_EMERG_ALRM_REQ;
++    m_emergency = true;
+ }
+ 
+ /* Decode a trunking signalling block. */
+@@ -43,30 +46,11 @@
+ 
+     ulong64_t tsbkValue = TSBK::toValue(tsbk);
+ 
+-    /*
+-    ** bryanb: this is a bit of a hack -- because the EMERG ALRM and DENY have the same
+-    ** opcode; the following are used by TSBK_OSP_DENY_RSP; best way to check is for m_response > 0
+-    */
+-    uint8_t si1 = (uint8_t)((tsbkValue >> 56) & 0xFFU);                             // Emerg. Special Info 1
+-    bool manDown = si1 & 0x01U;                                                     // Man Down Flag
+-    uint8_t si2 = (uint8_t)((tsbkValue >> 48) & 0xFFU);                             // Emerg. Special Info 2
+-
+-    // if we have no special info, this is a defacto emergency button press
+-    if (si1 == 0U && si2 == 0U) {
+-        m_emergency = true;
+-    }
+-
+-    // if we have a man down flag set and no special info 2, this is a man-down emergency
+-    if (manDown && si2 == 0U) {
+-        m_emergency = true;
+-    }
+-
+-    // all other emergency alarms aren't supported and are ignored (and infact most code will treat that as
+-    //  OSP_DENY_RSP)
+-
+-    m_aivFlag = (((tsbkValue >> 56) & 0xFFU) & 0x80U) == 0x80U;                     // Additional Info. Flag
+-    m_service = (uint8_t)((tsbkValue >> 56) & 0x3FU);                               // Service Type
+-    m_response = (uint8_t)((tsbkValue >> 48) & 0xFFU);                              // Reason
++    // AABC-E 6.1.6 and E-3: all SI combinations are emergency causes.
++    // Direction is selected explicitly by TSBKFactory; no DENY_RSP overlay.
++    m_specialInformation1 = uint8_t((tsbkValue >> 56) & 0xFFU);
++    m_specialInformation2 = uint8_t((tsbkValue >> 48) & 0xFFU);
++    m_emergency = true;
+ 
+     m_dstId = (uint32_t)((tsbkValue >> 24) & 0xFFFFU);                              // Target Radio Address
+     m_srcId = (uint32_t)(tsbkValue & 0xFFFFFFU);                                    // Source Radio Address
+@@ -80,7 +64,12 @@
+ {
+     assert(data != nullptr);
+ 
+-    /* stub */
++    ulong64_t value = ulong64_t(m_specialInformation1) << 56;
++    value |= ulong64_t(m_specialInformation2) << 48;
++    value |= ulong64_t(m_dstId & 0xFFFFU) << 24;
++    value |= m_srcId & 0xFFFFFFU;
++    std::unique_ptr<uint8_t[]> body = TSBK::fromValue(value);
++    TSBK::encode(data, body.get(), rawTSBK, noTrellis);
+ }
+ 
+ /* Returns a string that represents the current TSBK. */
+diff --git a/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h b/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h
+--- a/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h
++++ b/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h
+@@ -40,6 +40,11 @@
+                  */
+                 ISP_EMERG_ALRM_REQ();
+ 
++                uint8_t getSpecialInformation1() const { return m_specialInformation1; }
++                uint8_t getSpecialInformation2() const { return m_specialInformation2; }
++                void setSpecialInformation1(uint8_t value) { m_specialInformation1 = value; }
++                void setSpecialInformation2(uint8_t value) { m_specialInformation2 = value; }
++
+                 /**
+                  * @brief Decode a trunking signalling block.
+                  * @param[in] data Buffer containing a TSBK to decode.
+@@ -60,6 +65,10 @@
+                  * @returns std::string String representation of the TSBK.
+                  */
+                 std::string toString(bool isp = false) override;
++
++            private:
++                uint8_t m_specialInformation1;
++                uint8_t m_specialInformation2;
+             };
+         } // namespace tsbk
+     } // namespace lc
+diff --git a/src/common/p25/lc/tsbk/TSBKFactory.cpp b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+--- a/src/common/p25/lc/tsbk/TSBKFactory.cpp
++++ b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+@@ -44,7 +44,7 @@
+ 
+ /* Create an instance of a TSBK. */
+ 
+-std::unique_ptr<TSBK> TSBKFactory::createTSBK(const uint8_t* data, bool rawTSBK)
++std::unique_ptr<TSBK> TSBKFactory::createTSBK(const uint8_t* data, Direction direction, bool rawTSBK)
+ {
+     assert(data != nullptr);
+ 
+@@ -190,7 +190,10 @@
+     case TSBKO::IOSP_ACK_RSP:
+         return decode(new IOSP_ACK_RSP(), data, rawTSBK);
+     case TSBKO::ISP_EMERG_ALRM_REQ:
+-        return decode(new ISP_EMERG_ALRM_REQ(), data, rawTSBK);
++        // AABC-E Figures 6.1.6-1 and 6.2.5-1 share opcode 0x27.
++        if (direction == Direction::Inbound)
++            return decode(new ISP_EMERG_ALRM_REQ(), data, rawTSBK);
++        return decode(new OSP_DENY_RSP(), data, rawTSBK);
+     case TSBKO::IOSP_EXT_FNCT:
+         return decode(new IOSP_EXT_FNCT(), data, rawTSBK);
+     case TSBKO::IOSP_GRP_AFF:
+diff --git a/src/common/p25/lc/tsbk/TSBKFactory.h b/src/common/p25/lc/tsbk/TSBKFactory.h
+--- a/src/common/p25/lc/tsbk/TSBKFactory.h
++++ b/src/common/p25/lc/tsbk/TSBKFactory.h
+@@ -116,6 +116,8 @@
+              */
+             class HOST_SW_API TSBKFactory {
+             public:
++                // Opcode interpretation is determined by the CAI direction, not payload heuristics.
++                enum class Direction { Inbound, Outbound };
+                 /**
+                  * @brief Initializes a new instance of the TSBKFactory class.
+                  */
+@@ -128,10 +130,11 @@
+                 /**
+                  * @brief Create an instance of a TSBK.
+                  * @param[in] data Buffer containing TSBK packet data to decode.
++                 * @param direction Inbound (SU to FNE) or outbound (FNE to SU) CAI message direction.
+                  * @param rawTSBK Flag indicating whether or not the passed buffer is raw.
+                  * @returns TSBK* Instance of a TSBK representing the decoded data.
+                  */
+-                static std::unique_ptr<TSBK> createTSBK(const uint8_t* data, bool rawTSBK = false);
++                static std::unique_ptr<TSBK> createTSBK(const uint8_t* data, Direction direction, bool rawTSBK = false);
+                 /**
+                  * @brief Create an instance of a AMBT.
+                  * @param[in] dataHeader P25 PDU data header
+diff --git a/src/fne/network/callhandler/TagP25Data.cpp b/src/fne/network/callhandler/TagP25Data.cpp
+--- a/src/fne/network/callhandler/TagP25Data.cpp
++++ b/src/fne/network/callhandler/TagP25Data.cpp
+@@ -177,7 +177,7 @@
+         DECLARE_UINT8_ARRAY(data, frameLength);
+         ::memcpy(data, buffer + 24U, frameLength);
+ 
+-        tsbk = lc::tsbk::TSBKFactory::createTSBK(data);
++        tsbk = lc::tsbk::TSBKFactory::createTSBK(data, lc::tsbk::TSBKFactory::Direction::Outbound);
+     }
+ 
+     // Subscriber policy applies to physical voice and grant-demand ingress.
+@@ -1065,7 +1065,7 @@
+             DECLARE_UINT8_ARRAY(data, frameLength);
+             ::memcpy(data, buffer + 24U, frameLength);
+ 
+-            std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(data);
++            std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(data, lc::tsbk::TSBKFactory::Direction::Outbound);
+             if (tsbk != nullptr) {
+                 // handle standard P25 reference opcodes
+                 switch (tsbk->getLCO()) {
+@@ -1145,7 +1145,7 @@
+         DECLARE_UINT8_ARRAY(data, frameLength);
+         ::memcpy(data, buffer + 24U, frameLength);
+ 
+-        std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(data);
++        std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(data, lc::tsbk::TSBKFactory::Direction::Outbound);
+         if (tsbk != nullptr) {
+             // report tsbk event to InfluxDB
+             if (m_network->m_enableInfluxDB && m_network->m_influxLogRawData) {
+@@ -1260,7 +1260,7 @@
+         DECLARE_UINT8_ARRAY(data, frameLength);
+         ::memcpy(data, buffer + 24U, frameLength);
+ 
+-        std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(data);
++        std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(data, lc::tsbk::TSBKFactory::Direction::Outbound);
+         if (tsbk != nullptr) {
+             //uint32_t srcId = tsbk->getSrcId();
+             uint32_t dstId = tsbk->getDstId();
+@@ -1326,7 +1326,7 @@
+         DECLARE_UINT8_ARRAY(data, frameLength);
+         ::memcpy(data, buffer + 24U, frameLength);
+ 
+-        std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(data);
++        std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(data, lc::tsbk::TSBKFactory::Direction::Outbound);
+         if (tsbk != nullptr) {
+             // handle standard P25 reference opcodes
+             switch (tsbk->getLCO()) {
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -196,7 +196,7 @@
+         }
+ 
+         if (preDecodedTSBK == nullptr) {
+-            tsbk = TSBKFactory::createTSBK(data + 2U);
++            tsbk = TSBKFactory::createTSBK(data + 2U, TSBKFactory::Direction::Inbound);
+             if (tsbk == nullptr) {
+                 LogWarning(LOG_RF, P25_TSDU_STR ", undecodable LC");
+                 m_p25->m_rfState = prevRfState;
+@@ -555,12 +555,15 @@
+             {
+                 ISP_EMERG_ALRM_REQ* isp = static_cast<ISP_EMERG_ALRM_REQ*>(tsbk.get());
+                 if (isp->getEmergency()) {
+-                    VERBOSE_LOG_TSBK(tsbk->toString(true), srcId, dstId);
+-
+-                    ::ActivityLog("P25", true, "emergency alarm request request from %u", srcId);
+-
+-                    // emergency functions are expressly not supported by DVM -- DVM will *ACKNOWLEDGE* the request but will not do any
+-                    // further processing with it
++                    if (m_verbose) {
++                        LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, si1 = $%02X, si2 = $%02X, srcId = %u, dstId = %u",
++                            tsbk->toString(true).c_str(), isp->getSpecialInformation1(), isp->getSpecialInformation2(), srcId, dstId);
++                    }
++
++                    ::ActivityLog("P25", true, "emergency alarm request from %u", srcId);
++
++                    // Native ACK confirms FNE receipt. The Site's observed event
++                    // notifies consoles; human acknowledgment remains separate.
+                     writeRF_TSDU_ACK_FNE(srcId, TSBKO::ISP_EMERG_ALRM_REQ, false, true);
+                 }
+             }
+@@ -785,7 +788,7 @@
+     switch (duid) {
+         case DUID::TSDU:
+             if (m_p25->m_netState == RS_NET_IDLE) {
+-                std::unique_ptr<lc::TSBK> tsbk = TSBKFactory::createTSBK(data);
++                std::unique_ptr<lc::TSBK> tsbk = TSBKFactory::createTSBK(data, TSBKFactory::Direction::Outbound);
+                 if (tsbk == nullptr) {
+                     return false;
+                 }
+@@ -1038,13 +1041,9 @@
+                     break;
+                     case TSBKO::ISP_EMERG_ALRM_REQ:
+                     {
+-                        // non-emergency mode is a TSBKO::OSP_DENY_RSP
+-                        if (!tsbk->getEmergency()) {
+-                            break; // the FNE may explicitly send these
+-                        } else {
+-                            VERBOSE_LOG_TSBK_NET(tsbk->toString(true), srcId, dstId);
+-                            return true; // don't allow this to write to the air
+-                        }
++                        // This is outbound opcode 0x27: DENY_RSP, never an
++                        // inbound emergency inferred from its payload bytes.
++                        break;
+                     }
+                     break;
+                     case TSBKO::IOSP_GRP_AFF:
+@@ -1262,18 +1261,6 @@
+     ::ActivityLog("P25", true, "unit registration command from %u to %u", WUID_FNE, dstId);
+ 
+     writeRF_TSDU_SBF_Imm(osp.get(), true);
+-}
+-
+-/* Helper to write a emergency alarm packet. */
+-
+-void ControlSignaling::writeRF_TSDU_Emerg_Alrm(uint32_t srcId, uint32_t dstId)
+-{
+-    std::unique_ptr<ISP_EMERG_ALRM_REQ> isp = std::make_unique<ISP_EMERG_ALRM_REQ>();
+-    isp->setSrcId(srcId);
+-    isp->setDstId(dstId);
+-
+-    VERBOSE_LOG_TSBK(isp->toString(), srcId, dstId);
+-    writeRF_TSDU_SBF(isp.get(), true);
+ }
+ 
+ /* Helper to write a raw TSBK. */
+diff --git a/src/host/p25/packet/ControlSignaling.h b/src/host/p25/packet/ControlSignaling.h
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -121,12 +121,6 @@
+              */
+             void writeRF_TSDU_U_Reg_Cmd(uint32_t dstId);
+             /**
+-             * @brief Helper to write a emergency alarm packet.
+-             * @param srcId Source Radio ID.
+-             * @param dstId Destination Radio ID.
+-             */
+-            void writeRF_TSDU_Emerg_Alrm(uint32_t srcId, uint32_t dstId);
+-            /**
+              * @brief Helper to write a raw TSBK packet.
+              * @param tsbk Raw TSBK buffer to write.
+              */
+diff --git a/src/host/restapi/RESTAPI.cpp b/src/host/restapi/RESTAPI.cpp
+--- a/src/host/restapi/RESTAPI.cpp
++++ b/src/host/restapi/RESTAPI.cpp
+@@ -1494,22 +1494,6 @@
+     else if (::strtolower(command) == RID_CMD_UREG) {
+         m_p25->control()->writeRF_TSDU_U_Reg_Cmd(dstId);
+     }
+-    else if (::strtolower(command) == RID_CMD_EMERG) {
+-        // validate source ID is a integer within the JSON blob
+-        if (!req["srcId"].is<uint32_t>()) {
+-            errorPayload(reply, "source ID was not valid");
+-            return;
+-        }
+-
+-        uint32_t srcId = req["srcId"].get<uint32_t>();
+-
+-        if (srcId == 0U) {
+-            errorPayload(reply, "source ID was not valid");
+-            return;
+-        }
+-
+-        m_p25->control()->writeRF_TSDU_Emerg_Alrm(srcId, dstId);
+-    }
+     else {
+         errorPayload(reply, "invalid command");
+         return;
+diff --git a/src/host/setup/HostSetup.cpp b/src/host/setup/HostSetup.cpp
+--- a/src/host/setup/HostSetup.cpp
++++ b/src/host/setup/HostSetup.cpp
+@@ -1325,7 +1325,7 @@
+     else if (duid == DUID::TSDU) {
+         timerStop();
+ 
+-        std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(buffer);
++        std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(buffer, lc::tsbk::TSBKFactory::Direction::Inbound);
+ 
+         Utils::dump(1U, "P25, Raw TSBK Dump", buffer, P25_TSDU_FRAME_LENGTH_BYTES);
+ 
+diff --git a/src/sysview/SysViewMain.cpp b/src/sysview/SysViewMain.cpp
+--- a/src/sysview/SysViewMain.cpp
++++ b/src/sysview/SysViewMain.cpp
+@@ -567,7 +567,7 @@
+                         break;
+ 
+                     case P25DEF::DUID::TSDU:
+-                        std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(data.get());
++                        std::unique_ptr<lc::TSBK> tsbk = lc::tsbk::TSBKFactory::createTSBK(data.get(), lc::tsbk::TSBKFactory::Direction::Outbound);
+                         if (tsbk == nullptr) {
+                             LogWarning(LOG_NET, P25_TSDU_STR ", undecodable TSBK");
+                         }
+@@ -766,11 +766,10 @@
+                                 break;
+                                 case P25DEF::TSBKO::OSP_DENY_RSP:
+                                 {
+-                                    // non-emergency mode is a TSBKO::OSP_DENY_RSP
++                                    // SysView decodes the outbound control channel.
+                                     if (!tsbk->getEmergency()) {
+-                                        // bryanb: because our TSBKFactory will emit ISP_EMERG_ALRM_REQ for emergency alarm requests, we decoding OSP_DENY_RSP here
+-                                        lc::tsbk::OSP_DENY_RSP* osp = new lc::tsbk::OSP_DENY_RSP();
+-                                        osp->decode(data.get());
++                                        // The factory now selects the proper outbound DENY_RSP class.
++                                        auto* osp = static_cast<lc::tsbk::OSP_DENY_RSP*>(tsbk.get());
+ 
+                                         LogInfoEx(LOG_NET, P25_TSDU_STR ", %s, AIV = %u, reason = $%02X (%s), srcId = %u (%s), dstId = %u (%s)",
+                                             osp->toString().c_str(), osp->getAIV(), osp->getResponse(), P25Utils::denyRsnToString(osp->getResponse()).c_str(),
+diff --git a/tests/p25/CapacityPermit_Tests.cpp b/tests/p25/CapacityPermit_Tests.cpp
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -365,7 +365,7 @@
+         uint32_t length;
+         while ((length = controller->getFrame(frame.data())) != 0U) {
+             REQUIRE(length >= P25_TSDU_FRAME_LENGTH_BYTES + 2U);
+-            auto block = TSBKFactory::createTSBK(frame.data() + 2U);
++            auto block = TSBKFactory::createTSBK(frame.data() + 2U, TSBKFactory::Direction::Outbound);
+             REQUIRE(block != nullptr);
+             result.push_back(std::move(block));
+         }
+diff --git a/tests/p25/EmergencyDirection_Tests.cpp b/tests/p25/EmergencyDirection_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/EmergencyDirection_Tests.cpp
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Field fixtures follow AABC-E 6.1.6/6.2.5, with E-3's SI-1 amendment.
++// The same 0x27 opcode has different meanings on inbound/outbound CAI.
++#include "common/p25/lc/tsbk/TSBKFactory.h"
++#include "common/edac/CRC.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++
++using namespace p25::lc::tsbk;
++using namespace p25::defines;
++
++TEST_CASE("Emergency causes are decoded by inbound direction without a deny heuristic", "[p25][emergency-direction]") {
++    // Literal layout: opcode, MFID, SI-1, SI-2, reserved, group MSB/LSB,
++    // source MSB/middle/LSB, CRC. Values are not generated by its encoder.
++    for (uint8_t info1 : {0U, 1U, 2U, 4U, 8U, 0x10U, 0x20U, 0x40U, 0x80U, 0xFFU}) {
++        for (uint8_t info2 : {0U, 1U, 0x80U, 0xFFU}) {
++            CAPTURE(info1, info2);
++            std::array<uint8_t, 12> wire{0xA7U, 0U, info1, info2, 0U, 0x03U, 0xE9U, 0x12U, 0x34U, 0x56U, 0U, 0U};
++            edac::CRC::addCCITT162(wire.data(), wire.size());
++            auto decoded = TSBKFactory::createTSBK(wire.data(), TSBKFactory::Direction::Inbound, true);
++            auto* emergency = dynamic_cast<ISP_EMERG_ALRM_REQ*>(decoded.get());
++            REQUIRE(emergency != nullptr);
++            REQUIRE(emergency->getEmergency());
++            REQUIRE(emergency->getSrcId() == 0x123456U);
++            REQUIRE(emergency->getDstId() == 1001U);
++            REQUIRE(emergency->getSpecialInformation1() == info1);
++            REQUIRE(emergency->getSpecialInformation2() == info2);
++            std::array<uint8_t, 12> encoded{};
++            emergency->encode(encoded.data(), true, true);
++            REQUIRE(encoded == wire);
++        }
++    }
++}
++
++TEST_CASE("Outbound opcode 27 is a deny response including full individual address", "[p25][emergency-direction]") {
++    for (uint8_t reason : {0x10U, 0x11U, 0x31U, 0xFFU}) {
++        std::array<uint8_t, 12> wire{0xA7U, 0U, 0x83U, reason, 0x12U, 0x34U, 0x56U, 0x01U, 0x23U, 0x45U, 0U, 0U};
++        edac::CRC::addCCITT162(wire.data(), wire.size());
++        auto decoded = TSBKFactory::createTSBK(wire.data(), TSBKFactory::Direction::Outbound, true);
++        auto* denial = dynamic_cast<OSP_DENY_RSP*>(decoded.get());
++        REQUIRE(denial != nullptr);
++        REQUIRE_FALSE(denial->getEmergency());
++        REQUIRE(denial->getAIV());
++        REQUIRE(denial->getService() == 3U);
++        REQUIRE(denial->getResponse() == reason);
++        REQUIRE(denial->getDstId() == 0x123456U);
++        REQUIRE(denial->getSrcId() == 0x012345U);
++    }
++}
+diff --git a/tests/p25/SubscriberAccess_Tests.cpp b/tests/p25/SubscriberAccess_Tests.cpp
+--- a/tests/p25/SubscriberAccess_Tests.cpp
++++ b/tests/p25/SubscriberAccess_Tests.cpp
+@@ -303,3 +303,26 @@
+     }
+     REQUIRE(found);
+ }
++
++// AABC-E 6.1.6 Tables 6.1.6-1/2, E-3 Table 6.1.6-1; AABD-B 11.2.1.
++TEST_CASE("all defined emergency causes receive the FNE alarm acknowledgment", "[p25][emergency-direction]") {
++    for (uint8_t info1 : {0U, 1U, 2U, 4U, 8U, 0x80U}) {
++        for (uint8_t info2 : {0U, 1U, 0x80U}) {
++            CAPTURE(info1, info2);
++            Fixture f(true);
++            const uint64_t fields = (uint64_t(info1) << 56U) | (uint64_t(info2) << 48U) | (uint64_t(TG) << 24U) | RID;
++            REQUIRE(f.signal(TSBKO::ISP_EMERG_ALRM_REQ, fields));
++            auto replies = f.responses();
++            bool acknowledged = false;
++            for (const auto& reply : replies) {
++                REQUIRE((reply[0] & 0x3FU) != TSBKO::OSP_DENY_RSP);
++                if ((reply[0] & 0x3FU) == TSBKO::IOSP_ACK_RSP) {
++                    REQUIRE((reply[2] & 0x3FU) == TSBKO::ISP_EMERG_ALRM_REQ);
++                    acknowledged = true;
++                }
++            }
++            REQUIRE(acknowledged);
++            REQUIRE(f.controller->affiliations()->grantSize() == 0U);
++        }
++    }
++}
+diff --git a/tests/p25/ZeroCapacity_Tests.cpp b/tests/p25/ZeroCapacity_Tests.cpp
+--- a/tests/p25/ZeroCapacity_Tests.cpp
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -167,7 +167,7 @@
+         uint32_t length;
+         while ((length = controller->getFrame(frame.data())) != 0U) {
+             REQUIRE(length >= P25_TSDU_FRAME_LENGTH_BYTES + 2U);
+-            auto block = TSBKFactory::createTSBK(frame.data() + 2U);
++            auto block = TSBKFactory::createTSBK(frame.data() + 2U, TSBKFactory::Direction::Outbound);
+             REQUIRE(block != nullptr);
+             result.push_back(std::move(block));
+         }

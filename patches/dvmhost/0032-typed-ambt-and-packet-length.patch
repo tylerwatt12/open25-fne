@@ -1,0 +1,1417 @@
+diff --git a/src/common/p25/data/Assembler.cpp b/src/common/p25/data/Assembler.cpp
+--- a/src/common/p25/data/Assembler.cpp
++++ b/src/common/p25/data/Assembler.cpp
+@@ -299,24 +299,9 @@
+             LogDebugEx(LOG_P25, "Assembler::disassemble()", "packetLength = %u, secondHeaderOffset = %u, padLength = %u, pduLength = %u", packetLength, secondHeaderOffset, padLength, dataHeader.getPDULength());
+ #endif
+             if (dataHeader.getBlocksToFollow() > 0U) {
+-                if (padLength > 0U) {
+-                    // move CRC-32 properly before padding to check CRC of user data
+-                    uint8_t crcBytes[P25_MAX_PDU_BLOCKS * P25_PDU_CONFIRMED_LENGTH_BYTES + 2U];
+-                    ::memset(crcBytes, 0x00U, packetLength);
+-                    ::memcpy(crcBytes, m_pduUserData, packetLength);
+-                    ::memcpy(crcBytes + packetLength, m_pduUserData + packetLength + padLength, 4U);
+-
+-                    bool crcRet = edac::CRC::checkCRC32(crcBytes, packetLength + 4U);
+-                    if (!crcRet) {
+-                        LogWarning(LOG_P25, P25_PDU_STR ", failed CRC-32 check, blocks %u, len %u", dataHeader.getBlocksToFollow(), m_pduUserDataLength);
+-                        m_packetCRCFailed = true;
+-                    }
+-                } else {
+-                    bool crcRet = edac::CRC::checkCRC32(m_pduUserData, packetLength + 4U);
+-                    if (!crcRet) {
+-                        LogWarning(LOG_P25, P25_PDU_STR ", failed CRC-32 check, blocks %u, len %u", dataHeader.getBlocksToFollow(), m_pduUserDataLength);
+-                        m_packetCRCFailed = true;
+-                    }
++                if (!edac::CRC::checkCRC32(m_pduUserData, dataHeader.getPDULength())) {
++                    LogWarning(LOG_P25, P25_PDU_STR ", failed CRC-32 check, blocks %u", blocksToFollow);
++                    m_packetCRCFailed = true;
+                 }
+             }
+ 
+@@ -358,14 +343,31 @@
+ UInt8Array Assembler::assemble(data::DataHeader& dataHeader, bool extendedAddress, bool auxiliaryES, 
+     const uint8_t* pduUserData, uint32_t* assembledBitLength, void* userContext)
+ {
+-    assert(pduUserData != nullptr);
+-
+-    if (assembledBitLength != nullptr)
+-        *assembledBitLength = 0U;
+-
+-    uint32_t bitLength = ((dataHeader.getBlocksToFollow() + 1U) * P25_PDU_FEC_LENGTH_BITS) + P25_PREAMBLE_LENGTH_BITS;
+-    if (dataHeader.getPadLength() > 0U)
+-        bitLength += (dataHeader.getPadLength() * 8U);
++    if (assembledBitLength != nullptr) *assembledBitLength = 0U;
++    const uint32_t count = dataHeader.getBlocksToFollow();
++    const uint8_t format = dataHeader.getFormat();
++    if (count >= P25_MAX_PDU_BLOCKS) return nullptr;
++    if (format == PDUFormatType::RSP) {
++        if (count != 0U) return nullptr;
++    } else {
++        if ((format != PDUFormatType::CONFIRMED && format != PDUFormatType::UNCONFIRMED && format != PDUFormatType::AMBT) ||
++            count == 0U) return nullptr;
++        const uint32_t capacity = dataHeader.getPDULength();
++        const uint32_t blockSize = format == PDUFormatType::CONFIRMED ? P25_PDU_CONFIRMED_DATA_LENGTH_BYTES : P25_PDU_UNCONFIRMED_LENGTH_BYTES;
++        if (capacity < 4U || dataHeader.getPadLength() >= blockSize ||
++            dataHeader.getPadLength() > capacity - 4U) return nullptr;
++        const uint8_t sap = dataHeader.getSAP();
++        if (format == PDUFormatType::AMBT) {
++            if (pduUserData == nullptr || extendedAddress || auxiliaryES || dataHeader.getPadLength() != 0U ||
++                !edac::CRC::checkCRC32(pduUserData, capacity)) return nullptr;
++        } else if ((sap == PDUSAP::EXT_ADDR) != extendedAddress ||
++            ((sap == PDUSAP::ENC_USER_DATA || sap == PDUSAP::ENC_KMM) != auxiliaryES)) return nullptr;
++        const uint32_t secondary = extendedAddress ? (format == PDUFormatType::CONFIRMED ? 4U : 12U) : (auxiliaryES ? 13U : 0U);
++        if (dataHeader.getPacketLength() < secondary ||
++            (dataHeader.getPacketLength() > secondary && pduUserData == nullptr)) return nullptr;
++    }
++    // Padding occupies bytes inside the coded blocks; it adds no extra air bits.
++    uint32_t bitLength = ((count + 1U) * P25_PDU_FEC_LENGTH_BITS) + P25_PREAMBLE_LENGTH_BITS;
+ 
+     uint32_t offset = P25_PREAMBLE_LENGTH_BITS;
+ 
+@@ -398,14 +400,13 @@
+         Utils::setBitRange(block, data, offset, P25_PDU_FEC_LENGTH_BITS);
+     offset += P25_PDU_FEC_LENGTH_BITS;
+ 
+-    if (pduUserData != nullptr && blocksToFollow > 0U) {
++    if (blocksToFollow > 0U) {
+         uint32_t dataOffset = 0U;
+-        uint32_t pduLength = dataHeader.getPDULength() + dataHeader.getPadLength();
++        uint32_t pduLength = dataHeader.getPDULength();
+         uint32_t dataBlockCnt = 1U;
+         uint32_t secondHeaderOffset = 0U;
+ 
+-        // we pad 20 bytes of extra space -- confirmed data will use various extra space in the PDU
+-        DECLARE_UINT8_ARRAY(packetData, pduLength + 20U);
++        DECLARE_UINT8_ARRAY(packetData, pduLength);
+ 
+         // are we processing extended address data from the first block?
+         if (dataHeader.getSAP() == PDUSAP::EXT_ADDR && extendedAddress) {
+@@ -453,16 +454,11 @@
+         if (packetLength < secondHeaderOffset) return nullptr;
+         if (dataHeader.getFormat() != PDUFormatType::AMBT) {
+             // packetLength includes the secondary header already written above.
+-            ::memcpy(packetData + secondHeaderOffset, pduUserData, packetLength - secondHeaderOffset);
+-            edac::CRC::addCRC32(packetData, packetLength + 4U);
+-
+-            if (padLength > 0U) {
+-                // move the CRC-32 to the end of the packet data after the padding
+-                uint8_t crcBytes[4U];
+-                ::memcpy(crcBytes, packetData + packetLength, 4U);
+-                ::memset(packetData + packetLength, 0x00U, 4U);
+-                ::memcpy(packetData + (packetLength + padLength), crcBytes, 4U);
+-            }
++            if (packetLength != secondHeaderOffset)
++                ::memcpy(packetData + secondHeaderOffset, pduUserData, packetLength - secondHeaderOffset);
++            if (padLength != 0U) ::memset(packetData + packetLength, 0x00U, padLength);
++            // BAAA-B5.3.1/5.3.3: CRC follows and covers user/secondary data + pad.
++            edac::CRC::addCRC32(packetData, pduLength);
+         } else {
+             // our AMBTs have a pre-calculated CRC-32 -- we don't need to do it ourselves
+             ::memcpy(packetData + secondHeaderOffset, pduUserData, pduLength);
+diff --git a/src/common/p25/data/DataHeader.cpp b/src/common/p25/data/DataHeader.cpp
+--- a/src/common/p25/data/DataHeader.cpp
++++ b/src/common/p25/data/DataHeader.cpp
+@@ -583,12 +583,9 @@
+         return 0U; // responses have no packet length as they are header only
+     }
+ 
+-    if (m_fmt == PDUFormatType::CONFIRMED) {
+-        return P25_PDU_CONFIRMED_DATA_LENGTH_BYTES * m_blocksToFollow - 4 - m_padLength;
+-    }
+-    else {
+-        return P25_PDU_UNCONFIRMED_LENGTH_BYTES * m_blocksToFollow - 4 - m_padLength;
+-    }
++    const uint32_t capacity = getPDULength();
++    if (capacity < 4U || m_padLength > capacity - 4U) return 0U;
++    return capacity - 4U - m_padLength;
+ }
+ 
+ /* Gets the total length in bytes of entire PDU. */
+@@ -647,43 +644,30 @@
+ 
+ /* Helper to calculate the number of blocks to follow and padding length for a PDU. */
+ 
+-void DataHeader::calculateLength(uint32_t packetLength)
+-{
+-    uint32_t len = packetLength + 4U; // packet length + CRC32
+-    if (m_fmt == PDUFormatType::UNCONFIRMED && m_sap == PDUSAP::EXT_ADDR) {
+-        len += P25_PDU_HEADER_LENGTH_BYTES;
+-    }
+-
+-    if (m_fmt == PDUFormatType::CONFIRMED && m_sap == PDUSAP::EXT_ADDR) {
+-        len += 4U;
+-    }
+-
+-    if ((m_sap == PDUSAP::ENC_USER_DATA || m_sap == PDUSAP::ENC_KMM)) {
+-        len += 13U;
+-    }
+-
+-    uint32_t blockLen = (m_fmt == PDUFormatType::CONFIRMED) ? P25_PDU_CONFIRMED_DATA_LENGTH_BYTES : P25_PDU_UNCONFIRMED_LENGTH_BYTES;
+-
+-    if (len > blockLen) {
+-        m_padLength = blockLen - (len % blockLen);
+-        m_blocksToFollow = (uint8_t)ceilf((float)len / (float)blockLen);
+-    } else {
+-        m_padLength = 0U;
+-        m_blocksToFollow = 1U;
+-    }
+-}
+-
+-/* Helper to determine the pad length for a given packet length. */
++bool DataHeader::calculateLength(uint32_t packetLength)
++{
++    m_blocksToFollow = 0U; m_padLength = 0U;
++    if (m_fmt == PDUFormatType::RSP) return packetLength == 0U;
++    if (m_fmt != PDUFormatType::CONFIRMED && m_fmt != PDUFormatType::UNCONFIRMED) return false;
++    uint64_t total = uint64_t(packetLength) + 4U; // user + secondary header + final CRC
++    if (m_sap == PDUSAP::EXT_ADDR)
++        total += m_fmt == PDUFormatType::CONFIRMED ? 4U : P25_PDU_HEADER_LENGTH_BYTES;
++    if (m_sap == PDUSAP::ENC_USER_DATA || m_sap == PDUSAP::ENC_KMM) total += 13U;
++    const uint32_t block = m_fmt == PDUFormatType::CONFIRMED ?
++        P25_PDU_CONFIRMED_DATA_LENGTH_BYTES : P25_PDU_UNCONFIRMED_LENGTH_BYTES;
++    const uint64_t count = (total + block - 1U) / block;
++    if (count == 0U || count >= P25_MAX_PDU_BLOCKS) return false;
++    m_blocksToFollow = uint8_t(count);
++    m_padLength = uint32_t(count * block - total);
++    return true;
++}
+ 
+ uint32_t DataHeader::calculatePadLength(uint8_t fmt, uint32_t packetLength)
+ {
+-    uint32_t len = packetLength + 4U; // packet length + CRC32
+-    if (fmt == PDUFormatType::CONFIRMED) {
+-        return P25_PDU_CONFIRMED_DATA_LENGTH_BYTES - (len % P25_PDU_CONFIRMED_DATA_LENGTH_BYTES);
+-    }
+-    else {
+-        return P25_PDU_UNCONFIRMED_LENGTH_BYTES - (len % P25_PDU_UNCONFIRMED_LENGTH_BYTES);
+-    }
++    if (fmt == PDUFormatType::RSP) return 0U;
++    const uint32_t block = fmt == PDUFormatType::CONFIRMED ?
++        P25_PDU_CONFIRMED_DATA_LENGTH_BYTES : P25_PDU_UNCONFIRMED_LENGTH_BYTES;
++    return (block - ((uint64_t(packetLength) + 4U) % block)) % block;
+ }
+ 
+ /*
+diff --git a/src/common/p25/data/DataHeader.h b/src/common/p25/data/DataHeader.h
+--- a/src/common/p25/data/DataHeader.h
++++ b/src/common/p25/data/DataHeader.h
+@@ -130,7 +130,7 @@
+              * @brief Helper to calculate the number of blocks to follow and padding length for a PDU.
+              * @param packetLength Length of PDU.
+              */
+-            void calculateLength(uint32_t packetLength);
++            bool calculateLength(uint32_t packetLength);
+ 
+             /**
+              * @brief Sets the flag indicating CRC-errors should be warnings and not errors.
+diff --git a/src/common/p25/lc/AMBT.cpp b/src/common/p25/lc/AMBT.cpp
+--- a/src/common/p25/lc/AMBT.cpp
++++ b/src/common/p25/lc/AMBT.cpp
+@@ -37,9 +37,8 @@
+ {
+     assert(data != nullptr);
+ 
+-    LogError(LOG_P25, "AMBT::decode(), bad call, not implemented");
+-
+-    return true;
++    LogError(LOG_P25, "AMBT::decode(), single-block decode is unavailable for AMBT");
++    return false;
+ }
+ 
+ /* Encode a trunking signalling block. */
+@@ -78,8 +77,17 @@
+ 
+ bool AMBT::decode(const data::DataHeader& dataHeader, const data::DataBlock* blocks, uint8_t* pduUserData)
+ {
+-    assert(blocks != nullptr);
+-    assert(pduUserData != nullptr);
++    if (blocks == nullptr || pduUserData == nullptr) return false;
++    uint8_t header[P25_PDU_HEADER_LENGTH_BYTES];
++    dataHeader.getData(header);
++    if (!edac::CRC::checkCCITT162(header, sizeof(header)) ||
++        dataHeader.getOutbound() || dataHeader.getSAP() != PDUSAP::TRUNK_CTRL ||
++        (dataHeader.getMFId() != MFG_STANDARD && dataHeader.getMFId() != MFG_STANDARD_ALT) ||
++        (header[0U] & 0x80U) != 0U || (header[1U] & 0xC0U) != 0xC0U ||
++        (header[6U] & 0x80U) == 0U || (header[7U] & 0xC0U) != 0U)
++        return false;
++    const uint8_t expected = dataHeader.getAMBTOpcode() == TSBKO::ISP_AUTH_RESP_M ? 2U : 1U;
++    if (dataHeader.getBlocksToFollow() != expected) return false;
+ 
+     if (dataHeader.getFormat() != PDUFormatType::AMBT) {
+         LogError(LOG_P25, "AMBT::decode(), PDU is not a AMBT PDU");
+@@ -118,6 +126,28 @@
+         Utils::dump(2U, "P25, AMBT::decode(), pduUserData", pduUserData, P25_PDU_UNCONFIRMED_LENGTH_BYTES * dataHeader.getBlocksToFollow());
+     }
+ 
++    if (!edac::CRC::checkCRC32(pduUserData, P25_PDU_UNCONFIRMED_LENGTH_BYTES * expected))
++        return false;
++    // Current standard ISP layouts set these reserved fields to zero.
++    switch (m_lco) {
++    case TSBKO::IOSP_STS_UPDT: case TSBKO::IOSP_MSG_UPDT: case TSBKO::IOSP_EXT_FNCT:
++        if (pduUserData[7U] != 0U) return false;
++        break;
++    case TSBKO::IOSP_CALL_ALRT:
++        if (pduUserData[5U] != 0U || pduUserData[6U] != 0U || pduUserData[7U] != 0U) return false;
++        break;
++    case TSBKO::IOSP_ACK_RSP:
++        if ((header[8U] & 0xC0U) != 0U || pduUserData[6U] != 0U || pduUserData[7U] != 0U) return false;
++        break;
++    case TSBKO::IOSP_GRP_AFF:
++        if ((pduUserData[4U] & 0x7FU) != 0U || pduUserData[5U] != 0U ||
++            pduUserData[6U] != 0U || pduUserData[7U] != 0U) return false;
++        break;
++    case TSBKO::ISP_CAN_SRV_REQ:
++        if ((header[8U] & 0xC0U) != 0x80U || pduUserData[0U] != 0U) return false;
++        break;
++    default: break; // Typed operational admission separately rejects unavailable procedures.
++    }
+     return true;
+ }
+ 
+diff --git a/src/common/p25/lc/tsbk/IOSP_STS_UPDT.cpp b/src/common/p25/lc/tsbk/IOSP_STS_UPDT.cpp
+--- a/src/common/p25/lc/tsbk/IOSP_STS_UPDT.cpp
++++ b/src/common/p25/lc/tsbk/IOSP_STS_UPDT.cpp
+@@ -44,7 +44,7 @@
+ 
+     ulong64_t tsbkValue = TSBK::toValue(tsbk);
+ 
+-    m_statusValue = (uint8_t)((tsbkValue >> 56) & 0xFFU);                           // Status Value
++    m_statusValue = (uint16_t)((tsbkValue >> 48) & 0xFFFFU);                           // Status Value
+     m_dstId = (uint32_t)((tsbkValue >> 24) & 0xFFFFFFU);                            // Target Radio Address
+     m_srcId = (uint32_t)(tsbkValue & 0xFFFFFFU);                                    // Source Radio Address
+ 
+diff --git a/src/common/p25/lc/tsbk/IOSP_STS_UPDT.h b/src/common/p25/lc/tsbk/IOSP_STS_UPDT.h
+--- a/src/common/p25/lc/tsbk/IOSP_STS_UPDT.h
++++ b/src/common/p25/lc/tsbk/IOSP_STS_UPDT.h
+@@ -66,7 +66,7 @@
+                 /**
+                  * @brief Status value.
+                  */
+-                DECLARE_PROPERTY(uint8_t, statusValue, Status);
++                DECLARE_PROPERTY(uint16_t, statusValue, Status);
+ 
+                 DECLARE_COPY(IOSP_STS_UPDT);
+             };
+diff --git a/src/common/p25/lc/tsbk/ISP_CAN_SRV_REQ.cpp b/src/common/p25/lc/tsbk/ISP_CAN_SRV_REQ.cpp
+--- a/src/common/p25/lc/tsbk/ISP_CAN_SRV_REQ.cpp
++++ b/src/common/p25/lc/tsbk/ISP_CAN_SRV_REQ.cpp
+@@ -58,7 +58,12 @@
+ {
+     assert(data != nullptr);
+ 
+-    /* stub */
++    ulong64_t value = (m_aivFlag ? 0x80U : 0U) | (m_service & 0x3FU);
++    value = (value << 8U) | m_response;
++    value = (value << 24U) | (m_dstId & 0xFFFFFFU);
++    value = (value << 24U) | (m_srcId & 0xFFFFFFU);
++    auto payload = TSBK::fromValue(value);
++    TSBK::encode(data, payload.get(), rawTSBK, noTrellis);
+ }
+ 
+ /* Returns a string that represents the current TSBK. */
+diff --git a/src/common/p25/lc/tsbk/TSBKFactory.cpp b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+--- a/src/common/p25/lc/tsbk/TSBKFactory.cpp
++++ b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+@@ -324,11 +324,9 @@
+     assert(tsbk != nullptr);
+     assert(data != nullptr);
+ 
+-    if (!tsbk->decode(data, rawTSBK)) {
+-        return nullptr;
+-    }
+-
+-    return std::unique_ptr<TSBK>(tsbk);
++    std::unique_ptr<TSBK> owner(tsbk);
++    if (!tsbk->decode(data, rawTSBK)) return nullptr;
++    return owner;
+ }
+ 
+ /* Decode an AMBT. */
+@@ -338,9 +336,7 @@
+     assert(ambt != nullptr);
+     assert(blocks != nullptr);
+ 
+-    if (!ambt->decodeMBT(dataHeader, blocks)) {
+-        return nullptr;
+-    }
+-
+-    return std::unique_ptr<AMBT>(ambt);
++    std::unique_ptr<AMBT> owner(ambt);
++    if (!ambt->decodeMBT(dataHeader, blocks)) return nullptr;
++    return owner;
+ }
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.cpp b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.cpp
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.cpp
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.cpp
+@@ -24,7 +24,7 @@
+ /* Initializes a new instance of the MBT_IOSP_EXT_FNCT class. */
+ 
+ MBT_IOSP_EXT_FNCT::MBT_IOSP_EXT_FNCT() : AMBT(),
+-    m_extendedFunction(ExtendedFunctions::CHECK)
++    m_extendedFunction(ExtendedFunctions::CHECK), m_argument(0U)
+ {
+     m_lco = TSBKO::IOSP_EXT_FNCT;
+ }
+@@ -45,8 +45,9 @@
+ 
+     m_netId = (uint32_t)((tsbkValue >> 44) & 0xFFFFFU);                             // Network ID
+     m_sysId = (uint32_t)((tsbkValue >> 32) & 0xFFFU);                               // System ID
+-    m_extendedFunction = (uint32_t)(((tsbkValue) & 0xFFFFU) << 8) +                 // Extended Function
+-        pduUserData[6U];
++    m_extendedFunction = (uint32_t(pduUserData[2U]) << 8U) | pduUserData[3U];
++    m_argument = (uint32_t(pduUserData[4U]) << 16U) |
++        (uint32_t(pduUserData[5U]) << 8U) | pduUserData[6U];
+     m_srcId = dataHeader.getLLId();                                                 // Source Radio Address
+ 
+     return true;
+@@ -82,4 +83,5 @@
+     TSBK::copy(data);
+ 
+     m_extendedFunction = data.m_extendedFunction;
++    m_argument = data.m_argument;
+ }
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.h b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.h
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.h
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.h
+@@ -67,6 +67,7 @@
+                  * @brief Extended function opcode.
+                  */
+                 DECLARE_PROPERTY(uint32_t, extendedFunction, ExtendedFunction);
++                DECLARE_PROPERTY(uint32_t, argument, Argument);
+ 
+                 DECLARE_COPY(MBT_IOSP_EXT_FNCT);
+             };
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.cpp b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.cpp
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.cpp
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.cpp
+@@ -45,7 +45,8 @@
+ 
+     m_netId = (uint32_t)((tsbkValue >> 44) & 0xFFFFFU);                             // Network ID
+     m_sysId = (uint32_t)((tsbkValue >> 32) & 0xFFFU);                               // System ID
+-    m_dstId = (uint32_t)((tsbkValue >> 24) & 0xFFFFU);                              // Talkgroup Address
++    m_dstId = (uint32_t)((tsbkValue >> 16) & 0xFFFFU);                              // Talkgroup Address
++    m_emergency = (pduUserData[4U] & 0x80U) != 0U;
+     m_srcId = dataHeader.getLLId();                                                 // Source Radio Address
+ 
+     return true;
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.cpp b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.cpp
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.cpp
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.cpp
+@@ -43,7 +43,7 @@
+ 
+     ulong64_t tsbkValue = AMBT::toValue(dataHeader, pduUserData);
+ 
+-    m_messageValue  = (uint8_t)((tsbkValue >> 48) & 0xFFFFU);                       // Message Value
++    m_messageValue  = (uint16_t)((tsbkValue >> 48) & 0xFFFFU);                       // Message Value
+     m_netId = (uint32_t)((tsbkValue >> 28) & 0xFFFFFU);                             // Network ID
+     m_sysId = (uint32_t)((tsbkValue >> 16) & 0xFFFU);                               // System ID
+     m_dstId = (uint32_t)(((tsbkValue) & 0xFFFFU) << 8) + pduUserData[6U];           // Target Radio Address
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.h b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.h
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.h
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.h
+@@ -66,7 +66,7 @@
+                 /**
+                  * @brief Message value.
+                  */
+-                DECLARE_PROPERTY(uint8_t, messageValue, Message);
++                DECLARE_PROPERTY(uint16_t, messageValue, Message);
+ 
+                 DECLARE_COPY(MBT_IOSP_MSG_UPDT);
+             };
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.cpp b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.cpp
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.cpp
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.cpp
+@@ -43,7 +43,7 @@
+ 
+     ulong64_t tsbkValue = AMBT::toValue(dataHeader, pduUserData);
+ 
+-    m_statusValue = (uint8_t)((tsbkValue >> 48) & 0xFFFFU);                         // Message Value
++    m_statusValue = (uint16_t)((tsbkValue >> 48) & 0xFFFFU);                         // Message Value
+     m_netId = (uint32_t)((tsbkValue >> 28) & 0xFFFFFU);                             // Network ID
+     m_sysId = (uint32_t)((tsbkValue >> 16) & 0xFFFU);                               // System ID
+     m_dstId = (uint32_t)(((tsbkValue) & 0xFFFFU) << 8) + pduUserData[6U];           // Target Radio Address
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.h b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.h
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.h
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.h
+@@ -65,7 +65,7 @@
+                 /**
+                  * @brief Status value.
+                  */
+-                DECLARE_PROPERTY(uint8_t, statusValue, Status);
++                DECLARE_PROPERTY(uint16_t, statusValue, Status);
+ 
+                 DECLARE_COPY(MBT_IOSP_STS_UPDT);
+             };
+diff --git a/src/fne/network/callhandler/packetdata/P25PacketData.cpp b/src/fne/network/callhandler/packetdata/P25PacketData.cpp
+--- a/src/fne/network/callhandler/packetdata/P25PacketData.cpp
++++ b/src/fne/network/callhandler/packetdata/P25PacketData.cpp
+@@ -377,7 +377,10 @@
+     pktHeader->setLLId(llId);
+     pktHeader->setBlocksToFollow(1U);
+ 
+-    pktHeader->calculateLength(pktLen);
++    if (!pktHeader->calculateLength(pktLen)) {
++        LogWarning(LOG_P25, "PDU packet exceeds supported block capacity");
++        delete pktHeader; return;
++    }
+     uint32_t pduLength = pktHeader->getPDULength();
+     if (pduLength < pktLen) {
+         LogWarning(LOG_P25, "VTUN, data truncated!");
+@@ -451,7 +454,7 @@
+     dataHeader.setLLId(llId);
+     dataHeader.setBlocksToFollow(1U);
+ 
+-    dataHeader.calculateLength(len);
++    if (!dataHeader.calculateLength(len)) return;
+     uint32_t pduLength = dataHeader.getPDULength();
+ 
+     DECLARE_UINT8_ARRAY(pduUserData, pduLength);
+@@ -1057,7 +1060,7 @@
+                 rspHeader.setSAP(PDUSAP::SNDCP_CTRL_DATA);
+                 rspHeader.setLLId(llId);
+                 rspHeader.setBlocksToFollow(1U);
+-                rspHeader.calculateLength(2U);
++                if (!rspHeader.calculateLength(2U)) return false;
+ 
+                 dispatchUserFrameToFNE(rspHeader, false, false, txPduUserData);
+ 
+@@ -1094,7 +1097,7 @@
+                         rspHeader.setSAP(PDUSAP::SNDCP_CTRL_DATA);
+                         rspHeader.setLLId(llId);
+                         rspHeader.setBlocksToFollow(1U);
+-                        rspHeader.calculateLength(2U);
++                        if (!rspHeader.calculateLength(2U)) return false;
+ 
+                         dispatchUserFrameToFNE(rspHeader, false, false, txPduUserData);
+ 
+@@ -1125,7 +1128,7 @@
+                     rspHeader.setSAP(PDUSAP::SNDCP_CTRL_DATA);
+                     rspHeader.setLLId(llId);
+                     rspHeader.setBlocksToFollow(1U);
+-                    rspHeader.calculateLength(13U);
++                    if (!rspHeader.calculateLength(13U)) return false;
+ 
+                     m_arpTable[llId] = staticIP;
+                     m_readyForNextPkt[llId] = true;
+@@ -1159,7 +1162,7 @@
+                         rspHeader.setSAP(PDUSAP::SNDCP_CTRL_DATA);
+                         rspHeader.setLLId(llId);
+                         rspHeader.setBlocksToFollow(1U);
+-                        rspHeader.calculateLength(2U);
++                        if (!rspHeader.calculateLength(2U)) return false;
+ 
+                         dispatchUserFrameToFNE(rspHeader, false, false, txPduUserData);
+ 
+@@ -1190,7 +1193,7 @@
+                     rspHeader.setSAP(PDUSAP::SNDCP_CTRL_DATA);
+                     rspHeader.setLLId(llId);
+                     rspHeader.setBlocksToFollow(1U);
+-                    rspHeader.calculateLength(13U);
++                    if (!rspHeader.calculateLength(13U)) return false;
+ 
+                     m_arpTable[llId] = dynamicIP;
+                     m_readyForNextPkt[llId] = true;
+@@ -1221,7 +1224,7 @@
+                     rspHeader.setSAP(PDUSAP::SNDCP_CTRL_DATA);
+                     rspHeader.setLLId(llId);
+                     rspHeader.setBlocksToFollow(1U);
+-                    rspHeader.calculateLength(2U);
++                    if (!rspHeader.calculateLength(2U)) return false;
+ 
+                     dispatchUserFrameToFNE(rspHeader, false, false, txPduUserData);
+ 
+@@ -1295,7 +1298,7 @@
+     rspHeader.setEXSAP(PDUSAP::ARP);
+     rspHeader.setSrcLLId(WUID_FNE);
+ 
+-    rspHeader.calculateLength(P25_PDU_ARP_PCKT_LENGTH);
++    if (!rspHeader.calculateLength(P25_PDU_ARP_PCKT_LENGTH)) return;
+     uint32_t pduLength = rspHeader.getPDULength();
+ 
+     DECLARE_UINT8_ARRAY(pduUserData, pduLength);
+@@ -1351,7 +1354,7 @@
+     rspHeader.setEXSAP(PDUSAP::ARP);
+     rspHeader.setSrcLLId(WUID_FNE);
+ 
+-    rspHeader.calculateLength(P25_PDU_ARP_PCKT_LENGTH);
++    if (!rspHeader.calculateLength(P25_PDU_ARP_PCKT_LENGTH)) return;
+     uint32_t pduLength = rspHeader.getPDULength();
+ 
+     DECLARE_UINT8_ARRAY(pduUserData, pduLength);
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -849,7 +849,7 @@
+     DUID::E duid = m_nid.getDUID();
+     const uint32_t fixedBytes = fixedRFFrameBytes(duid);
+     if (duid == DUID::PDU) {
+-        if (!packet::Data::validRFFrame(data, len)) return false;
++        if (!m_data->admitRFFrame(data, len)) return false;
+     } else if (fixedBytes == 0U || len < fixedBytes + 2U) return false;
+ 
+     if (m_rfState == RS_RF_AUDIO || m_rfState == RS_RF_DATA) {
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -313,6 +313,7 @@
+         friend struct DispatchGrantTestAccess;
+         friend struct MultiSiteTestAccess;
+         friend struct NIDReceiveTestAccess;
++        friend struct AMBTIngressTestAccess;
+ #endif
+         friend class packet::Voice;
+         packet::Voice* m_voice;
+diff --git a/src/host/p25/packet/AMBTIngress.h b/src/host/p25/packet/AMBTIngress.h
+new file mode 100644
+--- /dev/null
++++ b/src/host/p25/packet/AMBTIngress.h
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// AABC-E6.1 ISP extended formats; implicit home identity is required before
++// conversion to concrete local handlers. This never invokes a wire encoder.
++#ifndef P25_AMBT_INGRESS_H
++#define P25_AMBT_INGRESS_H
++#include "common/p25/lc/tsbk/TSBKFactory.h"
++namespace p25 { namespace packet { namespace ambt {
++static inline std::unique_ptr<lc::TSBK> localMessage(const lc::AMBT& source, uint32_t wacn, uint32_t system)
++{
++    using namespace lc; using namespace lc::tsbk; using namespace defines;
++    if (source.getNetId() != wacn || source.getSysId() != system) return nullptr;
++    std::unique_ptr<TSBK> message;
++    switch (source.getLCO()) {
++    case TSBKO::IOSP_STS_UPDT: {
++        const auto* typed = dynamic_cast<const MBT_IOSP_STS_UPDT*>(&source);
++        if (typed == nullptr) return nullptr;
++        auto value = std::make_unique<IOSP_STS_UPDT>(); value->setStatus(typed->getStatus()); message = std::move(value); break;
++    }
++    case TSBKO::IOSP_MSG_UPDT: {
++        const auto* typed = dynamic_cast<const MBT_IOSP_MSG_UPDT*>(&source);
++        if (typed == nullptr) return nullptr;
++        auto value = std::make_unique<IOSP_MSG_UPDT>(); value->setMessage(typed->getMessage()); message = std::move(value); break;
++    }
++    case TSBKO::IOSP_CALL_ALRT:
++        if (dynamic_cast<const MBT_IOSP_CALL_ALRT*>(&source) == nullptr) return nullptr;
++        message = std::make_unique<IOSP_CALL_ALRT>(); break;
++    case TSBKO::IOSP_ACK_RSP:
++        if (dynamic_cast<const MBT_IOSP_ACK_RSP*>(&source) == nullptr) return nullptr;
++        message = std::make_unique<IOSP_ACK_RSP>(); message->setService(source.getService());
++        message->setAIV(false); message->setEX(false); break;
++    case TSBKO::IOSP_GRP_AFF:
++        if (dynamic_cast<const MBT_IOSP_GRP_AFF*>(&source) == nullptr) return nullptr;
++        message = std::make_unique<IOSP_GRP_AFF>(); message->setEmergency(source.getEmergency()); break;
++    case TSBKO::ISP_CAN_SRV_REQ:
++        if (dynamic_cast<const MBT_ISP_CAN_SRV_REQ*>(&source) == nullptr) return nullptr;
++        message = std::make_unique<ISP_CAN_SRV_REQ>(); message->setService(source.getService());
++        message->setAIV(source.getAIV()); message->setResponse(source.getResponse()); break;
++    case TSBKO::IOSP_EXT_FNCT: {
++        const auto* typed = dynamic_cast<const MBT_IOSP_EXT_FNCT*>(&source);
++        if (typed == nullptr) return nullptr;
++        const uint32_t function = typed->getExtendedFunction();
++        if (function != 0x0080U && function != 0x00FDU && function != 0x00FEU && function != 0x00FFU) return nullptr;
++        auto value = std::make_unique<IOSP_EXT_FNCT>(); value->setExtendedFunction(function);
++        // Ordinary codec names srcId=Argument and dstId=actual responding SU.
++        value->setSrcId(typed->getArgument()); value->setDstId(source.getSrcId());
++        value->setMFId(source.getMFId()); return value;
++    }
++    default: return nullptr; // Authentication/vendor procedures are unavailable.
++    }
++    message->setMFId(source.getMFId()); message->setSrcId(source.getSrcId()); message->setDstId(source.getDstId());
++    return message;
++}
++}}}
++#endif
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -21,6 +21,8 @@
+ #include "p25/lc/tsbk/OSP_DVM_GIT_HASH.h"
+ #include "p25/packet/Voice.h"
+ #include "p25/packet/ControlSignaling.h"
++#include "p25/packet/AMBTIngress.h"
++#include "common/edac/CRC.h"
+ #include "p25/lookups/P25AffiliationLookup.h"
+ #include "ActivityLog.h"
+ #include "HostMain.h"
+@@ -170,6 +172,8 @@
+ 
+     if (!m_p25->m_enableControl)
+         return false;
++    // Only the typed Site decoder may turn an AMBT into a local handler.
++    if (dynamic_cast<lc::AMBT*>(preDecodedTSBK.get()) != nullptr) return false;
+ 
+     DUID::E duid = DUID::HDU;
+     if (preDecodedTSBK == nullptr) {
+@@ -1087,12 +1091,18 @@
+ 
+     bool ret = false;
+ 
+-    std::unique_ptr<lc::AMBT> ambt = TSBKFactory::createAMBT(dataHeader, blocks);
+-    if (ambt != nullptr) {
+-        ret = process(data, 1U, std::move(ambt));
+-    }
+-
++    auto message = decodeMBTForSite(dataHeader, blocks);
++    if (message != nullptr) ret = process(data, 1U, std::move(message));
+     return ret;
++}
++
++std::unique_ptr<lc::TSBK> ControlSignaling::decodeMBTForSite(const DataHeader& header, const DataBlock* blocks)
++{
++    if (!m_p25->m_enableControl || blocks == nullptr || !m_p25->physicalSubscriberPermitted(header.getLLId()))
++        return nullptr;
++    auto decoded = TSBKFactory::createAMBT(header, blocks);
++    if (decoded == nullptr) return nullptr;
++    return ambt::localMessage(*decoded, m_p25->m_siteData.netId(), m_p25->m_siteData.sysId());
+ }
+ 
+ /* Helper to write P25 adjacent site information to the network. */
+@@ -1378,6 +1388,11 @@
+ 
+ void ControlSignaling::writeNetworkRF(lc::TSBK* tsbk, const uint8_t* data, bool autoReset)
+ {
++    if (dynamic_cast<lc::AMBT*>(tsbk) != nullptr) {
++        LogError(LOG_P25, "AMBT requires a typed message or its PDU encoder; single-block output refused");
++        return;
++    }
++
+     assert(tsbk != nullptr);
+     assert(data != nullptr);
+ 
+@@ -1510,6 +1525,11 @@
+ 
+ void ControlSignaling::writeRF_TSDU_SBF(lc::TSBK* tsbk, bool noNetwork, bool forceSingle, bool imm)
+ {
++    if (dynamic_cast<lc::AMBT*>(tsbk) != nullptr) {
++        LogError(LOG_P25, "AMBT requires a typed message or its PDU encoder; single-block output refused");
++        return;
++    }
++
+     if (!m_p25->m_enableControl)
+         return;
+ 
+@@ -1578,6 +1598,11 @@
+ 
+ void ControlSignaling::writeNet_TSDU(lc::TSBK* tsbk)
+ {
++    if (dynamic_cast<lc::AMBT*>(tsbk) != nullptr) {
++        LogError(LOG_P25, "AMBT requires a typed message or its PDU encoder; single-block output refused");
++        return;
++    }
++
+     assert(tsbk != nullptr);
+ 
+     uint8_t buffer[P25_TSDU_FRAME_LENGTH_BYTES + 2U];
+@@ -1611,6 +1636,11 @@
+ 
+ void ControlSignaling::writeRF_TSDU_MBF(lc::TSBK* tsbk)
+ {
++    if (dynamic_cast<lc::AMBT*>(tsbk) != nullptr) {
++        LogError(LOG_P25, "AMBT requires a typed message or its PDU encoder; single-block output refused");
++        return;
++    }
++
+     if (!m_p25->m_enableControl) {
+         ::memset(m_rfMBF, 0x00U, P25_PDU_FRAME_LENGTH_BYTES + 2U);
+         m_mbfCnt = 0U;
+@@ -1734,6 +1764,13 @@
+     // Generate TSBK block
+     ambt->setLastBlock(true); // always set last block -- this a Single Block TSDU
+     ambt->encodeMBT(header, pduUserData);
++    const uint32_t blocks = header.getBlocksToFollow();
++    if (header.getFormat() != PDUFormatType::AMBT || !header.getOutbound() ||
++        header.getSAP() != PDUSAP::TRUNK_CTRL || blocks == 0U || blocks >= P25_MAX_PDU_BLOCKS ||
++        !edac::CRC::checkCRC32(pduUserData, blocks * P25_PDU_UNCONFIRMED_LENGTH_BYTES)) {
++        LogError(LOG_P25, "AMBT encoder did not produce a bounded valid packet; output refused");
++        return;
++    }
+ 
+     if (m_debug) {
+         LogDebug(LOG_RF, P25_PDU_STR ", ack = %u, outbound = %u, fmt = $%02X, sap = $%02X, fullMessage = %u, blocksToFollow = %u, padLength = %u, n = %u, seqNo = %u, hdrOffset = %u",
+@@ -3270,6 +3307,11 @@
+ 
+ void ControlSignaling::writeNet_TSDU_From_RF(lc::TSBK* tsbk, uint8_t* data)
+ {
++    if (dynamic_cast<lc::AMBT*>(tsbk) != nullptr) {
++        LogError(LOG_P25, "AMBT requires a typed message or its PDU encoder; single-block output refused");
++        return;
++    }
++
+     assert(tsbk != nullptr);
+     assert(data != nullptr);
+ 
+diff --git a/src/host/p25/packet/ControlSignaling.h b/src/host/p25/packet/ControlSignaling.h
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -35,6 +35,7 @@
+ namespace p25
+ {
+     struct DispatchGrantTestAccess;
++    struct AMBTIngressTestAccess;
+     // ---------------------------------------------------------------------------
+     //  Class Prototypes
+     // ---------------------------------------------------------------------------
+@@ -153,6 +154,7 @@
+         protected:
+ #if defined(CATCH2_TEST_COMPILATION)
+             friend struct p25::DispatchGrantTestAccess;
++            friend struct p25::AMBTIngressTestAccess;
+ #endif
+             friend class packet::Voice;
+             friend class packet::Data;
+@@ -423,6 +425,7 @@
+              * @param data Buffer containing encoded TSBK.
+              */
+             void writeNet_TSDU_From_RF(lc::TSBK* tsbk, uint8_t* data);
++            std::unique_ptr<lc::TSBK> decodeMBTForSite(const data::DataHeader& header, const data::DataBlock* blocks);
+ 
+             /**
+              * @brief Helper to automatically inhibit a source ID on a denial.
+diff --git a/src/host/p25/packet/Data.cpp b/src/host/p25/packet/Data.cpp
+--- a/src/host/p25/packet/Data.cpp
++++ b/src/host/p25/packet/Data.cpp
+@@ -56,6 +56,16 @@
+ 
+ bool Data::validRFFrame(const uint8_t* data, uint32_t len)
+ {
++    return inspectRFFrame(data, len, nullptr);
++}
++
++bool Data::admitRFFrame(const uint8_t* data, uint32_t len) const
++{
++    return inspectRFFrame(data, len, m_p25);
++}
++
++bool Data::inspectRFFrame(const uint8_t* data, uint32_t len, const Control* owner)
++{
+     // BAAA-B7.2.4/Fig35: fill variable packets through the next status symbol.
+     // Current modem window: at most512 RF bytes; continuation is unqualified.
+     if (data == nullptr || len < 47U || len > P25_PDU_FRAME_LENGTH_BYTES + 2U)
+@@ -75,6 +85,10 @@
+     if (format != PDUFormatType::CONFIRMED && format != PDUFormatType::UNCONFIRMED &&
+         format != PDUFormatType::RSP && format != PDUFormatType::AMBT) return false;
+     if (count >= P25_MAX_PDU_BLOCKS) return false;
++    // AABB-B6.1: trunk-control SAP61/63 requires the alternate header.
++    // Protected trunk-control and ordinary packet headers have no Site action.
++    if (owner != nullptr && (header.getSAP() == PDUSAP::TRUNK_CTRL || header.getSAP() == 0x3FU) &&
++        format != PDUFormatType::AMBT) return false;
+     if (format == PDUFormatType::RSP) {
+         if (count != 0U) return false; // supported response profile is header-only
+     } else {
+@@ -102,7 +116,10 @@
+             P25_PDU_FEC_LENGTH_BITS);
+         if (!probe.disassemble(encoded, sizeof(encoded))) return false;
+     }
+-    return probe.getComplete() && !probe.getPacketCRCFailed() && probe.getUndecodableBlockCount() == 0U;
++    if (!probe.getComplete() || probe.getPacketCRCFailed() || probe.getUndecodableBlockCount() != 0U) return false;
++    if (owner != nullptr && format == PDUFormatType::AMBT)
++        return owner->m_control->decodeMBTForSite(probe.dataHeader, probe.dataBlocks) != nullptr;
++    return true;
+ }
+ 
+ bool Data::process(uint8_t* data, uint32_t len)
+@@ -111,7 +128,7 @@
+ 
+     // Only complete first-window packets are supported by this ingress path.
+     // The former nonzero-count offset/append path was unsafe reassembly.
+-    if (len < 17U || m_rfPDUCount != 0U || !validRFFrame(data, len)) return false;
++    if (len < 17U || m_rfPDUCount != 0U || !admitRFFrame(data, len)) return false;
+     if (!m_p25->m_nid.decode(data + 2U) || m_p25->m_nid.getDUID() != DUID::PDU) return false;
+ 
+     if (m_prevRfState != RS_RF_DATA) {
+@@ -185,7 +202,7 @@
+                     LogInfoEx(LOG_RF, P25_PDU_STR ", ISP, response, OSP ACK, llId = %u, all blocks received OK, n = %u",
+                         m_rfAssembler->dataHeader.getLLId(), m_rfAssembler->dataHeader.getResponseStatus());
+                     if (m_retryPDUData != nullptr && m_retryPDUBitLength > 0U) {
+-                        delete m_retryPDUData;
++                        delete[] m_retryPDUData;
+                         m_retryPDUData = nullptr;
+ 
+                         m_retryPDUBitLength = 0U;
+@@ -228,7 +245,7 @@
+                                 m_retryCount++;
+                             }
+                             else {
+-                                delete m_retryPDUData;
++                                delete[] m_retryPDUData;
+                                 m_retryPDUData = nullptr;
+ 
+                                 m_retryPDUBitLength = 0U;
+@@ -634,11 +651,11 @@
+ {
+     assert(pduUserData != nullptr);
+ 
+-    m_p25->writeRF_TDU(true, imm);
+-
+     uint32_t bitLength = 0U;
+     UInt8Array data = m_rfAssembler->assemble(dataHeader, extendedAddress, auxiliaryES, pduUserData, &bitLength);
+ 
++    if (data == nullptr || !fitsRFOutput(bitLength)) return;
++    m_p25->writeRF_TDU(true, imm);
+     writeRF_PDU(data.get(), bitLength, imm);
+ }
+ 
+@@ -856,7 +873,7 @@
+     delete[] m_rfPDU;
+ 
+     if (m_retryPDUData != nullptr)
+-        delete m_retryPDUData;
++        delete[] m_retryPDUData;
+ 
+     delete[] m_rfPduUserData;
+     delete[] m_netPduUserData;
+@@ -1000,10 +1017,23 @@
+ 
+ /* Helper to write a P25 PDU packet. */
+ 
++bool Data::fitsRFOutput(uint32_t bitLength)
++{
++    if (bitLength == 0U) return false;
++    // BAAA-B6/Table11: each70 data bits is followed by two status bits.
++    // No following status symbol is inserted after the final data bit. Use
++    // widened arithmetic before touching the fixed512-byte RF output window.
++    const uint64_t rawBits = uint64_t(bitLength) + 2U * ((uint64_t(bitLength) - 1U) / 70U);
++    return (rawBits + 7U) / 8U <= P25_PDU_FRAME_LENGTH_BYTES;
++}
++
+ void Data::writeRF_PDU(const uint8_t* pdu, uint32_t bitLength, bool imm, bool ackRetry)
+ {
+     assert(pdu != nullptr);
+-    assert(bitLength > 0U);
++    if (!fitsRFOutput(bitLength)) {
++        LogWarning(LOG_RF, P25_PDU_STR ", unsupported RF output span, coded bits = %u", bitLength);
++        return;
++    }
+ 
+     m_p25->writeRF_TDU(true, imm);
+ 
+@@ -1012,14 +1042,12 @@
+ 
+     if (!ackRetry) {
+         if (m_retryPDUData != nullptr)
+-            delete m_retryPDUData;
++            delete[] m_retryPDUData;
+ 
+         // store PDU for ACK RETRY logic
+         m_retryCount = 0U;
+         m_retryPDUBitLength = bitLength;
+-        uint32_t retryByteLength = bitLength / 8U;
+-        if ((retryByteLength % 8U) > 0U)
+-            retryByteLength++;
++        const uint32_t retryByteLength = (bitLength + 7U) / 8U;
+ 
+         m_retryPDUData = new uint8_t[retryByteLength];
+         ::memcpy(m_retryPDUData, pdu, retryByteLength);
+@@ -1065,7 +1093,7 @@
+ {
+     uint32_t bitLength = 0U;
+     UInt8Array data = m_rfAssembler->assemble(m_netAssembler->dataHeader, m_netAssembler->getExtendedAddress(), m_netAssembler->getAuxiliaryES(), m_netPduUserData, &bitLength);
+-    writeRF_PDU(data.get(), bitLength);
++    if (data != nullptr && bitLength != 0U) writeRF_PDU(data.get(), bitLength);
+ }
+ 
+ /* Helper to re-write a received P25 PDU packet. */
+@@ -1074,7 +1102,7 @@
+ {
+     uint32_t bitLength = 0U;
+     UInt8Array data = m_rfAssembler->assemble(m_rfAssembler->dataHeader, m_rfAssembler->getExtendedAddress(), m_rfAssembler->getAuxiliaryES(), m_rfPduUserData, &bitLength);
+-    writeRF_PDU(data.get(), bitLength);
++    if (data != nullptr && bitLength != 0U) writeRF_PDU(data.get(), bitLength);
+ }
+ 
+ /* Helper to write a PDU registration response. */
+@@ -1111,7 +1139,7 @@
+     if (m_dumpPDUData)
+         Utils::dump(1U, "P25, PDU Registration Response", pduUserData, 12U);
+ 
+-    rspHeader.calculateLength(12U);
++    if (!rspHeader.calculateLength(12U)) return;
+     writeRF_PDU_User(rspHeader, false, false, pduUserData);
+ }
+ 
+diff --git a/src/host/p25/packet/Data.h b/src/host/p25/packet/Data.h
+--- a/src/host/p25/packet/Data.h
++++ b/src/host/p25/packet/Data.h
+@@ -37,6 +37,7 @@
+     // ---------------------------------------------------------------------------
+ 
+     class HOST_SW_API Control;
++    struct AMBTIngressTestAccess;
+     namespace packet { class HOST_SW_API Trunk; }
+ 
+     namespace packet
+@@ -66,6 +67,11 @@
+             bool process(uint8_t* data, uint32_t len);
+             // Complete first-span CAI packet preflight, no operational effects.
+             static bool validRFFrame(const uint8_t* data, uint32_t len);
++            // Operational admission also enforces this Site's typed AMBT profile.
++            bool admitRFFrame(const uint8_t* data, uint32_t len) const;
++        private:
++            static bool inspectRFFrame(const uint8_t* data, uint32_t len, const Control* owner);
++        public:
+             /**
+              * @brief Process a data frame from the network.
+              * @param data Buffer containing data frame.
+@@ -131,6 +137,10 @@
+ 
+         private:
+             friend class p25::Control;
++#if defined(CATCH2_TEST_COMPILATION)
++            friend struct p25::AMBTIngressTestAccess;
++#endif
++            static bool fitsRFOutput(uint32_t bitLength);
+             Control* m_p25;
+ 
+             RPT_RF_STATE m_prevRfState;
+diff --git a/tests/p25/AMBTIngress_Tests.cpp b/tests/p25/AMBTIngress_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/AMBTIngress_Tests.cpp
+@@ -0,0 +1,155 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Exact local AMBT ISP layouts enter actual Data/Control handlers. Framing helpers
++// supply only CRC/Trellis/NID; message bytes and output expectations are literal.
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/p25/packet/ControlSignaling.h"
++#include "host/p25/packet/Data.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/p25/lc/tsbk/TSBKFactory.h"
++#include "common/p25/Sync.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/Utils.h"
++#include "common/Log.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <vector>
++using namespace p25; using namespace p25::defines; using namespace p25::lc; using namespace p25::lc::tsbk;
++namespace p25 {
++struct AMBTIngressTestAccess {
++ static std::array<uint32_t,4> state(const Control& c) { return {{uint32_t(c.m_rfState.load()),uint32_t(c.m_ccHalted),c.m_rfLossWatchdog.getTimer(),uint32_t(c.m_affiliations->unitRegSize())}}; }
++ static std::unique_ptr<lc::TSBK> typed(Control& c,const data::DataHeader& h,const data::DataBlock* b) { return c.m_control->decodeMBTForSite(h,b); }
++ static bool packet(Control& c,uint8_t* p,unsigned n) { return c.m_data->process(p,n); }
++ static bool fits(uint32_t bits){return packet::Data::fitsRFOutput(bits);}
++ static void output(Control& c,const uint8_t* p,uint32_t bits){c.m_data->writeRF_PDU(p,bits);}
++ static void outputUser(Control& c,data::DataHeader& h,uint8_t* p){c.m_data->writeRF_PDU_User(h,false,false,p);}
++ static std::pair<uint32_t,const void*> retry(const Control& c){return {c.m_data->m_retryPDUBitLength,c.m_data->m_retryPDUData};}
++ static void refuseOutputs(Control& c,lc::AMBT* value) { c.m_control->writeRF_TSDU_SBF(value,false);c.m_control->writeNet_TSDU(value);c.m_control->writeRF_TSDU_MBF(value);c.m_control->writeRF_TSDU_AMBT(value); }
++};
++}
++namespace {
++constexpr uint32_t RID=10001, TARGET=10003, TG=1001, NAC=0x293;
++using Raw=std::array<uint8_t,12>;
++struct Network:network::Network {
++ std::vector<std::array<uint8_t,45>> outgoing;
++ Network():network::Network("127.0.0.1",49991U,0U,100101001U,"unopened-ambt-test",true,false,false,true,false,false,false,false,false,false,false,false) {m_status=network::NET_STAT_RUNNING;}
++ bool writeP25TSDU(const lc::LC&,const uint8_t* p) override {std::array<uint8_t,45> frame;std::copy(p,p+45,frame.begin());outgoing.push_back(frame);return true;}
++};
++struct Packet {
++ Raw header{},body{};
++ void seal(){edac::CRC::addCCITT162(header.data(),header.size());edac::CRC::addCRC32(body.data(),body.size());}
++ std::vector<uint8_t> frame()const {
++  std::array<uint8_t,72> plain{}; std::array<uint8_t,25> coded{}; edac::Trellis trellis;
++  trellis.encode12(header.data(),coded.data());Utils::setBitRange(coded.data(),plain.data(),112,196);
++  trellis.encode12(body.data(),coded.data());Utils::setBitRange(coded.data(),plain.data(),308,196);
++  std::vector<uint8_t> raw(74);raw[0]=modem::TAG_DATA;raw[1]=1;P25Utils::encode(plain.data(),raw.data()+2,0,576);
++  Sync::addP25Sync(raw.data()+2);NID nid(NAC);nid.encode(raw.data()+2,DUID::PDU);return raw;
++ }
++};
++Packet request(uint8_t opcode){
++ Packet p;p.header={{0x17,0xFD,0,0,0x27,0x11,0x81,opcode,0,0,0,0}};
++ switch(opcode){
++ case 0x18:case 0x1C:p.header[8]=0xAB;p.header[9]=0xCD;p.body={{0,0,0x10,1,0,0x27,0x13,0,0,0,0,0}};break;
++ case 0x1F:p.body={{0x10,1,0,0x27,0x13,0,0,0,0,0,0,0}};break;
++ case 0x20:p.header[8]=0x18;p.body={{0,0x10,1,0,0x27,0x13,0,0,0,0,0,0}};break;
++ case 0x28:p.body={{0x10,1,3,0xE9,0x80,0,0,0,0,0,0,0}};break;
++ case 0x23:p.header[8]=0x84;p.header[9]=0x10;p.body={{0,0,0,0x10,1,0,0x27,0x13,0,0,0,0}};break;
++ case 0x24:p.body={{0x10,1,0,0x80,0xFF,0xFF,0xFC,0,0,0,0,0}};break;
++ }
++ p.seal();return p;
++}
++struct Fixture {
++ ::lookups::ChannelLookup channels;::lookups::RadioIdLookup radios{"",0,true};::lookups::TalkgroupRulesLookup groups{"",0,true};::lookups::IdenTableLookup identities{"",0};::lookups::RSSIInterpolator rssi;
++ modem::Modem modem{new modem::port::ModemNullPort(),true,false,false,false,false,false,0,0,0,8192,8192,8192,true,true,false,false,false,false};
++ Network network; network::NetRPC rpc{"127.0.0.1",48991U,0U,"unopened-ambt-test",false};network::NetRPC* oldRPC=g_RPC;
++ std::unique_ptr<Control> controller;
++ Fixture(){g_logDisplayLevel=0;g_RPC=&rpc;radios.addEntry(RID,true,"SU");radios.addEntry(TARGET,true,"Other SU");radios.addEntry(10002,true,"Console");groups.addEntry(TG,1,true);
++  controller=std::make_unique<Control>(true,NAC,1U,16384U,&modem,&network,120U,1U,true,&channels,&radios,&groups,&identities,&rssi,false,false,false,false,false);
++  yaml::Node cfg;REQUIRE(yaml::Parse(cfg,std::string("protocols:\n    p25:\n        managedSite: true\n        dispatchSubscribers:\n            - 10001\n            - 10003\n        verifyReg: true\n        noMessageAck: false\n        verifyAff: false\n        inhibitUnauthorized: false\n        tduPreambleCount: 0\n        control:\n            enable: true\n            dedicated: true\n            ackRequests: false\n            disableTSDUMBF: true\n            redundantImmediate: false\nsystem:\n    config:\n        controlCh:\n            notifyEnable: false\n")));
++  controller->setOptions(cfg,false,"N0TEST",::lookups::VoiceChData(),1U,1U,1U,1U,2U,25U,false);controller->configureIdentification(false);controller->setCCRunning(true);controller->setCCHalted(false);controller->setZoneConnected(false);controller->affiliations()->unitReg(RID);
++ }
++ ~Fixture(){controller.reset();g_RPC=oldRPC;}
++ bool input(Packet p){auto f=p.frame();return controller->processFrame(f.data(),f.size());}
++ std::vector<Raw> replies(){std::array<uint8_t,1024> f{};std::vector<Raw> result;while(controller->getFrame(f.data())){NID n(NAC);if(!n.decode(f.data()+2)||n.getDUID()!=DUID::TSDU)continue;std::array<uint8_t,25> c{};Raw r{};P25Utils::decode(f.data()+2,c.data(),114,318);edac::Trellis t;REQUIRE(t.decode12(c.data(),r.data()));REQUIRE(edac::CRC::checkCCITT162(r.data(),12));result.push_back(r);}return result;}
++};
++}
++TEST_CASE("local AMBT status and message use complete typed network payloads and real acknowledgments", "[p25][ambt-ingress]"){
++ for(uint8_t opcode:{0x18,0x1C})for(uint8_t mfid:{0,1}){CAPTURE(unsigned(opcode),unsigned(mfid));Fixture f;auto p=request(opcode);p.header[2]=mfid;p.seal();REQUIRE(f.input(p));REQUIRE(f.network.outgoing.size()==2);
++  auto& wire=f.network.outgoing[0];std::array<uint8_t,25> coded{};Raw raw{};P25Utils::decode(wire.data(),coded.data(),114,318);edac::Trellis t;REQUIRE(t.decode12(coded.data(),raw.data()));REQUIRE(edac::CRC::checkCCITT162(raw.data(),12));
++  const std::array<uint8_t,10> expected{{uint8_t(0x80|opcode),mfid,0xAB,0xCD,0,0x27,0x13,0,0x27,0x11}};for(unsigned i=0;i<10;++i)REQUIRE(raw[i]==expected[i]);
++  bool ack=false;for(const auto& r:f.replies())if((r[0]&0x3F)==0x20&&(r[2]&0x3F)==opcode){REQUIRE(r[7]==0);REQUIRE(r[8]==0x27);REQUIRE(r[9]==0x11);ack=true;}REQUIRE(ack);
++ }
++}
++TEST_CASE("local AMBT actions retain affiliation call alert ACK and cancel handler behavior", "[p25][ambt-ingress]"){
++ for(uint8_t opcode:{0x28,0x1F,0x20,0x23}){Fixture f;auto p=request(opcode);REQUIRE(f.input(p));auto responses=f.replies();REQUIRE_FALSE(responses.empty());
++  if(opcode==0x28)REQUIRE(f.controller->affiliations()->isGroupAff(RID,TG));
++  if(opcode==0x23){bool ack=false;for(const auto& r:responses)if((r[0]&0x3F)==0x20&&(r[2]&0x3F)==4)ack=true;REQUIRE(ack);}
++ }
++ Fixture f;auto p=request(0x24);data::DataHeader h;REQUIRE(h.decode(p.header.data(),true));data::DataBlock b;REQUIRE(b.decode(p.body.data(),h,true));auto typed=AMBTIngressTestAccess::typed(*f.controller,h,&b);REQUIRE(typed);REQUIRE(typed->getDstId()==RID);REQUIRE(typed->getSrcId()==WUID_FNE);REQUIRE(dynamic_cast<IOSP_EXT_FNCT*>(typed.get())->getExtendedFunction()==0x0080);
++}
++TEST_CASE("unsupported malformed and foreign AMBT packets cannot alter live control state", "[p25][ambt-ingress]"){
++ for(unsigned mode=0;mode<14;++mode){CAPTURE(mode);Fixture f;auto p=request(0x18);
++  if(mode==0)p.header[0]|=0x20; // wrong CAI direction
++  if(mode==1)p.header[1]=0xFF; // protected trunk-control
++  if(mode==2)p.header[2]=0xAA;
++  if(mode==3)p.header[2]=0x90;
++  if(mode==4)p.body[0]=1; // foreign WACN
++  if(mode==5)p.body[3]=2; // foreign System
++  if(mode==6)p.header[5]=0x12; // application source, not physical SU
++  if(mode==7)p.header[5]=0x19; // unknown source
++  if(mode==8){p=request(0x24);p.body[3]=0;} // command in a response profile
++  if(mode==9)p.header[7]=0x3B; // authentication demand unavailable
++  if(mode==10)p.header[6]=0x82;
++  if(mode==11)p.body[7]=1; // reserved current-layout bits
++  if(mode==12)p.header[0]=0x16; // confirmed header cannot carry AMBT SAP
++  if(mode==13)p.header[0]=0x15; // unconfirmed header cannot carry AMBT SAP
++  p.seal();const auto before=AMBTIngressTestAccess::state(*f.controller);auto raw=p.frame();REQUIRE_FALSE(f.controller->processFrame(raw.data(),raw.size()));REQUIRE_FALSE(AMBTIngressTestAccess::packet(*f.controller,raw.data(),raw.size()));REQUIRE(AMBTIngressTestAccess::state(*f.controller)==before);REQUIRE(f.replies().empty());REQUIRE(f.network.outgoing.empty());
++  if(mode>=12)for(unsigned n=0;n<raw.size();++n){std::unique_ptr<uint8_t[]> exact(new uint8_t[n]);std::copy(raw.begin(),raw.begin()+n,exact.get());REQUIRE_FALSE(f.controller->processFrame(exact.get(),n));REQUIRE_FALSE(AMBTIngressTestAccess::packet(*f.controller,exact.get(),n));REQUIRE(AMBTIngressTestAccess::state(*f.controller)==before);}
++ }
++ Fixture f;MBT_IOSP_STS_UPDT stub;AMBTIngressTestAccess::refuseOutputs(*f.controller,&stub);REQUIRE(f.replies().empty());REQUIRE(f.network.outgoing.empty());
++}
++
++TEST_CASE("proper existing explicit grant PDU encoders survive AMBT output guards", "[ambt-outbound-positive]") {
++ for(bool group:{true,false}) {
++  Fixture f;std::unique_ptr<AMBT> osp;
++  if(group){auto p=std::make_unique<MBT_OSP_GRP_VCH_GRANT>();p->setForceChannelId(true);p->setRxGrpVchId(5);p->setRxGrpVchNo(0x678);osp=std::move(p);}
++  else{auto p=std::make_unique<MBT_OSP_UU_VCH_GRANT>();p->setForceChannelId(true);p->setRxGrpVchId(5);p->setRxGrpVchNo(0x678);osp=std::move(p);}
++  osp->setSrcId(RID);osp->setDstId(group?TG:TARGET);osp->setGrpVchId(1);osp->setGrpVchNo(0x234);
++  // Three unsupported ordinary serializers must reject this object; its proper
++  // initialized PDU encoder must still enqueue exactly one bounded packet.
++  AMBTIngressTestAccess::refuseOutputs(*f.controller,osp.get());
++  unsigned packets=0;std::array<uint8_t,1024> raw{};
++  while(auto len=f.controller->getFrame(raw.data())) {
++   NID nid(NAC);if(!nid.decode(raw.data()+2) || nid.getDUID()!=DUID::PDU)continue;
++   ++packets;std::array<uint8_t,512> plain{};P25Utils::decode(raw.data()+2,plain.data(),0,(len-2)*8);
++   std::array<uint8_t,25> coded{};Raw h{},body{};edac::Trellis trellis;
++   Utils::getBitRange(plain.data(),coded.data(),112,196);REQUIRE(trellis.decode12(coded.data(),h.data()));REQUIRE(edac::CRC::checkCCITT162(h.data(),12));
++   data::DataHeader header;REQUIRE(header.decode(h.data(),true));REQUIRE(header.getFormat()==PDUFormatType::AMBT);REQUIRE(header.getOutbound());REQUIRE(header.getSAP()==PDUSAP::TRUNK_CTRL);
++   REQUIRE(header.getBlocksToFollow()==(group?1:2));
++   std::vector<uint8_t> payload;
++   for(unsigned n=0;n<header.getBlocksToFollow();++n){Utils::getBitRange(plain.data(),coded.data(),308+n*196,196);REQUIRE(trellis.decode12(coded.data(),body.data()));payload.insert(payload.end(),body.begin(),body.end());}
++   REQUIRE(edac::CRC::checkCRC32(payload.data(),payload.size()));
++  }
++  REQUIRE(packets==1);REQUIRE(f.network.outgoing.empty());
++ }
++}
++
++TEST_CASE("packet output capacity and exact source length are checked before effects", "[p25][ambt-ingress][packet-length]") {
++ // Independent RF budget:512*8 raw bits contain56 status pairs and3984
++ // data bits;3985 data bits would require4097 raw bits. Valid coded PDU
++ // lengths fit18 following blocks (3836 data bits) but not19 (4032).
++ REQUIRE_FALSE(AMBTIngressTestAccess::fits(0));REQUIRE(AMBTIngressTestAccess::fits(3984));REQUIRE_FALSE(AMBTIngressTestAccess::fits(3985));REQUIRE_FALSE(AMBTIngressTestAccess::fits(0xFFFFFFFFU));
++ Fixture f;data::DataHeader h;h.setFormat(PDUFormatType::CONFIRMED);h.setAckNeeded(true);h.setSAP(PDUSAP::USER_DATA);h.setOutbound(true);h.setLLId(RID);REQUIRE(h.calculateLength(284));REQUIRE(h.getBlocksToFollow()==18);
++ std::unique_ptr<uint8_t[]> user(new uint8_t[284]{});AMBTIngressTestAccess::outputUser(*f.controller,h,user.get());
++ unsigned packets=0;std::array<uint8_t,1024> queued{};while(auto n=f.controller->getFrame(queued.data())){NID nid(NAC);if(nid.decode(queued.data()+2)&&nid.getDUID()==DUID::PDU){++packets;REQUIRE(n==495);}}
++ REQUIRE(packets==1);const auto state=AMBTIngressTestAccess::state(*f.controller);const auto retry=AMBTIngressTestAccess::retry(*f.controller);
++ REQUIRE(retry.first==3836);REQUIRE(h.calculateLength(300));REQUIRE(h.getBlocksToFollow()==19);std::unique_ptr<uint8_t[]> oversized(new uint8_t[300]{});AMBTIngressTestAccess::outputUser(*f.controller,h,oversized.get());
++ const uint8_t tiny=0;for(uint32_t bits:{3985U,4032U,0xFFFFFFFFU})AMBTIngressTestAccess::output(*f.controller,&tiny,bits);
++ REQUIRE(AMBTIngressTestAccess::state(*f.controller)==state);REQUIRE(AMBTIngressTestAccess::retry(*f.controller)==retry);REQUIRE(f.controller->getFrame(queued.data())==0);REQUIRE(f.network.outgoing.empty());
++ // Exactly504 bits occupy63 bytes. The retry copy must not read an extra
++ // octet merely because63 is not divisible by8; replacement frees its array.
++ std::unique_ptr<uint8_t[]> exact(new uint8_t[63]{});AMBTIngressTestAccess::output(*f.controller,exact.get(),504);REQUIRE(AMBTIngressTestAccess::retry(*f.controller).first==504);
++}
+diff --git a/tests/p25/AMBTLayouts_Tests.cpp b/tests/p25/AMBTLayouts_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/AMBTLayouts_Tests.cpp
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Literal wire layouts from AABC-E figures6.1.1-2/4-2/5-2/7-2/9-2/11-2/15-2.
++// Header/body CRCs were generated independently by polynomial long division.
++#include "common/p25/lc/tsbk/TSBKFactory.h"
++#include "host/p25/packet/AMBTIngress.h"
++#include "common/edac/CRC.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <vector>
++#include <string>
++using namespace p25; using namespace p25::defines; using namespace p25::lc; using namespace p25::lc::tsbk;
++namespace {
++std::vector<uint8_t> bytes(const char* h) { std::vector<uint8_t> b; for(size_t n=0;h[n];n+=2) b.push_back(uint8_t(std::stoul(std::string(h+n,2),nullptr,16))); return b; }
++struct Wire { const char* header; const char* body; uint8_t opcode; uint32_t target; };
++const Wire vectors[] = {
++ {"17FD001234568118C3D4127B","ABCDE7896543210019753E47",0x18,0x654321},
++ {"17FD00123456811CBEEF3786","ABCDE7896543210019753E47",0x1C,0x654321},
++ {"17FD00123456811FABCD9670","E789654321000000D4637F80",0x1F,0x654321},
++ {"17FD00123456812018AB38DA","CDE7896543210000C431254E",0x20,0x654321},
++ {"17FD001234568128ABCDD645","E789A1B2800000009F0BEF96",0x28,0xA1B2},
++ {"17FD00123456812384102ABC","00ABCDE789654321F73F7DD3",0x23,0x654321},
++ {"17FD001234568124ABCDA324","E789008065432100E07B8FE5",0x24,0}
++};
++std::unique_ptr<AMBT> decode(const std::vector<uint8_t>& h, const std::vector<uint8_t>& b) {
++ data::DataHeader header; if(!header.decode(h.data(),true)) return nullptr;
++ // This is an actually received unconfirmed12-byte AMBT body. Mutating a
++ // header format must reach factory admission, not reinterpret the fixture as
++ // an18-byte confirmed block before the factory can reject it.
++ data::DataBlock blocks[2]; blocks[0].setFormat(PDUFormatType::AMBT); blocks[0].setData(b.data());
++ return TSBKFactory::createAMBT(header,blocks);
++}
++}
++TEST_CASE("AMBT literal layouts preserve full fields and produce actual concrete local types", "[p25][ambt-layout]") {
++ for(const auto& wire:vectors) {
++  CAPTURE(unsigned(wire.opcode)); auto h=bytes(wire.header), b=bytes(wire.body);
++  REQUIRE(edac::CRC::checkCCITT162(h.data(),h.size())); REQUIRE(edac::CRC::checkCRC32(b.data(),b.size()));
++  auto message=decode(h,b); REQUIRE(message); REQUIRE(message->getLCO()==wire.opcode);
++  REQUIRE(message->getNetId()==0xABCDE); REQUIRE(message->getSysId()==0x789); REQUIRE(message->getSrcId()==0x123456);
++  if(wire.opcode!=0x24) REQUIRE(message->getDstId()==wire.target);
++  auto local=packet::ambt::localMessage(*message,0xABCDE,0x789); REQUIRE(local);
++  REQUIRE(dynamic_cast<AMBT*>(local.get())==nullptr); REQUIRE(local->getMFId()==0U);
++  REQUIRE_FALSE(packet::ambt::localMessage(*message,0xABCDF,0x789)); REQUIRE_FALSE(packet::ambt::localMessage(*message,0xABCDE,0x788));
++  if(wire.opcode==0x18) { REQUIRE(dynamic_cast<IOSP_STS_UPDT*>(local.get())); REQUIRE(dynamic_cast<IOSP_STS_UPDT*>(local.get())->getStatus()==0xC3D4); }
++  if(wire.opcode==0x1C) { REQUIRE(dynamic_cast<IOSP_MSG_UPDT*>(local.get())); REQUIRE(dynamic_cast<IOSP_MSG_UPDT*>(local.get())->getMessage()==0xBEEF); }
++  if(wire.opcode==0x28) REQUIRE(local->getEmergency());
++  if(wire.opcode==0x23) { REQUIRE(local->getAIV()); REQUIRE(local->getService()==4U); REQUIRE(local->getResponse()==0x10U); }
++  if(wire.opcode==0x20) REQUIRE(local->getService()==0x18U);
++  if(wire.opcode==0x24) { REQUIRE(local->getSrcId()==0x654321); REQUIRE(local->getDstId()==0x123456); REQUIRE(dynamic_cast<IOSP_EXT_FNCT*>(local.get())->getExtendedFunction()==0x0080U); }
++  std::array<uint8_t,12> raw; raw.fill(0xA5); local->setLastBlock(true); local->encode(raw.data(),true,true);
++  REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); REQUIRE(raw[0]==(0x80U|wire.opcode));
++  if(wire.opcode==0x18) { REQUIRE(raw[2]==0xC3); REQUIRE(raw[3]==0xD4); }
++  if(wire.opcode==0x1C) { REQUIRE(raw[2]==0xBE); REQUIRE(raw[3]==0xEF); }
++  if(wire.opcode==0x24) { const auto expected=bytes("A4000080654321123456"); for(unsigned i=0;i<10;++i) REQUIRE(raw[i]==expected[i]); }
++  // MFID01 is the same standard message profile, not an unknown vendor alias.
++  h[2]=1U; edac::CRC::addCCITT162(h.data(),h.size()); message=decode(h,b); REQUIRE(message);
++  local=packet::ambt::localMessage(*message,0xABCDE,0x789); REQUIRE(local); REQUIRE(local->getMFId()==1U);
++ }
++}
++TEST_CASE("AMBT direct parsed ingress cannot bypass header body integrity or profile bounds", "[p25][ambt-layout]") {
++ data::DataHeader::setWarnCRC(true);
++ for(const auto& wire:vectors) {
++  const auto h=bytes(wire.header), b=bytes(wire.body);
++  for(unsigned bit=0;bit<96;++bit) { auto bad=h; bad[bit/8]^=0x80U>>(bit%8); REQUIRE_FALSE(decode(bad,b)); }
++  for(unsigned bit=0;bit<96;++bit) { auto bad=b; bad[bit/8]^=0x80U>>(bit%8); REQUIRE_FALSE(decode(h,bad)); }
++  for(auto mutation:std::vector<std::pair<unsigned,uint8_t>>{{0,0x37},{0,0x97},{1,0xFF},{2,0xAA},{2,0x90},{6,0x80},{6,0x82},{6,0xFF},{7,uint8_t(0xC0U|wire.opcode)}}) {
++   auto bad=h; bad[mutation.first]=mutation.second; edac::CRC::addCCITT162(bad.data(),bad.size()); REQUIRE_FALSE(decode(bad,b));
++  }
++ }
++ data::DataHeader::setWarnCRC(false);
++ MBT_IOSP_STS_UPDT wrong; wrong.setLCO(TSBKO::IOSP_MSG_UPDT); REQUIRE_FALSE(packet::ambt::localMessage(wrong,0U,0U));
++ const uint8_t dummy=0; REQUIRE_FALSE(wrong.decode(&dummy,true));
++}
+diff --git a/tests/p25/MultiAlgorithmVoice_Tests.cpp b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+--- a/tests/p25/MultiAlgorithmVoice_Tests.cpp
++++ b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+@@ -11,6 +11,7 @@
+ #include "common/p25/data/DataBlock.h"
+ #include "common/edac/CRC.h"
+ #include "common/p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.h"
++#include "common/p25/lc/tsbk/IOSP_GRP_AFF.h"
+ #include "common/p25/P25Utils.h"
+ #include "common/p25/Sync.h"
+ #include "common/Log.h"
+@@ -379,9 +380,11 @@
+     REQUIRE(fixture.drain().empty());REQUIRE(fixture.network.outgoing.size()==forwarded);
+ }
+ 
+-TEST_CASE("parsed AMBT route preserves its one-byte placeholder contract", "[p25][nid-ingress]") {
++TEST_CASE("typed parsed route preserves its one-byte placeholder and rejects bare AMBT", "[p25][nid-ingress]") {
+     VoiceFixture fixture(0x84U,7U);NIDReceiveTestAccess::enableControl(*fixture.controller);
+-    auto parsed=std::make_unique<p25::lc::tsbk::MBT_IOSP_GRP_AFF>();parsed->setSrcId(Source);parsed->setDstId(Group);
++    auto parsed=std::make_unique<p25::lc::tsbk::IOSP_GRP_AFF>();parsed->setSrcId(Source);parsed->setDstId(Group);
+     REQUIRE(NIDReceiveTestAccess::parsed(*fixture.controller,std::move(parsed)));
+-    // This checks raw-span bypass only; operational AMBT serialization is separate.
+-}
++    // Only the verified Site AMBT decoder may construct this concrete handler.
++    auto untyped=std::make_unique<p25::lc::tsbk::MBT_IOSP_GRP_AFF>();untyped->setSrcId(Source);untyped->setDstId(Group);
++    REQUIRE_FALSE(NIDReceiveTestAccess::parsed(*fixture.controller,std::move(untyped)));
++}
+diff --git a/tests/p25/PDU_Confirmed_AuxES_Test.cpp b/tests/p25/PDU_Confirmed_AuxES_Test.cpp
+--- a/tests/p25/PDU_Confirmed_AuxES_Test.cpp
++++ b/tests/p25/PDU_Confirmed_AuxES_Test.cpp
+@@ -85,8 +85,8 @@
+         uint8_t buffer[P25_PDU_FRAME_LENGTH_BYTES];
+         ::memset(buffer, 0x00U, P25_PDU_FRAME_LENGTH_BYTES);
+ 
+-        // for the purposes of our test we strip the pad bit length from the bit length
+-        bitLength -= dataHeader.getPadLength() * 8U;
++        // Padding is already inside each coded block.
++        REQUIRE(bitLength == P25_PREAMBLE_LENGTH_BITS + (dataHeader.getBlocksToFollow() + 1U) * P25_PDU_FEC_LENGTH_BITS);
+ 
+         uint32_t blockCnt = 0U;
+         for (uint32_t i = P25_PREAMBLE_LENGTH_BITS; i < bitLength; i += P25_PDU_FEC_LENGTH_BITS) {
+diff --git a/tests/p25/PDU_Confirmed_ExtAddr_Test.cpp b/tests/p25/PDU_Confirmed_ExtAddr_Test.cpp
+--- a/tests/p25/PDU_Confirmed_ExtAddr_Test.cpp
++++ b/tests/p25/PDU_Confirmed_ExtAddr_Test.cpp
+@@ -77,8 +77,8 @@
+         uint8_t buffer[P25_PDU_FRAME_LENGTH_BYTES];
+         ::memset(buffer, 0x00U, P25_PDU_FRAME_LENGTH_BYTES);
+ 
+-        // for the purposes of our test we strip the pad bit length from the bit length
+-        bitLength -= dataHeader.getPadLength() * 8U;
++        // Padding is already inside each coded block.
++        REQUIRE(bitLength == P25_PREAMBLE_LENGTH_BITS + (dataHeader.getBlocksToFollow() + 1U) * P25_PDU_FEC_LENGTH_BITS);
+ 
+         uint32_t blockCnt = 0U;
+         for (uint32_t i = P25_PREAMBLE_LENGTH_BITS; i < bitLength; i += P25_PDU_FEC_LENGTH_BITS) {
+diff --git a/tests/p25/PDU_Confirmed_Large_Test.cpp b/tests/p25/PDU_Confirmed_Large_Test.cpp
+--- a/tests/p25/PDU_Confirmed_Large_Test.cpp
++++ b/tests/p25/PDU_Confirmed_Large_Test.cpp
+@@ -80,8 +80,8 @@
+         uint8_t buffer[P25_PDU_FRAME_LENGTH_BYTES];
+         ::memset(buffer, 0x00U, P25_PDU_FRAME_LENGTH_BYTES);
+ 
+-        // for the purposes of our test we strip the pad bit length from the bit length
+-        bitLength -= dataHeader.getPadLength() * 8U;
++        // Padding is already inside each coded block.
++        REQUIRE(bitLength == P25_PREAMBLE_LENGTH_BITS + (dataHeader.getBlocksToFollow() + 1U) * P25_PDU_FEC_LENGTH_BITS);
+ 
+         uint32_t blockCnt = 0U;
+         for (uint32_t i = P25_PREAMBLE_LENGTH_BITS; i < bitLength; i += P25_PDU_FEC_LENGTH_BITS) {
+diff --git a/tests/p25/PDU_Confirmed_Small_Test.cpp b/tests/p25/PDU_Confirmed_Small_Test.cpp
+--- a/tests/p25/PDU_Confirmed_Small_Test.cpp
++++ b/tests/p25/PDU_Confirmed_Small_Test.cpp
+@@ -74,8 +74,8 @@
+         uint8_t buffer[P25_PDU_FRAME_LENGTH_BYTES];
+         ::memset(buffer, 0x00U, P25_PDU_FRAME_LENGTH_BYTES);
+ 
+-        // for the purposes of our test we strip the pad bit length from the bit length
+-        bitLength -= dataHeader.getPadLength() * 8U;
++        // Padding is already inside each coded block.
++        REQUIRE(bitLength == P25_PREAMBLE_LENGTH_BITS + (dataHeader.getBlocksToFollow() + 1U) * P25_PDU_FEC_LENGTH_BITS);
+ 
+         uint32_t blockCnt = 0U;
+         for (uint32_t i = P25_PREAMBLE_LENGTH_BITS; i < bitLength; i += P25_PDU_FEC_LENGTH_BITS) {
+diff --git a/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp b/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp
+--- a/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp
++++ b/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp
+@@ -85,8 +85,8 @@
+         uint8_t buffer[P25_PDU_FRAME_LENGTH_BYTES];
+         ::memset(buffer, 0x00U, P25_PDU_FRAME_LENGTH_BYTES);
+ 
+-        // for the purposes of our test we strip the pad bit length from the bit length
+-        bitLength -= dataHeader.getPadLength() * 8U;
++        // Padding is already inside each coded block.
++        REQUIRE(bitLength == P25_PREAMBLE_LENGTH_BITS + (dataHeader.getBlocksToFollow() + 1U) * P25_PDU_FEC_LENGTH_BITS);
+ 
+         uint32_t blockCnt = 0U;
+         for (uint32_t i = P25_PREAMBLE_LENGTH_BITS; i < bitLength; i += P25_PDU_FEC_LENGTH_BITS) {
+diff --git a/tests/p25/PDU_Unconfirmed_ExtAddr_Test.cpp b/tests/p25/PDU_Unconfirmed_ExtAddr_Test.cpp
+--- a/tests/p25/PDU_Unconfirmed_ExtAddr_Test.cpp
++++ b/tests/p25/PDU_Unconfirmed_ExtAddr_Test.cpp
+@@ -77,8 +77,8 @@
+         uint8_t buffer[P25_PDU_FRAME_LENGTH_BYTES];
+         ::memset(buffer, 0x00U, P25_PDU_FRAME_LENGTH_BYTES);
+ 
+-        // for the purposes of our test we strip the pad bit length from the bit length
+-        bitLength -= dataHeader.getPadLength() * 8U;
++        // Padding is already inside each coded block.
++        REQUIRE(bitLength == P25_PREAMBLE_LENGTH_BITS + (dataHeader.getBlocksToFollow() + 1U) * P25_PDU_FEC_LENGTH_BITS);
+ 
+         uint32_t blockCnt = 0U;
+         for (uint32_t i = P25_PREAMBLE_LENGTH_BITS; i < bitLength; i += P25_PDU_FEC_LENGTH_BITS) {
+diff --git a/tests/p25/PDU_Unconfirmed_Test.cpp b/tests/p25/PDU_Unconfirmed_Test.cpp
+--- a/tests/p25/PDU_Unconfirmed_Test.cpp
++++ b/tests/p25/PDU_Unconfirmed_Test.cpp
+@@ -80,8 +80,8 @@
+         uint8_t buffer[P25_PDU_FRAME_LENGTH_BYTES];
+         ::memset(buffer, 0x00U, P25_PDU_FRAME_LENGTH_BYTES);
+ 
+-        // for the purposes of our test we strip the pad bit length from the bit length
+-        bitLength -= dataHeader.getPadLength() * 8U;
++        // Padding is already inside each coded block.
++        REQUIRE(bitLength == P25_PREAMBLE_LENGTH_BITS + (dataHeader.getBlocksToFollow() + 1U) * P25_PDU_FEC_LENGTH_BITS);
+ 
+         uint32_t blockCnt = 0U;
+         for (uint32_t i = P25_PREAMBLE_LENGTH_BITS; i < bitLength; i += P25_PDU_FEC_LENGTH_BITS) {
+diff --git a/tests/p25/PacketLengthBoundary_Tests.cpp b/tests/p25/PacketLengthBoundary_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/PacketLengthBoundary_Tests.cpp
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// BAAA-B5.2/5.3: fixed16/12-byte block payloads, finalCRC4, secondary headers.
++// Expected boundary counts/pads below are explicit requirements-derived values.
++#include "common/p25/data/Assembler.h"
++#include "common/p25/data/DataHeader.h"
++#include "common/p25/data/DataBlock.h"
++#include "common/p25/P25Defines.h"
++#include "common/Utils.h"
++#include "common/edac/CRC.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <vector>
++using namespace p25; using namespace p25::defines;
++namespace {
++struct Row { uint8_t format,sap; uint32_t user,count,pad; };
++const Row rows[]={
++ {0x16,0,0,1,12},{0x16,0,1,1,11},{0x16,0,11,1,1},{0x16,0,12,1,0},{0x16,0,13,2,15},{0x16,0,27,2,1},{0x16,0,28,2,0},{0x16,0,29,3,15},{0x16,0,44,3,0},{0x16,0,652,41,0},
++ {0x15,0,0,1,8},{0x15,0,1,1,7},{0x15,0,7,1,1},{0x15,0,8,1,0},{0x15,0,9,2,11},{0x15,0,19,2,1},{0x15,0,20,2,0},{0x15,0,21,3,11},{0x15,0,32,3,0},{0x15,0,488,41,0},
++ {0x16,0x1F,0,1,8},{0x16,0x1F,1,1,7},{0x16,0x1F,8,1,0},{0x16,0x1F,9,2,15},{0x16,0x1F,24,2,0},
++ {0x15,0x1F,0,2,8},{0x15,0x1F,1,2,7},{0x15,0x1F,8,2,0},{0x15,0x1F,9,3,11},{0x15,0x1F,20,3,0},
++ {0x16,0x01,0,2,15},{0x16,0x01,1,2,14},{0x16,0x01,15,2,0},{0x16,0x01,16,3,15},{0x16,0x01,31,3,0},
++ {0x15,0x01,0,2,7},{0x15,0x01,1,2,6},{0x15,0x01,7,2,0},{0x15,0x01,8,3,11},{0x15,0x01,19,3,0}
++};
++}
++TEST_CASE("packet lengths round up at every sub-block and exact-block boundary without source overread", "[p25][packet-length]") {
++ for(const auto& row:rows) {
++  CAPTURE(unsigned(row.format),unsigned(row.sap),row.user);
++  data::DataHeader h; h.setFormat(row.format); h.setAckNeeded(row.format==0x16); h.setSAP(row.sap); h.setEXSAP(PDUSAP::USER_DATA); h.setSrcLLId(123U);
++  REQUIRE(h.calculateLength(row.user)); REQUIRE(h.getBlocksToFollow()==row.count); REQUIRE(h.getPadLength()==row.pad);
++  const uint32_t secondary=row.sap==0x1F?(row.format==0x16?4U:12U):(row.sap==0x01?13U:0U);
++  REQUIRE(h.getPacketLength()==row.user+secondary);
++  std::unique_ptr<uint8_t[]> user(new uint8_t[row.user]); for(unsigned i=0;i<row.user;++i) user[i]=uint8_t(1+i%251);
++  data::Assembler tx; uint32_t bits=0; auto wire=tx.assemble(h,row.sap==0x1F,row.sap==0x01,user.get(),&bits); REQUIRE(wire);
++  REQUIRE(bits==112U+(row.count+1U)*196U);
++  data::Assembler rx; std::array<uint8_t,25> block{};
++  for(unsigned n=0;n<=row.count;++n) { Utils::getBitRange(wire.get(),block.data(),112U+n*196U,196U); REQUIRE(rx.disassemble(block.data(),block.size(),n==0U)); }
++  REQUIRE(rx.getComplete()); REQUIRE_FALSE(rx.getPacketCRCFailed()); REQUIRE(rx.getUserDataLength()==row.user);
++  std::vector<uint8_t> recovered(758); if(row.user!=0U) rx.getUserData(recovered.data()); for(unsigned i=0;i<row.user;++i) REQUIRE(recovered[i]==user[i]);
++ }
++}
++TEST_CASE("invalid packet sizes and secondary contracts fail before assembler callbacks", "[p25][packet-length]") {
++ for(auto fmt:{PDUFormatType::CONFIRMED,PDUFormatType::UNCONFIRMED}) {
++  data::DataHeader h; h.setFormat(fmt); h.setSAP(PDUSAP::USER_DATA);
++  REQUIRE_FALSE(h.calculateLength(fmt==PDUFormatType::CONFIRMED?653U:489U)); REQUIRE(h.getBlocksToFollow()==0U); REQUIRE(h.getPacketLength()==0U);
++  REQUIRE_FALSE(h.calculateLength(0xFFFFFFFFU)); REQUIRE(h.getPacketLength()==0U);
++  data::Assembler a; unsigned writes=0; a.setBlockWriter([&](const void*,uint8_t,const uint8_t*,uint32_t,bool){++writes;}); uint8_t dummy=0; uint32_t bits=99; REQUIRE_FALSE(a.assemble(h,false,false,&dummy,&bits)); REQUIRE(bits==0U); REQUIRE(writes==0U);
++  REQUIRE(data::DataHeader::calculatePadLength(fmt,fmt==PDUFormatType::CONFIRMED?12U:8U)==0U);
++  h.setSAP(PDUSAP::EXT_ADDR); REQUIRE(h.calculateLength(1U)); REQUIRE_FALSE(a.assemble(h,false,false,&dummy,&bits)); REQUIRE(bits==0U); REQUIRE(writes==0U);
++ }
++ data::DataHeader response; response.setFormat(PDUFormatType::RSP); REQUIRE(response.calculateLength(0U));
++ data::Assembler a; uint32_t bits=0; REQUIRE(a.assemble(response,false,false,nullptr,&bits)); REQUIRE(bits==308U);
++}
++
++TEST_CASE("packet CRC follows and protects padding with independent polynomial fixtures", "[p25][packet-length]") {
++ // BAAA-B5.3.1/5.3.3 PDF38-39/printed24-25. These bodies were derived by
++ // MSB-first polynomial long division (0x104C11DB7, final complement), not CRC.cpp.
++ struct Vector { uint8_t format; unsigned user; const char* body; };
++ const Vector vectors[]={
++  {0x16,0,"000000000000000000000000FFFFFFFF"},
++  {0x16,1,"010000000000000000000000F8091CF9"},
++  {0x16,12,"0102030405060708090A0B0C3C183E49"},
++  {0x16,28,"0102030405060708090A0B0C0D0E0F101112131415161718191A1B1C754815AA"},
++  {0x15,0,"0000000000000000FFFFFFFF"},
++  {0x15,1,"0100000000000000A45E2335"},
++  {0x15,8,"010203040506070882F0C97E"},
++  {0x15,20,"0102030405060708090A0B0C0D0E0F10111213143E889BD2"}
++ };
++ for(const auto& v:vectors) {
++  CAPTURE(unsigned(v.format),v.user);
++  data::DataHeader h;h.setFormat(v.format);h.setAckNeeded(v.format==0x16);h.setSAP(PDUSAP::USER_DATA);REQUIRE(h.calculateLength(v.user));
++  std::vector<uint8_t> user(v.user);for(unsigned i=0;i<v.user;++i)user[i]=uint8_t(i+1);
++  data::Assembler tx;uint32_t bits=0;auto wire=tx.assemble(h,false,false,v.user?user.data():nullptr,&bits);REQUIRE(wire);
++  std::vector<uint8_t> expected;for(unsigned i=0;v.body[i];i+=2)expected.push_back(uint8_t(std::stoul(std::string(v.body+i,2),nullptr,16)));
++  std::vector<uint8_t> actual;std::array<uint8_t,25> coded{};
++  for(unsigned n=0;n<h.getBlocksToFollow();++n){Utils::getBitRange(wire.get(),coded.data(),308U+n*196U,196U);data::DataBlock b;REQUIRE(b.decode(coded.data(),h));std::array<uint8_t,16> raw{};auto size=b.getData(raw.data());actual.insert(actual.end(),raw.begin(),raw.begin()+size);}
++  REQUIRE(actual==expected);
++  if(v.user==1U) {
++   // Re-encode a pad-bit change, including its confirmed block CRC9. Packet
++   // CRC must still reject it: the CRC protects padding as well as user bytes.
++   actual[1]^=1;data::DataBlock b;b.setFormat(h);b.setSerialNo(0);b.setData(actual.data());b.encode(coded.data());
++   data::Assembler rx;std::array<uint8_t,25> header{};Utils::getBitRange(wire.get(),header.data(),112,196);REQUIRE(rx.disassemble(header.data(),header.size(),true));REQUIRE(rx.disassemble(coded.data(),coded.size(),false));REQUIRE(rx.getComplete());REQUIRE(rx.getPacketCRCFailed());
++  }
++ }
++}

@@ -1,0 +1,202 @@
+--- a/src/bridge/HostBridge.h
++++ b/src/bridge/HostBridge.h
+@@ -36,6 +36,7 @@
+ #include "network/PeerNetwork.h"
+ #include "RtsPttController.h"
+ #include "CtsCorController.h"
++#include "UDPInactivity.h"
+ 
+ #include <string>
+ #include <mutex>
+@@ -191,6 +192,7 @@
+     uint16_t m_dropTimeMS;
+     Timer m_localDropTime;
+     Timer m_udpDropTime;
++    UDPInactivity m_udpInactivity;
+ 
+     bool m_detectAnalogMDC1200;
+ 
+--- a/src/bridge/HostBridge.cpp
++++ b/src/bridge/HostBridge.cpp
+@@ -191,6 +191,7 @@
+     m_dropTimeMS(180U),
+     m_localDropTime(1000U, 0U, 180U),
+     m_udpDropTime(1000U, 0U, 180U),
++    m_udpInactivity(),
+     m_detectAnalogMDC1200(false),
+     m_preambleLeaderTone(false),
+     m_preambleTone(2175),
+@@ -1409,6 +1410,15 @@
+         if (m_udpRTPFrames && m_udpUseULaw)
+             pcmLength = AUDIO_SAMPLES_LENGTH_BYTES / 2U;
+ 
++        // Only a complete raw PCM frame may refresh the inactivity deadline.
++        // The Site codec uses 20 ms PCM16 packets, with optional trailing IDs.
++        if (!m_udpRTPFrames && !m_udpUsrp &&
++            (pcmLength != AUDIO_SAMPLES_LENGTH_BYTES ||
++             length < static_cast<int>(4U + pcmLength + (m_udpMetadata ? 8U : 0U)))) {
++            LogWarning(LOG_NET, "Incomplete UDP PCM frame, dropping");
++            return;
++        }
++
+         DECLARE_UINT8_ARRAY(pcm, pcmLength + 1U);
+         RTPHeader rtpHeader = RTPHeader();
+ 
+@@ -1488,6 +1498,7 @@
+ 
+         req->dstId = m_dstId;
+ 
++        m_udpInactivity.received();
+         m_udpPackets.push_back(req);
+     }
+ }
+@@ -1712,6 +1723,7 @@
+     m_audioDetect = false;
+     m_localDropTime.stop();
+     m_udpDropTime.stop();
++    m_udpInactivity.clear();
+ 
+     if (!m_callInProgress) {
+         switch (m_txMode) {
+@@ -2331,6 +2343,10 @@
+                     lastFrameTime = now;
+                 }
+                 
++                // Serialize source changes, encoding and timeout termination.
++                // A watchdog must never pad/reset the LDU being encoded here.
++                std::lock_guard<std::mutex> lock(s_audioMutex);
++                bridge->m_udpInactivity.received();
+                 bridge->m_udpDropTime.start();
+ 
+                 // handle source ID management
+@@ -2415,7 +2431,6 @@
+                 }
+ 
+                 // process the received audio frame
+-                std::lock_guard<std::mutex> lock(s_audioMutex);
+                 uint8_t pcm[AUDIO_SAMPLES_LENGTH_BYTES];
+                 ::memset(pcm, 0x00U, AUDIO_SAMPLES_LENGTH_BYTES);
+ 
+@@ -2881,13 +2896,14 @@
+             uint32_t ms = stopWatch.elapsed();
+             stopWatch.start();
+ 
++            // Receipt may be refreshed while this watchdog is descheduled.
++            // Adding the whole elapsed interval to a freshly reset Timer can
++            // falsely expire continuous audio. Recheck its monotonic receipt
++            // under the same lock as encoding before ending the call.
++            std::unique_lock<std::mutex> audioLock(s_audioMutex);
+             if (!bridge->m_trafficFromUDP) {
+                 if (bridge->m_localDropTime.isRunning())
+                     bridge->m_localDropTime.clock(ms);
+-            }
+-            else {
+-                if (bridge->m_udpDropTime.isRunning())
+-                    bridge->m_udpDropTime.clock(ms);
+             }
+ 
+             // Debounce RTS PTT clear using hold-off after last audio output
+@@ -2918,7 +2934,8 @@
+                 srcId = bridge->m_udpSrcId;
+                 dstId = bridge->m_udpDstId;
+ 
+-                if (bridge->m_udpDropTime.isRunning() && bridge->m_udpDropTime.hasExpired()) {
++                if (bridge->m_udpDropTime.isRunning() && bridge->m_udpPackets.empty() &&
++                    bridge->m_udpInactivity.expired(std::chrono::milliseconds(bridge->m_dropTimeMS))) {
+                     bridge->callEnd(srcId, dstId);
+                 }
+             }
+@@ -2932,6 +2949,7 @@
+                     }
+                 }
+             }
++            audioLock.unlock();
+ 
+             Thread::sleep(5U);
+         }
+--- /dev/null
++++ b/src/bridge/UDPInactivity.h
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// UDP activity is a receipt timestamp, not a timer clocked by another thread.
++#ifndef __UDP_INACTIVITY_H__
++#define __UDP_INACTIVITY_H__
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++
++class UDPInactivity {
++public:
++    using Clock = std::chrono::steady_clock;
++    void received(Clock::time_point now = Clock::now())
++    {
++        m_last.store(stamp(now), std::memory_order_release);
++    }
++    void clear() { m_last.store(-1, std::memory_order_release); }
++    bool expired(std::chrono::milliseconds quiet, Clock::time_point now = Clock::now()) const
++    {
++        const int64_t last = m_last.load(std::memory_order_acquire);
++        const int64_t current = stamp(now);
++        return last >= 0 && current >= last && current - last >=
++            std::chrono::duration_cast<std::chrono::nanoseconds>(quiet).count();
++    }
++private:
++    static int64_t stamp(Clock::time_point now)
++    {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
++    }
++    std::atomic<int64_t> m_last{-1};
++};
++#endif
+--- /dev/null
++++ b/tests/BridgeUDPInactivity_Tests.cpp
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "bridge/UDPInactivity.h"
++#include <catch2/catch_test_macros.hpp>
++#include <chrono>
++
++namespace {
++using namespace std::chrono;
++UDPInactivity::Clock::time_point at(int64_t ms)
++{
++    return UDPInactivity::Clock::time_point(milliseconds(ms));
++}
++}
++
++TEST_CASE("A delayed UDP watchdog cannot expire freshly received PCM", "[bridge-udp]")
++{
++    UDPInactivity activity;
++    activity.received(at(0));
++    // The watchdog sleeps for 500 ms while PCM continues on another thread.
++    for (int ms = 20; ms <= 500; ms += 20) activity.received(at(ms));
++    REQUIRE_FALSE(activity.expired(milliseconds(180), at(500)));
++    REQUIRE_FALSE(activity.expired(milliseconds(180), at(679)));
++    REQUIRE(activity.expired(milliseconds(180), at(680)));
++}
++
++TEST_CASE("Continuous PCM survives repeated delayed watchdog checks", "[bridge-udp]")
++{
++    UDPInactivity activity;
++    for (int ms = 0; ms <= 30000; ms += 20) {
++        activity.received(at(ms));
++        // Deliberately sparse checks model a descheduled watchdog.
++        if (ms % 1460 == 0) REQUIRE_FALSE(activity.expired(milliseconds(180), at(ms + 19)));
++    }
++    REQUIRE_FALSE(activity.expired(milliseconds(180), at(30179)));
++    REQUIRE(activity.expired(milliseconds(180), at(30180)));
++}
++
++TEST_CASE("A locked recheck observes PCM that arrived after a timeout candidate", "[bridge-udp]")
++{
++    UDPInactivity activity;
++    activity.received(at(1000));
++    REQUIRE(activity.expired(milliseconds(180), at(1200)));
++    activity.received(at(1201));
++    REQUIRE_FALSE(activity.expired(milliseconds(180), at(1202)));
++    activity.clear();
++    REQUIRE_FALSE(activity.expired(milliseconds(180), at(2000)));
++    activity.received(at(2001));
++    REQUIRE(activity.expired(milliseconds(180), at(2181)));
++}

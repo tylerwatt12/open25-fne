@@ -1,0 +1,1400 @@
+diff --git a/src/host/CWIDPolicy.h b/src/host/CWIDPolicy.h
+new file mode 100644
+index 0000000..13c8109
+--- /dev/null
++++ b/src/host/CWIDPolicy.h
+@@ -0,0 +1,229 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Pure identification scheduling and a bounded modem transaction. */
++#ifndef DVM_HOST_CWID_POLICY_H
++#define DVM_HOST_CWID_POLICY_H
++
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++#include <string>
++#include <mutex>
++#include <chrono>
++
++namespace identification {
++
++class Policy {
++public:
++    Policy() : m_enabled(false), m_startup(false), m_pending(false),
++        m_dirty(false), m_previousRF(false), m_intervalMs(0U), m_completedAt(0U) {}
++
++    void configure(bool enabled, uint32_t intervalSeconds) {
++        m_enabled = enabled;
++        m_startup = enabled;
++        m_pending = m_dirty = m_previousRF = false;
++        m_intervalMs = uint64_t(intervalSeconds) * 1000U;
++        m_completedAt = 0U;
++    }
++    bool enabled() const { return m_enabled; }
++
++    // The caller excludes the identification transmission itself. Only real
++    // non-ID RF activity creates a new periodic/final identification obligation.
++    void observeRF(bool tx) {
++        if (!m_enabled)
++            return;
++        if (tx)
++            m_dirty = true;
++        if (m_previousRF && !tx)
++            m_pending = true;
++        m_previousRF = tx;
++    }
++    void noteVoiceEnd() {
++        if (!m_enabled)
++            return;
++        m_dirty = m_pending = true;
++    }
++    bool due(uint64_t nowMs) const {
++        return m_enabled && (m_startup || m_pending ||
++            (m_dirty && nowMs >= m_completedAt && nowMs - m_completedAt >= m_intervalMs));
++    }
++    const char* reason(uint64_t nowMs) const {
++        if (!due(nowMs))
++            return "";
++        if (m_startup)
++            return "startup";
++        if (m_pending)
++            return "voice-end";
++        return "periodic";
++    }
++    bool finalDue() const { return m_enabled && (m_startup || m_pending || m_dirty); }
++    void complete(uint64_t nowMs) {
++        if (!m_enabled)
++            return;
++        m_startup = m_pending = m_dirty = m_previousRF = false;
++        m_completedAt = nowMs;
++    }
++
++private:
++    bool m_enabled, m_startup, m_pending, m_dirty, m_previousRF;
++    uint64_t m_intervalMs, m_completedAt;
++};
++
++// Shared by the actual P25 reader/site updater and the CW quiesce path.
++// A pending flag prevents new work; this barrier drains work already in flight.
++class ActivityBarrier {
++public:
++    std::unique_lock<std::timed_mutex> enter() { return std::unique_lock<std::timed_mutex>(m_mutex); }
++    std::unique_lock<std::timed_mutex> quiesce(uint32_t milliseconds) {
++        std::unique_lock<std::timed_mutex> lock(m_mutex, std::defer_lock);
++        lock.try_lock_for(std::chrono::milliseconds(milliseconds));
++        return lock;
++    }
++private:
++    std::timed_mutex m_mutex;
++};
++
++// No blocking mutex acquisition may sit outside the identification budget.
++// Clock and wait callbacks keep this directly testable without real delays.
++template<typename Attempt, typename Now, typename Wait, typename Healthy>
++bool acquireUntil(Attempt attempt, uint64_t deadlineMs, Now now, Wait wait, Healthy healthy) {
++    uint64_t previous = now();
++    for (uint32_t tries = 0U; tries <= 10001U; ++tries) {
++        const uint64_t current = now();
++        if (current < previous || current > deadlineMs || !healthy())
++            return false;
++        previous = current;
++        if (attempt()) {
++            const uint64_t acquiredAt = now();
++            return acquiredAt >= current && acquiredAt <= deadlineMs && healthy();
++        }
++        if (current == deadlineMs)
++            return false;
++        wait();
++    }
++    return false;
++}
++
++class Transport {
++public:
++    virtual ~Transport() {}
++    virtual uint64_t nowMs() const = 0;
++    virtual bool prepareIdle() = 0;
++    // Must represent a fresh modem status showing no TX, not cached host state.
++    virtual bool idleReady() const = 0;
++    virtual bool send(const std::string& text) = 0;
++    virtual bool transmitting() const = 0;
++    virtual bool healthy() const = 0;
++    virtual void pump(uint32_t milliseconds) = 0;
++};
++
++enum class Result {
++    Completed, Disabled, PrepareFailed, SendFailed, IdleTimeout,
++    StartTimeout, CompletionTimeout, Fault
++};
++
++namespace detail {
++inline uint64_t deadline(uint64_t now, uint32_t milliseconds) {
++    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
++    return now > maximum - milliseconds ? maximum : now + milliseconds;
++}
++
++// Absolute monotonic deadlines include work done in transport callbacks. The
++// finite pump allowance also prevents a broken/nonadvancing clock from spinning.
++class Transaction {
++public:
++    Transaction(Transport& transport, uint32_t totalTimeoutMs) : m_transport(transport),
++        m_lastTime(transport.nowMs()), m_begin(m_lastTime),
++        m_end(deadline(m_begin, totalTimeoutMs)),
++        m_pumps(uint64_t(totalTimeoutMs) / 20U + 8U) {}
++
++    uint64_t begin() const { return m_begin; }
++    uint64_t end() const { return m_end; }
++    bool time(uint64_t& now) {
++        now = m_transport.nowMs();
++        if (now < m_lastTime)
++            return false;
++        m_lastTime = now;
++        return true;
++    }
++    bool healthy() const { return m_transport.healthy(); }
++
++    template<typename Predicate>
++    Result wait(uint64_t until, Result timeout, Predicate ready) {
++        for (;;) {
++            if (!healthy())
++                return Result::Fault;
++            uint64_t now;
++            if (!time(now))
++                return Result::Fault;
++            if (now > until)
++                return timeout;
++            const bool observed = ready();
++            if (!healthy() || !time(now))
++                return Result::Fault;
++            if (now > until)
++                return timeout;
++            if (observed)
++                return Result::Completed;
++            if (now == until)
++                return timeout;
++            if (m_pumps == 0U)
++                return Result::Fault;
++            --m_pumps;
++            m_transport.pump(uint32_t(std::min<uint64_t>(20U, until - now)));
++        }
++    }
++
++private:
++    Transport& m_transport;
++    uint64_t m_lastTime, m_begin, m_end, m_pumps;
++};
++} // namespace detail
++
++inline Result transmit(Transport& transport, const std::string& text, bool enabled,
++    uint32_t idleTimeoutMs = 2000U, uint32_t startTimeoutMs = 2000U,
++    uint32_t totalTimeoutMs = 10000U) {
++    // In particular, do not read time/status or prepare a modem when disabled.
++    if (!enabled)
++        return Result::Disabled;
++    detail::Transaction transaction(transport, totalTimeoutMs);
++    if (!transaction.healthy())
++        return Result::Fault;
++    uint64_t now;
++    if (!transaction.time(now))
++        return Result::Fault;
++    if (now >= transaction.end())
++        return Result::IdleTimeout;
++
++    const uint64_t idleDeadline = std::min(transaction.end(),
++        detail::deadline(transaction.begin(), idleTimeoutMs));
++    const bool prepared = transport.prepareIdle();
++    if (!transaction.healthy())
++        return Result::Fault;
++    if (!prepared)
++        return Result::PrepareFailed;
++    Result result = transaction.wait(idleDeadline, Result::IdleTimeout,
++        [&transport]() { return transport.idleReady(); });
++    if (result != Result::Completed)
++        return result;
++
++    if (!transaction.time(now))
++        return Result::Fault;
++    if (now >= transaction.end())
++        return Result::IdleTimeout; // No budget remains for a new transmission.
++    const uint64_t startDeadline = std::min(transaction.end(),
++        detail::deadline(now, startTimeoutMs));
++    const bool sent = transport.send(text);
++    if (!transaction.healthy())
++        return Result::Fault;
++    if (!sent)
++        return Result::SendFailed;
++    result = transaction.wait(startDeadline, Result::StartTimeout,
++        [&transport]() { return transport.transmitting(); });
++    if (result != Result::Completed)
++        return result;
++    return transaction.wait(transaction.end(), Result::CompletionTimeout,
++        [&transport]() { return !transport.transmitting(); });
++}
++
++} // namespace identification
++#endif
+diff --git a/src/host/Host.P25.cpp b/src/host/Host.P25.cpp
+index 6fc7479..035a45d 100644
+--- a/src/host/Host.P25.cpp
++++ b/src/host/Host.P25.cpp
+@@ -76,6 +76,14 @@ void* Host::threadP25Reader(void* arg)
+                         }
+                     };
+ 
++                    auto processing = host->m_p25Processing.enter();
++                    // Recheck after entering: CW may have latched while this
++                    // reader waited for an earlier in-flight frame to finish.
++                    if (host->m_isTxCW.load() || host->m_p25->identificationActive()) {
++                        Thread::sleep(1U);
++                        continue;
++                    }
++
+                     // read P25 frames from modem, and if there are frames
+                     // write those frames to the P25 controller
+                     if (host->m_p25 != nullptr) {
+@@ -83,6 +91,8 @@ void* Host::threadP25Reader(void* arg)
+                         if (nextLen > 0U) {
+                             uint32_t len = host->m_modem->readP25Frame(data);
+                             if (len > 0U) {
++                                if (host->m_isTxCW.load() || host->m_p25->identificationActive())
++                                    continue;
+                                 if (host->m_state == STATE_IDLE) {
+                                     // process P25 frames
+                                     bool ret = host->m_p25->processFrame(data, len);
+@@ -218,9 +228,15 @@ void* Host::threadP25Writer(void* arg)
+                 stopWatch.start();
+                 host->m_p25TxLoopMS = ms;
+ 
++                if (host->m_isTxCW.load()) {
++                    Thread::sleep(1U);
++                    continue;
++                }
+                 // scope is intentional
+                 {
+                     std::lock_guard<std::mutex> lock(m_clockingMutex);
++                    if (host->m_isTxCW.load())
++                        continue;
+ 
+                     // ------------------------------------------------------
+                     //  -- Write to Modem Processing                      --
+@@ -276,7 +292,8 @@ void* Host::threadP25Writer(void* arg)
+ 
+                                     // if the state is P25; write P25 frame data
+                                     if (host->m_state == STATE_P25) {
+-                                        host->m_modem->writeP25Frame(data, len, imm);
++                                        if (host->m_modem->writeP25Frame(data, len, imm) && host->m_identification.enabled())
++                                            host->m_nonIdentificationFrames.store(true);
+ 
+                                         afterWriteCallback();
+ 
+diff --git a/src/host/Host.cpp b/src/host/Host.cpp
+index 440cc0a..b9b8c64 100644
+--- a/src/host/Host.cpp
++++ b/src/host/Host.cpp
+@@ -25,6 +25,7 @@ using namespace modem;
+ using namespace lookups;
+ 
+ #include <cstdio>
++#include <chrono>
+ #include <algorithm>
+ #include <functional>
+ #include <memory>
+@@ -355,6 +356,8 @@ int Host::run()
+     if (!ret)
+         return EXIT_FAILURE;
+ 
++    // Callsign source also serves digital trunked station identification.
++    m_cwCallsign = systemConf["cwId"]["callsign"].as<std::string>();
+     // set CW parameters
+     if (systemConf["cwId"]["enable"].as<bool>(false)) {
+         uint32_t time = systemConf["cwId"]["time"].as<uint32_t>(10U);
+@@ -366,8 +369,13 @@ int Host::run()
+ 
+         m_cwIdTime = time * 60U;
+ 
+-        m_cwIdTimer.setTimeout(m_cwIdTime / 2U);
+-        m_cwIdTimer.start();
++        if (!m_p25Enabled || m_dmrEnabled || m_nxdnEnabled || time < 1U || time > 9U ||
++            m_cwCallsign.empty() || m_cwCallsign.size() > 6U ||
++            m_cwCallsign.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != std::string::npos) {
++            LogError(LOG_HOST, "CW identification requires the P25-only profile, interval 1-9 minutes and an uppercase callsign of 1-6 characters");
++            return EXIT_FAILURE;
++        }
++        m_identification.configure(true, m_cwIdTime);
+     }
+ 
+     // for all modes we handle RSSI
+@@ -814,6 +822,19 @@ int Host::run()
+             }                                                                                                           \
+         }
+ 
++    if (m_p25 != nullptr)
++        m_p25->configureIdentification(m_identification.enabled());
++    if (m_identification.enabled() && !g_killed) {
++        if (!sendIdentification("startup", true)) {
++            setState(HOST_STATE_QUIT);
++            return EXIT_FAILURE;
++        }
++        if (g_killed) {
++            setState(HOST_STATE_QUIT);
++            return EXIT_SUCCESS;
++        }
++    }
++
+     /*
+     ** Initialize Threads
+     */
+@@ -986,60 +1007,14 @@ int Host::run()
+         //  -- Timer Clocking                                 --
+         // ------------------------------------------------------
+ 
+-        // clock and check CW timer
+-        m_cwIdTimer.clock(ms);
+-        if (m_cwIdTimer.isRunning() && m_cwIdTimer.hasExpired()) {
+-            m_mainLoopStage = 9U; // intentional magic number
+-            if (!m_modem->hasTX() && !m_p25CtrlChannel && !m_dmrCtrlChannel && !m_nxdnCtrlChannel) {
+-                if (m_dmrBeaconDurationTimer.isRunning() || m_p25BcastDurationTimer.isRunning() ||
+-                    m_nxdnBcastDurationTimer.isRunning()) {
+-                    LogDebug(LOG_HOST, "CW, beacon or CC timer running, ceasing");
+-
+-                    m_dmrBeaconDurationTimer.stop();
+-                    m_p25BcastDurationTimer.stop();
+-                    m_nxdnBcastDurationTimer.stop();
+-                }
+-
+-                LogInfoEx(LOG_HOST, "CW, start transmitting");
+-                m_isTxCW = true;
+-                std::lock_guard<std::mutex> lock(m_clockingMutex);
+-
+-                setState(STATE_IDLE);
+-                m_modem->sendCWId(m_cwCallsign);
+-
+-                Thread::sleep(CW_IDLE_SLEEP_MS);
+-
+-                bool first = true;
+-                do {
+-                    // ------------------------------------------------------
+-                    //  -- Modem Clocking                                 --
+-                    // ------------------------------------------------------
+-
+-                    ms = stopWatch.elapsed();
+-                    stopWatch.start();
+-
+-                    m_mainLoopWatchdogTimer.start();
+-                    m_mainLoopMS = ms;
+-
+-                    m_modem->clock(ms);
+-
+-                    if (!first && !m_modem->hasTX()) {
+-                        LogInfoEx(LOG_HOST, "CW, finished transmitting");
+-                        break;
+-                    }
+-
+-                    if (first) {
+-                        first = false;
+-                        Thread::sleep(200U + CW_IDLE_SLEEP_MS); // ~250ms; poll time of the modem
+-                    }
+-                    else
+-                        Thread::sleep(CW_IDLE_SLEEP_MS);
+-                } while (true);
+-
+-                m_isTxCW = false;
+-                m_cwIdTimer.setTimeout(m_cwIdTime);
+-                m_cwIdTimer.start();
+-            }
++        if (m_identification.enabled() && !g_killed) {
++            m_identification.observeRF(m_modem->hasTX());
++            if (m_p25 != nullptr && m_p25->identificationPending())
++                m_identification.noteVoiceEnd();
++            const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
++                std::chrono::steady_clock::now().time_since_epoch()).count();
++            if (m_identification.due(uint64_t(now)))
++                sendIdentification(m_identification.reason(uint64_t(now)), true);
+         }
+ 
+         m_mainLoopStage = 10U; // intentional magic number
+@@ -1299,8 +1274,13 @@ int Host::run()
+         delete rssi;
+     }
+ 
++    // SIGINT is the explicit orderly operator-stop contract. TERM/internal
++    // faults never begin a new autonomous firmware CW transmission.
++    if (!m_identificationFailed && (g_signal == SIGINT || g_signal == SIGHUP) && m_identification.enabled() &&
++        (m_identification.finalDue() || m_nonIdentificationFrames.load()))
++        sendIdentification("shutdown", false);
+     setState(HOST_STATE_QUIT);
+-    return EXIT_SUCCESS;
++    return m_identificationFailed ? EXIT_FAILURE : EXIT_SUCCESS;
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -1318,7 +1298,8 @@ json::object Host::getStatus()
+     {
+         response["state"].set<uint8_t>(m_state);
+ 
+-        response["isTxCW"].set<bool>(m_isTxCW);
++        const bool identifying = m_isTxCW.load();
++        response["isTxCW"].set<bool>(identifying);
+ 
+         response["fixedMode"].set<bool>(m_fixedMode);
+ 
+@@ -1599,11 +1580,142 @@ bool Host::rmtPortModemHandler(Modem* modem, uint32_t ms, modem::RESP_TYPE_DVM r
+     return true;
+ }
+ 
++namespace {
++uint64_t identificationNow() {
++    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++class CWModemTransport final : public identification::Transport {
++public:
++    CWModemTransport(modem::Modem& value, std::function<void()> heartbeat) :
++        m_modem(value), m_heartbeat(heartbeat), m_lastPump(identificationNow()), m_initialStatus(0U) {}
++    uint64_t nowMs() const override { return identificationNow(); }
++    bool prepareIdle() override {
++        m_initialStatus = m_modem.statusGeneration();
++        m_modem.clearP25Frame();
++        return m_modem.setState(modem::STATE_IDLE);
++    }
++    bool idleReady() const override { return m_modem.statusGeneration() > m_initialStatus &&
++        m_modem.getState() == modem::STATE_IDLE && !m_modem.hasTX(); }
++    bool send(const std::string& text) override { return m_modem.sendCWId(text); }
++    bool transmitting() const override { return m_modem.hasTX(); }
++    bool healthy() const override {
++        const bool hardStop = g_killed && g_signal != SIGINT && g_signal != SIGHUP;
++        return !hardStop && !m_modem.hasError() && !m_modem.hasLockout() && !m_modem.cwIdRejected();
++    }
++    void pump(uint32_t ms) override {
++        Thread::sleep(ms);
++        const uint64_t now = nowMs();
++        m_heartbeat();
++        m_modem.clock(uint32_t(now - m_lastPump));
++        m_lastPump = now;
++    }
++private:
++    modem::Modem& m_modem;
++    std::function<void()> m_heartbeat;
++    uint64_t m_lastPump, m_initialStatus;
++};
++}
++
++bool Host::sendIdentification(const char* reason, bool resume)
++{
++    if (!m_identification.enabled())
++        return true;
++    const uint64_t operationStarted = identificationNow();
++    const uint64_t operationDeadline = operationStarted + 10000U;
++    m_isTxCW.store(true);
++    m_modem->boundedCWOperation(true);
++    LogInfoEx(LOG_HOST, "CW, identification reason %s", reason);
++    LogInfoEx(LOG_HOST, "CW, start transmitting");
++    auto healthy = [this]() {
++        return !m_modem->hasError() && (!g_killed || g_signal == SIGINT || g_signal == SIGHUP);
++    };
++    auto wait = [this]() { m_mainLoopWatchdogTimer.start(); Thread::sleep(1U); };
++    auto fault = [this](bool modemOwned = false) {
++        // A blocked reader/owner must not be reset concurrently. Abort only
++        // when the modem writer is ours; process exit alone is no RF guarantee.
++        std::unique_lock<std::mutex> lock(m_clockingMutex, std::defer_lock);
++        if (modemOwned || lock.try_lock())
++            m_modem->abortCWId();
++        m_modem->boundedCWOperation(false);
++        m_identificationFailed = true;
++        g_killed = true;
++        LogError(LOG_HOST, "CW, identification failed");
++        return false;
++    };
++    if (!identification::acquireUntil([this]() { return m_p25 == nullptr || m_p25->tryBeginIdentification(); },
++            operationDeadline, identificationNow, wait, healthy))
++        return fault();
++    auto readerBarrier = m_p25Processing.quiesce(0U);
++    if (!identification::acquireUntil([&readerBarrier]() { return readerBarrier.owns_lock() || readerBarrier.try_lock(); },
++            std::min(operationDeadline, operationStarted + 1000U), identificationNow, wait, healthy))
++        return fault();
++    std::unique_lock<std::mutex> modemLock(m_clockingMutex, std::defer_lock);
++    if (!identification::acquireUntil([&modemLock]() { return modemLock.try_lock(); },
++            operationDeadline, identificationNow, wait, healthy))
++        return fault(modemLock.owns_lock());
++    std::unique_lock<std::recursive_mutex> stateLock(m_stateMutex, std::defer_lock);
++    if (!identification::acquireUntil([&stateLock]() { return stateLock.try_lock(); },
++            operationDeadline, identificationNow, wait, healthy)) {
++        return fault(true);
++    }
++    const bool wasControlRunning = m_p25 != nullptr && m_p25->getCCRunning();
++    m_p25DedicatedTxTestTimer.stop();
++    if (m_p25 != nullptr) {
++        m_p25->clearIdentificationTraffic();
++        m_p25->setCCRunning(false);
++        m_p25->affiliations()->releaseGrant(0U, true);
++        m_p25->reset();
++        m_p25->setCCHalted(true);
++    }
++    setState(STATE_IDLE);
++    m_modem->clearP25Receive();
++    CWModemTransport transport(*m_modem, [this]() { m_mainLoopWatchdogTimer.start(); });
++    const uint64_t elapsed = identificationNow() - operationStarted;
++    const uint32_t remaining = elapsed >= 10000U ? 0U : uint32_t(10000U - elapsed);
++    const auto result = identification::transmit(transport, m_cwCallsign, true, 2000U, 2000U, remaining);
++    m_modem->boundedCWOperation(false);
++    if (result != identification::Result::Completed) {
++        // In this firmware IDLE alone does not cancel CW: first select P25 to
++        // reset cwIdTX, clear its normal FIFO, then return to IDLE. Queued IO
++        // bits may still drain (~107ms); a killed host alone is no RF guarantee.
++        m_modem->abortCWId();
++        m_identificationFailed = true;
++        g_killed = true;
++        LogError(LOG_HOST, "CW, identification failure code %u", unsigned(result));
++        LogError(LOG_HOST, "CW, identification failed");
++        return false;
++    }
++    m_identification.complete(identificationNow());
++    m_nonIdentificationFrames.store(false);
++    m_modem->clearP25Receive();
++    if (m_p25 != nullptr) {
++        m_p25->reset();
++        m_p25->setCCRunning(wasControlRunning);
++        m_p25->setCCHalted(false);
++    }
++    m_p25TxWatchdogTimer.start();
++    m_p25TxLoopMS = 0U;
++    m_mainLoopWatchdogTimer.start();
++    m_isTxCW.store(false);
++    if (resume && !g_killed) {
++        setState(STATE_P25);
++        if (m_p25 != nullptr)
++            m_p25->completeIdentification();
++    }
++    m_mainLoopWatchdogTimer.start();
++    LogInfoEx(LOG_HOST, "CW, finished transmitting");
++    return true;
++}
++
+ /* Helper to set the host/modem running state. */
+ 
+ void Host::setState(uint8_t state)
+ {
++    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+     assert(m_modem != nullptr);
++    if (m_isTxCW.load() && state != STATE_IDLE && state != HOST_STATE_ERROR && state != HOST_STATE_QUIT)
++        return;
+ 
+     //if (m_state != state) {
+     //    LogDebug(LOG_HOST, "setState, m_state = %u, state = %u", m_state, state);
+@@ -1677,12 +1789,8 @@ void Host::setState(uint8_t state)
+             m_modem->clearDMRFrame2();
+             m_modem->clearP25Frame();
+ 
+-            if (m_state == HOST_STATE_ERROR) {
+-                m_modem->sendCWId(m_cwCallsign);
+-
+-                m_cwIdTimer.setTimeout(m_cwIdTime);
+-                m_cwIdTimer.start();
+-            }
++            if (m_state == HOST_STATE_ERROR && m_identification.enabled())
++                m_identification.noteVoiceEnd();
+ 
+             m_modeTimer.stop();
+ 
+@@ -2110,8 +2218,11 @@ void* Host::threadSiteData(void* arg)
+ 
+             if (host->m_dmr != nullptr)
+                 host->m_dmr->clockSiteData(ms);
+-            if (host->m_p25 != nullptr)
+-                host->m_p25->clockSiteData(ms);
++            if (host->m_p25 != nullptr) {
++                auto processing = host->m_p25Processing.enter();
++                if (!host->m_isTxCW.load())
++                    host->m_p25->clockSiteData(ms);
++            }
+             if (host->m_nxdn != nullptr)
+                 host->m_nxdn->clockSiteData(ms);
+ 
+diff --git a/src/host/Host.h b/src/host/Host.h
+index 774847c..37848f6 100644
+--- a/src/host/Host.h
++++ b/src/host/Host.h
+@@ -26,6 +26,8 @@
+ #define __HOST_H__
+ 
+ #include "Defines.h"
++#include "CWIDPolicy.h"
++#include <atomic>
+ #include "common/Timer.h"
+ #include "common/lookups/AffiliationLookup.h"
+ #include "common/lookups/ChannelLookup.h"
+@@ -115,7 +117,13 @@ private:
+ 
+     uint8_t m_state;
+ 
+-    bool m_isTxCW;
++    std::atomic<bool> m_isTxCW;
++    identification::Policy m_identification;
++    bool m_identificationFailed = false;
++    std::recursive_mutex m_stateMutex;
++    identification::ActivityBarrier m_p25Processing;
++    std::atomic<bool> m_nonIdentificationFrames{false};
++    bool sendIdentification(const char* reason, bool resume);
+ 
+     Timer m_modeTimer;
+     Timer m_dmrTXTimer;
+diff --git a/src/host/modem/Modem.cpp b/src/host/modem/Modem.cpp
+index fd5368b..aed7225 100644
+--- a/src/host/modem/Modem.cpp
++++ b/src/host/modem/Modem.cpp
+@@ -531,6 +531,10 @@ void Modem::clock(uint32_t ms)
+ 
+     m_inactivityTimer.clock(ms);
+     if (m_inactivityTimer.hasExpired()) {
++        if (m_boundedCWOperation.load()) {
++            m_error = true; // do not enter the unbounded reconnect loop during CW
++            return;
++        }
+         LogError(LOG_MODEM, "No reply from the modem for some time, resetting it");
+         reset();
+     }
+@@ -844,6 +848,7 @@ void Modem::clock(uint32_t ms)
+             }
+ 
+             m_gotModemStatus = true;
++            ++m_statusGeneration;
+             m_inactivityTimer.start();
+         }
+         break;
+@@ -854,6 +859,8 @@ void Modem::clock(uint32_t ms)
+ 
+         case CMD_NAK:
+         {
++            if (m_buffer[3U] == CMD_SEND_CWID)
++                m_cwIdRejected.store(true);
+             LogWarning(LOG_MODEM, "NAK, command = 0x%02X (%s), reason = %u (%s)", m_buffer[3U], cmdToString(m_buffer[3U]).c_str(), m_buffer[4U], rsnToString(m_buffer[4U]).c_str());
+             switch (m_buffer[4U]) {
+                 case RSN_RINGBUFF_FULL:
+@@ -901,6 +908,10 @@ void Modem::clock(uint32_t ms)
+     // force a modem reset because of a error condition
+     if (forceModemReset) {
+         forceModemReset = false;
++        if (m_boundedCWOperation.load()) {
++            m_error = true;
++            return;
++        }
+         reset();
+     }
+ }
+@@ -1262,6 +1273,12 @@ void Modem::clearP25Frame()
+     Thread::sleep(5); // 5ms delay
+ }
+ 
++void Modem::clearP25Receive()
++{
++    std::lock_guard<std::mutex> lock(m_p25ReadLock);
++    m_rxP25Queue.clear();
++}
++
+ /* Clears any buffered NXDN frame data to be sent to the air interface modem. */
+ 
+ void Modem::clearNXDNFrame()
+@@ -1767,6 +1784,7 @@ bool Modem::setState(DVM_STATE state)
+ bool Modem::sendCWId(const std::string& callsign)
+ {
+     LogDebug(LOG_MODEM, "sending CW ID");
++    m_cwIdRejected.store(false);
+ 
+     uint32_t length = (uint32_t)callsign.length();
+     if (length > 200U)
+@@ -1787,6 +1805,16 @@ bool Modem::sendCWId(const std::string& callsign)
+     return write(buffer, length + 3U) == int(length + 3U);
+ }
+ 
++/* IDLE alone is a no-op during hotspot CW; P25 resets its CW generator. */
++
++bool Modem::abortCWId()
++{
++    const bool resetGenerator = setState(STATE_P25);
++    clearP25Frame();
++    const bool idle = setState(STATE_IDLE);
++    return resetGenerator && idle;
++}
++
+ /* Returns the protocol version of the connected modem. */
+ 
+ uint8_t Modem::getVersion() const
+diff --git a/src/host/modem/Modem.h b/src/host/modem/Modem.h
+index 83bd70a..a90c69e 100644
+--- a/src/host/modem/Modem.h
++++ b/src/host/modem/Modem.h
+@@ -35,6 +35,7 @@
+ #include <string>
+ #include <functional>
+ #include <mutex>
++#include <atomic>
+ 
+ /**
+  * @addtogroup modem
+@@ -568,6 +569,7 @@ namespace modem
+          * @brief Clears any buffered P25 frame data to be sent to the air interface modem.
+          */
+         void clearP25Frame();
++        void clearP25Receive();
+         /**
+          * @brief Clears any buffered NXDN frame data to be sent to the air interface modem.
+          */
+@@ -688,6 +690,10 @@ namespace modem
+          * @returns bool True, if callsign written, otherwise false.
+          */
+         bool sendCWId(const std::string& callsign);
++        bool abortCWId();
++        uint64_t statusGeneration() const { return m_statusGeneration.load(); }
++        bool cwIdRejected() const { return m_cwIdRejected.load(); }
++        void boundedCWOperation(bool active) { m_boundedCWOperation.store(active); }
+ 
+         /**
+          * @brief Returns the protocol version of the connected modem.
+@@ -831,6 +837,9 @@ namespace modem
+         bool m_flashDisabled;
+ 
+         bool m_gotModemStatus;
++        std::atomic<uint64_t> m_statusGeneration{0U};
++        std::atomic<bool> m_cwIdRejected{false};
++        std::atomic<bool> m_boundedCWOperation{false};
+ 
+         bool m_dumpModemStatus;
+         bool m_displayModemDebugMessages;
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+index 4bf1c79..d2cd893 100644
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -229,10 +229,52 @@ void Control::reset()
+         m_data->resetRF();
+     }
+ 
++    std::lock_guard<std::mutex> queueLock(s_queueLock);
+     m_txImmQueue.clear();
+     m_txQueue.clear();
+ }
+ 
++/* Pending latching and permit commits share a total order. */
++void Control::requestIdentification()
++{
++    std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
++    if (m_identificationEnabled.load()) {
++        m_identificationPending.store(true);
++        m_identificationUnavailable.store(true);
++    }
++}
++
++bool Control::tryBeginIdentification()
++{
++    std::unique_lock<std::recursive_mutex> lock(m_permitMutex, std::try_to_lock);
++    if (!lock.owns_lock())
++        return false;
++    if (m_identificationEnabled.load()) {
++        m_identificationPending.store(true);
++        m_identificationUnavailable.store(true);
++        m_identificationActive.store(true);
++    }
++    return true;
++}
++
++void Control::setIdentificationActive(bool active)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
++    if (m_identificationEnabled.load())
++        m_identificationActive.store(active);
++}
++
++void Control::clearIdentificationTraffic()
++{
++    std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
++    const uint32_t oldDestination = m_permittedDstId.load();
++    m_permittedDstId.store(0U);
++    m_permitToken.clear();
++    m_rfTGHang.stop();
++    if (!m_authoritative && oldDestination != 0U)
++        notifyCC_ReleaseGrant(oldDestination);
++}
++
+ /* Helper to set P25 configuration options. */
+ 
+ void Control::setOptions(yaml::Node& conf, bool supervisor, const std::string cwCallsign, const ::lookups::VoiceChData controlChData,
+@@ -625,6 +667,7 @@ void Control::setOptions(yaml::Node& conf, bool supervisor, const std::string cw
+ 
+ bool Control::processFrame(uint8_t* data, uint32_t len)
+ {
++    if (identificationActive()) return false;
+     assert(data != nullptr);
+ 
+     bool sync = data[1U] == 0x01U;
+@@ -874,6 +917,7 @@ uint32_t Control::getFrame(uint8_t* data, bool *imm)
+ 
+ bool Control::writeRF_VoiceEnd()
+ {
++    if (identificationActive()) return false;
+     if (m_netState == RS_NET_IDLE && m_rfState == RS_RF_LISTENING) {
+         if (m_tailOnIdle) {
+             bool ret = false;
+@@ -1381,6 +1425,7 @@ void Control::addFrame(const uint8_t* data, uint32_t length, bool net, bool imm)
+     assert(data != nullptr);
+ 
+     std::lock_guard<std::mutex> lock(s_queueLock);
++    if (identificationActive()) return;
+ 
+     if (!net) {
+         if (m_rfTimeout.isRunning() && m_rfTimeout.hasExpired())
+@@ -1832,6 +1877,10 @@ void Control::processInCallCtrl(network::NET_ICC::ENUM command, uint32_t dstId)
+ 
+ void Control::notifyCC_ReleaseGrant(uint32_t dstId)
+ {
++    // Latch before notifying/releasing the CC so the next permit cannot race
++    // the end-of-transmission identification obligation on this VC.
++    if (!m_authoritative && dstId != 0U)
++        requestIdentification();
+     if (m_controlChData.address().empty()) {
+         return;
+     }
+@@ -2070,6 +2119,10 @@ void Control::RPC_permittedTG(json::object& req, json::object& reply)
+         return;
+     }
+     const uint32_t dstId = req["dstId"].get<uint32_t>();
++    if (dstId != 0U && identificationUnavailable()) {
++        g_RPC->defaultResponse(reply, "voice channel is identifying", network::NetRPC::BAD_REQUEST);
++        return;
++    }
+     const bool correlated = req.find("permitToken") != req.end();
+     std::string token;
+     if (correlated) {
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+index c8a6284..12b7aad 100644
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -205,6 +205,15 @@ namespace p25
+          * @param supervisor Flag indicating whether control has supervisory functions.
+          */
+         void setSupervisor(bool supervisor) { m_supervisor = supervisor; }
++        void configureIdentification(bool enabled) { m_identificationEnabled.store(enabled); if (!enabled) completeIdentification(); }
++        void requestIdentification();
++        bool tryBeginIdentification();
++        void clearIdentificationTraffic();
++        bool identificationPending() const { return m_identificationEnabled.load() && m_identificationPending.load(); }
++        bool identificationUnavailable() const { return m_identificationEnabled.load() && m_identificationUnavailable.load(); }
++        bool identificationActive() const { return m_identificationEnabled.load() && m_identificationActive.load(); }
++        void setIdentificationActive(bool active);
++        void completeIdentification() { m_identificationPending.store(false); m_identificationUnavailable.store(false); m_identificationActive.store(false); }
+         /**
+          * @brief Permits a TGID on a non-authoritative host.
+          * @param dstId Destination ID.
+@@ -352,6 +361,10 @@ namespace p25
+         uint32_t m_netLastSrcId;
+ 
+         std::atomic<uint32_t> m_permittedDstId;
++        std::atomic<bool> m_identificationEnabled{false};
++        std::atomic<bool> m_identificationPending{false};
++        std::atomic<bool> m_identificationUnavailable{false};
++        std::atomic<bool> m_identificationActive{false};
+         std::string m_permitToken;
+         std::string m_permitSession;
+         uint64_t m_permitSequence = 0U;
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+index d570c94..41f3ce9 100644
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -2178,6 +2178,7 @@ void ControlSignaling::queueRF_TSBK_Ctrl(uint8_t lco)
+ 
+ bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net, bool skip, uint32_t chNo)
+ {
++    if (m_p25->identificationUnavailable()) return false;
+     bool emergency = ((serviceOptions & 0xFFU) & 0x80U) == 0x80U;           // Emergency Flag
+     bool encryption = ((serviceOptions & 0xFFU) & 0x40U) == 0x40U;          // Encryption Flag
+     uint8_t priority = ((serviceOptions & 0xFFU) & 0x07U);                  // Priority
+@@ -2581,6 +2582,7 @@ void ControlSignaling::writeRF_TSDU_Grant_Update()
+ 
+ bool ControlSignaling::writeRF_TSDU_SNDCP_Grant(uint32_t srcId, bool skip, uint32_t chNo)
+ {
++    if (m_p25->identificationUnavailable()) return false;
+     if (!m_p25->m_sndcpSupport)
+         return false;
+ 
+@@ -2709,7 +2711,7 @@ bool ControlSignaling::permitTrafficChannel(const ::lookups::VoiceChData& channe
+                 response["permitToken"].is<std::string>() && response["permitToken"].get<std::string>() == token);
+         }, channel.address(), channel.port(), true);
+     grantGuard.lock();
+-    if (replied && accepted->load() && allocations->ownsGrant(dstId, srcId, chNo, epoch))
++    if (replied && accepted->load() && !m_p25->identificationUnavailable() && allocations->ownsGrant(dstId, srcId, chNo, epoch))
+         return true; // keep the guard until the RF grant has been enqueued
+ 
+     // Only this epoch can be rolled back. A late cleanup must not revoke a
+diff --git a/tests/CWIDModem_Tests.cpp b/tests/CWIDModem_Tests.cpp
+new file mode 100644
+index 0000000..7a9707e
+--- /dev/null
++++ b/tests/CWIDModem_Tests.cpp
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Exercise the actual protocol writer with no opened modem port. */
++#include "host/modem/Modem.h"
++#include "host/modem/port/ModemNullPort.h"
++#include <catch2/catch_test_macros.hpp>
++#include <vector>
++#include <string>
++
++namespace {
++class CWWriteModem : public modem::Modem {
++public:
++    std::vector<std::vector<uint8_t>> commands;
++    bool shortWrite = false;
++    CWWriteModem() : Modem(new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U,
++        true, true, false, false, false, false) {}
++    int write(const uint8_t* data, uint32_t length, bool = false) override {
++        commands.emplace_back(data, data + length);
++        return int(length) - (shortWrite ? 1 : 0);
++    }
++};
++}
++
++TEST_CASE("CW uses the actual protocol4 callsign command and detects short writes", "[modem][cwid]") {
++    CWWriteModem modem;
++    REQUIRE(modem.sendCWId("N0TEST"));
++    REQUIRE(modem.commands.size() == 1U);
++    const std::vector<uint8_t> expected{0xFEU, 9U, 0x0AU, 'K', 'D', '8', 'Z', 'M', 'M'};
++    REQUIRE(modem.commands.front() == expected);
++    modem.shortWrite = true;
++    REQUIRE_FALSE(modem.sendCWId("N0TEST"));
++    REQUIRE(modem.commands.size() == 2U);
++}
++
++TEST_CASE("CW abort cancels via P25 before IDLE and attempts every command on write failure", "[modem][cwid]") {
++    for (bool shortWrite : {false, true}) {
++        CWWriteModem modem;
++        modem.shortWrite = shortWrite;
++        REQUIRE(modem.abortCWId() == !shortWrite);
++        REQUIRE(modem.commands.size() == 3U);
++        const std::vector<uint8_t> p25{0xFEU, 4U, 0x03U, uint8_t(modem::STATE_P25)};
++        const std::vector<uint8_t> clear{0xFEU, 3U, 0x33U};
++        const std::vector<uint8_t> idle{0xFEU, 4U, 0x03U, uint8_t(modem::STATE_IDLE)};
++        REQUIRE(modem.commands[0] == p25);
++        REQUIRE(modem.commands[1] == clear);
++        REQUIRE(modem.commands[2] == idle);
++    }
++}
+diff --git a/tests/CWIDPolicy_Tests.cpp b/tests/CWIDPolicy_Tests.cpp
+new file mode 100644
+index 0000000..9696d15
+--- /dev/null
++++ b/tests/CWIDPolicy_Tests.cpp
+@@ -0,0 +1,328 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Offline clock/status and quiescence fixtures. No modem, network or RF. */
++#include "host/CWIDPolicy.h"
++#include <catch2/catch_test_macros.hpp>
++#include <functional>
++#include <future>
++#include <atomic>
++#include <chrono>
++#include <string>
++#include <vector>
++
++namespace {
++using identification::Policy;
++using identification::Result;
++
++struct FakeTransport : identification::Transport {
++    mutable uint64_t clock = 0U;
++    uint64_t idleAt = 40U, txAt = 80U, endAt = 140U;
++    uint32_t prepareCost = 0U, sendCost = 0U;
++    bool prepareOK = true, sendOK = true, freshIdle = true;
++    bool starts = true, finishes = true, fault = false, advance = true;
++    uint64_t faultAt = ~uint64_t(0U);
++    mutable unsigned calls = 0U;
++    unsigned sends = 0U, prepares = 0U, pumps = 0U;
++    bool sent = false;
++    std::string text;
++    mutable std::vector<std::string> phases;
++    std::function<void(FakeTransport&)> afterPrepare, afterSend, afterPump;
++
++    uint64_t nowMs() const override { ++calls; return clock; }
++    bool prepareIdle() override {
++        ++calls; ++prepares; phases.push_back("prepare"); clock += prepareCost;
++        if (afterPrepare) afterPrepare(*this);
++        return prepareOK;
++    }
++    bool idleReady() const override {
++        ++calls;
++        if (freshIdle && clock >= idleAt) { phases.push_back("idle"); return true; }
++        return false;
++    }
++    bool send(const std::string& value) override {
++        ++calls; ++sends; phases.push_back("send"); sent = true; text = value;
++        clock += sendCost;
++        if (afterSend) afterSend(*this);
++        return sendOK;
++    }
++    bool transmitting() const override {
++        ++calls;
++        const bool tx = sent && starts && clock >= txAt && (!finishes || clock < endAt);
++        phases.push_back(tx ? "tx" : "not-tx");
++        return tx;
++    }
++    bool healthy() const override { ++calls; return !fault && clock < faultAt; }
++    void pump(uint32_t milliseconds) override {
++        ++calls; ++pumps;
++        REQUIRE(milliseconds > 0U);
++        REQUIRE(milliseconds <= 20U);
++        if (advance) clock += milliseconds;
++        if (afterPump) afterPump(*this);
++    }
++};
++}
++
++TEST_CASE("CW policy identifies startup and real RF without self-generating idle RF", "[cwid][policy]") {
++    Policy policy;
++    REQUIRE_FALSE(policy.enabled());
++    REQUIRE_FALSE(policy.due(0U));
++    policy.configure(true, 540U);
++    REQUIRE(policy.enabled());
++    REQUIRE(policy.due(0U));
++    REQUIRE(std::string(policy.reason(0U)) == "startup");
++    REQUIRE(policy.finalDue());
++    policy.complete(100U);
++    REQUIRE_FALSE(policy.finalDue());
++    REQUIRE_FALSE(policy.due(10000000U)); // An unused capacity channel stays silent.
++    policy.observeRF(false);
++    REQUIRE_FALSE(policy.due(10000000U));
++    policy.observeRF(true);
++    REQUIRE(policy.finalDue());
++    REQUIRE_FALSE(policy.due(540099U));
++    REQUIRE(policy.due(540100U));
++    REQUIRE(std::string(policy.reason(540100U)) == "periodic");
++    policy.complete(540100U);
++    REQUIRE_FALSE(policy.due(540100U));
++    REQUIRE_FALSE(policy.finalDue());
++    policy.observeRF(false); // Completion reset the old TX edge.
++    REQUIRE_FALSE(policy.due(540101U));
++    policy.observeRF(true);
++    REQUIRE_FALSE(policy.due(540101U));
++    policy.observeRF(false);
++    REQUIRE(policy.due(540101U));
++    REQUIRE(std::string(policy.reason(540101U)) == "voice-end");
++}
++
++TEST_CASE("CW policy explicit end, reset and disabled observations preserve eligibility", "[cwid][policy]") {
++    Policy policy;
++    policy.configure(true, 540U);
++    policy.complete(900U);
++    policy.noteVoiceEnd();
++    REQUIRE(policy.due(901U));
++    REQUIRE(policy.finalDue());
++    REQUIRE(std::string(policy.reason(901U)) == "voice-end");
++    policy.complete(1000U);
++    policy.observeRF(true);
++    REQUIRE_FALSE(policy.due(999U)); // Clock regression must not wrap elapsed time.
++    policy.configure(false, 1U);
++    policy.observeRF(true); policy.observeRF(false); policy.noteVoiceEnd(); policy.complete(0U);
++    REQUIRE_FALSE(policy.enabled());
++    REQUIRE_FALSE(policy.due(~uint64_t(0U)));
++    REQUIRE_FALSE(policy.finalDue());
++    REQUIRE(std::string(policy.reason(0U)).empty());
++    policy.configure(true, 540U);
++    REQUIRE(std::string(policy.reason(0U)) == "startup");
++}
++
++TEST_CASE("Disabled CW executor performs absolutely no transport operations", "[cwid][executor]") {
++    FakeTransport transport;
++    REQUIRE(identification::transmit(transport, "N0TEST", false) == Result::Disabled);
++    REQUIRE(transport.calls == 0U);
++    REQUIRE(transport.sends == 0U);
++    REQUIRE(transport.prepares == 0U);
++}
++
++TEST_CASE("CW executor requires fresh idle followed by actual TX start and completion", "[cwid][executor]") {
++    FakeTransport transport;
++    REQUIRE(identification::transmit(transport, "N0TEST", true) == Result::Completed);
++    REQUIRE(transport.sends == 1U);
++    REQUIRE(transport.text == "N0TEST");
++    REQUIRE(transport.prepares == 1U);
++    REQUIRE(transport.clock == 140U);
++    REQUIRE(transport.phases.front() == "prepare");
++    REQUIRE(transport.phases[1U] == "idle");
++    REQUIRE(transport.phases[2U] == "send");
++    bool observedTX = false, observedEnd = false;
++    for (const auto& phase : transport.phases) {
++        if (phase == "tx") observedTX = true;
++        if (phase == "not-tx" && observedTX) observedEnd = true;
++    }
++    REQUIRE(observedTX);
++    REQUIRE(observedEnd);
++}
++
++TEST_CASE("CW executor reports operation failures without retrying or inventing TX", "[cwid][executor]") {
++    FakeTransport transport;
++    SECTION("prepare failure") {
++        transport.prepareOK = false;
++        REQUIRE(identification::transmit(transport, "N0TEST", true) == Result::PrepareFailed);
++        REQUIRE(transport.sends == 0U);
++    }
++    SECTION("send failure") {
++        transport.sendOK = false;
++        REQUIRE(identification::transmit(transport, "N0TEST", true) == Result::SendFailed);
++        REQUIRE(transport.sends == 1U);
++    }
++    SECTION("cached idle is insufficient") {
++        transport.freshIdle = false;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 60U) == Result::IdleTimeout);
++        REQUIRE(transport.clock == 60U);
++        REQUIRE(transport.sends == 0U);
++    }
++    SECTION("no TX transition") {
++        transport.starts = false;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 80U) == Result::StartTimeout);
++        REQUIRE(transport.clock == 120U);
++        REQUIRE(transport.sends == 1U);
++    }
++    SECTION("stuck transmitter") {
++        transport.finishes = false;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 100U, 200U) == Result::CompletionTimeout);
++        REQUIRE(transport.clock == 200U);
++        REQUIRE(transport.sends == 1U);
++    }
++}
++
++TEST_CASE("CW executor treats health failures in every transaction phase as faults", "[cwid][executor]") {
++    FakeTransport transport;
++    SECTION("already unhealthy") { transport.fault = true; }
++    SECTION("prepare failed and unhealthy") { transport.prepareOK = false; transport.afterPrepare = [](FakeTransport& t) { t.fault = true; }; }
++    SECTION("idle wait") { transport.faultAt = 20U; }
++    SECTION("send") { transport.afterSend = [](FakeTransport& t) { t.fault = true; }; }
++    SECTION("start wait") { transport.faultAt = 60U; }
++    SECTION("completion wait") { transport.faultAt = 100U; }
++    REQUIRE(identification::transmit(transport, "N0TEST", true) == Result::Fault);
++    REQUIRE(transport.sends <= 1U);
++}
++
++TEST_CASE("CW executor deadlines include callback work and the complete transaction", "[cwid][executor]") {
++    FakeTransport transport;
++    SECTION("prepare consumes idle budget") {
++        transport.prepareCost = 101U;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U) == Result::IdleTimeout);
++        REQUIRE(transport.sends == 0U);
++    }
++    SECTION("send consumes start budget") {
++        transport.sendCost = 101U;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 100U) == Result::StartTimeout);
++        REQUIRE(transport.sends == 1U);
++    }
++    SECTION("total budget limits completion even though local phases passed") {
++        transport.prepareCost = 10U;
++        transport.idleAt = 20U;
++        transport.sendCost = 15U;
++        transport.txAt = 60U;
++        transport.endAt = 100U;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 100U, 80U) == Result::CompletionTimeout);
++        REQUIRE(transport.clock == 80U);
++    }
++    SECTION("total budget also bounds start wait") {
++        transport.starts = false;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 1000U, 90U) == Result::StartTimeout);
++        REQUIRE(transport.clock == 90U);
++    }
++    SECTION("zero total budget cannot send") {
++        transport.idleAt = 0U;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 100U, 0U) == Result::IdleTimeout);
++        REQUIRE(transport.sends == 0U);
++        REQUIRE(transport.prepares == 0U);
++    }
++}
++
++TEST_CASE("CW deadline boundaries accept only transitions observed within the budget", "[cwid][executor]") {
++    FakeTransport transport;
++    SECTION("idle exactly at its deadline") {
++        transport.idleAt = 40U;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 40U) == Result::Completed);
++    }
++    SECTION("idle after its deadline") {
++        transport.idleAt = 41U;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 40U) == Result::IdleTimeout);
++        REQUIRE(transport.sends == 0U);
++    }
++    SECTION("TX exactly at its start deadline") {
++        transport.txAt = 80U;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 40U) == Result::Completed);
++    }
++    SECTION("TX after its start deadline") {
++        transport.txAt = 81U;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 40U) == Result::StartTimeout);
++    }
++    SECTION("completion exactly at total deadline") {
++        transport.endAt = 140U;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 100U, 140U) == Result::Completed);
++    }
++    SECTION("completion after total deadline") {
++        transport.endAt = 141U;
++        REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 100U, 140U) == Result::CompletionTimeout);
++    }
++}
++
++TEST_CASE("CW executor cannot spin forever with a broken monotonic clock", "[cwid][executor]") {
++    FakeTransport transport;
++    SECTION("clock does not advance") { transport.advance = false; }
++    SECTION("clock moves backward") { transport.afterPump = [](FakeTransport& t) { t.clock = 0U; }; transport.clock = 10U; }
++    REQUIRE(identification::transmit(transport, "N0TEST", true, 100U, 100U, 200U) == Result::Fault);
++    REQUIRE(transport.sends == 0U);
++    REQUIRE(transport.pumps < 20U);
++}
++
++TEST_CASE("CW quiescence drains an in-flight RF reader before state reset", "[cwid]") {
++    identification::ActivityBarrier barrier;
++    auto frame = barrier.enter();
++    std::atomic<bool> frameFinished{false};
++    auto id = std::async(std::launch::async, [&]() {
++        auto exclusive = barrier.quiesce(500U);
++        return exclusive.owns_lock() && frameFinished.load();
++    });
++    const bool resetTooEarly = id.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready;
++    frameFinished.store(true);
++    frame.unlock();
++    const bool safelyDrained = id.get();
++    CHECK_FALSE(resetTooEarly);
++    REQUIRE(safelyDrained);
++}
++
++TEST_CASE("A stuck RF reader fails bounded CW quiescence without resetting state", "[cwid]") {
++    identification::ActivityBarrier barrier;
++    auto frame = barrier.enter();
++    auto id = std::async(std::launch::async, [&]() {
++        auto exclusive = barrier.quiesce(10U);
++        return exclusive.owns_lock();
++    });
++    const bool resetAllowed = id.get();
++    frame.unlock();
++    REQUIRE_FALSE(resetAllowed);
++}
++
++TEST_CASE("CW ownership acquisition shares the absolute operation deadline", "[cwid][locking]") {
++    uint64_t clock = 0U, available = 3U;
++    unsigned attempts = 0U, waits = 0U;
++    bool healthy = true;
++    auto attempt = [&]() { ++attempts; return clock >= available; };
++    auto now = [&]() { return clock; };
++    auto wait = [&]() { ++waits; ++clock; };
++    auto health = [&]() { return healthy; };
++    SECTION("ownership obtained at the boundary") {
++        REQUIRE(identification::acquireUntil(attempt, 3U, now, wait, health));
++        REQUIRE(clock == 3U);
++        REQUIRE(attempts == 4U);
++    }
++    SECTION("blocked owner has no grace beyond deadline") {
++        available = 4U;
++        REQUIRE_FALSE(identification::acquireUntil(attempt, 3U, now, wait, health));
++        REQUIRE(clock == 3U);
++        REQUIRE(attempts == 4U);
++    }
++    SECTION("already elapsed budget does not attempt a lock") {
++        clock = 4U;
++        REQUIRE_FALSE(identification::acquireUntil(attempt, 3U, now, wait, health));
++        REQUIRE(attempts == 0U);
++        REQUIRE(waits == 0U);
++    }
++    SECTION("callback time cannot overrun the deadline") {
++        REQUIRE_FALSE(identification::acquireUntil([&]() { clock = 4U; return true; }, 3U, now, wait, health));
++    }
++    SECTION("hard cancellation does not wait for ownership") {
++        healthy = false;
++        REQUIRE_FALSE(identification::acquireUntil(attempt, 3U, now, wait, health));
++        REQUIRE(attempts == 0U);
++    }
++    SECTION("backwards time fails closed") {
++        clock = 1U;
++        REQUIRE_FALSE(identification::acquireUntil(attempt, 3U, now, [&]() { clock = 0U; }, health));
++    }
++    SECTION("stalled time cannot create an infinite lock wait") {
++        REQUIRE_FALSE(identification::acquireUntil(attempt, 3U, now, []() {}, health));
++        REQUIRE(attempts <= 10002U);
++    }
++}
+diff --git a/tests/p25/CapacityPermit_Tests.cpp b/tests/p25/CapacityPermit_Tests.cpp
+index e433405..51d1326 100644
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -33,6 +33,8 @@ namespace p25 {
+ struct CapacityPermitTestAccess {
+     static void startOldCallHang(Control& value) { value.m_rfTGHang.start(); }
+     static void advanceHang(Control& value, uint32_t ms) { value.m_rfTGHang.clock(ms); }
++    static void notifyEnd(Control& value, uint32_t destination) { value.notifyCC_ReleaseGrant(destination); }
++    static std::unique_lock<std::recursive_mutex> permitGuard(Control& value) { return std::unique_lock<std::recursive_mutex>(value.m_permitMutex); }
+ };
+ }
+ 
+@@ -589,3 +591,73 @@ TEST_CASE("A newly issued VC permit survives the previous call hang deadline", "
+     // A successful conditional clear proves expiry did not discard the new token.
+     REQUIRE(send(0U, "abc:2") == network::NetRPC::OK);
+ }
++
++TEST_CASE("Identification closes new grants and also rechecks an outstanding permit", "[p25][cwid]") {
++    for (bool duringReply : {false, true}) {
++        DYNAMIC_SECTION("CW pending during reply " << duringReply) {
++            ControllerFixture fixture(true, false);
++            fixture.registerAndAffiliate();
++            fixture.controller->configureIdentification(true);
++            fixture.controller->setSupervisor(true);
++            fixture.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, VOICE_CHANNEL, "127.0.0.1", 48993U, "offline-test"));
++            if (duringReply) fixture.rpc.beforeReply = [&]() { fixture.controller->requestIdentification(); };
++            else fixture.controller->requestIdentification();
++            fixture.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++            REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
++            REQUIRE(fixture.rpc.permits == (duringReply ? 1U : 0U));
++            for (const auto& frame : fixture.drain()) REQUIRE(frame->getLCO() != TSBKO::IOSP_GRP_VCH);
++        }
++    }
++}
++
++TEST_CASE("VC end latches unavailability before release and master off bypasses it", "[p25][cwid]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.controller->configureIdentification(true);
++    CapacityPermitTestAccess::notifyEnd(*voice.controller, GROUP);
++    REQUIRE(voice.controller->identificationPending());
++    REQUIRE(voice.controller->identificationUnavailable());
++    json::object permit, response;
++    setJSON<uint32_t>(permit, "dstId", GROUP);
++    permit["permitToken"].set<std::string>("abc:1");
++    permit = wireObject(permit);
++    REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, permit, response));
++    REQUIRE(response["status"].get<int>() == network::NetRPC::BAD_REQUEST);
++    voice.controller->configureIdentification(false);
++    CapacityPermitTestAccess::notifyEnd(*voice.controller, GROUP);
++    REQUIRE_FALSE(voice.controller->identificationPending());
++    REQUIRE_FALSE(voice.controller->identificationUnavailable());
++    response.clear();
++    permit = wireObject(permit);
++    REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, permit, response));
++    REQUIRE(response["status"].get<int>() == network::NetRPC::OK);
++}
++
++TEST_CASE("Actual P25 RF input is discarded only during active identification", "[p25][cwid]") {
++    ControllerFixture fixture;
++    fixture.controller->configureIdentification(true);
++    fixture.controller->setIdentificationActive(true);
++    auto request = ControllerFixture::rawBlock(TSBKO::IOSP_GRP_VCH, (uint64_t(GROUP) << 24U) | SOURCE);
++    REQUIRE_FALSE(fixture.receiveRaw(request));
++    REQUIRE(fixture.drain().empty());
++    REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
++    fixture.controller->configureIdentification(false);
++    REQUIRE_FALSE(fixture.controller->identificationActive());
++    fixture.registerAndAffiliate();
++    REQUIRE(fixture.controller->affiliations()->isGroupAff(SOURCE, GROUP));
++}
++
++TEST_CASE("CW pending latch is serialized with a permit already being committed", "[p25][cwid]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.controller->configureIdentification(true);
++    auto permit = CapacityPermitTestAccess::permitGuard(*voice.controller);
++    auto begin = std::async(std::launch::async, [&]() { return voice.controller->tryBeginIdentification(); });
++    REQUIRE_FALSE(begin.get()); // Host can honor its deadline without blocking here.
++    auto pending = std::async(std::launch::async, [&]() { voice.controller->requestIdentification(); });
++    const bool latchedDuringCommit = pending.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready;
++    permit.unlock();
++    pending.get();
++    CHECK_FALSE(latchedDuringCommit);
++    REQUIRE(voice.controller->identificationUnavailable());
++    REQUIRE(voice.controller->tryBeginIdentification());
++    REQUIRE(voice.controller->identificationActive());
++}

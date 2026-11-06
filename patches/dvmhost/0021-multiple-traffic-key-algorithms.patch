@@ -1,0 +1,848 @@
+--- a/src/bridge/PacketCodec.cpp
++++ b/src/bridge/PacketCodec.cpp
+@@ -26,60 +26,89 @@
+ 
+ namespace {
+ constexpr size_t Header = 64;
+-constexpr uint8_t Clear = 0x80, AES256 = 0x84;
++constexpr uint8_t Clear = 0x80, DES = 0x81, AES256 = 0x84, ADP = 0xaa;
++size_t keyBytes(uint8_t algorithm) {
++    switch (algorithm) { case DES: return 8; case AES256: return 32; case ADP: return 5; default: return 0; }
++}
+ uint16_t u16(const uint8_t* p) { return (uint16_t(p[0]) << 8) | p[1]; }
+ uint32_t u32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
+ uint64_t u64(const uint8_t* p) { return (uint64_t(u32(p)) << 32) | u32(p + 4); }
+ void put16(uint8_t* p, uint16_t n) { p[0] = n >> 8; p[1] = n; }
+ void put32(uint8_t* p, uint32_t n) { p[0] = n >> 24; p[1] = n >> 16; p[2] = n >> 8; p[3] = n; }
+-using Key = std::array<uint8_t, 32>;
++using Key = std::vector<uint8_t>;
++using KeyIdentity = std::pair<uint8_t, uint16_t>;
+ struct Keys {
+-    std::map<uint16_t, Key> values;
++    std::map<KeyIdentity, Key> values;
+     ~Keys() { for (auto& entry : values) OPENSSL_cleanse(entry.second.data(), entry.second.size()); }
+     bool load(const char* path) {
+         if (std::strcmp(path, "-") == 0) return true;
++        std::string text;
++        text.reserve(65536); // Avoid reallocating copies of key material.
++        struct WipeText {
++            std::string& value;
++            ~WipeText() { if (!value.empty()) OPENSSL_cleanse(&value[0], value.size()); }
++        } wipeText{text};
++        char buffer[1024]{};
++        struct WipeBuffer {
++            char* value; size_t size;
++            ~WipeBuffer() { OPENSSL_cleanse(value, size); }
++        } wipeBuffer{buffer, sizeof(buffer)};
+ #if !defined(_WIN32)
+         int fd = ::open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+         if (fd < 0) return false;
+         struct stat info{};
+         if (::fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_uid != ::geteuid() || (info.st_mode & 0077) || info.st_size > 65536) { ::close(fd); return false; }
+-        std::string text;
+-        char buffer[1024];
+         ssize_t count;
+-        while ((count = ::read(fd, buffer, sizeof(buffer))) > 0) text.append(buffer, size_t(count));
++        while ((count = ::read(fd, buffer, sizeof(buffer))) > 0) {
++            if (text.size() + size_t(count) > 65536) { ::close(fd); return false; }
++            text.append(buffer, size_t(count));
++        }
+         ::close(fd);
+-        OPENSSL_cleanse(buffer, sizeof(buffer));
+         if (count < 0) return false;
+-        std::istringstream input(text);
+ #else
+-        std::ifstream input(path);
++        std::ifstream input(path, std::ios::binary);
+         if (!input) return false;
++        while (input) {
++            input.read(buffer, sizeof(buffer));
++            if (text.size() + size_t(input.gcount()) > 65536) return false;
++            text.append(buffer, size_t(input.gcount()));
++        }
++        if (!input.eof()) return false;
+ #endif
+-        std::string line;
+-        while (std::getline(input, line)) {
+-            if (line.empty()) continue;
+-            auto first = line.find(':'), second = line.find(':', first == std::string::npos ? first : first + 1);
+-            if (first == std::string::npos || second == std::string::npos || line.size() - second - 1 != 64) return false;
+-            std::string alg = line.substr(0, first), kid = line.substr(first + 1, second - first - 1);
+-            if (alg != "132" || kid.empty() || kid.find_first_not_of("0123456789") != std::string::npos) return false;
+-            unsigned long id;
+-            try { id = std::stoul(kid); } catch (...) { return false; }
+-            if (!id || id > 65535 || values.count(uint16_t(id))) return false;
+-            Key key{};
++        // Parse directly in the one wiped text buffer; istringstream would
++        // retain a second unwiped copy of every plaintext key.
++        size_t cursor = 0;
++        while (cursor < text.size()) {
++            const size_t start = cursor;
++            const size_t newline = text.find('\n', cursor);
++            const size_t end = newline == std::string::npos ? text.size() : newline;
++            cursor = end == text.size() ? end : end + 1;
++            if (start == end) continue;
++            const size_t first = text.find(':', start);
++            const size_t second = first == std::string::npos ? first : text.find(':', first + 1);
++            if (first >= end || second >= end) return false;
++            std::string alg = text.substr(start, first - start), kid = text.substr(first + 1, second - first - 1);
++            WipeText wipeAlgorithm{alg}, wipeID{kid};
++            if (alg.empty() || alg.find_first_not_of("0123456789") != std::string::npos || kid.empty() || kid.find_first_not_of("0123456789") != std::string::npos) return false;
++            unsigned long algorithm, id;
++            try { algorithm = std::stoul(alg); id = std::stoul(kid); } catch (...) { return false; }
++            if (algorithm > 255 || !keyBytes(uint8_t(algorithm)) || id > 65535) return false;
++            KeyIdentity identity{uint8_t(algorithm), uint16_t(id)};
++            if (values.count(identity) || end - second - 1 != keyBytes(identity.first) * 2) return false;
++            Key key(keyBytes(identity.first));
++            struct WipeKey {
++                Key& value;
++                ~WipeKey() { OPENSSL_cleanse(value.data(), value.size()); }
++            } wipeKey{key};
+             for (size_t i = 0; i < key.size(); i++) {
+                 auto digit = [](char c) -> int { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; };
+-                int a = digit(line[second + 1 + 2*i]), b = digit(line[second + 2 + 2*i]);
++                int a = digit(text[second + 1 + 2*i]), b = digit(text[second + 2 + 2*i]);
+                 if (a < 0 || b < 0) return false;
+                 key[i] = uint8_t(a * 16 + b);
+             }
+-            values[uint16_t(id)] = key;
+-            OPENSSL_cleanse(key.data(), key.size());
+-            if (!line.empty()) OPENSSL_cleanse(&line[0], line.size());
++            values[identity] = key;
+             if (values.size() > 256) return false;
+         }
+-#if !defined(_WIN32)
+-        if (!text.empty()) OPENSSL_cleanse(&text[0], text.size());
+-#endif
+         return true;
+     }
+ };
+@@ -92,16 +121,24 @@
+     uint16_t key = 0;
+     std::chrono::steady_clock::time_point seen = std::chrono::steady_clock::now();
+ };
+-void crypt(uint8_t* imbe, const Key& key, const uint8_t* mi, uint8_t index) {
++void crypt(uint8_t* imbe, uint8_t algorithm, const Key& key, const uint8_t* mi, uint8_t index) {
+     p25::crypto::P25Crypto crypto;
+-    crypto.setTEKAlgoId(AES256);
+-    crypto.setKey(key.data(), 32);
++    crypto.setTEKAlgoId(algorithm);
++    crypto.setKey(key.data(), uint8_t(key.size()));
+     crypto.setMI(mi);
+     crypto.generateKeystream();
+     uint8_t skipped[11]{};
+     auto duid = index < 9 ? p25::defines::DUID::LDU1 : p25::defines::DUID::LDU2;
+-    for (unsigned i = 0; i < unsigned(index % 9); i++) crypto.cryptAES_IMBE(skipped, duid);
+-    crypto.cryptAES_IMBE(imbe, duid);
++    auto transform = [&](uint8_t* word) {
++        switch (algorithm) {
++        case DES: crypto.cryptDES_IMBE(word, duid); break;
++        case AES256: crypto.cryptAES_IMBE(word, duid); break;
++        case ADP: crypto.cryptARC4_IMBE(word, duid); break;
++        }
++    };
++    for (unsigned i = 0; i < unsigned(index % 9); i++) transform(skipped);
++    transform(imbe);
++    OPENSSL_cleanse(skipped, sizeof(skipped));
+     crypto.clearKey();
+ }
+ std::vector<uint8_t> process(std::vector<uint8_t> request, const Keys& keys, std::map<std::string, Call>& calls) {
+@@ -124,8 +161,9 @@
+         response[5] = 0;
+         return response;
+     }
+-    if (!sequence || index > 17 || (algorithm != Clear && algorithm != AES256) || (algorithm == Clear && keyID)) return reject(1);
+-    if (algorithm == AES256 && (!keyID || !keys.values.count(keyID))) return reject(2);
++    if (!sequence || index > 17 || (algorithm != Clear && !keyBytes(algorithm)) || (algorithm == Clear && keyID)) return reject(1);
++    const KeyIdentity keyIdentity{algorithm, keyID};
++    if (algorithm != Clear && !keys.values.count(keyIdentity)) return reject(2);
+     if ((op == 1 && size != 320) || (op != 1 && size != 11)) return reject(1);
+     auto now = std::chrono::steady_clock::now();
+     for (auto it = calls.begin(); it != calls.end();) {
+@@ -141,9 +179,10 @@
+     if (op == 1) {
+         if (sequence <= call.encodedSequence) return reject(3);
+         if (!call.encoder) {
++            if (algorithm != Clear && RAND_bytes(call.mi.data(), 8) != 1) return reject(5);
++            call.mi[8] = 0; // The supported Phase 1 algorithms use a 64-bit MI.
+             call.encoder = std::make_unique<vocoder::MBEEncoder>(vocoder::ENCODE_88BIT_IMBE);
+             call.encoder->setGainAdjust(1.0f);
+-            if (algorithm == AES256 && RAND_bytes(call.mi.data(), int(call.mi.size())) != 1) return reject(5);
+         }
+         uint64_t superframe = (sequence - 1) / 18;
+         if (superframe - call.superframe > 10000) return reject(3);
+@@ -166,7 +205,7 @@
+         if (op == 2 && sequence <= call.decodedSequence) return reject(3);
+         std::memcpy(imbe, request.data() + Header, 11);
+     }
+-    if (algorithm == AES256) crypt(imbe, keys.values.at(keyID), op == 1 ? call.mi.data() : request.data() + 48, index);
++    if (algorithm != Clear) crypt(imbe, algorithm, keys.values.at(keyIdentity), op == 1 ? call.mi.data() : request.data() + 48, index);
+     if (op == 2) {
+         if (!call.decoder) {
+             call.decoder = std::make_unique<vocoder::MBEDecoder>(vocoder::DECODE_88BIT_IMBE);
+@@ -191,7 +230,7 @@
+ 
+ int packetCodecMain(const char* keyFile) {
+     Keys keys;
+-    if (!keys.load(keyFile)) { std::fprintf(stderr, "Packet codec requires an owner-only regular key file with valid AES-256 entries.\n"); return 2; }
++    if (!keys.load(keyFile)) { std::fprintf(stderr, "Packet codec requires an owner-only regular key file with valid algorithm/key entries.\n"); return 2; }
+     std::map<std::string, Call> calls;
+     uint8_t prefix[4];
+     while (true) {
+--- a/src/bridge/HostBridge.Opaque.cpp
++++ b/src/bridge/HostBridge.Opaque.cpp
+@@ -10,6 +10,7 @@
+ 
+ namespace {
+ const unsigned packetHeader = 64;
++bool supportedSecure(uint8_t algorithm) { return algorithm==0x81 || algorithm==0x84 || algorithm==0xaa; }
+ const unsigned voiceOffsets[9] = {10,26,55,80,105,130,155,180,204};
+ const unsigned dfsiOffsets[9] = {24,46,60,77,94,111,128,145,162};
+ const unsigned dfsiLengths[9] = {22,14,17,17,17,17,17,17,16};
+@@ -28,7 +29,7 @@
+     write16(packet+8,m_opaqueRxKey);write16(packet+10,end?1:0);
+     write32(packet+12,src);write32(packet+16,dst);write64(packet+24,++m_opaqueRxSequence);
+     std::memcpy(packet+32,m_opaqueRxToken,16);
+-    if (m_opaqueRxAlgorithm==0x84) std::memcpy(packet+48,m_opaqueRxMI,9);
++    if (supportedSecure(m_opaqueRxAlgorithm)) std::memcpy(packet+48,m_opaqueRxMI,9);
+     write16(packet+58,end?0:11);
+     if (!end) std::memcpy(packet+packetHeader,imbe,11);
+     sockaddr_storage address;uint32_t addressLength;
+@@ -79,7 +80,7 @@
+         if (duid==DUID::LDU1) dfsiLC.decodeLDU1(buffer+dfsiOffsets[i],words[i]);
+         else dfsiLC.decodeLDU2(buffer+dfsiOffsets[i],words[i]);
+     }
+-    const bool known=(m_opaqueRxAlgorithm==0x80 && m_opaqueRxKey==0) || (m_opaqueRxAlgorithm==0x84 && m_opaqueRxKey!=0);
++    const bool known=(m_opaqueRxAlgorithm==0x80 && m_opaqueRxKey==0) || supportedSecure(m_opaqueRxAlgorithm);
+     if (known) for (unsigned i=0;i<9;i++) writeOpaqueP25(src,dst,words[i],uint8_t(i+(duid==DUID::LDU2?9:0)),false);
+     // The LDU2 encryption sync applies to the NEXT superframe, never the nine
+     // encrypted codewords just exported above.
+@@ -101,7 +102,7 @@
+         if (length==packetHeader && m_trafficFromUDP && std::memcmp(packet+32,m_opaqueTxToken,16)==0) callEnd(src,dst);
+         return;
+     }
+-    if (length!=packetHeader+11 || !sequence || index>17 || !((algorithm==0x80 && key==0)||(algorithm==0x84 && key!=0))) return;
++    if (length!=packetHeader+11 || !sequence || index>17 || !((algorithm==0x80 && key==0)||supportedSecure(algorithm))) return;
+     bool fresh=!m_trafficFromUDP || std::memcmp(packet+32,m_opaqueTxToken,16)!=0 || m_udpSrcId!=src;
+     if (fresh) {
+         if (index!=0) return;
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -331,7 +331,7 @@
+         void endDispatch(const std::string& leaseId, const std::string& state);
+         bool preemptDispatchResource(uint32_t destination);
+         void recordGrantPriority(uint32_t destination, uint32_t source, bool emergency);
+-        bool rfSecurityPermitted(uint32_t destination, bool secure, uint32_t key = 0U, bool media = false) const;
++        bool rfSecurityPermitted(uint32_t destination, bool secure, uint32_t key = 0U, bool media = false, uint32_t algorithm = 0U) const;
+         bool dispatchReady(bool admitNew = true) const;
+         void rememberDispatch(const DispatchResult& result);
+         void retryPermitReleases();
+@@ -354,7 +354,7 @@
+         };
+         std::unordered_map<uint32_t, GrantPriority> m_grantPriorities;
+         std::unordered_map<uint32_t, uint32_t> m_dispatchTalkgroupPriorities;
+-        struct RFSecurity { std::string mode; uint32_t key = 0U; };
++        struct RFSecurity { std::string mode; uint32_t key = 0U; uint32_t algorithm = 0U; };
+         std::unordered_map<uint32_t, RFSecurity> m_rfTalkgroupSecurity;
+ 
+         bool m_authoritative;
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -360,7 +360,7 @@
+         for (size_t i = 0U; i < security.size(); ++i) {
+             const uint32_t group = security[i]["talkgroup"].as<uint32_t>(0U);
+             if (group > 0U && group < 0xFFFFU)
+-                m_rfTalkgroupSecurity[group] = RFSecurity{security[i]["mode"].as<std::string>("clear"), security[i]["keyId"].as<uint32_t>(0U)};
++                m_rfTalkgroupSecurity[group] = RFSecurity{security[i]["mode"].as<std::string>("clear"), security[i]["keyId"].as<uint32_t>(0U), security[i]["algorithmId"].as<uint32_t>(0U)};
+         }
+     }
+     auto priorities = p25Protocol["dispatchTalkgroupPriorities"];
+@@ -768,8 +768,7 @@
+     if (identificationActive()) return false;
+     assert(data != nullptr);
+ 
+-    bool sync = data[1U] == 0x01U;
+-
++    if (len == 0U) return false;
+     if (data[0U] == modem::TAG_LOST) {
+         if (m_frameLossCnt > m_frameLossThreshold) {
+             m_frameLossCnt = 0U;
+@@ -795,7 +794,13 @@
+                 return false;
+             }
+         }
+-    }
++        // A loss notification contains no CAI frame to decode.
++        return false;
++    }
++
++    // Sync plus the complete interleaved NID must precede any decoder read.
++    if (len < 17U) return false;
++    bool sync = data[1U] == 0x01U;
+ 
+     if (m_rfState == RS_RF_AUDIO || m_rfState == RS_RF_DATA) {
+         if (m_rfLossWatchdog.isRunning()) {
+--- a/src/host/p25/Control.Dispatch.cpp
++++ b/src/host/p25/Control.Dispatch.cpp
+@@ -139,14 +139,17 @@
+     m_grantPriorities[destination] = GrantPriority{source, channel, emergency ? 1U : priority, epoch, emergency};
+ }
+ 
+-bool Control::rfSecurityPermitted(uint32_t destination, bool secure, uint32_t key, bool media) const
+-{
++bool Control::rfSecurityPermitted(uint32_t destination, bool secure, uint32_t key, bool media, uint32_t algorithm) const
++{
++    if (media && (secure != (algorithm != 0x80U) || (!secure && key != 0U) ||
++        (algorithm != 0x80U && algorithm != 0x81U && algorithm != 0x84U && algorithm != 0xaaU))) return false;
+     const auto policy = m_rfTalkgroupSecurity.find(destination);
+     if (policy == m_rfTalkgroupSecurity.end()) return true;
+     const auto& value = policy->second;
+     if (value.mode != "clear" && value.mode != "secure" && value.mode != "selectable") return false;
+     if ((value.mode == "clear" && secure) || (value.mode == "secure" && !secure)) return false;
+-    return !secure || !media || (value.key != 0U && key == value.key);
++    return !secure || !media || (key == value.key && algorithm == value.algorithm &&
++        (algorithm == 0x81U || algorithm == 0x84U || algorithm == 0xaaU));
+ }
+ 
+ // Retire the actual VC permit before reusing a channel. This covers both
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -94,6 +94,9 @@
+ bool Voice::process(uint8_t* data, uint32_t len)
+ {
+     assert(data != nullptr);
++    // The modem supplies the exact received frame length, including its two
++    // leading tag/flag bytes. NID decoding touches the first 15 RF bytes.
++    if (len < 17U) return false;
+ 
+     // Decode the NID
+     bool valid = m_p25->m_nid.decode(data + 2U);
+@@ -102,24 +105,16 @@
+     }
+ 
+     DUID::E duid = m_p25->m_nid.getDUID();
++    if ((duid == DUID::HDU && len < P25_HDU_FRAME_LENGTH_BYTES + 2U) ||
++        ((duid == DUID::LDU1 || duid == DUID::LDU2) && len < P25_LDU_FRAME_LENGTH_BYTES + 2U)) return false;
+ 
+     if (m_p25->m_rfState != RS_RF_LISTENING) {
+         m_p25->m_rfTGHang.start();
+     }
+ 
+-    if (duid == DUID::HDU && m_lastDUID == DUID::HDU) {
+-        duid = DUID::LDU1;
+-    }
+-
+     // handle individual DUIDs
+     if (duid == DUID::HDU) {
+-        m_lastDUID = DUID::HDU;
+-
+         if (m_p25->m_rfState == RS_RF_LISTENING || m_p25->m_rfState == RS_RF_AUDIO) {
+-            resetRF();
+-
+-            m_inbound = true;
+-
+             lc::LC lc = lc::LC();
+             bool ret = lc.decodeHDU(data + 2U);
+             if (!ret) {
+@@ -128,6 +123,16 @@
+                 return false;
+             }
+ 
++            // The grant request supplies only a secure flag. The HDU is the
++            // first opportunity to enforce the actual algorithm/key pair,
++            // before this stream can preempt or repeat any voice.
++            if (!m_p25->rfSecurityPermitted(lc.getDstId(), lc.getAlgId() != ALGO_UNENCRYPT,
++                lc.getKId(), true, lc.getAlgId())) return false;
++
++            resetRF();
++            m_inbound = true;
++            m_lastDUID = DUID::HDU;
++
+             if (m_verbose) {
+                 LogInfoEx(LOG_RF, P25_HDU_STR ", HDU_BSDWNACT, dstId = %u, algo = $%02X, kid = $%04X", lc.getDstId(), lc.getAlgId(), lc.getKId());
+ 
+@@ -742,6 +747,8 @@
+             // add status bits
+             P25Utils::addStatusBits(data + 2U, P25_LDU_FRAME_LENGTH_BITS, m_inbound, false);
+ 
++            if (m_rfLC.getGroup() && !m_p25->rfSecurityPermitted(m_rfLC.getDstId(), m_rfLC.getEncrypted(),
++                m_rfLC.getKId(), true, m_rfLC.getAlgId())) return false;
+             writeNetwork(data + 2U, DUID::LDU1, frameType);
+ 
+             if (m_p25->m_duplex && (!m_p25->m_isModemDFSI || (m_p25->m_isModemDFSI && m_p25->m_dfsiFDX))) {
+@@ -764,13 +771,14 @@
+         if (m_lastDUID == DUID::LDU2) {
+             return false;
+         }
+-        m_lastDUID = DUID::LDU2;
+-
+         if (m_p25->m_rfState == RS_RF_LISTENING) {
+             return false;
+         }
+         else if (m_p25->m_rfState == RS_RF_AUDIO) {
+-            bool ret = m_rfLC.decodeLDU2(data + 2U);
++            lc::LC candidate = m_rfLC;
++            bool ret = candidate.decodeLDU2(data + 2U);
++            if (ret && candidate.getGroup() && !m_p25->rfSecurityPermitted(candidate.getDstId(),
++                candidate.getAlgId() != ALGO_UNENCRYPT, candidate.getKId(), true, candidate.getAlgId())) return false;
+             if (!ret) {
+                 LogWarning(LOG_RF, P25_LDU2_STR ", undecodable LC, using last LDU2 LC");
+                 m_rfLC = m_rfLastLDU2;
+@@ -803,10 +811,12 @@
+                 m_rfLastLDU2.setMI(nextMI);
+             }
+             else {
++                m_rfLC = candidate;
+                 m_rfLastLDU2 = m_rfLC;
+                 m_rfFirstLDU2 = false;
+             }
+ 
++            m_lastDUID = DUID::LDU2;
+             m_inbound = true;
+ 
+             // generate Sync
+@@ -859,6 +869,8 @@
+             // add status bits
+             P25Utils::addStatusBits(data + 2U, P25_LDU_FRAME_LENGTH_BITS, m_inbound, false);
+ 
++            if (m_rfLC.getGroup() && !m_p25->rfSecurityPermitted(m_rfLC.getDstId(), m_rfLC.getAlgId() != ALGO_UNENCRYPT,
++                m_rfLC.getKId(), true, m_rfLC.getAlgId())) return false;
+             writeNetwork(data + 2U, DUID::LDU2);
+ 
+             if (m_p25->m_duplex && (!m_p25->m_isModemDFSI || (m_p25->m_isModemDFSI && m_p25->m_dfsiFDX))) {
+@@ -1260,42 +1272,54 @@
+                 (data[70U] == DFSIFrameType::LDU2_VOICE14) && (data[87U] == DFSIFrameType::LDU2_VOICE15) &&
+                 (data[104U] == DFSIFrameType::LDU2_VOICE16) && (data[121U] == DFSIFrameType::LDU2_VOICE17) &&
+                 (data[138U] == DFSIFrameType::LDU2_VOICE18)) {
+-                m_dfsiLC.setFrameType(DFSIFrameType::LDU2_VOICE10);
+-                m_dfsiLC.decodeLDU2(data + count, m_netLDU2 + 10U);
++                // Decode into a candidate before touching accepted ESS/audio or
++                // generating any missing-LDU filler. Rejected key identities
++                // must not cause a partial RF transmission.
++                dfsi::LC candidate = m_dfsiLC;
++                uint8_t candidateVoice[225U]{};
++                candidate.setFrameType(DFSIFrameType::LDU2_VOICE10);
++                candidate.decodeLDU2(data + count, candidateVoice + 10U);
+                 count += DFSI_LDU2_VOICE10_FRAME_LENGTH_BYTES;
+ 
+-                m_dfsiLC.setFrameType(DFSIFrameType::LDU2_VOICE11);
+-                m_dfsiLC.decodeLDU2(data + count, m_netLDU2 + 26U);
++                candidate.setFrameType(DFSIFrameType::LDU2_VOICE11);
++                candidate.decodeLDU2(data + count, candidateVoice + 26U);
+                 count += DFSI_LDU2_VOICE11_FRAME_LENGTH_BYTES;
+ 
+-                m_dfsiLC.setFrameType(DFSIFrameType::LDU2_VOICE12);
+-                m_dfsiLC.decodeLDU2(data + count, m_netLDU2 + 55U);
++                candidate.setFrameType(DFSIFrameType::LDU2_VOICE12);
++                candidate.decodeLDU2(data + count, candidateVoice + 55U);
+                 count += DFSI_LDU2_VOICE12_FRAME_LENGTH_BYTES;
+ 
+-                m_dfsiLC.setFrameType(DFSIFrameType::LDU2_VOICE13);
+-                m_dfsiLC.decodeLDU2(data + count, m_netLDU2 + 80U);
++                candidate.setFrameType(DFSIFrameType::LDU2_VOICE13);
++                candidate.decodeLDU2(data + count, candidateVoice + 80U);
+                 count += DFSI_LDU2_VOICE13_FRAME_LENGTH_BYTES;
+ 
+-                m_dfsiLC.setFrameType(DFSIFrameType::LDU2_VOICE14);
+-                m_dfsiLC.decodeLDU2(data + count, m_netLDU2 + 105U);
++                candidate.setFrameType(DFSIFrameType::LDU2_VOICE14);
++                candidate.decodeLDU2(data + count, candidateVoice + 105U);
+                 count += DFSI_LDU2_VOICE14_FRAME_LENGTH_BYTES;
+ 
+-                m_dfsiLC.setFrameType(DFSIFrameType::LDU2_VOICE15);
+-                m_dfsiLC.decodeLDU2(data + count, m_netLDU2 + 130U);
++                candidate.setFrameType(DFSIFrameType::LDU2_VOICE15);
++                candidate.decodeLDU2(data + count, candidateVoice + 130U);
+                 count += DFSI_LDU2_VOICE15_FRAME_LENGTH_BYTES;
+ 
+-                m_dfsiLC.setFrameType(DFSIFrameType::LDU2_VOICE16);
+-                m_dfsiLC.decodeLDU2(data + count, m_netLDU2 + 155U);
++                candidate.setFrameType(DFSIFrameType::LDU2_VOICE16);
++                candidate.decodeLDU2(data + count, candidateVoice + 155U);
+                 count += DFSI_LDU2_VOICE16_FRAME_LENGTH_BYTES;
+ 
+-                m_dfsiLC.setFrameType(DFSIFrameType::LDU2_VOICE17);
+-                m_dfsiLC.decodeLDU2(data + count, m_netLDU2 + 180U);
++                candidate.setFrameType(DFSIFrameType::LDU2_VOICE17);
++                candidate.decodeLDU2(data + count, candidateVoice + 180U);
+                 count += DFSI_LDU2_VOICE17_FRAME_LENGTH_BYTES;
+ 
+-                m_dfsiLC.setFrameType(DFSIFrameType::LDU2_VOICE18);
+-                m_dfsiLC.decodeLDU2(data + count, m_netLDU2 + 204U);
++                candidate.setFrameType(DFSIFrameType::LDU2_VOICE18);
++                candidate.decodeLDU2(data + count, candidateVoice + 204U);
+                 count += DFSI_LDU2_VOICE18_FRAME_LENGTH_BYTES;
+ 
++                const auto* candidateControl = candidate.control();
++                if (candidateControl->getGroup() && !m_p25->rfSecurityPermitted(candidateControl->getDstId(),
++                    candidateControl->getAlgId() != ALGO_UNENCRYPT, candidateControl->getKId(), true,
++                    candidateControl->getAlgId())) return false;
++                m_dfsiLC = candidate;
++                ::memcpy(m_netLDU2, candidateVoice, sizeof(candidateVoice));
++
+                 m_gotNetLDU2 = true;
+ 
+                 if (m_p25->m_enableControl) {
+@@ -1799,6 +1823,13 @@
+             m_dfsiLC.control()->getEmergency(), m_dfsiLC.control()->getEncrypted(), m_dfsiLC.control()->getPriority());
+     }
+ 
++    // Ordinary LDU1s do not repeat ALGID/KID. Preserve the accepted public
++    // encryption sync until the next HDU/LDU2 supplies it; never infer AES.
++    const uint8_t activeAlgorithm = m_netLC.getAlgId();
++    const uint32_t activeKey = m_netLC.getKId();
++    uint8_t activeMI[MI_LENGTH_BYTES]{};
++    m_netLC.getMI(activeMI);
++
+     // set network and RF link control states
+     m_netLC = lc::LC();
+     m_netLC.setLCO(control.getLCO());
+@@ -1820,6 +1851,11 @@
+     m_rfLC.setEmergency(control.getEmergency());
+     m_rfLC.setEncrypted(control.getEncrypted());
+     m_rfLC.setPriority(control.getPriority());
++
++    if (m_p25->m_netState != RS_NET_IDLE) {
++        m_netLC.setAlgId(activeAlgorithm); m_netLC.setKId(activeKey); m_netLC.setMI(activeMI);
++        m_rfLC.setAlgId(activeAlgorithm); m_rfLC.setKId(activeKey); m_rfLC.setMI(activeMI);
++    }
+ 
+     // if we are idle lets generate HDU data
+     if (m_p25->m_netState == RS_NET_IDLE) {
+@@ -1830,7 +1866,7 @@
+             control.getMI(m_lastMI);
+         }*/
+ 
+-        if (m_netLastLDU1.getAlgId() != ALGO_UNENCRYPT && m_netLastLDU1.getKId() != 0) {
++        if (m_netLastLDU1.getAlgId() != ALGO_UNENCRYPT) {
+             control.setAlgId(m_netLastLDU1.getAlgId());
+             control.setKId(m_netLastLDU1.getKId());
+         }
+@@ -1844,6 +1880,9 @@
+         m_rfLC.setAlgId(control.getAlgId());
+         m_netLC.setKId(control.getKId());
+         m_rfLC.setKId(control.getKId());
++
++        if (group && !m_p25->rfSecurityPermitted(dstId, control.getEncrypted(),
++            control.getKId(), true, control.getAlgId())) return;
+ 
+         // validate source RID
+         if (!acl::AccessControl::validateSrcId(srcId)) {
+@@ -2018,6 +2057,9 @@
+             m_p25->m_netTGHang.start();
+         }
+     }
++
++    if (group && !m_p25->rfSecurityPermitted(dstId, m_netLC.getEncrypted(),
++        m_netLC.getKId(), true, m_netLC.getAlgId())) return;
+ 
+     uint32_t netId = control.getNetId();
+     if (netId == 0U)
+@@ -2164,6 +2206,9 @@
+     uint8_t mi[MI_LENGTH_BYTES];
+     control.getMI(mi);
+ 
++    if (control.getGroup() && !m_p25->rfSecurityPermitted(dstId, control.getAlgId() != ALGO_UNENCRYPT,
++        control.getKId(), true, control.getAlgId())) return;
++
+     m_netLC.setMI(mi);
+     m_netLC.setAlgId(control.getAlgId());
+     m_netLC.setKId(control.getKId());
+--- a/src/common/p25/Crypto.cpp
++++ b/src/common/p25/Crypto.cpp
+@@ -192,9 +192,10 @@
+         break;
+     case ALGO_ARC4:
+         {
+-            if (m_keystream == nullptr)
+-                m_keystream = new uint8_t[469U];
+-            ::memset(m_keystream, 0x00U, 469U);
++            // RC4::keystream allocates its returned buffer. Release the old
++            // stream instead of leaking a separate 469-byte allocation.
++            delete[] m_keystream;
++            m_keystream = nullptr;
+ 
+             uint8_t padding = (uint8_t)::fmax(5U - m_tekLength, 0U);
+             uint8_t adpKey[13U];
+--- a/tests/p25/DispatchGrant_Tests.cpp
++++ b/tests/p25/DispatchGrant_Tests.cpp
+@@ -19,7 +19,8 @@
+         return c.m_control->writeRF_TSDU_Grant(source, group, 4U | (emergency ? 0x80U : 0U), true, false, false, 0U);
+     }
+     static void priority(Control& c, uint32_t group, uint32_t priority) { c.m_dispatchTalkgroupPriorities[group] = priority; }
+-    static void security(Control& c, uint32_t group, const std::string& mode, uint32_t key = 0U) { c.m_rfTalkgroupSecurity[group] = Control::RFSecurity{mode,key}; }
++    static void security(Control& c, uint32_t group, const std::string& mode, uint32_t key = 0U, uint32_t algorithm = 0x84U) { c.m_rfTalkgroupSecurity[group] = Control::RFSecurity{mode,key,algorithm}; }
++    static bool mediaPermitted(Control& c, uint32_t group, bool secure, uint32_t key, uint32_t algorithm) { return c.rfSecurityPermitted(group, secure, key, true, algorithm); }
+     static void allStart(Control& c, uint32_t group) { c.m_managedSite = true; c.setZoneConnected(true); c.m_rfAllStartTalkgroups.insert(group); }
+     static bool queue(Control& c, uint32_t source, uint32_t group) { return c.queueRFAdmission(source, group, 4U); }
+     static void expireAdmission(Control& c, const std::string& id) { std::lock_guard<std::mutex> lock(c.m_rfAdmissionMutex); c.m_rfAdmissions.at(id).deadline = std::chrono::steady_clock::now() - std::chrono::milliseconds(1); }
+@@ -436,3 +437,27 @@
+     REQUIRE_FALSE(p25::DispatchGrantTestAccess::rfGrant(*f.control, 10001U, TG, false));
+     REQUIRE_FALSE(f.control->affiliations()->isGranted(TG)); REQUIRE(f.rpc.permits == 0U);
+ }
++
++TEST_CASE("native media security uses the algorithm and key ID together", "[dispatch-grant][rf-admission][crypto]") {
++    for (uint32_t allowed : {0x81U, 0x84U, 0xaaU}) {
++        Fixture f;
++        p25::DispatchGrantTestAccess::security(*f.control, TG, "secure", 7U, allowed);
++        REQUIRE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 7U, allowed));
++        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, false, 0U, 0x80U));
++        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 8U, allowed));
++        for (uint32_t other : {0x81U, 0x82U, 0x84U, 0x85U, 0x9fU, 0xaaU}) {
++            if (other == allowed) continue;
++            REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 7U, other));
++        }
++        p25::DispatchGrantTestAccess::security(*f.control, TG, "selectable", 7U, allowed);
++        REQUIRE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, false, 0U, 0x80U));
++        REQUIRE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 7U, allowed));
++        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, false, 7U, allowed));
++        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 0U, 0x80U));
++        p25::DispatchGrantTestAccess::security(*f.control, TG, "secure", 0U, allowed);
++        REQUIRE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 0U, allowed));
++        p25::DispatchGrantTestAccess::security(*f.control, TG, "clear");
++        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 7U, allowed));
++        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, false, 7U, allowed));
++    }
++}
+--- /dev/null
++++ b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+@@ -0,0 +1,239 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Actual RF/DFSI voice-path regression tests. All modem/network ports remain
++ * unopened. Cipher correctness is qualified separately by packet-codec vectors;
++ * these valid FEC frames exercise admission, accepted ESS state and repetition. */
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/p25/Audio.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
++#include "common/Log.h"
++#include <catch2/catch_test_macros.hpp>
++#include <algorithm>
++#include <array>
++#include <deque>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace {
++using namespace p25;
++using namespace p25::defines;
++constexpr uint32_t Source = 10001U, Group = 1001U, NAC = 0x293U;
++using MI = std::array<uint8_t, MI_LENGTH_BYTES>;
++
++class VoiceNetwork : public network::Network {
++public:
++    std::deque<std::vector<uint8_t>> incoming;
++    std::vector<std::vector<uint8_t>> outgoing;
++    VoiceNetwork() : Network("127.0.0.1", 49991U, 0U, 100101001U, "unopened-voice-test", true, false,
++        false, true, false, false, false, false, false, false, false, false) { m_status = network::NET_STAT_RUNNING; }
++    UInt8Array readP25(bool& available, uint32_t& length) override {
++        available = !incoming.empty(); length = 0U;
++        if (!available) return nullptr;
++        auto bytes = std::move(incoming.front()); incoming.pop_front(); length = bytes.size();
++        UInt8Array result(new uint8_t[length]); std::copy(bytes.begin(), bytes.end(), result.get()); return result;
++    }
++    void resetP25() override { incoming.clear(); }
++    using network::BaseNetwork::createP25_LDU1Message;
++    using network::BaseNetwork::createP25_LDU2Message;
++    bool writeP25LDU1(const lc::LC& control, const p25::data::LowSpeedData& lsd, const uint8_t* data,
++        FrameType::E type, uint8_t flags) override {
++        uint32_t length; auto message = createP25_LDU1Message(length, control, lsd, data, type, flags);
++        outgoing.emplace_back(message.get(), message.get() + length); return true;
++    }
++    bool writeP25LDU2(const lc::LC& control, const p25::data::LowSpeedData& lsd, const uint8_t* data,
++        uint8_t flags) override {
++        uint32_t length; auto message = createP25_LDU2Message(length, control, lsd, data, flags);
++        outgoing.emplace_back(message.get(), message.get() + length); return true;
++    }
++};
++
++struct Observed {
++    DUID::E duid;
++    uint32_t source, group, key;
++    uint8_t algorithm;
++    bool secure;
++    MI mi;
++};
++
++struct VoiceFixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, false};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, false};
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U,
++        true, true, false, false, false, false};
++    VoiceNetwork network;
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-voice-test", false};
++    network::NetRPC* previousRPC = g_RPC;
++    std::unique_ptr<Control> controller;
++    uint8_t algorithm;
++    uint16_t key;
++    VoiceFixture(uint8_t selectedAlgorithm, uint16_t selectedKey) : algorithm(selectedAlgorithm), key(selectedKey) {
++        g_logDisplayLevel = 0U;
++        g_RPC = &rpc;
++        controller = std::make_unique<Control>(true, NAC, 1U, 16384U, &modem, &network, 120U, 1U, true,
++            &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
++        yaml::Node configuration;
++        REQUIRE(yaml::Parse(configuration, std::string(R"(
++protocols:
++    p25:
++        verifyReg: false
++        verifyAff: false
++        inhibitUnauthorized: false
++        tduPreambleCount: 0
++        rfTalkgroupSecurity:
++            - talkgroup: 1001
++              mode: secure
++              algorithmId: )") + std::to_string(algorithm) + R"(
++              keyId: )" + std::to_string(key) + R"(
++        control:
++            enable: false
++            dedicated: false
++system:
++    config:
++        controlCh:
++            notifyEnable: false
++)"));
++        controller->setOptions(configuration, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 25U, false);
++        controller->setCCRunning(false);
++        controller->configureIdentification(false);
++    }
++    ~VoiceFixture() { controller.reset(); g_RPC = previousRPC; }
++    lc::LC control(uint8_t selectedAlgorithm, uint16_t selectedKey, const MI& mi) const {
++        lc::LC value; value.setLCO(LCO::GROUP); value.setGroup(true);
++        value.setSrcId(Source); value.setDstId(Group);
++        value.setNetId(1U); value.setSysId(1U);
++        value.setEncrypted(selectedAlgorithm != ALGO_UNENCRYPT);
++        value.setAlgId(selectedAlgorithm); value.setKId(selectedKey); value.setMI(mi.data());
++        return value;
++    }
++    std::vector<uint8_t> frame(DUID::E duid, uint8_t selectedAlgorithm, uint16_t selectedKey, const MI& mi) const {
++        const uint32_t length = duid == DUID::HDU ? P25_HDU_FRAME_LENGTH_BYTES : P25_LDU_FRAME_LENGTH_BYTES;
++        std::vector<uint8_t> result(length + 2U, 0U);
++        result[0U] = modem::TAG_DATA; result[1U] = 1U;
++        auto value = control(selectedAlgorithm, selectedKey, mi);
++        if (duid != DUID::HDU) {
++            Audio audio; for (unsigned i = 0U; i < 9U; ++i) audio.encode(result.data() + 2U, NULL_IMBE, i);
++        }
++        if (duid == DUID::HDU) value.encodeHDU(result.data() + 2U);
++        if (duid == DUID::LDU1) value.encodeLDU1(result.data() + 2U);
++        if (duid == DUID::LDU2) value.encodeLDU2(result.data() + 2U);
++        Sync::addP25Sync(result.data() + 2U); NID nid(NAC); nid.encode(result.data() + 2U, duid);
++        P25Utils::addStatusBits(result.data() + 2U, length * 8U, true, false);
++        return result;
++    }
++    bool rf(DUID::E duid, const MI& mi, uint8_t selectedAlgorithm = 0U, uint16_t selectedKey = UINT16_MAX) {
++        auto bytes = frame(duid, selectedAlgorithm ? selectedAlgorithm : algorithm,
++            selectedKey == UINT16_MAX ? key : selectedKey, mi);
++        return controller->processFrame(bytes.data(), bytes.size());
++    }
++    void net(DUID::E duid, const MI& mi, bool initial = false, uint8_t selectedAlgorithm = 0U, uint16_t selectedKey = UINT16_MAX) {
++        auto value = control(selectedAlgorithm ? selectedAlgorithm : algorithm,
++            selectedKey == UINT16_MAX ? key : selectedKey, mi);
++        auto bytes = frame(duid, value.getAlgId(), value.getKId(), mi);
++        p25::data::LowSpeedData lsd; uint32_t length = 0U; UInt8Array message;
++        if (duid == DUID::LDU1) message = network.createP25_LDU1Message(length, value, lsd,
++            bytes.data() + 2U, initial ? FrameType::HDU_VALID : FrameType::DATA_UNIT, 0U);
++        else message = network.createP25_LDU2Message(length, value, lsd, bytes.data() + 2U, 0U);
++        network.incoming.emplace_back(message.get(), message.get() + length);
++        controller->clock();
++        REQUIRE(network.incoming.empty());
++    }
++    std::vector<Observed> drain() {
++        std::vector<Observed> result; std::array<uint8_t, 1024U> bytes{};
++        while (controller->getFrame(bytes.data()) != 0U) {
++            NID nid(NAC); if (!nid.decode(bytes.data() + 2U)) continue;
++            lc::LC value; const auto duid = nid.getDUID();
++            if (duid == DUID::HDU) REQUIRE(value.decodeHDU(bytes.data() + 2U));
++            else if (duid == DUID::LDU1) REQUIRE(value.decodeLDU1(bytes.data() + 2U));
++            else if (duid == DUID::LDU2) REQUIRE(value.decodeLDU2(bytes.data() + 2U));
++            else continue;
++            Observed observation{duid, value.getSrcId(), value.getDstId(), value.getKId(), value.getAlgId(), value.getEncrypted(), {}};
++            value.getMI(observation.mi.data()); result.push_back(observation);
++        }
++        return result;
++    }
++    void requireLDU(DUID::E duid, const MI& mi) {
++        const auto emitted = drain();
++        const auto found = std::find_if(emitted.begin(), emitted.end(), [&](const Observed& value) { return value.duid == duid; });
++        REQUIRE(found != emitted.end());
++        REQUIRE(found->secure);
++        if (duid == DUID::LDU1) { REQUIRE(found->source == Source); REQUIRE(found->group == Group); }
++        if (duid == DUID::LDU2) { REQUIRE(found->algorithm == algorithm); REQUIRE(found->key == key); REQUIRE(found->mi == mi); }
++    }
++    void requireForwardedIdentity() {
++        REQUIRE_FALSE(network.outgoing.empty());
++        for (const auto& bytes : network.outgoing) {
++            const uint32_t source = GET_UINT24(bytes.data(), 5U);
++            const uint32_t group = GET_UINT24(bytes.data(), 8U);
++            REQUIRE(source == Source);
++            REQUIRE(group == Group);
++        }
++    }
++};
++}
++
++TEST_CASE("rejected RF encryption headers preserve the active voice session", "[p25][crypto][voice-path]") {
++    for (uint8_t algorithm : {0x81U, 0x84U, 0xaaU}) for (uint16_t key : {0U, 7U}) {
++        CAPTURE(algorithm, key);
++        VoiceFixture fixture(algorithm, key);
++        MI first{1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 0U};
++        REQUIRE(fixture.rf(DUID::HDU, first)); fixture.drain();
++        REQUIRE(fixture.rf(DUID::LDU1, first)); fixture.requireLDU(DUID::LDU1, first);
++        REQUIRE(fixture.controller->getRFState() == RS_RF_AUDIO);
++        const auto forwarded = fixture.network.outgoing.size();
++        // Reject actual short buffers before NID/FEC decoding, without
++        // replacing the accepted RF session or its encryption metadata.
++        for (DUID::E duid : {DUID::HDU, DUID::LDU1, DUID::LDU2}) {
++            auto truncated = fixture.frame(duid, algorithm, key, first);
++            truncated.resize(truncated.size() - 1U);
++            REQUIRE_FALSE(fixture.controller->processFrame(truncated.data(), truncated.size()));
++        }
++        auto noNID = fixture.frame(DUID::LDU1, algorithm, key, first);
++        for (size_t length : {0U, 1U, 2U, 8U, 16U})
++            REQUIRE_FALSE(fixture.controller->processFrame(noNID.data(), length));
++        REQUIRE_FALSE(fixture.rf(DUID::HDU, first, algorithm, uint16_t(key + 1U)));
++        REQUIRE_FALSE(fixture.rf(DUID::HDU, first, algorithm == 0x81U ? 0x84U : 0x81U, key));
++        REQUIRE(fixture.drain().empty()); REQUIRE(fixture.network.outgoing.size() == forwarded);
++        REQUIRE(fixture.controller->getRFState() == RS_RF_AUDIO);
++        for (unsigned pair = 0U; pair < 3U; ++pair) {
++            MI next = first; next[7U] = uint8_t(9U + pair);
++            REQUIRE_FALSE(fixture.rf(DUID::LDU2, next, algorithm, uint16_t(key + 1U)));
++            REQUIRE_FALSE(fixture.rf(DUID::LDU2, next, algorithm == 0x81U ? 0x84U : 0x81U, key));
++            REQUIRE(fixture.drain().empty());
++            REQUIRE(fixture.rf(DUID::LDU2, next)); fixture.requireLDU(DUID::LDU2, next);
++            REQUIRE(fixture.rf(DUID::LDU1, next)); fixture.requireLDU(DUID::LDU1, next);
++        }
++        fixture.requireForwardedIdentity();
++    }
++}
++
++TEST_CASE("network secure voice retains accepted ESS across ordinary LDU1s and rejected ESS", "[p25][crypto][voice-path]") {
++    for (uint8_t algorithm : {0x81U, 0x84U, 0xaaU}) for (uint16_t key : {0U, 7U}) {
++        CAPTURE(algorithm, key);
++        VoiceFixture fixture(algorithm, key);
++        MI first{8U, 7U, 6U, 5U, 4U, 3U, 2U, 1U, 0U};
++        fixture.net(DUID::LDU1, first, true);
++        // The RF engine buffers the first LDU1 until the first LDU2 completes
++        // setup. Start with an accepted pair before testing rejected ESS.
++        fixture.net(DUID::LDU2, first); fixture.requireLDU(DUID::LDU1, first);
++        for (unsigned pair = 0U; pair < 3U; ++pair) {
++            MI next = first; next[7U] = uint8_t(11U + pair);
++            fixture.net(DUID::LDU2, next, false, algorithm, uint16_t(key + 1U));
++            fixture.net(DUID::LDU2, next, false, algorithm == 0x81U ? 0x84U : 0x81U, key);
++            REQUIRE(fixture.drain().empty());
++            // No valid ESS has arrived to repair the state. An ordinary
++            // LDU1 must still use the previously accepted security identity.
++            fixture.net(DUID::LDU1, first); fixture.requireLDU(DUID::LDU1, first);
++            fixture.net(DUID::LDU2, next); fixture.requireLDU(DUID::LDU2, next);
++            fixture.net(DUID::LDU1, next); fixture.requireLDU(DUID::LDU1, next);
++        }
++        REQUIRE(fixture.network.outgoing.empty()); // Network voice must not loop back to its input.
++    }
++}

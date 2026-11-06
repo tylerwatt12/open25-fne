@@ -1,0 +1,1552 @@
+diff --git a/src/common/lookups/AffiliationLookup.cpp b/src/common/lookups/AffiliationLookup.cpp
+index 2488645..f057aaa 100644
+--- a/src/common/lookups/AffiliationLookup.cpp
++++ b/src/common/lookups/AffiliationLookup.cpp
+@@ -334,11 +334,12 @@ std::vector<uint32_t> AffiliationLookup::clearGroupAff(uint32_t dstId, bool rele
+ 
+ bool AffiliationLookup::grantCh(uint32_t dstId, uint32_t srcId, uint32_t grantTimeout, bool grp, bool netGranted)
+ {
++    auto lifecycle = lockGrants();
+     if (dstId == 0U) {
+         return false;
+     }
+ 
+-    if (!m_chLookup->isRFChAvailable()) {
++    if (isGranted(dstId) || !m_chLookup->isRFChAvailable()) {
+         return false;
+     }
+ 
+@@ -351,6 +352,8 @@ bool AffiliationLookup::grantCh(uint32_t dstId, uint32_t srcId, uint32_t grantTi
+ 
+     m_grantChTable[dstId] = chNo;
+     m_grantSrcIdTable[dstId] = srcId;
++    m_grantEpochs[dstId] = ++m_nextGrantEpoch;
++    m_grantPermitTokens.erase(dstId);
+     m_rfGrantChCnt++;
+ 
+     m_uuGrantedTable[dstId] = !grp;
+@@ -369,10 +372,43 @@ bool AffiliationLookup::grantCh(uint32_t dstId, uint32_t srcId, uint32_t grantTi
+     return true;
+ }
+ 
++/* Allocation leases for supervised permit/reply correlation. */
++
++uint64_t AffiliationLookup::grantEpoch(uint32_t dstId)
++{
++    auto lock = lockGrants();
++    auto found = m_grantEpochs.find(dstId);
++    return found == m_grantEpochs.end() ? 0U : found->second;
++}
++
++bool AffiliationLookup::ownsGrant(uint32_t dstId, uint32_t srcId, uint32_t chNo, uint64_t epoch)
++{
++    auto lock = lockGrants();
++    return epoch != 0U && grantEpoch(dstId) == epoch && isGranted(dstId) &&
++        getGrantedSrcId(dstId) == srcId && getGrantedCh(dstId) == chNo;
++}
++
++bool AffiliationLookup::setGrantPermitToken(uint32_t dstId, uint64_t epoch, const std::string& token)
++{
++    auto lock = lockGrants();
++    if (epoch == 0U || grantEpoch(dstId) != epoch)
++        return false;
++    m_grantPermitTokens[dstId] = token;
++    return true;
++}
++
++std::string AffiliationLookup::grantPermitToken(uint32_t dstId)
++{
++    auto lock = lockGrants();
++    auto found = m_grantPermitTokens.find(dstId);
++    return found == m_grantPermitTokens.end() ? "" : found->second;
++}
++
+ /* Helper to start the destination ID grant timer. */
+ 
+ void AffiliationLookup::touchGrant(uint32_t dstId)
+ {
++    auto lifecycle = lockGrants();
+     if (dstId == 0U) {
+         return;
+     }
+@@ -394,6 +430,7 @@ void AffiliationLookup::touchGrant(uint32_t dstId)
+ 
+ bool AffiliationLookup::releaseGrant(uint32_t dstId, bool releaseAll)
+ {
++    auto lifecycle = lockGrants();
+     if (dstId == 0U && !releaseAll) {
+         return false;
+     }
+@@ -444,6 +481,8 @@ bool AffiliationLookup::releaseGrant(uint32_t dstId, bool releaseAll)
+ 
+         m_grantChTable.erase(dstId);
+         m_grantSrcIdTable.erase(dstId);
++        m_grantEpochs.erase(dstId);
++        m_grantPermitTokens.erase(dstId);
+         m_uuGrantedTable.erase(dstId);
+         m_netGrantedTable.erase(dstId);
+         m_chLookup->addRFCh(chNo, true);
+@@ -664,6 +703,7 @@ uint32_t AffiliationLookup::getGrantedSrcId(uint32_t dstId)
+ 
+ void AffiliationLookup::clock(uint32_t ms)
+ {
++    auto lifecycle = lockGrants();
+     m_grantChTable.spinlock();
+ 
+     // clock all the grant timers
+diff --git a/src/common/lookups/AffiliationLookup.h b/src/common/lookups/AffiliationLookup.h
+index f14cbd9..50436bf 100644
+--- a/src/common/lookups/AffiliationLookup.h
++++ b/src/common/lookups/AffiliationLookup.h
+@@ -30,6 +30,8 @@
+ #include <cstdio>
+ #include <algorithm>
+ #include <functional>
++#include <mutex>
++#include <unordered_map>
+ 
+ namespace lookups
+ {
+@@ -174,6 +176,13 @@ namespace lookups
+          * @returns bool True, if the destination address has been granted to the source ID, otherwise false.
+          */
+         virtual bool grantCh(uint32_t dstId, uint32_t srcId, uint32_t grantTimeout, bool grp, bool netGranted);
++        // A lease epoch distinguishes a released/reassigned allocation, including
++        // an identical RID/TG/channel reacquisition, while an RPC is outstanding.
++        std::unique_lock<std::recursive_mutex> lockGrants() { return std::unique_lock<std::recursive_mutex>(m_grantLifecycle); }
++        uint64_t grantEpoch(uint32_t dstId);
++        bool ownsGrant(uint32_t dstId, uint32_t srcId, uint32_t chNo, uint64_t epoch);
++        bool setGrantPermitToken(uint32_t dstId, uint64_t epoch, const std::string& token);
++        std::string grantPermitToken(uint32_t dstId);
+         /**
+          * @brief Helper to start/reset the destination ID grant timer.
+          * @param dstId Destination Address.
+@@ -281,6 +290,10 @@ namespace lookups
+ 
+     protected:
+         uint8_t m_rfGrantChCnt;
++        std::recursive_mutex m_grantLifecycle;
++        uint64_t m_nextGrantEpoch = 0U;
++        std::unordered_map<uint32_t, uint64_t> m_grantEpochs;
++        std::unordered_map<uint32_t, std::string> m_grantPermitTokens;
+ 
+         concurrent::vector<uint32_t> m_unitRegTable;
+         concurrent::unordered_map<uint32_t, Timer> m_unitRegTimers;
+diff --git a/src/common/network/NetRPC.cpp b/src/common/network/NetRPC.cpp
+index b34b10a..ef00b5e 100644
+--- a/src/common/network/NetRPC.cpp
++++ b/src/common/network/NetRPC.cpp
+@@ -44,7 +44,8 @@ NetRPC::NetRPC(const std::string& address, uint16_t port, uint16_t localPort, co
+     m_frameQueue(nullptr),
+     m_password(password),
+     m_handlers(),
+-    m_handlerReplied()
++    m_pendingReplies(),
++    m_handlerMutex()
+ {
+     assert(!address.empty());
+     assert(port > 0U);
+@@ -119,8 +120,10 @@ void NetRPC::clock(uint32_t ms)
+             return;
+         }
+ 
+-        // parse JSON body
+-        std::string content = std::string((char*)message.get());
++        if (messageLength == 0U || message[messageLength - 1U] != 0U)
++            return;
++        // The wire body is bounded by the checked RPC message length.
++        std::string content((char*)message.get(), messageLength - 1U);
+ 
+         json::value v;
+         std::string err = json::parse(v, content);
+@@ -138,42 +141,18 @@ void NetRPC::clock(uint32_t ms)
+         json::object request = v.get<json::object>();
+         json::object response;
+ 
+-        // find RPC function callback
+-        if (m_handlers.find(rpcHeader.getFunction()) != m_handlers.end()) {
+-            bool isReply = (rpcHeader.getFunction() & RPC_REPLY_FUNC) == RPC_REPLY_FUNC;
+-            if (isReply) {
+-                m_handlerReplied[rpcHeader.getFunction()] = true;
+-            }
+-
+-            m_handlers[rpcHeader.getFunction()](request, response);
+-
+-            // remove the reply handler (these should be temporary)
+-            if (isReply) {
+-                m_handlers.erase(rpcHeader.getFunction());
+-            } else {
+-                reply(rpcHeader.getFunction(), response, address, addrLen);
+-            }
+-        } else {
+-            bool isReply = (rpcHeader.getFunction() & RPC_REPLY_FUNC) == RPC_REPLY_FUNC;
+-            if (isReply) {
+-                m_handlerReplied[rpcHeader.getFunction()] = true;
+-
+-                if (!request["status"].is<int>()) {
+-                    ::LogError(LOG_NET, "RPC %s:%u, invalid RPC response", udp::Socket::address(address).c_str(), udp::Socket::port(address));
+-                    return;
+-                }
+-
+-                int status = request["status"].get<int>();
+-                if (status != network::NetRPC::OK) {
+-                    if (request["message"].is<std::string>()) {
+-                        std::string retMsg = request["message"].get<std::string>();
+-                        ::LogError(LOG_NET, "RPC %s:%u failed, %s", udp::Socket::address(address).c_str(), udp::Socket::port(address), retMsg.c_str());
+-                    }
+-                }
+-            }
+-            else
+-                LogWarning(LOG_NET, "NetRPC::clock(), ignoring unhandled function, func = $%04X, reply = %u", rpcHeader.getFunction() & 0x3FFFU, isReply);
++        const uint16_t function = rpcHeader.getFunction();
++        if ((function & RPC_REPLY_FUNC) == RPC_REPLY_FUNC) {
++            // A reply belongs to one pending request and the selected peer only.
++            // Completion is published after its callback has validated the body.
++            dispatchReply(function, request, address);
++            return;
+         }
++
++        if (dispatchRequest(function, request, response))
++            reply(function, response, address, addrLen);
++        else
++            LogWarning(LOG_NET, "NetRPC::clock(), ignoring unhandled function, func = $%04X", function);
+     }
+ }
+ 
+@@ -233,46 +212,42 @@ bool NetRPC::req(uint16_t func, const json::object& request, RPCType reply, sock
+     header.encode(buffer);
+     ::memcpy(buffer + 8U, message, json.length() + 1U);
+ 
+-    // install reply handler
+-    if (reply != nullptr) {
+-        m_handlers[func | RPC_REPLY_FUNC] = reply;
+-        m_handlerReplied[func | RPC_REPLY_FUNC] = false;
++    std::shared_ptr<PendingReply> pending;
++    const uint16_t replyFunction = func | RPC_REPLY_FUNC;
++    if (reply != nullptr || blocking) {
++        pending = std::make_shared<PendingReply>();
++        pending->callback = reply;
++        pending->address = address;
++        pending->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(REPLY_WAIT);
++        std::lock_guard<std::mutex> lock(m_handlerMutex);
++        auto found = m_pendingReplies.find(replyFunction);
++        if (found != m_pendingReplies.end()) {
++            if (std::chrono::steady_clock::now() < found->second->deadline)
++                return false; // never replace another in-flight callback
++            found->second->cancelled.store(true);
++            m_pendingReplies.erase(found);
++        }
++        m_pendingReplies[replyFunction] = pending;
+     }
+ 
+-    bool ret = m_frameQueue->write(buffer, json.length() + 9U, address, addrLen);
+-    if (!ret)
+-        return false;
+-    else {
+-        // are we blocking return until a reply is received?
+-        if (blocking) {
+-            // we only block for up to 200ms -- after we we treat the call as failed and return
+-            int timeout = REPLY_WAIT;
+-            while (timeout > 0) {
+-                if (m_handlerReplied.find(func | RPC_REPLY_FUNC) != m_handlerReplied.end()) {
+-                    if (m_handlerReplied[func | RPC_REPLY_FUNC]) {
+-                        m_handlerReplied[func | RPC_REPLY_FUNC] = false;
+-                        break;
+-                    }
+-                }
+-
+-                if (m_debug)
+-                    LogDebugEx(LOG_HOST, "NetRPC::req()", "blocking = %u, to = %d", blocking, timeout);
+-
+-                timeout--;
+-                Thread::sleep(1);
+-            }
+-
+-            if (timeout == 0) {
+-                return false;
+-            }
+-
+-            return true;
+-        }
+-        else {
+-            return true;
++    const bool written = writeRequest(buffer, json.length() + 9U, address, addrLen);
++    if (written && !blocking)
++        return true;
++
++    if (written) {
++        while (std::chrono::steady_clock::now() < pending->deadline) {
++            if (pending->completed.load())
++                return true;
++            Thread::sleep(1);
+         }
+     }
+-
++    if (pending) {
++        pending->cancelled.store(true);
++        std::lock_guard<std::mutex> lock(m_handlerMutex);
++        auto found = m_pendingReplies.find(replyFunction);
++        if (found != m_pendingReplies.end() && found->second == pending)
++            m_pendingReplies.erase(found);
++    }
+     return false;
+ }
+ 
+@@ -324,6 +299,60 @@ void NetRPC::close()
+     m_socket->close();
+ }
+ 
++/* Writes an outbound request. Tests override this without opening a socket. */
++
++bool NetRPC::writeRequest(const uint8_t* data, uint32_t length, sockaddr_storage& address, uint32_t addrLen)
++{
++    return m_frameQueue->write(data, length, address, addrLen);
++}
++
++/* Dispatches a registered request outside the handler-registry lock. */
++
++bool NetRPC::dispatchRequest(uint16_t func, json::object& request, json::object& response)
++{
++    RPCType handler;
++    {
++        std::lock_guard<std::mutex> lock(m_handlerMutex);
++        auto found = m_handlers.find(func);
++        if (found != m_handlers.end())
++            handler = found->second;
++    }
++    if (!handler)
++        return false;
++    handler(request, response);
++    return true;
++}
++
++/* Dispatches one peer-matched response, publishing completion after the callback. */
++
++bool NetRPC::dispatchReply(uint16_t func, json::object& response, const sockaddr_storage& address)
++{
++    std::shared_ptr<PendingReply> pending;
++    {
++        std::lock_guard<std::mutex> lock(m_handlerMutex);
++        auto found = m_pendingReplies.find(func);
++        if (found == m_pendingReplies.end() || !udp::Socket::match(found->second->address, address))
++            return false;
++        pending = found->second;
++        if (pending->claimed.exchange(true))
++            return false;
++    }
++    if (pending->cancelled.load() || std::chrono::steady_clock::now() >= pending->deadline)
++        return false;
++    if (pending->callback) {
++        json::object ignored;
++        pending->callback(response, ignored);
++    }
++    {
++        std::lock_guard<std::mutex> lock(m_handlerMutex);
++        auto found = m_pendingReplies.find(func);
++        if (found != m_pendingReplies.end() && found->second == pending)
++            m_pendingReplies.erase(found);
++    }
++    pending->completed.store(true);
++    return true;
++}
++
+ /* Helper to register an RPC handler. */
+ 
+ bool NetRPC::registerHandler(uint16_t func, RPCType handler)
+@@ -332,6 +361,7 @@ bool NetRPC::registerHandler(uint16_t func, RPCType handler)
+     if (func > RPC_MAX_FUNC)
+         return false;
+ 
++    std::lock_guard<std::mutex> lock(m_handlerMutex);
+     auto it = std::find_if(m_handlers.begin(), m_handlers.end(), [&](RPCHandlerMapPair x) { return x.first == func; });
+     if (it != m_handlers.end()) {
+         LogError(LOG_HOST, "NetRPC::registerHandler() can't register RPC $%04X already registered. BUGBUG.", func);
+@@ -353,6 +383,7 @@ bool NetRPC::unregisterHandler(uint16_t func)
+     if (func > RPC_MAX_FUNC)
+         return false;
+ 
++    std::lock_guard<std::mutex> lock(m_handlerMutex);
+     auto it = std::find_if(m_handlers.begin(), m_handlers.end(), [&](RPCHandlerMapPair x) { return x.first == func; });
+     if (it != m_handlers.end()) {
+         if (m_debug)
+diff --git a/src/common/network/NetRPC.h b/src/common/network/NetRPC.h
+index 2401f32..d065c57 100644
+--- a/src/common/network/NetRPC.h
++++ b/src/common/network/NetRPC.h
+@@ -29,6 +29,10 @@
+ #include <cstdint>
+ #include <functional>
+ #include <unordered_map>
++#include <memory>
++#include <mutex>
++#include <atomic>
++#include <chrono>
+ 
+ namespace network
+ {
+@@ -87,7 +91,7 @@ namespace network
+         /**
+          * @brief Finalizes a instance of the NetRPC class.
+          */
+-        ~NetRPC();
++        virtual ~NetRPC();
+ 
+         /**
+          * @brief Updates the timer by the passed number of milliseconds.
+@@ -105,7 +109,7 @@ namespace network
+          * @param blocking Flag indicating this RPC call should block while waiting for a reply.
+          * @returns bool True, if message was written, otherwise false.
+          */
+-        bool req(uint16_t func, const json::object& request, RPCType reply, std::string address, uint16_t port, bool blocking = false);
++        virtual bool req(uint16_t func, const json::object& request, RPCType reply, std::string address, uint16_t port, bool blocking = false);
+         /**
+          * @brief Writes an RPC request to the network.
+          * @note When using blocking, execution will only be blocked up to a timeout period maximum of 200ms.
+@@ -151,7 +155,21 @@ namespace network
+          */
+         bool unregisterHandler(uint16_t func);
+ 
++    protected:
++        // Narrow transport/parser seams allow deterministic tests without sockets.
++        virtual bool writeRequest(const uint8_t* data, uint32_t length, sockaddr_storage& address, uint32_t addrLen);
++        bool dispatchReply(uint16_t func, json::object& response, const sockaddr_storage& address);
++        bool dispatchRequest(uint16_t func, json::object& request, json::object& response);
++
+     private:
++        struct PendingReply {
++            RPCType callback;
++            sockaddr_storage address{};
++            std::chrono::steady_clock::time_point deadline;
++            std::atomic<bool> completed{false};
++            std::atomic<bool> claimed{false};
++            std::atomic<bool> cancelled{false};
++        };
+         std::string m_address;
+         uint16_t m_port;
+ 
+@@ -164,7 +182,8 @@ namespace network
+ 
+         typedef std::pair<const uint16_t, RPCType> RPCHandlerMapPair;
+         std::map<uint16_t, RPCType> m_handlers;
+-        std::map<uint16_t, bool> m_handlerReplied;
++        std::map<uint16_t, std::shared_ptr<PendingReply>> m_pendingReplies;
++        std::mutex m_handlerMutex;
+ 
+         /**
+          * @brief Writes an RPC reply to the network.
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+index 894944b..4bf1c79 100644
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -476,10 +476,15 @@ void Control::setOptions(yaml::Node& conf, bool supervisor, const std::string cw
+             if (voiceChData.isValidCh() && !voiceChData.address().empty() && voiceChData.port() > 0 &&
+                 chNo != m_siteData.channelNo()) {
+                 json::object req = json::object();
+-                dstId = 0U; // clear TG value
++                const std::string token = m_affiliations->grantPermitToken(dstId);
++                if (token.empty())
++                    return;
++                dstId = 0U; // clear only this allocation's permit
+                 req["dstId"].set<uint32_t>(dstId);
++                req["permitToken"].set<std::string>(token);
+ 
+-                g_RPC->req(RPC_PERMIT_P25_TG, req, nullptr, voiceChData.address(), voiceChData.port());
++                if (g_RPC != nullptr)
++                    g_RPC->req(RPC_PERMIT_P25_TG, req, nullptr, voiceChData.address(), voiceChData.port());
+             }
+             else {
+                 ::LogError(LOG_P25, P25_TSDU_STR ", TSBKO, IOSP_GRP_VCH (Group Voice Channel Grant), failed to clear TG permit, chNo = %u", chNo);
+@@ -959,6 +964,8 @@ void Control::clock()
+     m_rfVoiceCallTermTimeout.clock(ms);
+ 
+     if (m_rfTGHang.isRunning()) {
++        // Serialize old-call expiry with a newly issued VC permit.
++        std::lock_guard<std::recursive_mutex> permitLock(m_permitMutex);
+         m_rfTGHang.clock(ms);
+ 
+         if (m_rfTGHang.hasExpired()) {
+@@ -971,7 +978,9 @@ void Control::clock()
+ 
+             // reset permitted ID and clear permission state
+             if (!m_authoritative && m_permittedDstId != 0U) {
++                std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
+                 m_permittedDstId = 0U;
++                m_permitToken.clear();
+             }
+ 
+             // has the talkgroup hang timer expired while the modem is in a non-listening state?
+@@ -1254,6 +1263,7 @@ void Control::clockSiteData(uint32_t ms)
+ 
+ void Control::permittedTG(uint32_t dstId, bool dataPermit)
+ {
++    std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
+     if (m_authoritative) {
+         return;
+     }
+@@ -1271,6 +1281,8 @@ void Control::permittedTG(uint32_t dstId, bool dataPermit)
+             writeRF_TDU(true);
+     }
+ 
++    if (dstId != 0U)
++        m_rfTGHang.stop(); // an old call's hang timer cannot clear a new permit
+     m_permittedDstId = dstId;
+ 
+     // is this a data permit?
+@@ -2047,25 +2059,79 @@ void Control::writeRF_TDU(bool noNetwork, bool imm)
+ 
+ void Control::RPC_permittedTG(json::object& req, json::object& reply)
+ {
++    std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
+     g_RPC->defaultResponse(reply, "OK", network::NetRPC::OK);
+-
+-    // validate destination ID is a integer within the JSON blob
+     if (!req["dstId"].is<int>()) {
+         g_RPC->defaultResponse(reply, "destination ID was not a valid integer", network::NetRPC::INVALID_ARGS);
+         return;
+     }
+-
+-    uint32_t dstId = req["dstId"].get<uint32_t>();
+-    bool dataPermit = false;
+-
+-    // validate destination ID is a integer within the JSON blob
+-    if (req["dataPermit"].is<bool>()) {
+-        dataPermit = (bool)req["dataPermit"].get<bool>();
++    if (m_authoritative) {
++        g_RPC->defaultResponse(reply, "host is authoritative, not a voice channel", network::NetRPC::BAD_REQUEST);
++        return;
++    }
++    const uint32_t dstId = req["dstId"].get<uint32_t>();
++    const bool correlated = req.find("permitToken") != req.end();
++    std::string token;
++    if (correlated) {
++        if (!req["permitToken"].is<std::string>() || req["permitToken"].get<std::string>().empty() ||
++            req["permitToken"].get<std::string>().size() > 64U) {
++            g_RPC->defaultResponse(reply, "permitToken was not a bounded string", network::NetRPC::INVALID_ARGS);
++            return;
++        }
++        token = req["permitToken"].get<std::string>();
++        if (dstId == 0U && token != m_permitToken) {
++            g_RPC->defaultResponse(reply, "permit is no longer owned by that allocation", network::NetRPC::BAD_REQUEST);
++            return;
++        }
++        reply["permitToken"].set<std::string>(token);
++        reply["dstId"].set<uint32_t>(dstId);
++    } else if (!m_permitSession.empty()) {
++        g_RPC->defaultResponse(reply, "correlated permit requires correlated cleanup", network::NetRPC::BAD_REQUEST);
++        return;
++    }
++    const bool dataPermit = req["dataPermit"].is<bool>() && req["dataPermit"].get<bool>();
++    if (dataPermit && !m_sndcpSupport) {
++        g_RPC->defaultResponse(reply, "voice channel does not support SNDCP", network::NetRPC::BAD_REQUEST);
++        return;
++    }
++    if (correlated && dstId != 0U) {
++        const size_t separator = token.find(':');
++        const auto hex = [](const std::string& value) {
++            return !value.empty() && value.size() <= 16U &&
++                value.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
++        };
++        const std::string session = token.substr(0U, separator);
++        const std::string counter = separator == std::string::npos ? "" : token.substr(separator + 1U);
++        if (!hex(session) || !hex(counter)) {
++            g_RPC->defaultResponse(reply, "permit token has no valid session and sequence", network::NetRPC::INVALID_ARGS);
++            return;
++        }
++        const uint64_t sequence = ::strtoull(counter.c_str(), nullptr, 16);
++        if (sequence == 0U || m_retiredPermitSessions.count(session) != 0U) {
++            g_RPC->defaultResponse(reply, "stale permit session or sequence", network::NetRPC::BAD_REQUEST);
++            return;
++        }
++        if (session == m_permitSession) {
++            if (sequence <= m_permitSequence) {
++                // The sole idempotent repeat is the currently active permit.
++                if (sequence == m_permitSequence && token == m_permitToken && dstId == m_permittedDstId.load())
++                    return;
++                g_RPC->defaultResponse(reply, "stale permit sequence", network::NetRPC::BAD_REQUEST);
++                return;
++            }
++        } else {
++            if (m_retiredPermitSessions.size() >= 64U) {
++                g_RPC->defaultResponse(reply, "permit session history full; restart capacity", network::NetRPC::BAD_REQUEST);
++                return;
++            }
++            if (!m_permitSession.empty())
++                m_retiredPermitSessions.insert(m_permitSession);
++            m_permitSession = session;
++        }
++        m_permitSequence = sequence;
+     }
+-
+-    // LogDebugEx(LOG_P25, "Control::RPC_permittedTG()", "callback, dstId = %u, dataPermit = %u", dstId, dataPermit);
+-
+     permittedTG(dstId, dataPermit);
++    m_permitToken = dstId == 0U ? "" : token;
+ }
+ 
+ /* (RPC Handler) Active TGID list from the authoritative CC host. */
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+index 1e7a725..c8a6284 100644
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -26,6 +26,9 @@
+ #define __P25_CONTROL_H__
+ 
+ #include "Defines.h"
++#include <mutex>
++#include <atomic>
++#include <set>
+ #include "common/p25/NID.h"
+ #include "common/lookups/RSSIInterpolator.h"
+ #include "common/lookups/IdenTableLookup.h"
+@@ -50,6 +53,8 @@
+ #include <unordered_map>
+ #include <random>
+ #include <mutex>
++#include <atomic>
++#include <set>
+ 
+ namespace p25
+ {
+@@ -276,6 +281,9 @@ namespace p25
+         uint32_t getLastSrcId() const;
+ 
+     private:
++#if defined(CATCH2_TEST_COMPILATION)
++        friend struct CapacityPermitTestAccess;
++#endif
+         friend class packet::Voice;
+         packet::Voice* m_voice;
+         friend class packet::Data;
+@@ -343,7 +351,12 @@ namespace p25
+         uint32_t m_netLastDstId;
+         uint32_t m_netLastSrcId;
+ 
+-        uint32_t m_permittedDstId;
++        std::atomic<uint32_t> m_permittedDstId;
++        std::string m_permitToken;
++        std::string m_permitSession;
++        uint64_t m_permitSequence = 0U;
++        std::set<std::string> m_retiredPermitSessions;
++        std::recursive_mutex m_permitMutex;
+ 
+         bool m_tailOnIdle;
+         bool m_ccRunning;
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+index ed35779..d570c94 100644
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -35,6 +35,9 @@ using namespace p25::packet;
+ #include <cassert>
+ #include <cstring>
+ #include <random>
++#include <atomic>
++#include <memory>
++#include <sstream>
+ 
+ // ---------------------------------------------------------------------------
+ //  Macros
+@@ -1862,7 +1865,7 @@ void ControlSignaling::writeRF_ControlData(uint8_t frameCnt, uint8_t n, bool adj
+         break;
+     /** extra data */
+     case 6:
+-        if (m_p25->m_dedicatedControl && m_p25->m_affiliations->rfCh()->rfChDataSize() == 0U) {
++        if (!m_p25->m_sndcpSupport || (m_p25->m_dedicatedControl && m_p25->m_affiliations->rfCh()->rfChDataSize() == 0U)) {
+             queueRF_TSBK_Ctrl(TSBKO::OSP_SYS_SRV_BCAST);
+         } else {
+             queueRF_TSBK_Ctrl(TSBKO::OSP_SNDCP_CH_ANN);
+@@ -2088,14 +2091,12 @@ void ControlSignaling::queueRF_TSBK_Ctrl(uint8_t lco)
+             break;
+         case TSBKO::OSP_SYS_SRV_BCAST:
+         {
+-            // The zero-resource profile supports control-plane access only.
+-            // Do not advertise voice or packet-data service, or the CC itself
+-            // as a data resource. Ordinary capacity profiles keep their
+-            // existing broadcast schedule and service-mask behavior.
+-            if (!m_p25->m_dedicatedControl || m_p25->m_affiliations->rfCh()->rfChDataSize() != 0U) {
++            // Explicitly advertise only the services backed by this profile.
++            if (!m_p25->m_dedicatedControl)
+                 return;
+-            }
+             uint32_t services = SystemService::UNIT_REG | SystemService::GROUP_AFF | SystemService::GROUP_AFF_Q;
++            if (m_p25->m_affiliations->rfCh()->rfChDataSize() != 0U)
++                services |= SystemService::GROUP_VOICE | SystemService::IND_VOICE;
+             if (m_p25->m_siteData.netActive()) {
+                 services |= SystemService::NET_ACTIVE;
+             }
+@@ -2107,7 +2108,7 @@ void ControlSignaling::queueRF_TSBK_Ctrl(uint8_t lco)
+         break;
+         case TSBKO::OSP_SNDCP_CH_ANN:
+         {
+-            if (m_p25->m_dedicatedControl && m_p25->m_affiliations->rfCh()->rfChDataSize() == 0U) {
++            if (!m_p25->m_sndcpSupport || (m_p25->m_dedicatedControl && m_p25->m_affiliations->rfCh()->rfChDataSize() == 0U)) {
+                 return;
+             }
+             // transmit SNDCP announcement
+@@ -2351,48 +2352,15 @@ bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_
+     if (chNo > 0U) {
+         ::lookups::VoiceChData voiceChData = m_p25->m_affiliations->rfCh()->getRFChData(chNo);
+ 
++        std::unique_lock<std::recursive_mutex> grantGuard;
+         if (grp) {
+-            // callback RPC to permit the granted TG on the specified voice channel
+-            if (m_p25->m_authoritative && m_p25->m_supervisor) {
+-                if (voiceChData.isValidCh() && !voiceChData.address().empty() && voiceChData.port() > 0 &&
+-                    chNo != m_p25->m_siteData.channelNo()) {
+-                    json::object req = json::object();
+-                    req["dstId"].set<uint32_t>(dstId);
+-
+-                    // send blocking RPC request
+-                    bool requestFailed = !g_RPC->req(RPC_PERMIT_P25_TG, req, [=, &requestFailed](json::object& req, json::object& reply) {
+-                        if (!req["status"].is<int>()) {
+-                            return;
+-                        }
+-
+-                        int status = req["status"].get<int>();
+-                        if (status != network::NetRPC::OK) {
+-                            if (req["message"].is<std::string>()) {
+-                                std::string retMsg = req["message"].get<std::string>();
+-                                ::LogError((net) ? LOG_NET : LOG_RF, "P25, RPC failed, %s", retMsg.c_str());
+-                            }
+-                            requestFailed = true;
+-                        } else {
+-                            requestFailed = false;
+-                        }
+-                    }, voiceChData.address(), voiceChData.port(), true);
+-
+-                    // if the request failed block grant
+-                    if (requestFailed) {
+-                        ::LogError((net) ? LOG_NET : LOG_RF, P25_TSDU_STR ", TSBKO, IOSP_GRP_VCH (Group Voice Channel Request), failed to permit TG for use, chNo = %u-%u", voiceChData.chId(), chNo);
+-
+-                        m_p25->m_affiliations->releaseGrant(dstId, false);
+-                        if (!net) {
+-                            writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_PTT_BONK, (grp) ? TSBKO::IOSP_GRP_VCH : TSBKO::IOSP_UU_VCH, grp, true);
+-                            m_p25->m_rfState = RS_RF_REJECTED;
+-                        }
+-
+-                        return false;
+-                    }
+-                }
+-                else {
+-                    ::LogError((net) ? LOG_NET : LOG_RF, P25_TSDU_STR ", TSBKO, IOSP_GRP_VCH (Group Voice Channel Request), failed to permit TG for use, chNo = %u-%u", voiceChData.chId(), chNo);
++            if (!permitTrafficChannel(voiceChData, dstId, srcId, chNo, false, grantGuard)) {
++                if (!net) {
++                    writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_PTT_BONK, TSBKO::IOSP_GRP_VCH, true, true);
++                    m_p25->m_rfState = RS_RF_REJECTED;
+                 }
++                LogError((net) ? LOG_NET : LOG_RF, "P25 voice channel permit failed, chNo = %u-%u, dstId = %u", voiceChData.chId(), chNo, dstId);
++                return false;
+             }
+ 
+             if (!net) {
+@@ -2456,47 +2424,13 @@ bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_
+             }
+         }
+         else {
+-            // callback RPC to permit the granted TG on the specified voice channel
+-            if (m_p25->m_authoritative && m_p25->m_supervisor) {
+-                if (voiceChData.isValidCh() && !voiceChData.address().empty() && voiceChData.port() > 0 &&
+-                    chNo != m_p25->m_siteData.channelNo()) {
+-                    json::object req = json::object();
+-                    req["dstId"].set<uint32_t>(dstId);
+-
+-                    // send blocking RPC request
+-                    bool requestFailed = !g_RPC->req(RPC_PERMIT_P25_TG, req, [=, &requestFailed](json::object& req, json::object& reply) {
+-                        if (!req["status"].is<int>()) {
+-                            return;
+-                        }
+-
+-                        int status = req["status"].get<int>();
+-                        if (status != network::NetRPC::OK) {
+-                            if (req["message"].is<std::string>()) {
+-                                std::string retMsg = req["message"].get<std::string>();
+-                                ::LogError((net) ? LOG_NET : LOG_RF, "P25, RPC failed, %s", retMsg.c_str());
+-                            }
+-                            requestFailed = true;
+-                        } else {
+-                            requestFailed = false;
+-                        }
+-                    }, voiceChData.address(), voiceChData.port(), true);
+-
+-                    // if the request failed block grant
+-                    if (requestFailed) {
+-                        ::LogError((net) ? LOG_NET : LOG_RF, P25_TSDU_STR ", TSBKO, IOSP_UU_VCH (Unit-to-Unit Voice Channel Request), failed to permit TG for use, chNo = %u-%u", voiceChData.chId(), chNo);
+-
+-                        m_p25->m_affiliations->releaseGrant(dstId, false);
+-                        if (!net) {
+-                            writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_PTT_BONK, (grp) ? TSBKO::IOSP_GRP_VCH : TSBKO::IOSP_UU_VCH, grp, true);
+-                            m_p25->m_rfState = RS_RF_REJECTED;
+-                        }
+-
+-                        return false;
+-                    }
+-                }
+-                else {
+-                    ::LogError((net) ? LOG_NET : LOG_RF, P25_TSDU_STR ", TSBKO, IOSP_UU_VCH (Unit-to-Unit Voice Channel Request), failed to permit TG for use, chNo = %u-%u", voiceChData.chId(), chNo);
++            if (!permitTrafficChannel(voiceChData, dstId, srcId, chNo, false, grantGuard)) {
++                if (!net) {
++                    writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_PTT_BONK, TSBKO::IOSP_UU_VCH, false, true);
++                    m_p25->m_rfState = RS_RF_REJECTED;
+                 }
++                LogError((net) ? LOG_NET : LOG_RF, "P25 voice channel permit failed, chNo = %u-%u, dstId = %u", voiceChData.chId(), chNo, dstId);
++                return false;
+             }
+ 
+             if (!net) {
+@@ -2704,49 +2638,12 @@ bool ControlSignaling::writeRF_TSDU_SNDCP_Grant(uint32_t srcId, bool skip, uint3
+     if (chNo > 0U) {
+         ::lookups::VoiceChData voiceChData = m_p25->m_affiliations->rfCh()->getRFChData(chNo);
+ 
+-        // callback RPC to permit the granted TG on the specified voice channel
+-        if (m_p25->m_authoritative && m_p25->m_supervisor) {
+-            if (voiceChData.isValidCh() && !voiceChData.address().empty() && voiceChData.port() > 0 &&
+-                chNo != m_p25->m_siteData.channelNo()) {
+-                json::object req = json::object();
+-                int state = modem::DVM_STATE::STATE_P25;
+-                req["state"].set<int>(state);
+-                req["dstId"].set<uint32_t>(srcId);
+-                bool dataCh = true;
+-                req["dataPermit"].set<bool>(dataCh);
+-
+-                // send blocking RPC request
+-                bool requestFailed = !g_RPC->req(RPC_PERMIT_P25_TG, req, [=, &requestFailed](json::object& req, json::object& reply) {
+-                    if (!req["status"].is<int>()) {
+-                        return;
+-                    }
+-
+-                    int status = req["status"].get<int>();
+-                    if (status != network::NetRPC::OK) {
+-                        if (req["message"].is<std::string>()) {
+-                            std::string retMsg = req["message"].get<std::string>();
+-                            ::LogError(LOG_RF, "P25, RPC failed, %s", retMsg.c_str());
+-                        }
+-                        requestFailed = true;
+-                    } else {
+-                        requestFailed = false;
+-                    }
+-                }, voiceChData.address(), voiceChData.port(), true);
+-
+-                // if the request failed block grant
+-                if (requestFailed) {
+-                    ::LogError(LOG_RF, P25_TSDU_STR ", TSBKO, ISP_SNDCP_CH_REQ (SNDCP Data Channel Request), failed to permit for use, chNo = %u-%u", voiceChData.chId(), chNo);
+-
+-                    m_p25->m_affiliations->releaseGrant(srcId, false);
+-                    writeRF_TSDU_Deny(srcId, srcId, ReasonCode::DENY_PTT_BONK, TSBKO::ISP_SNDCP_CH_REQ, false, true);
+-                    m_p25->m_rfState = RS_RF_REJECTED;
+-
+-                    return false;
+-                }
+-            }
+-            else {
+-                ::LogError(LOG_RF, P25_TSDU_STR ", TSBKO, ISP_SNDCP_CH_REQ (SNDCP Data Channel Request), failed to permit for use, chNo = %u-%u", voiceChData.chId(), chNo);
+-            }
++        std::unique_lock<std::recursive_mutex> grantGuard;
++        if (!permitTrafficChannel(voiceChData, srcId, srcId, chNo, true, grantGuard)) {
++            writeRF_TSDU_Deny(srcId, srcId, ReasonCode::DENY_PTT_BONK, TSBKO::ISP_SNDCP_CH_REQ, false, true);
++            m_p25->m_rfState = RS_RF_REJECTED;
++            LogError(LOG_RF, "P25 data channel permit failed, chNo = %u-%u, srcId = %u", voiceChData.chId(), chNo, srcId);
++            return false;
+         }
+ 
+         ::ActivityLog("P25", true, "SNDCP grant request from %u", srcId);
+@@ -2767,6 +2664,66 @@ bool ControlSignaling::writeRF_TSDU_SNDCP_Grant(uint32_t srcId, bool skip, uint3
+     return true;
+ }
+ 
++/* Require a correlated positive VC permit before emitting a supervised grant. */
++
++bool ControlSignaling::permitTrafficChannel(const ::lookups::VoiceChData& channel, uint32_t dstId,
++    uint32_t srcId, uint32_t chNo, bool dataPermit, std::unique_lock<std::recursive_mutex>& grantGuard)
++{
++    if (!m_p25->m_authoritative || !m_p25->m_supervisor)
++        return true;
++
++    auto* allocations = m_p25->m_affiliations;
++    grantGuard = allocations->lockGrants();
++    const uint64_t epoch = allocations->grantEpoch(dstId);
++    if (!allocations->ownsGrant(dstId, srcId, chNo, epoch))
++        return false;
++
++    if (g_RPC == nullptr || !channel.isValidCh() || channel.address().empty() ||
++        channel.port() == 0U || channel.chNo() == m_p25->m_siteData.channelNo()) {
++        allocations->releaseGrant(dstId, false);
++        return false;
++    }
++
++    // Per-process entropy plus a monotonic sequence also separates restarts.
++    static const uint64_t nonce = (uint64_t(std::random_device{}()) << 32U) | std::random_device{}();
++    static std::atomic<uint64_t> nextToken{0U};
++    std::ostringstream tokenText;
++    tokenText << std::hex << nonce << ':' << ++nextToken;
++    const std::string token = tokenText.str();
++    allocations->setGrantPermitToken(dstId, epoch, token);
++    auto accepted = std::make_shared<std::atomic<bool>>(false);
++    json::object request;
++    request["dstId"].set<uint32_t>(dstId);
++    request["permitToken"].set<std::string>(token);
++    if (dataPermit) {
++        const int state = modem::DVM_STATE::STATE_P25;
++        const bool permit = true;
++        request["state"].set<int>(state);
++        request["dataPermit"].set<bool>(permit);
++    }
++    grantGuard.unlock(); // never hold the allocation lock across an RPC wait
++    const bool replied = g_RPC->req(RPC_PERMIT_P25_TG, request,
++        [accepted, token, dstId](json::object& response, json::object&) {
++            accepted->store(response["status"].is<int>() && response["status"].get<int>() == network::NetRPC::OK &&
++                response["dstId"].is<int>() && response["dstId"].get<uint32_t>() == dstId &&
++                response["permitToken"].is<std::string>() && response["permitToken"].get<std::string>() == token);
++        }, channel.address(), channel.port(), true);
++    grantGuard.lock();
++    if (replied && accepted->load() && allocations->ownsGrant(dstId, srcId, chNo, epoch))
++        return true; // keep the guard until the RF grant has been enqueued
++
++    // Only this epoch can be rolled back. A late cleanup must not revoke a
++    // different allocation that has already taken over this physical VC.
++    if (allocations->ownsGrant(dstId, srcId, chNo, epoch))
++        allocations->releaseGrant(dstId, false);
++    json::object clear;
++    const uint32_t clearedDestination = 0U;
++    clear["dstId"].set<uint32_t>(clearedDestination);
++    clear["permitToken"].set<std::string>(token);
++    g_RPC->req(RPC_PERMIT_P25_TG, clear, nullptr, channel.address(), channel.port());
++    return false;
++}
++
+ /* Helper to write a unit to unit answer request packet. */
+ 
+ void ControlSignaling::writeRF_TSDU_UU_Ans_Req(uint32_t srcId, uint32_t dstId)
+diff --git a/src/host/p25/packet/ControlSignaling.h b/src/host/p25/packet/ControlSignaling.h
+index ce19d6c..9f5b21c 100644
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -17,6 +17,8 @@
+ #define __P25_PACKET_CONTROL_SIGNALING_H__
+ 
+ #include "Defines.h"
++#include "common/lookups/ChannelLookup.h"
++#include <mutex>
+ #include "common/p25/data/DataHeader.h"
+ #include "common/p25/data/DataBlock.h"
+ #include "common/p25/lc/TSBK.h"
+@@ -240,6 +242,9 @@ namespace p25
+              */
+             void writeNetworkRF(lc::TDULC* tduLc, const uint8_t* data, bool autoReset);
+ 
++            bool permitTrafficChannel(const ::lookups::VoiceChData& channel, uint32_t dstId, uint32_t srcId,
++                uint32_t chNo, bool dataPermit, std::unique_lock<std::recursive_mutex>& grantGuard);
++
+             /*
+             ** Modem Frame Queuing
+             */
+diff --git a/tests/p25/CapacityPermit_Tests.cpp b/tests/p25/CapacityPermit_Tests.cpp
+new file mode 100644
+index 0000000..e433405
+--- /dev/null
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -0,0 +1,591 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Offline controller tests. No modem port or network socket is opened. */
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/lookups/AffiliationLookup.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
++#include "common/p25/lc/tsbk/TSBKFactory.h"
++#include "common/Log.h"
++
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <cstdlib>
++#include <fstream>
++#include <vector>
++#include <thread>
++#include <future>
++#include <chrono>
++#include "host/network/RPCDefines.h"
++#include "common/network/RPCHeader.h"
++
++using namespace p25;
++using namespace p25::defines;
++using namespace p25::lc;
++using namespace p25::lc::tsbk;
++
++namespace p25 {
++struct CapacityPermitTestAccess {
++    static void startOldCallHang(Control& value) { value.m_rfTGHang.start(); }
++    static void advanceHang(Control& value, uint32_t ms) { value.m_rfTGHang.clock(ms); }
++};
++}
++
++namespace {
++template<typename T> void setJSON(json::object& object, const char* key, T value) {
++    object[key].set<T>(value);
++}
++json::object wireObject(const json::object& object) {
++    json::value decoded;
++    const std::string encoded = json::value(object).serialize();
++    REQUIRE(json::parse(decoded, encoded).empty());
++    REQUIRE(decoded.is<json::object>());
++    return decoded.get<json::object>();
++}
++constexpr uint32_t SOURCE = 1001U;
++constexpr uint32_t TARGET = 1002U;
++constexpr uint32_t GROUP = 101U;
++constexpr uint32_t VOICE_CHANNEL = 25U;
++constexpr uint32_t DENIED_SOURCE = 1003U;
++constexpr uint32_t UNKNOWN_SOURCE = 1004U;
++constexpr uint32_t DENIED_GROUP = 102U;
++constexpr uint32_t UNKNOWN_GROUP = 103U;
++
++// Exercise the real scheduler without wall-clock sleeps or a running Host.
++class OfflineScheduler : public packet::ControlSignaling {
++public:
++    explicit OfflineScheduler(Control* controller) : ControlSignaling(controller, false, false, false) {
++        m_ctrlTSDUMBF = false;
++    }
++    using ControlSignaling::writeRF_ControlData;
++    using ControlSignaling::queueRF_TSBK_Ctrl;
++};
++
++// Some broadcast decoders in this upstream revision are stubs. Use the shared
++// FEC/CRC decoder and inspect the standardized octets instead of those stubs.
++class WireBlock : public OSP_DENY_RSP {
++public:
++    std::array<uint8_t, 8U> payload(const uint8_t* frame) {
++        std::array<uint8_t, 8U> result{};
++        REQUIRE(TSBK::decode(frame, result.data(), false));
++        return result;
++    }
++};
++
++enum class PermitMode { Accepted, Rejected, MissingStatus, BadStatusType, MissingEcho, WrongDestination, StaleToken, Timeout, Late };
++class PermitRPC : public network::NetRPC {
++public:
++    PermitMode mode = PermitMode::Accepted;
++    unsigned permits = 0;
++    std::function<void()> beforeReply;
++    RPCType late;
++    json::object lateRequest;
++    std::function<bool(uint16_t, json::object&, json::object&)> nativeHandler;
++    using NetRPC::dispatchRequest;
++    PermitRPC() : NetRPC("127.0.0.1", 48991U, 0U, "offline-test", false) {}
++    bool req(uint16_t func, const json::object& request, RPCType callback, std::string, uint16_t, bool blocking = false) override {
++        if (func != RPC_PERMIT_P25_TG || request.at("dstId").get<uint32_t>() == 0U)
++            return true; // asynchronous unpermit after rollback
++        ++permits;
++        REQUIRE(blocking);
++        REQUIRE(callback != nullptr);
++        if (beforeReply) beforeReply();
++        if (mode == PermitMode::Timeout) return false;
++        if (mode == PermitMode::Late) { late = callback; lateRequest = request; return false; }
++        json::object response;
++        if (nativeHandler) {
++            json::object copied = wireObject(request);
++            REQUIRE(nativeHandler(func, copied, response));
++            json::object ignored;
++            response = wireObject(response);
++            callback(response, ignored);
++            return true;
++        }
++        if (mode != PermitMode::MissingStatus) setJSON<int>(response, "status", mode == PermitMode::Rejected ? BAD_REQUEST : OK);
++        if (mode == PermitMode::BadStatusType) response["status"].set<std::string>("200");
++        if (mode != PermitMode::MissingEcho) {
++            response["dstId"] = request.at("dstId");
++            response["permitToken"] = request.at("permitToken");
++        }
++        if (mode == PermitMode::WrongDestination) setJSON<uint32_t>(response, "dstId", 999U);
++        if (mode == PermitMode::StaleToken) response["permitToken"].set<std::string>("old-process:1");
++        json::object ignored;
++        response = wireObject(response);
++        callback(response, ignored);
++        return true;
++    }
++    void deliverLate() {
++        json::object response;
++        setJSON<int>(response, "status", OK);
++        response["dstId"] = lateRequest.at("dstId");
++        response["permitToken"] = lateRequest.at("permitToken");
++        json::object ignored;
++        REQUIRE(late != nullptr);
++        response = wireObject(response);
++        late(response, ignored);
++    }
++};
++
++struct ControllerFixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, false};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, false};
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    PermitRPC rpc;
++    network::NetRPC* previousRPC = g_RPC;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U,
++        true, true, false, false, false, false};
++    std::unique_ptr<Control> controller;
++
++    explicit ControllerFixture(bool withCapacity = false, bool sndcp = false, bool strictACL = false, bool messageAck = false, bool authoritative = true) :
++        radios("", 0U, strictACL), groups("", 0U, strictACL) {
++        g_logDisplayLevel = 0U;
++        g_RPC = &rpc;
++        if (strictACL) {
++            radios.addEntry(SOURCE, true, "Allowed radio");
++            radios.addEntry(TARGET, true, "Allowed target");
++            radios.addEntry(DENIED_SOURCE, false, "Disabled radio");
++            groups.addEntry(GROUP, 1U, true);
++            groups.addEntry(DENIED_GROUP, 1U, false);
++        }
++        if (withCapacity) {
++            channels.setRFChData(VOICE_CHANNEL,
++                ::lookups::VoiceChData(2U, VOICE_CHANNEL, "", 0U, ""));
++            channels.addRFCh(VOICE_CHANNEL);
++        }
++        controller = std::make_unique<Control>(authoritative, 0x293U, 1U, 16384U,
++            &modem, nullptr, 120U, 1U, true, &channels, &radios, &groups,
++            &identities, &rssi, false, false, false, false, false);
++        yaml::Node config;
++        const std::string configText = std::string(R"(
++protocols:
++    p25:
++        unitToUnitAvailCheck: false
++        verifyReg: true
++        verifyAff: true
++        inhibitUnauthorized: false
++        sndcpSupport: )") + (sndcp ? "true" : "false") + R"(
++        noMessageAck: )" + (messageAck ? "false" : "true") + R"(
++        tduPreambleCount: 0
++        control:
++            enable: true
++            dedicated: true
++            ackRequests: false
++            disableTSDUMBF: true
++            redundantImmediate: false
++system:
++    config:
++        controlCh:
++            notifyEnable: false
++)";
++        REQUIRE(yaml::Parse(config, configText));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(),
++            1U, 1U, 1U, 1U, 2U, 1U, false);
++        controller->setCCRunning(true);
++    }
++
++    ~ControllerFixture() {
++        controller.reset();
++        g_RPC = previousRPC;
++    }
++
++    template<typename Request> void receive(uint32_t source, uint32_t target = 0U) {
++        auto request = std::make_unique<Request>();
++        request->setSrcId(source);
++        request->setDstId(target);
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES + 2U> frame{};
++        REQUIRE(controller->control()->process(frame.data(), frame.size(), std::move(request)));
++    }
++
++    using RawBlock = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++    using TaggedFrame = std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES + 2U>;
++
++    static RawBlock rawBlock(uint8_t opcode, uint64_t payload) {
++        RawBlock raw{};
++        raw[0U] = 0x80U | opcode;
++        for (uint32_t i = 0U; i < 8U; ++i)
++            raw[2U + i] = uint8_t(payload >> ((7U - i) * 8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        return raw;
++    }
++
++    // Feed real sync/NID/interleaved, trellis-coded, CRC-protected RF bytes
++    // through Control::processFrame, rather than passing a predecoded object.
++    bool receiveRaw(const RawBlock& raw) {
++        TaggedFrame frame{};
++        frame[0U] = modem::TAG_DATA;
++        frame[1U] = 1U;
++        Sync::addP25Sync(frame.data() + 2U);
++        NID nid(0x293U);
++        nid.encode(frame.data() + 2U, DUID::TSDU);
++        std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{};
++        edac::Trellis trellis;
++        trellis.encode12(raw.data(), coded.data());
++        P25Utils::encode(coded.data(), frame.data() + 2U, 114U, 318U);
++        P25Utils::addStatusBits(frame.data() + 2U, P25_TSDU_FRAME_LENGTH_BITS, false, false);
++        return controller->processFrame(frame.data(), frame.size());
++    }
++
++    std::vector<std::unique_ptr<TSBK>> drain() {
++        std::vector<std::unique_ptr<TSBK>> result;
++        std::array<uint8_t, 1024U> frame{};
++        uint32_t length;
++        while ((length = controller->getFrame(frame.data())) != 0U) {
++            REQUIRE(length >= P25_TSDU_FRAME_LENGTH_BYTES + 2U);
++            auto block = TSBKFactory::createTSBK(frame.data() + 2U);
++            REQUIRE(block != nullptr);
++            result.push_back(std::move(block));
++        }
++        return result;
++    }
++
++    void receiveRegistration(uint32_t source, uint32_t system = 1U) {
++        // IOSP_U_REG's decoder reads the inbound system ID; its encoder produces
++        // the outbound layout. Decode a raw request so the real handler sees 001.
++        auto request = std::make_unique<IOSP_U_REG>();
++        // Raw decode deliberately verifies its checksum as a real received block.
++        std::array<uint8_t, P25_TSBK_LENGTH_BYTES> raw{};
++        raw[0U] = TSBKO::IOSP_U_REG;
++        const uint64_t registration = (uint64_t(1U) << 36U) | (uint64_t(system) << 24U) | source;
++        for (uint32_t i = 0U; i < 8U; i++)
++            raw[2U + i] = uint8_t(registration >> ((7U - i) * 8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        REQUIRE(request->decode(raw.data(), true));
++        REQUIRE(request->getSysId() == system);
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES + 2U> frame{};
++        REQUIRE(controller->control()->process(frame.data(), frame.size(), std::move(request)));
++    }
++
++    void registerAndAffiliate() {
++        receiveRegistration(SOURCE);
++        REQUIRE(controller->affiliations()->isUnitReg(SOURCE));
++        drain();
++        receive<IOSP_GRP_AFF>(SOURCE, GROUP);
++        REQUIRE(controller->affiliations()->isGroupAff(SOURCE, GROUP));
++        drain();
++        controller->affiliations()->unitReg(TARGET);
++    }
++
++    void requireAccessResponse(uint8_t opcode, uint8_t response) {
++        auto replies = drain();
++        // Exactly one response also proves automatic radio inhibit was not sent.
++        REQUIRE(replies.size() == 1U);
++        REQUIRE(replies.front()->getLCO() == opcode);
++        const uint8_t* raw = replies.front()->getDecodedRaw();
++        REQUIRE(raw != nullptr);
++        REQUIRE(edac::CRC::checkCCITT162(raw, P25_TSBK_LENGTH_BYTES));
++        // These upstream IOSP decoders parse inbound request layouts, so inspect
++        // the response's actual transmitted bits rather than getResponse().
++        const uint8_t actual = opcode == TSBKO::IOSP_U_REG ? ((raw[2U] >> 4U) & 3U) : (raw[2U] & 3U);
++        REQUIRE(actual == response);
++        REQUIRE(controller->affiliations()->grantSize() == 0U);
++        REQUIRE(channels.rfChDataSize() == 0U);
++        REQUIRE(channels.rfChSize() == 0U);
++    }
++
++    void requireNoResources(uint8_t service) {
++        REQUIRE(controller->affiliations()->grantSize() == 0U);
++        REQUIRE(channels.rfChDataSize() == 0U);
++        REQUIRE(channels.rfChSize() == 0U);
++        auto responses = drain();
++        REQUIRE(responses.size() == 1U);
++        REQUIRE(responses.front()->getLCO() == TSBKO::OSP_DENY_RSP);
++        REQUIRE(responses.front()->getResponse() == ReasonCode::DENY_NO_RF_RSRC_AVAIL);
++        REQUIRE(responses.front()->getService() == service);
++    }
++};
++}
++
++TEST_CASE("Supervised P25 grants require a positive correlated voice-channel permit", "[p25][capacity-permit]") {
++    for (int service = 0; service < 3; ++service) {
++        for (PermitMode mode : {PermitMode::Accepted, PermitMode::Rejected, PermitMode::MissingStatus,
++             PermitMode::BadStatusType, PermitMode::MissingEcho, PermitMode::WrongDestination,
++             PermitMode::StaleToken, PermitMode::Timeout, PermitMode::Late}) {
++            DYNAMIC_SECTION("service " << service << " reply " << int(mode)) {
++                ControllerFixture fixture(true, true);
++                fixture.registerAndAffiliate();
++                fixture.controller->setSupervisor(true);
++                fixture.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, VOICE_CHANNEL, "127.0.0.1", 48993U, "offline-test"));
++                fixture.rpc.mode = mode;
++                fixture.rpc.beforeReply = [&]() { REQUIRE(fixture.controller->peekFrameLength() == 0U); };
++                if (service == 0) fixture.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++                if (service == 1) fixture.receive<IOSP_UU_VCH>(SOURCE, TARGET);
++                if (service == 2) fixture.receive<ISP_SNDCP_CH_REQ>(SOURCE);
++                REQUIRE(fixture.rpc.permits == 1U);
++                const uint32_t destination = service == 0 ? GROUP : service == 1 ? TARGET : SOURCE;
++                auto frames = fixture.drain();
++                REQUIRE_FALSE(frames.empty());
++                if (mode == PermitMode::Accepted) {
++                    REQUIRE(fixture.controller->affiliations()->isGranted(destination));
++                    REQUIRE(fixture.channels.rfChSize() == 0U);
++                    const uint8_t expected = service == 0 ? TSBKO::IOSP_GRP_VCH : service == 1 ? TSBKO::IOSP_UU_VCH : TSBKO::OSP_SNDCP_CH_GNT;
++                    for (const auto& frame : frames) REQUIRE(frame->getLCO() == expected);
++                    REQUIRE(fixture.controller->affiliations()->releaseGrant(destination, false));
++                    REQUIRE(fixture.channels.rfChSize() == 1U);
++                } else {
++                    REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
++                    REQUIRE(fixture.channels.rfChSize() == 1U);
++                    for (const auto& frame : frames) REQUIRE(frame->getLCO() == TSBKO::OSP_DENY_RSP);
++                    if (mode == PermitMode::Late) {
++                        fixture.rpc.deliverLate(); // owned callback is safe after the grant stack returned
++                        REQUIRE(fixture.drain().empty());
++                        REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
++                    }
++                }
++            }
++        }
++    }
++}
++
++TEST_CASE("The actual VC handler authorizes only supported correlated permits", "[p25][capacity-permit]") {
++    for (int service = 0; service < 3; ++service) {
++        for (bool authoritative : {false, true}) {
++            for (bool sndcp : {false, true}) {
++                DYNAMIC_SECTION("service " << service << " remote authoritative " << authoritative << " SNDCP " << sndcp) {
++                    ControllerFixture voice(true, sndcp, false, false, authoritative);
++                    ControllerFixture control(true, true);
++                    control.registerAndAffiliate();
++                    control.controller->setSupervisor(true);
++                    control.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, VOICE_CHANNEL, "127.0.0.1", 48993U, "offline-test"));
++                    control.rpc.nativeHandler = [&](uint16_t func, json::object& req, json::object& reply) {
++                        return voice.rpc.dispatchRequest(func, req, reply);
++                    };
++                    if (service == 0) control.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++                    if (service == 1) control.receive<IOSP_UU_VCH>(SOURCE, TARGET);
++                    if (service == 2) control.receive<ISP_SNDCP_CH_REQ>(SOURCE);
++                    const uint32_t destination = service == 0 ? GROUP : service == 1 ? TARGET : SOURCE;
++                    const bool allowed = !authoritative && (service != 2 || sndcp);
++                    REQUIRE(control.controller->affiliations()->isGranted(destination) == allowed);
++                    auto frames = control.drain();
++                    REQUIRE_FALSE(frames.empty());
++                    const uint8_t granted = service == 0 ? TSBKO::IOSP_GRP_VCH : service == 1 ? TSBKO::IOSP_UU_VCH : TSBKO::OSP_SNDCP_CH_GNT;
++                    for (const auto& frame : frames)
++                        REQUIRE(frame->getLCO() == (allowed ? granted : TSBKO::OSP_DENY_RSP));
++                }
++            }
++        }
++    }
++}
++
++TEST_CASE("Missing or local VC endpoints and missing RPC never emit supervised grants", "[p25][capacity-permit]") {
++    for (int service = 0; service < 3; ++service) {
++        for (int invalid = 0; invalid < 4; ++invalid) {
++            DYNAMIC_SECTION("service " << service << " invalid endpoint " << invalid) {
++                ControllerFixture fixture(true, true);
++                fixture.registerAndAffiliate();
++                fixture.controller->setSupervisor(true);
++                fixture.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, invalid == 2 ? 1U : VOICE_CHANNEL,
++                    invalid == 0 ? "" : "127.0.0.1", invalid == 1 ? 0U : 48993U, "offline-test"));
++                if (invalid == 3) g_RPC = nullptr;
++                if (service == 0) fixture.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++                if (service == 1) fixture.receive<IOSP_UU_VCH>(SOURCE, TARGET);
++                if (service == 2) fixture.receive<ISP_SNDCP_CH_REQ>(SOURCE);
++                REQUIRE(fixture.rpc.permits == 0U);
++                REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
++                REQUIRE(fixture.channels.rfChSize() == 1U);
++                auto frames = fixture.drain();
++                REQUIRE_FALSE(frames.empty());
++                for (const auto& frame : frames) REQUIRE(frame->getLCO() == TSBKO::OSP_DENY_RSP);
++            }
++        }
++    }
++}
++
++namespace {
++class MemoryRPC : public network::NetRPC {
++public:
++    std::function<void(uint16_t, const sockaddr_storage&)> onWrite;
++    MemoryRPC() : NetRPC("127.0.0.1", 48991U, 0U, "offline-test", false) {}
++    using NetRPC::dispatchReply;
++protected:
++    bool writeRequest(const uint8_t* data, uint32_t, sockaddr_storage& address, uint32_t) override {
++        network::frame::RPCHeader header;
++        REQUIRE(header.decode(data));
++        if (onWrite) onWrite(header.getFunction() | RPC_REPLY_FUNC, address);
++        return true;
++    }
++};
++}
++
++TEST_CASE("Native RPC publishes completion after callback and rejects wrong peers and late replies", "[network][capacity-permit]") {
++    MemoryRPC rpc;
++    json::object request; setJSON<int>(request, "dstId", 101);
++    unsigned called = 0U;
++    SECTION("callback is complete before blocking return") {
++        rpc.onWrite = [&](uint16_t func, const sockaddr_storage& peer) {
++            json::object response; setJSON<int>(response, "status", 200);
++            REQUIRE(rpc.dispatchReply(func, response, peer));
++        };
++        REQUIRE(rpc.req(RPC_PERMIT_P25_TG, request, [&](json::object&, json::object&) { ++called; }, "127.0.0.1", 48993U, true));
++        REQUIRE(called == 1U);
++    }
++    SECTION("wrong peer cannot complete request") {
++        rpc.onWrite = [&](uint16_t func, const sockaddr_storage& peer) {
++            sockaddr_storage other; uint32_t length;
++            REQUIRE(network::udp::Socket::lookup("127.0.0.1", 48994U, other, length) == 0);
++            json::object response;
++            REQUIRE_FALSE(rpc.dispatchReply(func, response, other));
++            REQUIRE(rpc.dispatchReply(func, response, peer));
++        };
++        REQUIRE(rpc.req(RPC_PERMIT_P25_TG, request, [&](json::object&, json::object&) { ++called; }, "127.0.0.1", 48993U, true));
++        REQUIRE(called == 1U);
++    }
++    SECTION("timed out callback is removed before a late response") {
++        uint16_t savedFunction = 0U; sockaddr_storage savedPeer{};
++        rpc.onWrite = [&](uint16_t func, const sockaddr_storage& peer) { savedFunction = func; savedPeer = peer; };
++        const auto start = std::chrono::steady_clock::now();
++        REQUIRE_FALSE(rpc.req(RPC_PERMIT_P25_TG, request, [&](json::object&, json::object&) { ++called; }, "127.0.0.1", 48993U, true));
++        REQUIRE(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
++        json::object response;
++        REQUIRE_FALSE(rpc.dispatchReply(savedFunction, response, savedPeer));
++        REQUIRE(called == 0U);
++    }
++}
++
++TEST_CASE("Blocking native RPC waits for callback completion and refuses in-flight replacement", "[network][capacity-permit]") {
++    MemoryRPC rpc;
++    json::object request; setJSON<int>(request, "dstId", 101);
++    std::promise<void> entered, release;
++    auto released = release.get_future().share();
++    std::thread responder;
++    std::atomic<bool> responderStored{false};
++    bool nestedRejected = false;
++    rpc.onWrite = [&](uint16_t func, const sockaddr_storage& peer) {
++        nestedRejected = !rpc.req(RPC_PERMIT_P25_TG, request, nullptr, "127.0.0.1", 48993U, true);
++        responder = std::thread([&, func, peer]() {
++            while (!responderStored.load()) std::this_thread::yield();
++            json::object response;
++            rpc.dispatchReply(func, response, peer);
++        });
++        responderStored.store(true);
++    };
++    auto result = std::async(std::launch::async, [&]() {
++        return rpc.req(RPC_PERMIT_P25_TG, request, [&](json::object&, json::object&) {
++            entered.set_value();
++            released.wait();
++        }, "127.0.0.1", 48993U, true);
++    });
++    auto started = entered.get_future();
++    const bool callbackEntered = started.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
++    const bool completedTooSoon = result.wait_for(std::chrono::milliseconds(10)) == std::future_status::ready;
++    const bool duringCallbackRejected = !rpc.req(RPC_PERMIT_P25_TG, request, nullptr, "127.0.0.1", 48993U, true);
++    release.set_value();
++    if (responder.joinable()) responder.join();
++    const bool accepted = result.get();
++    CHECK(callbackEntered);
++    CHECK_FALSE(completedTooSoon);
++    CHECK(nestedRejected);
++    CHECK(duringCallbackRejected);
++    REQUIRE(accepted);
++}
++
++TEST_CASE("Released or reassigned allocations cannot emit a late permitted grant", "[p25][capacity-permit]") {
++    for (int service = 0; service < 3; ++service) {
++        for (int replacement = 0; replacement < 3; ++replacement) {
++            DYNAMIC_SECTION("service " << service << " replacement " << replacement) {
++                ControllerFixture fixture(true, true);
++                fixture.registerAndAffiliate();
++                fixture.controller->setSupervisor(true);
++                fixture.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, VOICE_CHANNEL, "127.0.0.1", 48993U, "offline-test"));
++                const uint32_t destination = service == 0 ? GROUP : service == 1 ? TARGET : SOURCE;
++                uint64_t originalEpoch = 0U, newEpoch = 0U;
++                fixture.rpc.beforeReply = [&]() {
++                    originalEpoch = fixture.controller->affiliations()->grantEpoch(destination);
++                    REQUIRE(originalEpoch != 0U);
++                    REQUIRE(fixture.controller->affiliations()->releaseGrant(destination, false));
++                    if (replacement != 0) {
++                        REQUIRE(fixture.controller->affiliations()->grantCh(destination, replacement == 2 ? SOURCE + 5U : SOURCE, 15U, service == 0, false));
++                        newEpoch = fixture.controller->affiliations()->grantEpoch(destination);
++                        REQUIRE(newEpoch != originalEpoch); // even identical RID/TG/channel is a different lease
++                    }
++                };
++                if (service == 0) fixture.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++                if (service == 1) fixture.receive<IOSP_UU_VCH>(SOURCE, TARGET);
++                if (service == 2) fixture.receive<ISP_SNDCP_CH_REQ>(SOURCE);
++                REQUIRE(fixture.controller->affiliations()->grantSize() == (replacement == 0 ? 0U : 1U));
++                REQUIRE(fixture.controller->affiliations()->grantEpoch(destination) == newEpoch);
++                auto frames = fixture.drain();
++                REQUIRE_FALSE(frames.empty());
++                for (const auto& frame : frames) REQUIRE(frame->getLCO() == TSBKO::OSP_DENY_RSP);
++            }
++        }
++    }
++}
++
++TEST_CASE("VC cleanup is conditional on the allocation token", "[p25][capacity-permit]") {
++    ControllerFixture voice(true, false, false, false, false);
++    auto send = [&](uint32_t destination, const std::string& token) {
++        json::object req, reply;
++        setJSON<uint32_t>(req, "dstId", destination);
++        req["permitToken"].set<std::string>(token);
++        req = wireObject(req);
++        REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, req, reply));
++        REQUIRE(reply["status"].is<int>());
++        return reply["status"].get<int>();
++    };
++    REQUIRE(send(GROUP, "abc:1") == network::NetRPC::OK);
++    REQUIRE(send(GROUP + 1U, "abc:2") == network::NetRPC::OK);
++    REQUIRE(send(0U, "abc:1") == network::NetRPC::BAD_REQUEST);
++    REQUIRE(send(GROUP, "abc:1") == network::NetRPC::BAD_REQUEST);
++    REQUIRE(send(GROUP + 1U, "abc:2") == network::NetRPC::OK); // active duplicate only
++    REQUIRE(send(0U, "abc:2") == network::NetRPC::OK);
++    REQUIRE(send(GROUP + 1U, "abc:2") == network::NetRPC::BAD_REQUEST); // cannot resurrect a cleared permit
++    REQUIRE(send(GROUP, "def:1") == network::NetRPC::OK);
++    REQUIRE(send(GROUP + 1U, "abc:3") == network::NetRPC::BAD_REQUEST); // retired process session
++    REQUIRE(send(0U, "def:1") == network::NetRPC::OK);
++}
++
++TEST_CASE("Voice-only capacity broadcasts voice services without packet-data advertisements", "[p25][capacity-permit]") {
++    for (bool capacity : {false, true}) {
++        for (bool busy : {false, true}) {
++            DYNAMIC_SECTION("capacity " << capacity << " busy " << busy) {
++                ControllerFixture fixture(capacity, false);
++                if (capacity && busy) REQUIRE(fixture.controller->affiliations()->grantCh(GROUP, SOURCE, 15U, true, false));
++                OfflineScheduler scheduler(fixture.controller.get());
++                WireBlock decoded;
++                std::array<uint8_t, 1024U> frame{};
++                scheduler.writeRF_ControlData(2U, 2U, false);
++                REQUIRE(fixture.controller->getFrame(frame.data()) > 0U);
++                auto rfss = decoded.payload(frame.data() + 2U);
++                REQUIRE(rfss[7U] == (capacity ? 0x60U : 0x40U));
++                scheduler.writeRF_ControlData(2U, 6U, false);
++                REQUIRE(fixture.controller->getFrame(frame.data()) > 0U);
++                auto services = decoded.payload(frame.data() + 2U);
++                REQUIRE(decoded.getLCO() == TSBKO::OSP_SYS_SRV_BCAST);
++                const std::array<uint8_t, 8U> expected = capacity ?
++                    std::array<uint8_t, 8U>{0U, 0x0CU, 0x0EU, 0U, 0x0CU, 0x0EU, 0U, 0U} :
++                    std::array<uint8_t, 8U>{0U, 0U, 0x0EU, 0U, 0U, 0x0EU, 0U, 0U};
++                REQUIRE(services == expected);
++                scheduler.queueRF_TSBK_Ctrl(TSBKO::OSP_SNDCP_CH_ANN);
++                REQUIRE(fixture.controller->getFrame(frame.data()) == 0U);
++            }
++        }
++    }
++}
++
++TEST_CASE("A newly issued VC permit survives the previous call hang deadline", "[p25][capacity-permit]") {
++    ControllerFixture voice(true, false, false, false, false);
++    auto send = [&](uint32_t destination, const std::string& token) {
++        json::object req, reply;
++        setJSON<uint32_t>(req, "dstId", destination);
++        req["permitToken"].set<std::string>(token);
++        req = wireObject(req);
++        REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, req, reply));
++        return reply["status"].get<int>();
++    };
++    REQUIRE(send(GROUP, "abc:1") == network::NetRPC::OK);
++    CapacityPermitTestAccess::startOldCallHang(*voice.controller);
++    CapacityPermitTestAccess::advanceHang(*voice.controller, 999U);
++    REQUIRE(send(GROUP + 1U, "abc:2") == network::NetRPC::OK);
++    CapacityPermitTestAccess::advanceHang(*voice.controller, 2U);
++    voice.controller->clock();
++    // A successful conditional clear proves expiry did not discard the new token.
++    REQUIRE(send(0U, "abc:2") == network::NetRPC::OK);
++}
+diff --git a/tests/p25/ZeroCapacity_Tests.cpp b/tests/p25/ZeroCapacity_Tests.cpp
+index 850c69b..4ca7af8 100644
+--- a/tests/p25/ZeroCapacity_Tests.cpp
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -338,7 +338,9 @@ TEST_CASE("Broadcast services describe zero inventory rather than temporary cong
+     REQUIRE(fixture.controller->getFrame(frame.data()) > 0U);
+     auto services = block.payload(frame.data() + 2U);
+     if (capacity) {
+-        REQUIRE(block.getLCO() == TSBKO::OSP_SNDCP_CH_ANN);
++        REQUIRE(block.getLCO() == TSBKO::OSP_SYS_SRV_BCAST);
++        const std::array<uint8_t, 8U> voiceServices{0U, 0x0CU, 0x0EU, 0U, 0x0CU, 0x0EU, 0U, 0U};
++        REQUIRE(services == voiceServices);
+     } else {
+         REQUIRE(block.getLCO() == TSBKO::OSP_SYS_SRV_BCAST);
+         // Full TSBK octet 2 is reserved; 3..5 are available, 6..8

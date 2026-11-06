@@ -1,0 +1,407 @@
+--- a/src/fne/HostFNE.cpp
++++ b/src/fne/HostFNE.cpp
+@@ -29,6 +29,7 @@
+ #include <cstdio>
+ #include <algorithm>
+ #include <functional>
++#include <system_error>
+ 
+ #if !defined(_WIN32)
+ #include <sys/utsname.h>
+@@ -89,7 +90,34 @@
+ 
+ /* Finalizes a instance of the HostFNE class. */
+ 
+-HostFNE::~HostFNE() = default;
++HostFNE::~HostFNE() { stopTrafficReader(); }
++
++bool HostFNE::startTrafficReader()
++{
++    if (m_trafficReader.joinable()) return false;
++    try {
++#if defined(CATCH2_TEST_COMPILATION)
++        if (m_trafficReaderStartTestHook)
++            m_trafficReader = m_trafficReaderStartTestHook();
++        else
++#endif
++            m_trafficReader = std::thread(threadTrafficNetwork, this);
++    } catch (const std::system_error& error) {
++        LogError(LOG_HOST, "Failed starting traffic reader: %s", error.what());
++        return false;
++    }
++    return true;
++}
++
++void HostFNE::stopTrafficReader()
++{
++    if (!m_trafficReader.joinable()) return;
++    g_killed = true;
++#if defined(CATCH2_TEST_COMPILATION)
++    if (m_beforeTrafficReaderJoinTestHook) m_beforeTrafficReaderJoinTestHook();
++#endif
++    m_trafficReader.join();
++}
+ 
+ /* Executes the main FNE processing loop. */
+ 
+@@ -211,13 +239,17 @@
+     ** Initialize Threads
+     */
+ 
+-    if (!Thread::runAsThread(this, threadTrafficNetwork))
++    if (!startTrafficReader())
+         return EXIT_FAILURE;
+-    if (!Thread::runAsThread(this, threadMetadataNetwork))
++    if (!Thread::runAsThread(this, threadMetadataNetwork)) {
++        stopTrafficReader();
+         return EXIT_FAILURE;
++    }
+ #if !defined(_WIN32)
+-    if (!Thread::runAsThread(this, threadVirtualNetworking))
++    if (!Thread::runAsThread(this, threadVirtualNetworking)) {
++        stopTrafficReader();
+         return EXIT_FAILURE;
++    }
+ #endif // !defined(_WIN32)
+     /*
+     ** Main execution loop
+@@ -272,6 +304,9 @@
+         if (ms < 2U)
+             Thread::sleep(1U);
+     }
++
++    // The reader can still be completing inline P25 state/output work.
++    stopTrafficReader();
+ 
+     // shutdown threads
+     if (m_network != nullptr) {
+@@ -696,50 +731,23 @@
+ 
+ void* HostFNE::threadTrafficNetwork(void* arg)
+ {
+-    thread_t* th = (thread_t*)arg;
+-    if (th != nullptr) {
+-#if defined(_WIN32)
+-        ::CloseHandle(th->thread);
+-#else
+-        ::pthread_detach(th->thread);
+-#endif // defined(_WIN32)
+-
+-        std::string threadName("fne:traf-net");
+-        HostFNE* fne = static_cast<HostFNE*>(th->obj);
+-        if (fne == nullptr) {
+-            g_killed = true;
+-            LogError(LOG_HOST, "[FAIL] %s", threadName.c_str());
+-        }
+-
+-        if (g_killed) {
+-            delete th;
+-            return nullptr;
+-        }
+-
+-        LogInfoEx(LOG_HOST, "[ OK ] %s", threadName.c_str());
++    HostFNE* fne = static_cast<HostFNE*>(arg);
++    if (fne == nullptr) return nullptr;
++    const std::string threadName("fne:traf-net");
++    LogInfoEx(LOG_HOST, "[ OK ] %s", threadName.c_str());
+ #ifdef _GNU_SOURCE
+-        ::pthread_setname_np(th->thread, threadName.c_str());
+-#endif // _GNU_SOURCE
+-
+-        StopWatch stopWatch;
++    ::pthread_setname_np(::pthread_self(), threadName.c_str());
++#endif
++    StopWatch stopWatch;
++    stopWatch.start();
++    while (!g_killed && fne->m_network != nullptr) {
++        const uint32_t ms = stopWatch.elapsed();
+         stopWatch.start();
+-
+-        if (fne->m_network != nullptr) {
+-            while (!g_killed) {
+-                uint32_t ms = stopWatch.elapsed();
+-                stopWatch.start();
+-
+-                fne->m_network->processNetwork();
+-
+-                if (ms < THREAD_CYCLE_THRESHOLD)
+-                    Thread::sleep(THREAD_CYCLE_THRESHOLD);
+-            }
+-        }
+-
+-        LogInfoEx(LOG_HOST, "[STOP] %s", threadName.c_str());
+-        delete th;
+-    }
+-
++        fne->m_network->processNetwork();
++        if (ms < THREAD_CYCLE_THRESHOLD)
++            Thread::sleep(THREAD_CYCLE_THRESHOLD);
++    }
++    LogInfoEx(LOG_HOST, "[STOP] %s", threadName.c_str());
+     return nullptr;
+ }
+ 
+--- a/src/fne/HostFNE.h
++++ b/src/fne/HostFNE.h
+@@ -31,6 +31,7 @@
+ #include "CryptoContainer.h"
+ 
+ #include <string>
++#include <thread>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -80,6 +81,14 @@
+     int run();
+ 
+ private:
++#if defined(CATCH2_TEST_COMPILATION)
++    friend struct HostTrafficReaderTestAccess;
++    std::function<std::thread()> m_trafficReaderStartTestHook;
++    std::function<void()> m_beforeTrafficReaderJoinTestHook;
++#endif
++    std::thread m_trafficReader;
++    bool startTrafficReader();
++    void stopTrafficReader();
+     const std::string& m_confFile;
+     yaml::Node m_conf;
+ 
+@@ -142,8 +151,8 @@
+      */
+     bool createMasterNetwork();
+     /**
+-     * @brief Entry point to master traffic network thread.
+-     * @param arg Instance of the thread_t structure.
++     * @brief Entry point to the owned master traffic reader.
++     * @param arg Instance of HostFNE.
+      * @returns void* (Ignore)
+      */
+     static void* threadTrafficNetwork(void* arg);
+--- a/src/fne/network/TrafficNetwork.cpp
++++ b/src/fne/network/TrafficNetwork.cpp
+@@ -447,7 +447,13 @@
+     int length = 0U;
+ 
+     // read message
+-    UInt8Array buffer = m_frameQueue->read(length, address, addrLen, &rtpHeader, &fneHeader);
++    UInt8Array buffer;
++#if defined(CATCH2_TEST_COMPILATION)
++    if (m_readPacketTestHook)
++        buffer = m_readPacketTestHook(length, address, addrLen, rtpHeader, fneHeader);
++    else
++#endif
++        buffer = m_frameQueue->read(length, address, addrLen, &rtpHeader, &fneHeader);
+     if (length > 0) {
+         if (m_debug)
+             Utils::dump(1U, "TrafficNetwork::processNetwork(), Network Message", buffer.get(), length);
+@@ -469,6 +475,14 @@
+         req->length = length;
+         req->buffer = new uint8_t[length];
+         ::memcpy(req->buffer, buffer.get(), length);
++
++        // P25 call state is shared by talkgroup. Complete each received packet
++        // on this sole traffic reader before admitting its successor or End.
++        if (fneHeader.getFunction() == NET_FUNC::PROTOCOL &&
++            fneHeader.getSubFunction() == NET_SUBFUNC::PROTOCOL_SUBFUNC_P25) {
++            taskNetworkRx(req);
++            return;
++        }
+ 
+         // enqueue the task
+         if (!m_threadPool.enqueue(new_pooltask(taskNetworkRx, req))) {
+@@ -916,6 +930,9 @@
+ 
+         if (req == nullptr)
+             return;
++#if defined(CATCH2_TEST_COMPILATION)
++        if (network->m_taskStartedTestHook) network->m_taskStartedTestHook();
++#endif
+ 
+         if (req->length > 0) {
+             uint32_t peerId = req->fneHeader.getPeerId();
+@@ -3215,6 +3232,13 @@
+ bool TrafficNetwork::writePeerQueue(udp::BufferQueue* buffers, uint32_t peerId, uint32_t ssrc, FrameQueue::OpcodePair opcode, 
+     const uint8_t* data, uint32_t length, uint16_t pktSeq, uint32_t streamId, bool incPktSeq) const
+ {
++#if defined(CATCH2_TEST_COMPILATION)
++    // Test-only output sink after the actual handler recipient/routing gates.
++    if (m_p25QueueSinkTestHook) {
++        m_p25QueueSinkTestHook(pktSeq, peerId);
++        return true;
++    }
++#endif
+     if (streamId == 0U) {
+         LogError(LOG_NET, "BUGBUG: PEER %u, trying to send data with a streamId of 0?", peerId);
+     }
+--- a/src/fne/network/TrafficNetwork.h
++++ b/src/fne/network/TrafficNetwork.h
+@@ -298,6 +298,7 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+         friend struct KeyIngressTestAccess;
+         friend struct ParrotWorkerTestAccess;
++        friend struct P25AdmissionOrderTestAccess;
+ #endif
+         friend class MetadataNetwork;
+         friend class callhandler::TagDMRData;
+@@ -417,6 +418,10 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+         std::function<void()> m_parrotIterationTestHook;
+         std::function<void()> m_parrotBeforeJoinTestHook;
++        std::function<void(uint16_t, uint32_t)> m_p25BeforeForwardTestHook;
++        std::function<void(uint16_t, uint32_t)> m_p25QueueSinkTestHook;
++        std::function<UInt8Array(int&, sockaddr_storage&, uint32_t&, frame::RTPHeader&, frame::RTPFNEHeader&)> m_readPacketTestHook;
++        std::function<void()> m_taskStartedTestHook;
+ #endif
+ 
+         bool m_disablePacketData;
+--- a/src/fne/network/callhandler/TagP25Data.cpp
++++ b/src/fne/network/callhandler/TagP25Data.cpp
+@@ -694,6 +694,10 @@
+                         }
+                     }
+ 
++#if defined(CATCH2_TEST_COMPILATION)
++                    if (groupVoice && m_network->m_p25BeforeForwardTestHook)
++                        m_network->m_p25BeforeForwardTestHook(pktSeq, peer.first);
++#endif
+                     if (groupVoice && !m_network->m_p25Sites.forward(peerId, peer.first, streamId, srcId, dstId, demand, terminal)) continue;
+                     if (signaling && !m_network->m_p25Sites.sameSite(peerId, peer.first) &&
+                         !(adjacency && m_network->m_p25Sites.role(peer.first) == P25SiteRouting::Role::Control)) continue;
+--- a/tests/fne/SubscriberAccessIngress_Tests.cpp
++++ b/tests/fne/SubscriberAccessIngress_Tests.cpp
+@@ -20,6 +20,7 @@
+ public:
+     using network::TrafficNetwork::TrafficNetwork;
+     using network::BaseNetwork::createP25_LDU1Message;
++    using network::BaseNetwork::createP25_LDU2Message;
+     using network::BaseNetwork::createP25_TDUMessage;
+ };
+ struct Fixture {
+@@ -282,3 +283,127 @@
+     REQUIRE(f.network.open()); const bool processed=gate->wait(&WorkerGate::entered);
+     f.network.close(); REQUIRE(processed); REQUIRE(WorkerAccess::joined(f.network));
+ }
++
++// Actual processNetwork admission; only packet input and output I/O are replaced.
++#include <cstring>
++#include <cerrno>
++#include <system_error>
++#include <vector>
++#include <netinet/in.h>
++namespace network {
++struct P25AdmissionOrderTestAccess {
++    using ReadHook=std::function<UInt8Array(int&,sockaddr_storage&,uint32_t&,frame::RTPHeader&,frame::RTPFNEHeader&)>;
++    static void start(TrafficNetwork& n) {n.m_status=NET_STAT_MST_RUNNING;n.m_threadPool.start();}
++    static void stop(TrafficNetwork& n) {n.m_threadPool.stop();n.m_threadPool.wait();}
++    static void peer(TrafficNetwork& n,uint32_t id,FNEPeerConnection* p) {if(p)n.m_peers[id]=p;else n.m_peers.erase(id);}
++    static void read(TrafficNetwork& n,ReadHook f) {n.m_readPacketTestHook=std::move(f);}
++    static void hooks(TrafficNetwork& n,std::function<void(uint16_t,uint32_t)> before,
++        std::function<void(uint16_t,uint32_t)> sink,std::function<void()> task={}) {
++        n.m_p25BeforeForwardTestHook=std::move(before);n.m_p25QueueSinkTestHook=std::move(sink);n.m_taskStartedTestHook=std::move(task);
++    }
++};
++}
++struct HostTrafficReaderTestAccess {
++    static void network(HostFNE& host,network::TrafficNetwork* n) {host.m_network=n;}
++    static bool start(HostFNE& host) {return host.startTrafficReader();}
++    static void stop(HostFNE& host) {host.stopTrafficReader();}
++    static bool joined(HostFNE& host) {return !host.m_trafficReader.joinable();}
++    static void hooks(HostFNE& host,std::function<std::thread()> start,std::function<void()> join={}) {
++        host.m_trafficReaderStartTestHook=std::move(start);host.m_beforeTrafficReaderJoinTestHook=std::move(join);
++    }
++};
++namespace {
++using AdmissionAccess=network::P25AdmissionOrderTestAccess;
++struct AdmissionGate {
++    std::mutex mutex;std::condition_variable changed;
++    bool entered=false,released=false,expired=false,stopping=false;
++    std::thread::id taskThread;
++    unsigned reads=0U;std::vector<uint16_t> queued;
++    void block() {
++        std::unique_lock<std::mutex> lock(mutex);entered=true;taskThread=std::this_thread::get_id();changed.notify_all();
++        if(!changed.wait_for(lock,std::chrono::seconds(2),[&]{return released;}))expired=true;
++    }
++    bool wait(bool AdmissionGate::*field) {
++        std::unique_lock<std::mutex> lock(mutex);return changed.wait_for(lock,std::chrono::seconds(2),[&]{return this->*field;});
++    }
++    bool waitQueued() {
++        std::unique_lock<std::mutex> lock(mutex);return changed.wait_for(lock,std::chrono::seconds(2),[&]{return !queued.empty();});
++    }
++    void release() {std::lock_guard<std::mutex> lock(mutex);released=true;changed.notify_all();}
++};
++struct AdmissionFixture {
++    Fixture f;network::FNEPeerConnection source,target;
++    std::shared_ptr<AdmissionGate> gate=std::make_shared<AdmissionGate>();
++    std::vector<uint16_t> input;size_t next=0U;
++    AdmissionFixture(std::vector<uint16_t> sequences,bool generic=false):input(std::move(sequences)) {
++        f.permit();source.id(VOICE);source.address("127.0.0.1");source.connected(true);
++        target.id(CONSOLE);target.address("127.0.0.1");target.connected(true);
++        AdmissionAccess::peer(f.network,VOICE,&source);AdmissionAccess::peer(f.network,CONSOLE,&target);
++        AdmissionAccess::hooks(f.network,[g=gate](uint16_t s,uint32_t p){if(s==1U&&p==CONSOLE)g->block();},
++            [g=gate](uint16_t s,uint32_t p){if(p==CONSOLE){std::lock_guard<std::mutex> lock(g->mutex);g->queued.push_back(s);g->changed.notify_all();}},
++            generic?std::function<void()>([g=gate]{g->block();}):std::function<void()>());
++        AdmissionAccess::read(f.network,[this,generic](int& length,sockaddr_storage& address,uint32_t& addrLen,network::frame::RTPHeader& rtp,network::frame::RTPFNEHeader& fne){
++            if(next==input.size()){length=0;return UInt8Array();}
++            const auto sequence=input[next++];auto payload=packet(sequence);length=int(payload.size());
++            UInt8Array result(new uint8_t[payload.size()]);std::memcpy(result.get(),payload.data(),payload.size());
++            address={};auto* a=reinterpret_cast<sockaddr_in*>(&address);a->sin_family=AF_INET;a->sin_addr.s_addr=htonl(INADDR_LOOPBACK);addrLen=sizeof(sockaddr_in);
++            rtp.setSSRC(VOICE);rtp.setSequence(sequence);fne.setPeerId(VOICE);fne.setStreamId(0x01020304U);
++            fne.setFunction(generic?network::NET_FUNC::ILLEGAL:network::NET_FUNC::PROTOCOL);
++            fne.setSubFunction(network::NET_SUBFUNC::PROTOCOL_SUBFUNC_P25);
++            {std::lock_guard<std::mutex> lock(gate->mutex);++gate->reads;gate->changed.notify_all();}
++            return result;
++        });
++        AdmissionAccess::start(f.network);
++    }
++    ~AdmissionFixture() {
++        gate->release();HostTrafficReaderTestAccess::stop(f.host);HostTrafficReaderTestAccess::network(f.host,nullptr);
++        AdmissionAccess::stop(f.network);AdmissionAccess::hooks(f.network,{},{});AdmissionAccess::read(f.network,{});
++        AdmissionAccess::peer(f.network,VOICE,nullptr);AdmissionAccess::peer(f.network,CONSOLE,nullptr);
++    }
++    std::vector<uint8_t> packet(uint16_t sequence) {
++        lc::LC c;c.setLCO(LCO::GROUP);c.setGroup(true);c.setSrcId(RID);c.setDstId(TG);c.setAlgId(ALGO_UNENCRYPT);data::LowSpeedData lsd;
++        std::array<uint8_t,P25_LDU_FRAME_LENGTH_BYTES> rf{};Audio audio;for(unsigned i=0;i<9;++i)audio.encode(rf.data(),NULL_IMBE,i);
++        uint32_t length=0;UInt8Array bytes;
++        if(sequence==RTP_END_OF_CALL_SEQ)bytes=f.network.createP25_TDUMessage(length,c,lsd,0U);
++        else if(sequence%2U)bytes=f.network.createP25_LDU2Message(length,c,lsd,rf.data());
++        else bytes=f.network.createP25_LDU1Message(length,c,lsd,rf.data(),FrameType::HDU_VALID,0U);
++        return std::vector<uint8_t>(bytes.get(),bytes.get()+length);
++    }
++};
++}
++TEST_CASE("P25 processNetwork completes earlier voice before reading later voice or End", "[fne-admission-inline]") {
++    const std::vector<uint16_t> expected{0U,1U,2U,3U,RTP_END_OF_CALL_SEQ};AdmissionFixture f(expected);
++    f.f.network.processNetwork();const bool first=f.gate->waitQueued();std::thread::id reader;
++    auto receive=std::async(std::launch::async,[&]{reader=std::this_thread::get_id();for(unsigned i=0;i<4;++i)f.f.network.processNetwork();});
++    const bool entered=f.gate->wait(&AdmissionGate::entered);
++    const bool held=receive.wait_for(std::chrono::milliseconds(100))==std::future_status::timeout;
++    unsigned reads;bool sameThread;
++    {std::lock_guard<std::mutex> lock(f.gate->mutex);reads=f.gate->reads;sameThread=f.gate->taskThread==reader;}
++    f.gate->release();receive.get();AdmissionAccess::stop(f.f.network);
++    REQUIRE(first);REQUIRE(entered);REQUIRE(held);REQUIRE(reads==2U);REQUIRE(sameThread);REQUIRE_FALSE(f.gate->expired);REQUIRE(f.gate->queued==expected);
++}
++TEST_CASE("non P25 processNetwork packets retain asynchronous pool admission", "[fne-admission-inline]") {
++    AdmissionFixture f({0U},true);std::thread::id reader;
++    auto receive=std::async(std::launch::async,[&]{reader=std::this_thread::get_id();f.f.network.processNetwork();});
++    const bool entered=f.gate->wait(&AdmissionGate::entered);
++    const bool returned=receive.wait_for(std::chrono::seconds(1))==std::future_status::ready;
++    bool different;{std::lock_guard<std::mutex> lock(f.gate->mutex);different=f.gate->taskThread!=reader;}
++    f.gate->release();receive.get();AdmissionAccess::stop(f.f.network);
++    REQUIRE(entered);REQUIRE(returned);REQUIRE(different);REQUIRE_FALSE(f.gate->expired);
++}
++TEST_CASE("owned FNE traffic reader joins blocked inline work and handles creation failure", "[fne-admission-inline][fne-reader-lifetime]") {
++    {
++        HostFNE host("unused");HostTrafficReaderTestAccess::hooks(host,[]{throw std::system_error(EAGAIN,std::generic_category());return std::thread();});
++        REQUIRE_FALSE(HostTrafficReaderTestAccess::start(host));REQUIRE(HostTrafficReaderTestAccess::joined(host));
++    }
++    AdmissionFixture f({1U});HostTrafficReaderTestAccess::network(f.f.host,&f.f.network);
++    HostTrafficReaderTestAccess::hooks(f.f.host,{},[g=f.gate]{std::lock_guard<std::mutex> lock(g->mutex);g->stopping=true;g->changed.notify_all();});
++    g_killed=false;const bool started=HostTrafficReaderTestAccess::start(f.f.host);
++    const bool entered=f.gate->wait(&AdmissionGate::entered);
++    auto stop=std::async(std::launch::async,[&]{HostTrafficReaderTestAccess::stop(f.f.host);});
++    const bool stopping=f.gate->wait(&AdmissionGate::stopping);
++    const bool held=stop.wait_for(std::chrono::milliseconds(0))==std::future_status::timeout;
++    f.gate->release();stop.get();
++    REQUIRE(started);REQUIRE(entered);REQUIRE(stopping);REQUIRE(held);REQUIRE(HostTrafficReaderTestAccess::joined(f.f.host));REQUIRE_FALSE(f.gate->expired);
++    HostTrafficReaderTestAccess::hooks(f.f.host,{});g_killed=false;
++}

@@ -1,0 +1,1333 @@
+--- a/configs/config.example.yml
++++ b/configs/config.example.yml
+@@ -213,6 +213,9 @@
+     # Project 25
+     #
+     p25:
++        # Managed site service sets the authenticated /p25/site-state heartbeat.
++        # A managed process starts in site trunking until zoneConnected is true.
++        managedSite: false
+         # Flag indicating whether or not the protocol is enabled.
+         enable: true
+         # Sets the number of TDU preambles to transmit at the start of a transmission.
+--- a/configs/fne-config.example.yml
++++ b/configs/fne-config.example.yml
+@@ -46,6 +46,19 @@
+ #   (This is the endpoint that downstream peers connect to for this FNE instance.)
+ #
+ master:
++    # One managed P25 system per FNE. Peer IDs must be unique in this map.
++    p25System:
++        netId: 1
++        sysId: 1
++    p25Sites:
++        - controlPeerId: 100100256
++          voicePeerIds:
++              - 100100257
++          consolePeerIds:
++              - 100100384
++          talkgroups:
++              - 1001
++              - 1002
+     # Network Peer ID
+     #   NOTE: This ID is a uniquely identifying number. It *MUST* be a unique number across any networks this FNE
+     #        instance connects to. Failure to use a unique number *WILL* cause network issues.
+--- /dev/null
++++ b/src/common/network/P25SiteRouting.h
+@@ -0,0 +1,161 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Current TrunkSystem P25 system/site routing policy. No transport or RF scheduler. */
++#ifndef __P25_SITE_ROUTING_H__
++#define __P25_SITE_ROUTING_H__
++#include "common/yaml/Yaml.h"
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <set>
++#include <string>
++#include <vector>
++
++namespace network {
++class P25SiteRouting {
++public:
++    enum class Role { Unknown, Control, Voice, Console };
++    struct Site {
++        uint32_t control = 0U;
++        std::set<uint32_t> voice, consoles, groups;
++        std::map<uint32_t, uint32_t> affiliations;
++    };
++    bool configure(yaml::Node master, std::string& error) {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        m_sites.clear(); m_peers.clear(); m_owners.clear(); m_calls.clear(); m_valid = false;
++        const auto number = [](const yaml::Node& node, uint32_t maximum, uint32_t& result) {
++            if (!node.isScalar()) return false;
++            const auto value = node.as<std::string>();
++            if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) return false;
++            try { const auto parsed = std::stoull(value); if (parsed == 0U || parsed > maximum) return false; result = uint32_t(parsed); return true; }
++            catch (...) { return false; }
++        };
++        auto system = master["p25System"];
++        if (!system.isMap() || !number(system["netId"], 0xFFFFFU, m_netId) || !number(system["sysId"], 0xFFFU, m_sysId)) {
++            error = "p25System requires nonzero netId (20 bit) and sysId (12 bit)"; return false;
++        }
++        auto sites = master["p25Sites"];
++        if (!sites.isSequence() || sites.size() == 0U) { error = "p25Sites must contain configured sites"; return false; }
++        for (size_t i = 0U; i < sites.size(); ++i) {
++            auto node = sites[i]; Site site;
++            if (!node.isMap() || !number(node["controlPeerId"], 999999999U, site.control)) { error = "invalid controlPeerId"; return false; }
++            if (m_peers.count(site.control)) { error = "duplicate P25 peer ID"; return false; }
++            m_peers[site.control] = {site.control, Role::Control};
++            const auto list = [&](const char* key, std::set<uint32_t>& values, Role role, uint32_t maximum) {
++                auto entries = node[key];
++                if (entries.isScalar() && entries.as<std::string>() == "[]") return true;
++                if (!entries.isSequence()) return false;
++                for (size_t j = 0U; j < entries.size(); ++j) {
++                    uint32_t value = 0U;
++                    if (!number(entries[j], maximum, value) || values.count(value)) return false;
++                    if (role != Role::Unknown && m_peers.count(value)) return false;
++                    values.insert(value);
++                    if (role != Role::Unknown) m_peers[value] = {site.control, role};
++                }
++                return true;
++            };
++            if (!list("voicePeerIds", site.voice, Role::Voice, 999999999U) ||
++                !list("consolePeerIds", site.consoles, Role::Console, 999999999U) ||
++                !list("talkgroups", site.groups, Role::Unknown, 65535U)) { error = "invalid or duplicate site peer/talkgroup list"; return false; }
++            m_sites.emplace(site.control, std::move(site));
++        }
++        m_valid = true; error.clear(); return true;
++    }
++    uint32_t netId() const { return m_netId; }
++    uint32_t sysId() const { return m_sysId; }
++    bool owns(uint32_t origin, uint32_t stream, uint32_t rid, uint32_t group) const {
++        std::lock_guard<std::mutex> lock(m_mutex); const auto found=m_calls.find(group);
++        return found!=m_calls.end() && found->second.origin==origin && found->second.stream==stream && found->second.rid==rid;
++    }
++    bool valid() const { std::lock_guard<std::mutex> lock(m_mutex); return m_valid; }
++    bool system(uint32_t net, uint32_t sys) const { std::lock_guard<std::mutex> lock(m_mutex); return m_valid && net == m_netId && sys == m_sysId; }
++    Role role(uint32_t peer) const { std::lock_guard<std::mutex> lock(m_mutex); return roleUnlocked(peer); }
++    uint32_t controlPeer(uint32_t peer) const { std::lock_guard<std::mutex> lock(m_mutex); return controlUnlocked(peer); }
++    bool allowed(uint32_t peer, uint32_t group) const { std::lock_guard<std::mutex> lock(m_mutex); return allowedUnlocked(peer, group); }
++    bool sameSite(uint32_t a, uint32_t b) const { std::lock_guard<std::mutex> lock(m_mutex); return controlUnlocked(a) != 0U && controlUnlocked(a) == controlUnlocked(b); }
++    bool voiceAssociation(uint32_t cc, uint32_t vc) const { std::lock_guard<std::mutex> lock(m_mutex); return roleUnlocked(cc) == Role::Control && roleUnlocked(vc) == Role::Voice && controlUnlocked(vc) == cc; }
++    // These methods receive accepted reports from the authenticated site CC.
++    // A new accepted registration/affiliation moves the subscriber's interest.
++    bool affiliate(uint32_t cc, uint32_t rid, uint32_t group, bool snapshot = false) {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (roleUnlocked(cc) != Role::Control || rid == 0U || !allowedUnlocked(cc, group)) return false;
++        auto owner = m_owners.find(rid);
++        if (snapshot && owner != m_owners.end() && owner->second != cc) return false;
++        for (auto& entry : m_sites) if (entry.first != cc) entry.second.affiliations.erase(rid);
++        m_owners[rid] = cc; m_sites.at(cc).affiliations[rid] = group; return true;
++    }
++    bool registerUnit(uint32_t cc, uint32_t rid) {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (roleUnlocked(cc) != Role::Control || rid == 0U) return false;
++        for (auto& entry : m_sites) if (entry.first != cc) entry.second.affiliations.erase(rid);
++        m_owners[rid] = cc; return true;
++    }
++    void unaffiliate(uint32_t cc, uint32_t rid, bool deregister = false) {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (roleUnlocked(cc) != Role::Control) return;
++        m_sites.at(cc).affiliations.erase(rid);
++        if (deregister && m_owners.count(rid) && m_owners.at(rid) == cc) m_owners.erase(rid);
++    }
++    void clearSnapshot(uint32_t cc) { std::lock_guard<std::mutex> lock(m_mutex); if (roleUnlocked(cc) == Role::Control) m_sites.at(cc).affiliations.clear(); }
++    void disconnected(uint32_t cc) {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (roleUnlocked(cc) != Role::Control) return;
++        m_sites.at(cc).affiliations.clear();
++        for (auto it = m_owners.begin(); it != m_owners.end();) if (it->second == cc) it = m_owners.erase(it); else ++it;
++    }
++    // A call's recipient sites remain attached through its terminal TDU, even if
++    // affiliation changes during the call. Only one origin owns a group stream.
++    bool begin(uint32_t origin, uint32_t stream, uint32_t rid, uint32_t group, bool* first = nullptr) {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        const auto role = roleUnlocked(origin);
++        if ((role != Role::Voice && role != Role::Console) || !allowedUnlocked(origin, group) || !rid || !stream) return false;
++        if (first) *first = false;
++        auto found = m_calls.find(group);
++        const auto now = std::chrono::steady_clock::now();
++        if (found != m_calls.end() && now - found->second.last > std::chrono::seconds(10)) { m_calls.erase(found); found = m_calls.end(); }
++        if (found != m_calls.end()) {
++            if (found->second.origin != origin || found->second.stream != stream || found->second.rid != rid) return false;
++            found->second.last = now; return true;
++        }
++        if (first) *first = true;
++        Call call{origin, stream, rid, {}, now};
++        for (const auto& entry : m_sites) if (entry.second.groups.count(group) && interestedUnlocked(entry.second, group)) call.sites.insert(entry.first);
++        call.sites.insert(controlUnlocked(origin));
++        m_calls[group] = std::move(call); return true;
++    }
++    bool forward(uint32_t origin, uint32_t target, uint32_t stream, uint32_t rid, uint32_t group, bool demand, bool terminal, bool signaling = false) const {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        const auto sourceCC = controlUnlocked(origin), targetCC = controlUnlocked(target);
++        if (!sourceCC || !targetCC || origin == target) return false;
++        // Site control signaling has site-local channel numbers and subscriber
++        // responses. It must never be rebroadcast as another site's signaling.
++        if (signaling) return sourceCC == targetCC;
++        if (!allowedUnlocked(origin, group) || !allowedUnlocked(target, group)) return false;
++        const auto call = m_calls.find(group);
++        if (call == m_calls.end() || call->second.origin != origin || call->second.stream != stream || call->second.rid != rid || !call->second.sites.count(targetCC)) return false;
++        const auto targetRole = roleUnlocked(target);
++        if (demand) return targetRole == Role::Control && sourceCC != targetCC;
++        if (targetRole == Role::Control) return terminal && sourceCC != targetCC;
++        return targetRole == Role::Voice || targetRole == Role::Console;
++    }
++    void end(uint32_t origin, uint32_t stream, uint32_t group) {
++        std::lock_guard<std::mutex> lock(m_mutex); const auto call = m_calls.find(group);
++        if (call != m_calls.end() && call->second.origin == origin && call->second.stream == stream) m_calls.erase(call);
++    }
++private:
++    struct Call { uint32_t origin, stream, rid; std::set<uint32_t> sites; std::chrono::steady_clock::time_point last; };
++    Role roleUnlocked(uint32_t peer) const { const auto it=m_peers.find(peer); return it==m_peers.end()?Role::Unknown:it->second.second; }
++    uint32_t controlUnlocked(uint32_t peer) const { const auto it=m_peers.find(peer); return it==m_peers.end()?0U:it->second.first; }
++    bool allowedUnlocked(uint32_t peer, uint32_t group) const { const auto it=m_sites.find(controlUnlocked(peer)); return m_valid && it!=m_sites.end() && it->second.groups.count(group); }
++    static bool interestedUnlocked(const Site& site, uint32_t group) { return std::any_of(site.affiliations.begin(), site.affiliations.end(), [group](const auto& item){return item.second==group;}); }
++    mutable std::mutex m_mutex;
++    bool m_valid = false;
++    uint32_t m_netId = 0U, m_sysId = 0U;
++    std::map<uint32_t, Site> m_sites;
++    std::map<uint32_t, std::pair<uint32_t, Role>> m_peers;
++    std::map<uint32_t, uint32_t> m_owners;
++    std::map<uint32_t, Call> m_calls;
++};
++}
++#endif
+--- a/src/fne/network/TrafficNetwork.cpp
++++ b/src/fne/network/TrafficNetwork.cpp
+@@ -200,6 +200,8 @@
+ 
+ void TrafficNetwork::setOptions(yaml::Node& conf, bool printOptions)
+ {
++    std::string routingError;
++    if (!m_p25Sites.configure(conf, routingError)) LogError(LOG_MASTER, "P25 site configuration: %s", routingError.c_str());
+     m_disallowAdjStsBcast = conf["disallowAdjStsBcast"].as<bool>(false);
+     m_disallowExtAdjStsBcast = conf["disallowExtAdjStsBcast"].as<bool>(true);
+     m_allowConvSiteAffOverride = conf["allowConvSiteAffOverride"].as<bool>(true);
+@@ -708,6 +710,7 @@
+ 
+ bool TrafficNetwork::open()
+ {
++    if (m_p25Enabled && !m_p25Sites.valid()) return false;
+     if (m_debug)
+         LogInfoEx(LOG_MASTER, "Opening Network");
+ 
+@@ -1813,6 +1816,16 @@
+ 
+             case NET_FUNC::ANNOUNCE:                                    // Announce
+                 {
++                    if (network->m_p25Enabled && network->m_p25Sites.role(peerId) != P25SiteRouting::Role::Control) break;
++                    const auto announcement = req->fneHeader.getSubFunction();
++                    const bool listAnnouncement = announcement == NET_SUBFUNC::ANNC_SUBFUNC_AFFILS || announcement == NET_SUBFUNC::ANNC_SUBFUNC_SITE_VC;
++                    const uint32_t minimum = listAnnouncement ? 4U : (announcement == NET_SUBFUNC::ANNC_SUBFUNC_GRP_AFFIL ? 6U : 3U);
++                    if (req->length < minimum) break;
++                    if (listAnnouncement) {
++                        const uint32_t count = GET_UINT32(req->buffer, 0U);
++                        const uint32_t width = announcement == NET_SUBFUNC::ANNC_SUBFUNC_AFFILS ? 8U : 4U;
++                        if (count > (req->length - 4U) / width) break;
++                    }
+                     // process incoming message subfunction opcodes
+                     switch (req->fneHeader.getSubFunction()) {
+                     case NET_SUBFUNC::ANNC_SUBFUNC_GRP_AFFIL:           // Announce Group Affiliation
+@@ -1831,6 +1844,7 @@
+                                     if (connection->connected() && connection->address() == ip && aff != nullptr) {
+                                         uint32_t srcId = GET_UINT24(req->buffer, 0U);           // Source Address
+                                         uint32_t dstId = GET_UINT24(req->buffer, 3U);           // Destination Address
++                                        if (!network->m_p25Sites.affiliate(peerId, srcId, dstId)) break;
+                                         aff->groupUnaff(srcId);
+                                         aff->groupAff(srcId, dstId);
+ 
+@@ -1869,6 +1883,7 @@
+                                     // validate peer (simple validation really)
+                                     if (connection->connected() && connection->address() == ip && aff != nullptr) {
+                                         uint32_t srcId = GET_UINT24(req->buffer, 0U);           // Source Address
++                                        if (!network->m_p25Sites.registerUnit(peerId, srcId)) break;
+                                         aff->unitReg(srcId, ssrc);
+ 
+                                         // attempt to repeat traffic to replica masters
+@@ -1905,6 +1920,7 @@
+                                     // validate peer (simple validation really)
+                                     if (connection->connected() && connection->address() == ip && aff != nullptr) {
+                                         uint32_t srcId = GET_UINT24(req->buffer, 0U);           // Source Address
++                                        network->m_p25Sites.unaffiliate(peerId, srcId, true);
+                                         aff->unitDereg(srcId);
+ 
+                                         // attempt to repeat traffic to replica masters
+@@ -1942,6 +1958,7 @@
+                                     // validate peer (simple validation really)
+                                     if (connection->connected() && connection->address() == ip && aff != nullptr) {
+                                         uint32_t srcId = GET_UINT24(req->buffer, 0U);           // Source Address
++                                        network->m_p25Sites.unaffiliate(peerId, srcId);
+                                         aff->groupUnaff(srcId);
+ 
+                                         // attempt to repeat traffic to replica masters
+@@ -1981,6 +1998,7 @@
+ 
+                                         if (aff != nullptr) {
+                                             aff->clearGroupAff(0U, true);
++                                            network->m_p25Sites.clearSnapshot(peerId);
+ 
+                                             // update TGID lists
+                                             uint32_t len = GET_UINT32(req->buffer, 0U);
+@@ -1989,7 +2007,7 @@
+                                                 uint32_t srcId = GET_UINT24(req->buffer, offs);
+                                                 uint32_t dstId = GET_UINT24(req->buffer, offs + 4U);
+ 
+-                                                aff->groupAff(srcId, dstId);
++                                                if (network->m_p25Sites.affiliate(peerId, srcId, dstId, true)) aff->groupAff(srcId, dstId);
+                                                 offs += 8U;
+                                             }
+                                             LogInfoEx(LOG_MASTER, "PEER %u (%s) announced %u affiliations", peerId, connection->identWithQualifier().c_str(), len);
+@@ -2031,7 +2049,7 @@
+                                         uint32_t offs = 4U;
+                                         for (uint32_t i = 0; i < len; i++) {
+                                             uint32_t vcPeerId = GET_UINT32(req->buffer, offs);
+-                                            if (vcPeerId > 0 && (network->m_peers.find(vcPeerId) != network->m_peers.end())) {
++                                            if (network->m_p25Sites.voiceAssociation(peerId, vcPeerId) && (network->m_peers.find(vcPeerId) != network->m_peers.end())) {
+                                                 FNEPeerConnection* vcConnection = network->m_peers[vcPeerId];
+                                                 if (vcConnection != nullptr) {
+                                                     vcConnection->ccPeerId(peerId);
+@@ -2207,6 +2225,7 @@
+ 
+ void TrafficNetwork::erasePeer(uint32_t peerId)
+ {
++    m_p25Sites.disconnected(peerId);
+     bool neighborFNE = false;
+     {
+         auto it = std::find_if(m_peers.begin(), m_peers.end(), [&](PeerMapPair x) { return x.first == peerId; });
+--- a/src/fne/network/TrafficNetwork.h
++++ b/src/fne/network/TrafficNetwork.h
+@@ -33,6 +33,7 @@
+ #include "common/lookups/PeerListLookup.h"
+ #include "common/lookups/AdjSiteMapLookup.h"
+ #include "common/network/BaseNetwork.h"
++#include "common/network/P25SiteRouting.h"
+ #include "common/network/Network.h"
+ #include "common/network/PacketBuffer.h"
+ #include "common/ThreadPool.h"
+@@ -306,6 +307,7 @@
+ 
+         friend class ::RESTAPI;
+         HostFNE* m_host;
++        P25SiteRouting m_p25Sites;
+ 
+         std::string m_address;
+         uint16_t m_port;
+--- a/src/fne/network/callhandler/TagP25Data.cpp
++++ b/src/fne/network/callhandler/TagP25Data.cpp
+@@ -101,11 +101,15 @@
+     DUID::E duid = (DUID::E)data[22U];
+     FrameType::E frameType = FrameType::DATA_UNIT;
+ 
+-    if (duid == DUID::PDU) {
+-        if (m_network->m_disablePacketData)
+-            return false;
+-        return m_packetData->processFrame(data, len, peerId, pktSeq, streamId, fromUpstream);
+-    }
++    if (fromUpstream || !m_network->m_p25Sites.system(netId, sysId) ||
++        m_network->m_p25Sites.role(peerId) == P25SiteRouting::Role::Unknown) return false;
++    if ((duid == DUID::LDU1 && len < P25_LDU1_PACKET_LENGTH) ||
++        (duid == DUID::LDU2 && len < P25_LDU2_PACKET_LENGTH) ||
++        (duid == DUID::TSDU && len < P25_TSDU_PACKET_LENGTH) ||
++        (duid == DUID::TDULC && len < P25_TDULC_PACKET_LENGTH)) return false;
++
++    if (duid == DUID::PDU) return false; // Group-voice profile excludes wide-area packet data.
++
+ 
+     // perform TGID route rewrites if configured
+     routeRewrite(buffer, peerId, duid, dstId, false);
+@@ -161,6 +165,8 @@
+     lsd.setLSD2(lsd2);
+ 
+     uint8_t frameLength = buffer[23U];
++    if ((duid == DUID::TSDU && frameLength != P25_TSDU_FRAME_LENGTH_BYTES) ||
++        (duid == DUID::TDULC && frameLength != P25_TDULC_FRAME_LENGTH_BYTES)) return false;
+ 
+     if (!m_network->validateP25FrameLength(frameLength, len, duid))
+         return false;
+@@ -176,10 +182,17 @@
+ 
+     // is the stream valid?
+     if (validate(peerId, control, duid, tsbk.get(), streamId)) {
+-        // is this peer ignored?
+-        if (!isPeerPermitted(peerId, control, duid, streamId, fromUpstream)) {
+-            return false;
+-        }
++        const bool signaling = duid == DUID::TSDU;
++        const bool adjacency = signaling && tsbk != nullptr && tsbk->getLCO() == TSBKO::OSP_ADJ_STS_BCAST;
++        if (adjacency && (m_network->m_p25Sites.role(peerId) != P25SiteRouting::Role::Control ||
++            static_cast<lc::tsbk::OSP_ADJ_STS_BCAST*>(tsbk.get())->getAdjSiteSysId() != sysId)) return false;
++        const bool groupVoice = !signaling && control.getGroup();
++        const bool demand = duid == DUID::TDU && (controlByte & NET_CTRL_GRANT_DEMAND);
++        const bool terminal = (duid == DUID::TDU || duid == DUID::TDULC) && !demand;
++        bool firstSiteCall = false;
++        if (groupVoice && terminal && !m_network->m_p25Sites.owns(peerId, streamId, srcId, dstId)) return false;
++        if (groupVoice && !terminal && !m_network->m_p25Sites.begin(peerId, streamId, srcId, dstId, &firstSiteCall)) return false;
++        if (!groupVoice && !isPeerPermitted(peerId, control, duid, streamId, fromUpstream)) return false;
+ 
+         // special case: if we've received a TSDU and its an LC_CALL_TERM; lets validate the source peer ID,
+         //  LC_CALL_TERMs should only be sourced from the peer that initiated the call; other peers should not be
+@@ -600,6 +613,20 @@
+         ** MASTER TRAFFIC
+         */
+ 
++        // Late entry may start with LDU1 rather than RF HDU. Generate the same
++        // native demand so each remote CC allocates its own local channel.
++        if (groupVoice && firstSiteCall && duid == DUID::LDU1) {
++            uint32_t demandLength = 0U;
++            auto demandFrame = m_network->createP25_TDUMessage(demandLength, control, lsd, NET_CTRL_GRANT_DEMAND);
++            SET_UINT24(netId, demandFrame.get(), 16U); demandFrame[11U] = uint8_t(sysId >> 8U); demandFrame[12U] = uint8_t(sysId);
++            m_network->m_peers.shared_lock();
++            for (auto peer : m_network->m_peers) {
++                if (peer.second && m_network->m_p25Sites.forward(peerId, peer.first, streamId, srcId, dstId, true, false))
++                    m_network->writePeer(peer.first, ssrc, { NET_FUNC::PROTOCOL, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25 }, demandFrame.get(), demandLength, pktSeq, streamId);
++            }
++            m_network->m_peers.shared_unlock();
++        }
++
+         // repeat traffic to nodes connected to us as peers
+         if (m_network->m_peers.size() > 0U && !noConnectedPeerRepeat) {
+             uint32_t i = 0U;
+@@ -641,8 +668,12 @@
+                         }
+                     }
+ 
+-                    // is this peer ignored?
+-                    if (!isPeerPermitted(peer.first, control, duid, streamId)) {
++                    if (groupVoice && !m_network->m_p25Sites.forward(peerId, peer.first, streamId, srcId, dstId, demand, terminal)) continue;
++                    if (signaling && !m_network->m_p25Sites.sameSite(peerId, peer.first) &&
++                        !(adjacency && m_network->m_p25Sites.role(peer.first) == P25SiteRouting::Role::Control)) continue;
++                    // The current site policy uses accepted CC affiliation reports.
++                    // Existing global RID/TG validation above still applies.
++                    if (!groupVoice && !isPeerPermitted(peer.first, control, duid, streamId)) {
+                         continue;
+                     }
+ 
+@@ -675,59 +706,12 @@
+             m_network->m_peers.shared_unlock();
+         }
+ 
++        if (groupVoice && terminal) m_network->m_p25Sites.end(peerId, streamId, dstId);
++
+         // if this is a private call, and we have already repeated to the connected peer that registered
+         // the unit, don't repeat to any neighbor FNE peers
+         if (privateCallInProgress && !noConnectedPeerRepeat) {
+             return true;
+-        }
+-
+-        /*
+-        ** PEER TRAFFIC (e.g. upstream networks this FNE is peered to)
+-        */
+-
+-        // repeat traffic to master nodes we have connected to as a peer
+-        if (m_network->m_host->m_peerNetworks.size() > 0U && !tg.config().parrot()) {
+-            for (auto peer : m_network->m_host->m_peerNetworks) {
+-                uint32_t dstPeerId = peer.second->getPeerId();
+-
+-                // don't try to repeat traffic to the source peer...if this traffic
+-                // is coming from a neighbor FNE peer
+-                if (dstPeerId != peerId) {
+-                    if (ssrc == dstPeerId) {
+-                        // skip the peer if it is the source peer
+-                        continue;
+-                    }
+-
+-                    // skip peer if it isn't enabled
+-                    if (!peer.second->isEnabled()) {
+-                        continue;
+-                    }
+-
+-                    // is this peer ignored?
+-                    if (!isPeerPermitted(dstPeerId, control, duid, streamId, true)) {
+-                        continue;
+-                    }
+-
+-                    DECLARE_UINT8_ARRAY(outboundPeerBuffer, len);
+-                    ::memcpy(outboundPeerBuffer, buffer, len);
+-
+-                    // perform TGID route rewrites if configured
+-                    routeRewrite(outboundPeerBuffer, dstPeerId, duid, dstId);
+-
+-                    // process TSDUs going to neighbor FNE peers
+-                    if (processTSDUToNeighbor(outboundPeerBuffer, peerId, dstPeerId, duid)) {
+-                        // are we a replica peer?
+-                        if (peer.second->isReplica())
+-                            peer.second->writeMaster({ NET_FUNC::PROTOCOL, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25 }, outboundPeerBuffer, len, pktSeq, streamId, false, 0U, ssrc);
+-                        else
+-                            peer.second->writeMaster({ NET_FUNC::PROTOCOL, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25 }, outboundPeerBuffer, len, pktSeq, streamId);
+-                        if (m_network->m_debug) {
+-                            LogDebugEx(LOG_P25, "TagP25Data::processFrame()", "Peers, ssrc = %u, srcPeer = %u, dstPeer = %u, duid = $%02X, lco = $%02X, MFId = $%02X, srcId = %u, dstId = %u, len = %u, pktSeq = %u, streamId = %u, fromUpstream = %u", 
+-                                ssrc, peerId, dstPeerId, duid, lco, MFId, srcId, dstId, len, pktSeq, streamId, fromUpstream);
+-                        }
+-                    }
+-                }
+-            }
+         }
+ 
+         return true;
+@@ -771,14 +755,17 @@
+         return false;
+     } 
+ 
+-    // repeat traffic to the connected peers
++    if (unitToUnit || !m_network->m_p25Sites.begin(peerId, streamId, srcId, dstId)) return false;
++    lc::LC control; control.setLCO(LCO::GROUP); control.setGroup(true); control.setSrcId(srcId); control.setDstId(dstId);
++    data::LowSpeedData lsd;
++    uint32_t length = 0U;
++    auto demand = m_network->createP25_TDUMessage(length, control, lsd, NET_CTRL_GRANT_DEMAND);
++    const uint32_t netId = m_network->m_p25Sites.netId(), sysId = m_network->m_p25Sites.sysId();
++    SET_UINT24(netId, demand.get(), 16U); demand[11U] = uint8_t(sysId >> 8U); demand[12U] = uint8_t(sysId);
+     m_network->m_peers.shared_lock();
+-    if (m_network->m_peers.size() > 0U) {
+-        for (auto peer : m_network->m_peers) {
+-            if (peerId != peer.first) {
+-                write_TSDU_Grant(peer.first, srcId, dstId, 4U, !unitToUnit);
+-            }
+-        }
++    for (auto peer : m_network->m_peers) {
++        if (peer.second && m_network->m_p25Sites.forward(peerId, peer.first, streamId, srcId, dstId, true, false))
++            m_network->writePeer(peer.first, peerId, { NET_FUNC::PROTOCOL, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25 }, demand.get(), length, pktSeq, streamId);
+     }
+     m_network->m_peers.shared_unlock();
+ 
+@@ -1185,7 +1172,7 @@
+                                 // if the peer is mapped, we can repeat the ADJ_STS_BCAST to other peers
+                                 if (m_network->m_peers.size() > 0U) {
+                                     for (auto peer : m_network->m_peers) {
+-                                        if (peerId != peer.first) {
++                                        if (peerId != peer.first && m_network->m_p25Sites.role(peer.first) == P25SiteRouting::Role::Control) {
+                                             write_TSDU(peer.first, osp);
+                                         }
+                                     }
+--- a/src/host/p25/Control.Dispatch.cpp
++++ b/src/host/p25/Control.Dispatch.cpp
+@@ -74,7 +74,7 @@
+ 
+ bool Control::dispatchReady(bool admitNew) const
+ {
+-    return m_dispatchEnabled && !m_dispatchClosing.load() && m_authoritative && m_supervisor &&
++    return externalNetworkAvailable() && m_dispatchEnabled && !m_dispatchClosing.load() && m_authoritative && m_supervisor &&
+         m_enableControl && m_dedicatedControl && m_duplex && m_ccRunning && !m_ccHalted &&
+         !identificationActive() && (!admitNew || !identificationUnavailable()) && m_modem != nullptr && !m_modem->hasError() &&
+         !m_modem->hasLockout() && m_modem->statusGeneration() != 0U &&
+@@ -193,10 +193,12 @@
+         }
+         auto accepted = std::make_shared<std::atomic<bool>>(false);
+         json::object req;
++        req["srcId"].set<uint32_t>(lease.srcId);
+         req["dstId"].set<uint32_t>(lease.dstId); req["permitToken"].set<std::string>(permitToken);
+         const bool replied = !permitToken.empty() && g_RPC->req(RPC_PERMIT_P25_TG, req,
+             [accepted, permitToken, lease](json::object& response, json::object&) {
+                 accepted->store(response["status"].is<int>() && response["status"].get<int>() == network::NetRPC::OK &&
++                    response["srcId"].is<int>() && response["srcId"].get<uint32_t>() == lease.srcId &&
+                     response["dstId"].is<int>() && response["dstId"].get<uint32_t>() == lease.dstId &&
+                     response["permitToken"].is<std::string>() && response["permitToken"].get<std::string>() == permitToken);
+             }, channel.address(), channel.port(), true);
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -307,6 +307,8 @@
+     std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
+     const uint32_t oldDestination = m_permittedDstId.load();
+     m_permittedDstId.store(0U);
++    m_permittedSrcId = 0U;
++    m_pendingSiteFrames.clear();
+     m_permitToken.clear();
+     m_rfTGHang.stop();
+     // A completed/preempted session must not recreate a tail after CW reset.
+@@ -333,6 +335,8 @@
+ {
+     yaml::Node systemConf = conf["system"];
+     yaml::Node p25Protocol = conf["protocols"]["p25"];
++    m_managedSite = p25Protocol["managedSite"].as<bool>(false);
++    m_zoneConnected.store(false);
+ 
+     // Digital BSI is independent of the Ham Morse scheduler.
+     m_control->m_ctrlStationId = systemConf["bsi"]["enable"].as<bool>(false);
+@@ -1026,12 +1030,16 @@
+     if (m_network != nullptr) {
+         processNetwork();
+ 
+-        if (m_network->getStatus() == network::NET_STAT_RUNNING) {
+-            m_siteData.setNetActive(true);
+-        }
+-        else {
+-            m_siteData.setNetActive(false);
+-        }
++        const bool connected = m_network->getStatus() == network::NET_STAT_RUNNING && externalNetworkAvailable();
++        m_siteData.setNetActive(connected);
++        if (connected && !m_externalWasRunning && m_authoritative && m_enableControl) {
++            // Rebuild FNE interest immediately after restart/reconnect, using
++            // only registrations/affiliations actually accepted at this site.
++            const auto affiliations = m_affiliations->grpAffTable();
++            m_network->announceAffiliationUpdate(affiliations);
++            m_control->writeAdjSSNetwork();
++        }
++        m_externalWasRunning = connected;
+ 
+         lc::TDULC::setSiteData(m_siteData);
+         lc::TSBK::setSiteData(m_siteData);
+@@ -1092,6 +1100,8 @@
+             if (!m_authoritative && m_permittedDstId != 0U) {
+                 std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
+                 m_permittedDstId = 0U;
++                m_permittedSrcId = 0U;
++                m_pendingSiteFrames.clear();
+                 m_permitToken.clear();
+             }
+ 
+@@ -1153,7 +1163,7 @@
+         p25::data::LowSpeedData lsd = p25::data::LowSpeedData();
+ 
+         uint8_t controlByte = 0x00U;
+-        m_network->writeP25TDU(lc, lsd);
++        if (m_network != nullptr && externalNetworkAvailable()) m_network->writeP25TDU(lc, lsd);
+ 
+         m_rfCallTermDstId = 0U;
+         m_rfCallTermSrcId = 0U;
+@@ -1174,7 +1184,10 @@
+             }
+ 
+             m_networkWatchdog.stop();
++            const uint32_t expiredDestination = m_netLastDstId;
+             m_affiliations->releaseGrant(m_voice->m_netLC.getDstId(), false);
++            if (!m_authoritative && m_rfState == RS_RF_LISTENING)
++                notifyCC_ReleaseGrant(expiredDestination);
+ 
+             if (m_dedicatedControl) {
+                 if (m_network != nullptr)
+@@ -1396,6 +1409,7 @@
+     if (dstId != 0U)
+         m_rfTGHang.stop(); // an old call's hang timer cannot clear a new permit
+     m_permittedDstId = dstId;
++    if (dstId == 0U) { m_permittedSrcId = 0U; m_pendingSiteFrames.clear(); }
+ 
+     // is this a data permit?
+     if (dataPermit && m_sndcpSupport) {
+@@ -1572,12 +1586,24 @@
+ {
+     std::unique_lock<std::recursive_mutex> permitLock(m_permitMutex, std::defer_lock);
+     if (!m_authoritative) permitLock.lock();
++    const auto read24 = [](const uint8_t* bytes, uint32_t offset) { return (uint32_t(bytes[offset]) << 16U) | (uint32_t(bytes[offset + 1U]) << 8U) | bytes[offset + 2U]; };
+     uint32_t length = 0U;
+     bool ret = false;
+-    UInt8Array buffer = m_network->readP25(ret, length);
++    UInt8Array buffer;
++    const auto now = std::chrono::steady_clock::now();
++    for (auto it = m_pendingSiteFrames.begin(); it != m_pendingSiteFrames.end();) {
++        if (now - it->received > std::chrono::milliseconds(750)) { it = m_pendingSiteFrames.erase(it); continue; }
++        if (!buffer && m_permittedDstId.load() != 0U && read24(it->bytes.data(), 8U) == m_permittedDstId.load() &&
++            read24(it->bytes.data(), 5U) == m_permittedSrcId) {
++            length = uint32_t(it->bytes.size()); buffer.reset(new uint8_t[length]);
++            ::memcpy(buffer.get(), it->bytes.data(), length); it = m_pendingSiteFrames.erase(it); ret = true;
++        } else ++it;
++    }
++    if (!buffer) buffer = m_network->readP25(ret, length);
+     if (!ret)
+         return;
+-    if (length == 0U)
++    if (!externalNetworkAvailable()) { m_pendingSiteFrames.clear(); return; }
++    if (length < 24U)
+         return;
+     if (buffer == nullptr) {
+         m_network->resetP25();
+@@ -1599,6 +1625,32 @@
+     // process network message header
+     DUID::E duid = (DUID::E)buffer[22U];
+     uint8_t MFId = buffer[15U];
++    if ((duid == DUID::LDU1 && length < network::P25_LDU1_PACKET_LENGTH) ||
++        (duid == DUID::LDU2 && length < network::P25_LDU2_PACKET_LENGTH) ||
++        (duid == DUID::TSDU && length < network::P25_TSDU_PACKET_LENGTH) ||
++        (duid == DUID::TDULC && length < network::P25_TDULC_PACKET_LENGTH)) return;
++    const uint32_t networkSrc = read24(buffer.get(), 5U), networkDst = read24(buffer.get(), 8U);
++    const uint32_t networkSys = (buffer[11U] << 8) | buffer[12U];
++    const uint32_t networkNet = GET_UINT24(buffer, 16U);
++    if (networkSys != m_siteData.sysId() || networkNet != m_siteData.netId()) return;
++    const bool encodedVoice = duid == DUID::LDU1 || duid == DUID::LDU2;
++    const bool encodedEnd = duid == DUID::TDU && !grantDemand;
++    if (!m_authoritative && (encodedVoice || encodedEnd)) {
++        if (m_permittedDstId.load() == 0U) {
++            // Queue only encoded setup traffic. The native CC must positively
++            // permit the same RID/TG before any frame reaches the modem queue.
++            const bool existingSetup = std::any_of(m_pendingSiteFrames.begin(), m_pendingSiteFrames.end(), [&](const auto& frame) {
++                return read24(frame.bytes.data(), 5U) == networkSrc && read24(frame.bytes.data(), 8U) == networkDst;
++            });
++            if (!identificationUnavailable() && (encodedVoice || existingSetup) &&
++                acl::AccessControl::validateSrcId(networkSrc) && acl::AccessControl::validateTGId(networkDst)) {
++                if (m_pendingSiteFrames.size() >= 4U) m_pendingSiteFrames.pop_front();
++                m_pendingSiteFrames.push_back({std::vector<uint8_t>(buffer.get(), buffer.get() + length), now});
++            }
++            return;
++        }
++        if (networkDst != m_permittedDstId.load() || networkSrc != m_permittedSrcId) return;
++    }
+ 
+     // process raw P25 data bytes
+     UInt8Array data;
+@@ -1623,7 +1675,7 @@
+         else {
+             data = std::unique_ptr<uint8_t[]>(new uint8_t[frameLength]);
+             ::memset(data.get(), 0x00U, frameLength);
+-            ::memcpy(data.get(), buffer.get() + 24U, frameLength);
++            ::memcpy(data.get(), buffer.get() + 24U, std::min<uint32_t>(frameLength, length - 24U));
+         }
+     }
+ 
+@@ -1665,14 +1717,6 @@
+ 
+     FrameType::E frameType = FrameType::DATA_UNIT;
+ 
+-    // if the netId or sysId is missing; default to our netId and sysId
+-    if (netId == 0U) {
+-        netId = lc::LC::getSiteData().netId();
+-    }
+-
+-    if (sysId == 0U) {
+-        sysId = lc::LC::getSiteData().sysId();
+-    }
+ 
+     if (m_debug) {
+         LogDebug(LOG_NET, "P25, duid = $%02X, lco = $%02X, MFId = $%02X, srcId = %u, dstId = %u, len = %u", duid, lco, MFId, srcId, dstId, length);
+@@ -1744,6 +1788,9 @@
+             }
+ 
+             m_voice->processNetwork(data.get(), frameLength, control, lsd, duid, frameType);
++            // Initial DFSI setup resets the decoder. Arm after it commits
++            // audio so even a short remote call is bounded by the watchdog.
++            if (m_netState == RS_NET_AUDIO || m_netState == RS_NET_DATA) m_networkWatchdog.start();
+             break;
+ 
+         case DUID::TDU:
+@@ -1964,6 +2011,8 @@
+     }
+     requestIdentification();
+     m_permittedDstId.store(0U);
++    m_permittedSrcId = 0U;
++    m_pendingSiteFrames.clear();
+     m_permitToken.clear();
+     m_nextPermitRelease = std::chrono::steady_clock::time_point();
+     retryPermitReleases();
+@@ -2201,6 +2250,10 @@
+         return;
+     }
+     const uint32_t dstId = req["dstId"].get<uint32_t>();
++    if (dstId != 0U && (!req["srcId"].is<int>() || req["srcId"].get<uint32_t>() == 0U || req["srcId"].get<uint32_t>() > 0xFFFFFFU)) {
++        g_RPC->defaultResponse(reply, "permit requires a valid source ID", network::NetRPC::INVALID_ARGS); return;
++    }
++    const uint32_t srcId = dstId == 0U ? 0U : req["srcId"].get<uint32_t>();
+     std::string token;
+     if (!req["permitToken"].is<std::string>() || req["permitToken"].get<std::string>().empty() ||
+         req["permitToken"].get<std::string>().size() > 64U) {
+@@ -2214,14 +2267,16 @@
+     }
+     reply["permitToken"].set<std::string>(token);
+     reply["dstId"].set<uint32_t>(dstId);
++    reply["srcId"].set<uint32_t>(srcId);
+     if (dstId != 0U && identificationUnavailable()) {
+         // A repeat of an already committed permit remains owned while the
+         // channel drains. New tokens must use another voice resource.
+-        if (dstId == m_permittedDstId.load() && token == m_permitToken)
++        if (dstId == m_permittedDstId.load() && srcId == m_permittedSrcId && token == m_permitToken)
+             return;
+         g_RPC->defaultResponse(reply, "voice channel is draining or identifying", network::NetRPC::BAD_REQUEST);
+         reply["permitToken"].set<std::string>(token);
+         reply["dstId"].set<uint32_t>(dstId);
++        reply["srcId"].set<uint32_t>(srcId);
+         const bool unavailable = true;
+         reply["identificationUnavailable"].set<bool>(unavailable);
+         return;
+@@ -2251,7 +2306,7 @@
+         if (session == m_permitSession) {
+             if (sequence <= m_permitSequence) {
+                 // The sole idempotent repeat is the currently active permit.
+-                if (sequence == m_permitSequence && token == m_permitToken && dstId == m_permittedDstId.load())
++                if (sequence == m_permitSequence && token == m_permitToken && dstId == m_permittedDstId.load() && srcId == m_permittedSrcId)
+                     return;
+                 g_RPC->defaultResponse(reply, "stale permit sequence", network::NetRPC::BAD_REQUEST);
+                 return;
+@@ -2268,6 +2323,7 @@
+         m_permitSequence = sequence;
+     }
+     permittedTG(dstId, dataPermit);
++    m_permittedSrcId = srcId;
+     m_permitToken = dstId == 0U ? "" : token;
+ }
+ 
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -297,10 +297,15 @@
+          */
+         uint32_t getLastSrcId() const;
+ 
++        void setZoneConnected(bool connected) { m_zoneConnected.store(connected); }
++        bool zoneConnected() const { return m_zoneConnected.load(); }
++        bool externalNetworkAvailable() const { return !m_managedSite || m_zoneConnected.load(); }
++
+     private:
+ #if defined(CATCH2_TEST_COMPILATION)
+         friend struct CapacityPermitTestAccess;
+         friend struct DispatchGrantTestAccess;
++        friend struct MultiSiteTestAccess;
+ #endif
+         friend class packet::Voice;
+         packet::Voice* m_voice;
+@@ -328,6 +333,9 @@
+         std::chrono::steady_clock::time_point m_dispatchExpires{};
+ 
+         bool m_authoritative;
++        bool m_managedSite = false;
++        bool m_externalWasRunning = false;
++        std::atomic<bool> m_zoneConnected{false};
+         bool m_supervisor;
+ 
+         uint32_t m_nac;
+@@ -387,6 +395,9 @@
+         uint32_t m_netLastSrcId;
+ 
+         std::atomic<uint32_t> m_permittedDstId;
++        uint32_t m_permittedSrcId = 0U;
++        struct PendingSiteFrame { std::vector<uint8_t> bytes; std::chrono::steady_clock::time_point received; };
++        std::deque<PendingSiteFrame> m_pendingSiteFrames;
+         std::atomic<bool> m_identificationEnabled{false};
+         std::atomic<bool> m_identificationPending{false};
+         std::atomic<bool> m_identificationUnavailable{false};
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -1353,7 +1353,7 @@
+     assert(tsbk != nullptr);
+     assert(data != nullptr);
+ 
+-    if (m_p25->m_network == nullptr)
++    if (m_p25->m_network == nullptr || !m_p25->externalNetworkAvailable())
+         return;
+ 
+     if (m_p25->m_rfTimeout.isRunning() && m_p25->m_rfTimeout.hasExpired())
+@@ -1376,7 +1376,7 @@
+ {
+     assert(data != nullptr);
+ 
+-    if (m_p25->m_network == nullptr)
++    if (m_p25->m_network == nullptr || !m_p25->externalNetworkAvailable())
+         return;
+ 
+     if (m_p25->m_rfTimeout.isRunning() && m_p25->m_rfTimeout.hasExpired())
+@@ -2724,6 +2724,7 @@
+     auto unavailable = std::make_shared<std::atomic<bool>>(false);
+     json::object request;
+     request["dstId"].set<uint32_t>(dstId);
++    request["srcId"].set<uint32_t>(srcId);
+     request["permitToken"].set<std::string>(token);
+     if (dataPermit) {
+         const int state = modem::DVM_STATE::STATE_P25;
+@@ -2733,8 +2734,9 @@
+     }
+     grantGuard.unlock(); // never hold the allocation lock across an RPC wait
+     const bool replied = g_RPC->req(RPC_PERMIT_P25_TG, request,
+-        [accepted, unavailable, token, dstId](json::object& response, json::object&) {
+-            const bool correlated = response["dstId"].is<int>() && response["dstId"].get<uint32_t>() == dstId &&
++        [accepted, unavailable, token, dstId, srcId](json::object& response, json::object&) {
++            const bool correlated = response["srcId"].is<int>() && response["srcId"].get<uint32_t>() == srcId &&
++                response["dstId"].is<int>() && response["dstId"].get<uint32_t>() == dstId &&
+                 response["permitToken"].is<std::string>() && response["permitToken"].get<std::string>() == token;
+             accepted->store(response["status"].is<int>() && response["status"].get<int>() == network::NetRPC::OK &&
+                 correlated);
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -355,7 +355,7 @@
+             }
+ 
+             // send network grant demand TDU
+-            if (m_p25->m_network != nullptr) {
++            if (m_p25->m_network != nullptr && m_p25->externalNetworkAvailable()) {
+                 if (!m_p25->m_dedicatedControl && m_p25->m_convNetGrantDemand) {
+                     uint8_t controlByte = network::NET_CTRL_GRANT_DEMAND;                   // Grant Demand Flag
+                     if (encrypted)
+@@ -1475,7 +1475,7 @@
+ {
+     assert(data != nullptr);
+ 
+-    if (m_p25->m_network == nullptr)
++    if (m_p25->m_network == nullptr || !m_p25->externalNetworkAvailable())
+         return;
+ 
+     if (m_p25->m_rfTimeout.isRunning() && m_p25->m_rfTimeout.hasExpired())
+--- a/src/host/restapi/RESTAPI.cpp
++++ b/src/host/restapi/RESTAPI.cpp
+@@ -320,6 +320,7 @@
+     m_dispatcher.match(GET_P25_CC).get(REST_API_BIND(RESTAPI::restAPI_GetP25CC, this));
+     m_dispatcher.match(GET_P25_DEBUG, true).get(REST_API_BIND(RESTAPI::restAPI_GetP25Debug, this));
+     m_dispatcher.match(GET_P25_DUMP_TSBK, true).get(REST_API_BIND(RESTAPI::restAPI_GetP25DumpTSBK, this));
++    m_dispatcher.match("/p25/site-state").put(REST_API_BIND(RESTAPI::restAPI_PutP25SiteState, this));
+     m_dispatcher.match(PUT_P25_RID).put(REST_API_BIND(RESTAPI::restAPI_PutP25RID, this));
+     m_dispatcher.match(GET_P25_CC_DEDICATED).get(REST_API_BIND(RESTAPI::restAPI_GetP25CCEnable, this));
+     m_dispatcher.match(GET_P25_CC_BCAST).get(REST_API_BIND(RESTAPI::restAPI_GetP25CCBroadcast, this));
+@@ -1380,6 +1381,21 @@
+         errorPayload(reply, "P25 mode is not enabled", HTTPPayload::SERVICE_UNAVAILABLE);
+         return;
+     }
++}
++
++/* Site service heartbeat. Loss of zone management never stops local trunking. */
++void RESTAPI::restAPI_PutP25SiteState(const HTTPPayload& request, HTTPPayload& reply, const RequestMatch&)
++{
++    if (!validateAuth(request, reply)) return;
++    json::object req;
++    if (!parseRequestBody(request, reply, req)) return;
++    if (m_p25 == nullptr) { errorPayload(reply, "P25 mode is not enabled", HTTPPayload::SERVICE_UNAVAILABLE); return; }
++    if (!req["zoneConnected"].is<bool>()) { errorPayload(reply, "zoneConnected must be boolean"); return; }
++    m_p25->setZoneConnected(req["zoneConnected"].get<bool>());
++    json::object response; setResponseDefaultStatus(response);
++    const bool connected = m_p25->zoneConnected();
++    response["zoneConnected"].set<bool>(connected);
++    reply.payload(response);
+ }
+ 
+ /* REST API endpoint; implements P25 RID operation request. */
+--- a/src/host/restapi/RESTAPI.h
++++ b/src/host/restapi/RESTAPI.h
+@@ -332,6 +332,7 @@
+      * @param reply HTTP reply.
+      * @param match HTTP request matcher.
+      */
++    void restAPI_PutP25SiteState(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+     void restAPI_PutP25RID(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+     /**
+      * @brief REST API endpoint; implements toggle P25 CC request.
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -14,6 +14,9 @@
+ #include "common/p25/lc/tdulc/LC_GROUP.h"
+ #include "common/p25/lc/tsbk/TSBKFactory.h"
+ #include "common/Log.h"
++#include "common/network/P25SiteRouting.h"
++#include "common/p25/lc/tsbk/OSP_RFSS_STS_BCAST.h"
++#include "common/p25/Audio.h"
+ 
+ #include <catch2/catch_test_macros.hpp>
+ #include <array>
+@@ -34,6 +37,14 @@
+ using namespace p25::lc::tsbk;
+ 
+ namespace p25 {
++struct MultiSiteTestAccess {
++    static void process(Control& value) { value.processNetwork(); }
++    static bool permitted(Control& value) { return value.m_permittedDstId.load() != 0U; }
++    static size_t pending(Control& value) { return value.m_pendingSiteFrames.size(); }
++    static void expire(Control& value) { for (auto& frame : value.m_pendingSiteFrames) frame.received -= std::chrono::seconds(1); }
++    static void expireNetwork(Control& value) { value.m_networkWatchdog.clock(1501U); }
++    static void managed(Control& value) { value.m_managedSite = true; value.setZoneConnected(false); }
++};
+ struct CapacityPermitTestAccess {
+     static void startOldCallHang(Control& value) { value.m_rfTGHang.start(); }
+     static void advanceHang(Control& value, uint32_t ms) { value.m_rfTGHang.clock(ms); }
+@@ -89,7 +100,7 @@
+     }
+ };
+ 
+-enum class PermitMode { Accepted, Rejected, MissingStatus, BadStatusType, MissingEcho, WrongDestination, StaleToken, Timeout, Late };
++enum class PermitMode { Accepted, Rejected, MissingStatus, BadStatusType, MissingEcho, WrongDestination, WrongSource, StaleToken, Timeout, Late };
+ class PermitRPC : public network::NetRPC {
+ public:
+     PermitMode mode = PermitMode::Accepted;
+@@ -145,9 +156,11 @@
+         if (mode == PermitMode::BadStatusType) response["status"].set<std::string>("200");
+         if (mode != PermitMode::MissingEcho) {
+             response["dstId"] = request.at("dstId");
++            response["srcId"] = request.at("srcId");
+             response["permitToken"] = request.at("permitToken");
+         }
+         if (mode == PermitMode::WrongDestination) setJSON<uint32_t>(response, "dstId", 999U);
++        if (mode == PermitMode::WrongSource) setJSON<uint32_t>(response, "srcId", 999U);
+         if (mode == PermitMode::StaleToken) response["permitToken"].set<std::string>("old-process:1");
+         json::object ignored;
+         response = wireObject(response);
+@@ -158,6 +171,7 @@
+         json::object response;
+         setJSON<int>(response, "status", OK);
+         response["dstId"] = lateRequest.at("dstId");
++        response["srcId"] = lateRequest.at("srcId");
+         response["permitToken"] = lateRequest.at("permitToken");
+         json::object ignored;
+         REQUIRE(late != nullptr);
+@@ -179,7 +193,7 @@
+         true, true, false, false, false, false};
+     std::unique_ptr<Control> controller;
+ 
+-    explicit ControllerFixture(bool withCapacity = false, bool sndcp = false, bool strictACL = false, bool messageAck = false, bool authoritative = true) :
++    explicit ControllerFixture(bool withCapacity = false, bool sndcp = false, bool strictACL = false, bool messageAck = false, bool authoritative = true, network::Network* network = nullptr) :
+         radios("", 0U, strictACL), groups("", 0U, strictACL) {
+         g_logDisplayLevel = 0U;
+         g_RPC = &rpc;
+@@ -196,7 +210,7 @@
+             channels.addRFCh(VOICE_CHANNEL);
+         }
+         controller = std::make_unique<Control>(authoritative, 0x293U, 1U, 16384U,
+-            &modem, nullptr, 120U, 1U, true, &channels, &radios, &groups,
++            &modem, network, 120U, 1U, true, &channels, &radios, &groups,
+             &identities, &rssi, false, false, false, false, false);
+         yaml::Node config;
+         const std::string configText = std::string(R"(
+@@ -256,6 +270,7 @@
+     void permitVoice(const std::string& token) {
+         json::object request, reply;
+         setJSON<uint32_t>(request, "dstId", GROUP);
++        setJSON<uint32_t>(request, "srcId", SOURCE);
+         request["permitToken"].set<std::string>(token);
+         request = wireObject(request);
+         REQUIRE(rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));
+@@ -270,6 +285,9 @@
+         LC control;
+         control.setSrcId(SOURCE); control.setDstId(destination);
+         control.setGroup(true); control.setLCO(LCO::GROUP); control.setAlgId(ALGO_UNENCRYPT);
++        if (duid == DUID::LDU1 || duid == DUID::LDU2) {
++            p25::Audio audio; for (uint32_t i=0U; i<9U; ++i) audio.encode(frame.data()+2U, NULL_IMBE, i);
++        }
+         if (duid == DUID::HDU) control.encodeHDU(frame.data() + 2U);
+         if (duid == DUID::LDU1) control.encodeLDU1(frame.data() + 2U);
+         if (duid == DUID::LDU2) control.encodeLDU2(frame.data() + 2U);
+@@ -623,6 +641,7 @@
+     auto send = [&](uint32_t destination, const std::string& token) {
+         json::object req, reply;
+         setJSON<uint32_t>(req, "dstId", destination);
++        setJSON<uint32_t>(req, "srcId", SOURCE);
+         req["permitToken"].set<std::string>(token);
+         req = wireObject(req);
+         REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, req, reply));
+@@ -674,6 +693,7 @@
+     auto send = [&](uint32_t destination, const std::string& token) {
+         json::object req, reply;
+         setJSON<uint32_t>(req, "dstId", destination);
++        setJSON<uint32_t>(req, "srcId", SOURCE);
+         req["permitToken"].set<std::string>(token);
+         req = wireObject(req);
+         REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, req, reply));
+@@ -695,6 +715,7 @@
+     for (uint32_t destination : {0U, GROUP, GROUP + 1U}) {
+         json::object request, reply;
+         setJSON<uint32_t>(request, "dstId", destination);
++        setJSON<uint32_t>(request, "srcId", SOURCE);
+         request = wireObject(request);
+         REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));
+         REQUIRE(reply["status"].get<int>() == network::NetRPC::INVALID_ARGS);
+@@ -725,6 +746,7 @@
+     auto send = [&](uint16_t function, const std::string& token) {
+         json::object request, reply;
+         setJSON<uint32_t>(request, "dstId", GROUP);
++        setJSON<uint32_t>(request, "srcId", SOURCE);
+         if (!token.empty()) request["permitToken"].set<std::string>(token);
+         request = wireObject(request);
+         REQUIRE(control.rpc.dispatchRequest(function, request, reply));
+@@ -772,6 +794,7 @@
+     REQUIRE_FALSE(voice.controller->consumeIdentificationEnd()); // duplicate end
+     json::object permit, response;
+     setJSON<uint32_t>(permit, "dstId", GROUP);
++        setJSON<uint32_t>(permit, "srcId", SOURCE);
+     permit["permitToken"].set<std::string>("abc:2");
+     permit = wireObject(permit);
+     REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, permit, response));
+@@ -880,6 +903,7 @@
+     REQUIRE_FALSE(voice.drainVoice().empty());
+     json::object request, reply;
+     setJSON<uint32_t>(request, "dstId", GROUP);
++        setJSON<uint32_t>(request, "srcId", SOURCE);
+     request["permitToken"].set<std::string>("abcdef:1");
+     request = wireObject(request);
+     REQUIRE(voice.rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));
+@@ -1101,3 +1125,284 @@
+     REQUIRE(voice.drainVoice().empty());
+     REQUIRE_FALSE(voice.controller->identificationPending());
+ }
++
++namespace {
++class SiteNetwork : public network::Network {
++public:
++    std::deque<std::vector<uint8_t>> incoming;
++    std::vector<std::vector<uint8_t>> outgoing;
++    std::vector<std::unordered_map<uint32_t,uint32_t>> snapshots;
++    bool announceAffiliationUpdate(const std::unordered_map<uint32_t,uint32_t> affiliations) override { snapshots.push_back(affiliations); return true; }
++    SiteNetwork() : Network("127.0.0.1", 49991U, 0U, 100101001U, "offline", true, false,
++        false, true, false, false, false, false, false, false, false, false) { m_status = network::NET_STAT_RUNNING; }
++    void running(bool active) { m_status = active ? network::NET_STAT_RUNNING : network::NET_STAT_WAITING_CONNECT; }
++    UInt8Array readP25(bool& ret, uint32_t& length) override {
++        ret = !incoming.empty(); length = 0U; if (!ret) return nullptr;
++        auto bytes = std::move(incoming.front()); incoming.pop_front(); length = bytes.size();
++        UInt8Array result(new uint8_t[length]); std::copy(bytes.begin(), bytes.end(), result.get()); return result;
++    }
++    void resetP25() override { incoming.clear(); }
++    using network::BaseNetwork::createP25_TDUMessage;
++    using network::BaseNetwork::createP25_LDU1Message;
++    using network::BaseNetwork::createP25_LDU2Message;
++    bool writeP25LDU1(const LC& control, const p25::data::LowSpeedData& lsd, const uint8_t* data, FrameType::E type, uint8_t flags) override {
++        uint32_t length; auto message=createP25_LDU1Message(length, control, lsd, data, type, flags);
++        outgoing.emplace_back(message.get(),message.get()+length); return true;
++    }
++    bool writeP25LDU2(const LC& control, const p25::data::LowSpeedData& lsd, const uint8_t* data, uint8_t flags) override {
++        uint32_t length; auto message=createP25_LDU2Message(length, control, lsd, data, flags);
++        outgoing.emplace_back(message.get(),message.get()+length); return true;
++    }
++    bool writeP25TDU(const LC& control, const p25::data::LowSpeedData& lsd, uint8_t flags = 0U) override {
++        uint32_t length; auto message=createP25_TDUMessage(length,control,lsd,flags);
++        outgoing.emplace_back(message.get(),message.get()+length); return true;
++    }
++    std::vector<uint8_t> encoded(DUID::E duid, uint32_t source = SOURCE) {
++        LC control; control.setLCO(LCO::GROUP); control.setGroup(true); control.setSrcId(source); control.setDstId(GROUP); control.setAlgId(ALGO_UNENCRYPT);
++        p25::data::LowSpeedData lsd;
++        std::array<uint8_t,P25_LDU_FRAME_LENGTH_BYTES> frame{};
++        // Native IMBE FEC/interleaving, then native DFSI serialization.
++        p25::Audio audio;
++        for (uint32_t i=0; i<9U; ++i) audio.encode(frame.data(), NULL_IMBE, i);
++        uint32_t length=0;
++        UInt8Array message;
++        if (duid == DUID::TDU) message=createP25_TDUMessage(length,control,lsd,0U);
++        else if (duid == DUID::LDU1) message=createP25_LDU1Message(length,control,lsd,frame.data(),FrameType::HDU_VALID);
++        else message=createP25_LDU2Message(length,control,lsd,frame.data());
++        return std::vector<uint8_t>(message.get(), message.get()+length);
++    }
++};
++yaml::Node sitePolicy() {
++    yaml::Node value;
++    REQUIRE(yaml::Parse(value, std::string(R"(
++p25System:
++    netId: 1
++    sysId: 1
++p25Sites:
++    - controlPeerId: 100101000
++      voicePeerIds:
++          - 100101001
++      consolePeerIds:
++          - 100101128
++      talkgroups:
++          - 101
++          - 102
++    - controlPeerId: 100102000
++      voicePeerIds:
++          - 100102001
++      consolePeerIds:
++          - 100102128
++      talkgroups:
++          - 101
++    - controlPeerId: 100103000
++      voicePeerIds:
++          - 100103001
++      consolePeerIds:
++          - 100103128
++      talkgroups:
++          - 102
++)")));
++    return value;
++}
++}
++
++TEST_CASE("P25 system routes only accepted interested sites and retains terminal legs", "[p25][multisite]") {
++    network::P25SiteRouting route; std::string error;
++    REQUIRE(route.configure(sitePolicy(),error)); REQUIRE(error.empty());
++    REQUIRE(route.system(1U,1U)); REQUIRE_FALSE(route.system(2U,1U)); REQUIRE_FALSE(route.system(1U,2U));
++    REQUIRE(route.affiliate(100101000U,SOURCE,GROUP));
++    REQUIRE_FALSE(route.affiliate(100102001U,TARGET,GROUP)); // Only accepted CC reports.
++    REQUIRE_FALSE(route.affiliate(100103000U,TARGET,GROUP)); // Restricted site.
++    REQUIRE(route.begin(100101001U,42U,SOURCE,GROUP));
++    REQUIRE_FALSE(route.forward(100101001U,100102000U,42U,SOURCE,GROUP,true,false));
++    route.end(100101001U,42U,GROUP);
++    REQUIRE(route.affiliate(100102000U,TARGET,GROUP));
++    REQUIRE(route.begin(100101001U,43U,SOURCE,GROUP));
++    REQUIRE(route.forward(100101001U,100102000U,43U,SOURCE,GROUP,true,false));
++    REQUIRE_FALSE(route.forward(100101001U,100101000U,43U,SOURCE,GROUP,true,false));
++    REQUIRE_FALSE(route.forward(100101001U,100103001U,43U,SOURCE,GROUP,false,false));
++    REQUIRE_FALSE(route.forward(100101001U,123U,43U,SOURCE,GROUP,false,false));
++    REQUIRE_FALSE(route.forward(100101001U,100102001U,43U,TARGET,GROUP,false,false));
++    REQUIRE_FALSE(route.begin(100102001U,44U,TARGET,GROUP)); // No second origin/relay loop.
++    REQUIRE(route.forward(100101001U,100102001U,43U,SOURCE,GROUP,false,false));
++    REQUIRE_FALSE(route.forward(100101000U,100102000U,43U,SOURCE,GROUP,false,false,true));
++    route.unaffiliate(100102000U,TARGET);
++    REQUIRE(route.forward(100101001U,100102000U,43U,SOURCE,GROUP,false,true));
++    REQUIRE(route.forward(100101001U,100102001U,43U,SOURCE,GROUP,false,true));
++    route.end(100101001U,43U,GROUP);
++    REQUIRE_FALSE(route.forward(100101001U,100102001U,43U,SOURCE,GROUP,false,true));
++    REQUIRE(route.begin(100101001U,45U,SOURCE,GROUP));
++    REQUIRE_FALSE(route.forward(100101001U,100102001U,45U,SOURCE,GROUP,false,false));
++}
++
++TEST_CASE("Accepted roaming removes old site interest and stale snapshots cannot restore it", "[p25][multisite]") {
++    network::P25SiteRouting route; std::string error; REQUIRE(route.configure(sitePolicy(),error));
++    REQUIRE(route.affiliate(100101000U,SOURCE,GROUP));
++    REQUIRE(route.affiliate(100102000U,TARGET,GROUP));
++    REQUIRE(route.affiliate(100101000U,TARGET,GROUP));
++    route.clearSnapshot(100102000U);
++    REQUIRE_FALSE(route.affiliate(100102000U,TARGET,GROUP,true));
++    REQUIRE(route.begin(100101001U,42U,SOURCE,GROUP));
++    REQUIRE_FALSE(route.forward(100101001U,100102000U,42U,SOURCE,GROUP,true,false));
++    route.end(100101001U,42U,GROUP);
++    REQUIRE(route.registerUnit(100102000U,TARGET));
++    REQUIRE(route.affiliate(100102000U,TARGET,GROUP));
++    REQUIRE(route.begin(100101001U,43U,SOURCE,GROUP));
++    REQUIRE(route.forward(100101001U,100102000U,43U,SOURCE,GROUP,true,false));
++    route.disconnected(100102000U); route.end(100101001U,43U,GROUP);
++    REQUIRE(route.begin(100101001U,44U,SOURCE,GROUP));
++    REQUIRE_FALSE(route.forward(100101001U,100102000U,44U,SOURCE,GROUP,true,false));
++}
++
++TEST_CASE("Managed P25 routing rejects missing or overlapping peer/site identities", "[p25][multisite]") {
++    network::P25SiteRouting route; std::string error; yaml::Node missing;
++    REQUIRE_FALSE(route.configure(missing,error)); REQUIRE_FALSE(error.empty());
++    auto config=sitePolicy(); config["p25Sites"][1U]["controlPeerId"]="100101001";
++    REQUIRE_FALSE(route.configure(config,error));
++    config=sitePolicy(); config["p25Sites"][0U]["voicePeerIds"]="[]"; config["p25Sites"][0U]["consolePeerIds"]="[]";
++    REQUIRE(route.configure(config,error));
++    config=sitePolicy(); config["p25System"]["netId"]="1048576";
++    REQUIRE_FALSE(route.configure(config,error));
++}
++
++TEST_CASE("Two sites allocate local correlated voice permits and relay native encoded IMBE", "[p25][multisite]") {
++    SiteNetwork sourceNet, targetNet, ccNet;
++    ControllerFixture source(true,false,false,false,false,&sourceNet); source.voiceMode(false); source.permitVoice("aaa:1");
++    ControllerFixture target(true,false,true,false,false,&targetNet); target.voiceMode(false);
++    ControllerFixture cc(false,false,true,false,true,&ccNet);
++    const uint32_t targetChannel=VOICE_CHANNEL+50U;
++    // Remote source is globally allowed but only the target subscriber is locally affiliated.
++    cc.controller->affiliations()->unitReg(TARGET); cc.controller->affiliations()->groupAff(TARGET,GROUP);
++    REQUIRE_FALSE(cc.controller->affiliations()->isUnitReg(SOURCE));
++    cc.channels.setRFChData(targetChannel, ::lookups::VoiceChData(2U,targetChannel,"127.0.0.1",48994U,"offline-test"));
++    cc.channels.addRFCh(targetChannel);
++    yaml::Node options; REQUIRE(yaml::Parse(options,std::string("protocols:\n    p25:\n        control:\n            enable: true\n            dedicated: true\n            disableTSDUMBF: true\n")));
++    cc.controller->setOptions(options,true,"N0TEST",::lookups::VoiceChData(),1U,1U,1U,2U,2U,1U,false);
++    cc.rpc.nativeChannelHandler=[&](uint16_t func,uint16_t port,json::object& req,json::object& reply) {
++        REQUIRE(port==48994U); return target.rpc.dispatchRequest(func,req,reply);
++    };
++    g_RPC=&cc.rpc;
++    REQUIRE(source.voiceFrame(DUID::HDU)); REQUIRE(source.voiceFrame(DUID::LDU1)); REQUIRE(source.voiceFrame(DUID::LDU2));
++    REQUIRE(sourceNet.outgoing.size()>=2U);
++    const auto first=std::find_if(sourceNet.outgoing.begin(),sourceNet.outgoing.end(),[](const auto& p){return p[22U]==DUID::LDU1;});
++    REQUIRE(first!=sourceNet.outgoing.end());
++    // Reproduce real setup race: media arrives before the separate CC permit.
++    targetNet.incoming.push_back(*first); MultiSiteTestAccess::process(*target.controller);
++    REQUIRE(MultiSiteTestAccess::pending(*target.controller)==1U); REQUIRE(target.drainVoice().empty());
++    network::P25SiteRouting route; std::string error; REQUIRE(route.configure(sitePolicy(),error));
++    REQUIRE(route.affiliate(100101000U,SOURCE,GROUP)); REQUIRE(route.affiliate(100102000U,TARGET,GROUP));
++    REQUIRE(route.begin(100101001U,42U,SOURCE,GROUP));
++    REQUIRE(route.forward(100101001U,100102000U,42U,SOURCE,GROUP,true,false));
++    auto demand=sourceNet.encoded(DUID::TDU); demand[14U]=network::NET_CTRL_GRANT_DEMAND;
++    ccNet.incoming.push_back(demand); MultiSiteTestAccess::process(*cc.controller);
++    REQUIRE(cc.rpc.permits==1U); REQUIRE(MultiSiteTestAccess::permitted(*target.controller));
++    auto grants=cc.drain(); REQUIRE_FALSE(grants.empty());
++    for (const auto& grant:grants) { REQUIRE(grant->getLCO()==TSBKO::IOSP_GRP_VCH); REQUIRE(grant->getGrpVchNo()==targetChannel); }
++    MultiSiteTestAccess::process(*target.controller); REQUIRE(MultiSiteTestAccess::pending(*target.controller)==0U);
++    for (const auto& packet:sourceNet.outgoing) if(packet[22U]==DUID::LDU2) targetNet.incoming.push_back(packet);
++    MultiSiteTestAccess::process(*target.controller);
++    std::vector<DUID::E> audio;
++    std::array<uint8_t,1024U> output{};
++    while (target.controller->getFrame(output.data()) != 0U) {
++        NID nid(0x293U); REQUIRE(nid.decode(output.data()+2U)); audio.push_back(nid.getDUID());
++        if (nid.getDUID()==DUID::LDU1 || nid.getDUID()==DUID::LDU2) {
++            p25::Audio codec; std::array<uint8_t,11U> imbe{};
++            for (uint32_t i=0U;i<9U;++i) { codec.decode(output.data()+2U,imbe.data(),i); REQUIRE(std::equal(imbe.begin(),imbe.end(),NULL_IMBE)); }
++        }
++    }
++    REQUIRE(std::count(audio.begin(),audio.end(),DUID::LDU1)==1U);
++    REQUIRE(std::count(audio.begin(),audio.end(),DUID::LDU2)==1U);
++    REQUIRE(targetNet.outgoing.empty()); // Network received media never loops back to FNE.
++    auto end=sourceNet.encoded(DUID::TDU); targetNet.incoming.push_back(end);
++    MultiSiteTestAccess::process(*target.controller); REQUIRE_FALSE(MultiSiteTestAccess::permitted(*target.controller));
++    REQUIRE(cc.rpc.releases==std::vector<uint32_t>{GROUP});
++    g_RPC=&cc.rpc;
++}
++
++TEST_CASE("Unpermitted site audio expires and cannot attach to another source permit", "[p25][multisite]") {
++    SiteNetwork net; ControllerFixture target(true,false,false,false,false,&net); target.voiceMode(false);
++    net.incoming.push_back(net.encoded(DUID::LDU1,TARGET)); MultiSiteTestAccess::process(*target.controller);
++    REQUIRE(MultiSiteTestAccess::pending(*target.controller)==1U);
++    target.permitVoice("aaa:1"); MultiSiteTestAccess::process(*target.controller);
++    REQUIRE(target.drainVoice().empty());
++    MultiSiteTestAccess::expire(*target.controller); MultiSiteTestAccess::process(*target.controller);
++    REQUIRE(MultiSiteTestAccess::pending(*target.controller)==0U);
++    auto alien=net.encoded(DUID::LDU1); alien[11U]=0U;alien[12U]=2U;
++    net.incoming.push_back(alien); MultiSiteTestAccess::process(*target.controller); REQUIRE(target.drainVoice().empty());
++    net.incoming.push_back(std::vector<uint8_t>(10U)); MultiSiteTestAccess::process(*target.controller); REQUIRE(target.drainVoice().empty());
++}
++
++TEST_CASE("Native RFSS enters site trunking and recovers without losing local permits", "[p25][multisite][site-trunking]") {
++    SiteNetwork net; ControllerFixture cc(true,false,false,false,true,&net);
++    MultiSiteTestAccess::managed(*cc.controller);
++    REQUIRE(cc.controller->affiliations()->grantCh(GROUP,SOURCE,10U,true,false));
++    cc.controller->affiliations()->groupAff(TARGET,GROUP);
++    const auto flags=[&]() {
++        cc.controller->clock(); cc.drainVoice();
++        OfflineScheduler scheduler(cc.controller.get()); scheduler.writeRF_ControlData(2U,2U,false);
++        std::array<uint8_t,1024U> frame{}; REQUIRE(cc.controller->getFrame(frame.data())>0U);
++        WireBlock block; auto payload=block.payload(frame.data()+2U); REQUIRE(block.getLCO()==TSBKO::OSP_RFSS_STS_BCAST);
++        REQUIRE(payload[7U]==uint8_t(ServiceClass::REG|ServiceClass::VOICE));
++        REQUIRE(cc.controller->affiliations()->isGranted(GROUP));
++        const bool active=(payload[1U]&0x10U)!=0U;
++        scheduler.writeRF_ControlData(2U,6U,false);
++        REQUIRE(cc.controller->getFrame(frame.data())>0U);
++        auto services=block.payload(frame.data()+2U); REQUIRE(block.getLCO()==TSBKO::OSP_SYS_SRV_BCAST);
++        const uint32_t available=(uint32_t(services[1U])<<16U)|(uint32_t(services[2U])<<8U)|services[3U];
++        const uint32_t supported=(uint32_t(services[4U])<<16U)|(uint32_t(services[5U])<<8U)|services[6U];
++        const uint32_t local=SystemService::UNIT_REG|SystemService::GROUP_AFF|SystemService::GROUP_AFF_Q|SystemService::GROUP_VOICE|SystemService::IND_VOICE;
++        REQUIRE(available==(local|(active?SystemService::NET_ACTIVE:0U))); REQUIRE(supported==available);
++        return active;
++    };
++    REQUIRE_FALSE(flags()); // Managed startup waits for zone heartbeat.
++    cc.controller->setZoneConnected(true); REQUIRE(flags());
++    REQUIRE(net.snapshots.size()==1U); REQUIRE(net.snapshots.back().at(TARGET)==GROUP);
++    cc.controller->setZoneConnected(false); REQUIRE_FALSE(flags()); // HTTPS-only outage, UDP still running.
++    cc.controller->setZoneConnected(true); net.running(false); REQUIRE_FALSE(flags());
++    net.running(true); REQUIRE(flags());
++    REQUIRE(net.snapshots.size()==2U); REQUIRE(net.snapshots.back().at(TARGET)==GROUP);
++    cc.controller->affiliations()->unitReg(SOURCE); cc.controller->affiliations()->groupAff(SOURCE,GROUP);
++    cc.receive<IOSP_GRP_VCH>(SOURCE,GROUP); REQUIRE_FALSE(cc.drain().empty());
++}
++
++TEST_CASE("Positive permit replies must echo the requested source radio", "[p25][multisite][capacity-permit]") {
++    ControllerFixture cc(true);
++    cc.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U,VOICE_CHANNEL,"127.0.0.1",48994U,"offline-test"));
++    yaml::Node options; REQUIRE(yaml::Parse(options,std::string("protocols:\n    p25:\n        control:\n            enable: true\n            dedicated: true\n            disableTSDUMBF: true\n")));
++    cc.controller->setOptions(options,true,"N0TEST",::lookups::VoiceChData(),1U,1U,1U,1U,2U,1U,false);
++    cc.controller->affiliations()->unitReg(SOURCE); cc.controller->affiliations()->groupAff(SOURCE,GROUP);
++    cc.rpc.mode=PermitMode::WrongSource;
++    cc.receive<IOSP_GRP_VCH>(SOURCE,GROUP);
++    REQUIRE_FALSE(cc.controller->affiliations()->isGranted(GROUP));
++    for (const auto& frame:cc.drain()) REQUIRE(frame->getLCO()==TSBKO::OSP_DENY_RSP);
++}
++
++TEST_CASE("Zone outage keeps local RF voice while blocking external encoded media", "[p25][multisite][site-trunking]") {
++    SiteNetwork net; ControllerFixture voice(true,false,false,false,false,&net); voice.voiceMode(false); voice.permitVoice("aaa:1");
++    MultiSiteTestAccess::managed(*voice.controller);
++    REQUIRE(voice.voiceFrame(DUID::HDU)); REQUIRE(voice.voiceFrame(DUID::LDU1)); REQUIRE(voice.voiceFrame(DUID::LDU2));
++    REQUIRE(net.outgoing.empty()); REQUIRE_FALSE(voice.drainVoice().empty());
++    REQUIRE(MultiSiteTestAccess::permitted(*voice.controller));
++    voice.controller->setZoneConnected(true);
++    REQUIRE(voice.voiceFrame(DUID::LDU1)); REQUIRE_FALSE(net.outgoing.empty());
++}
++
++TEST_CASE("Native peer timeout schedules reconnection without site restart", "[network][multisite][site-trunking]") {
++    network::Network peer("127.0.0.1",49999U,0U,100101000U,"offline",true,false,false,true,false,false,false,false,false,false,false,false);
++    peer.enable(true); REQUIRE(peer.open()); REQUIRE(peer.getStatus()==network::NET_STAT_WAITING_CONNECT);
++    // Native retry clock, real localhost UDP socket; no running FNE is required.
++    peer.clock(10001U); REQUIRE(peer.getStatus()==network::NET_STAT_WAITING_LOGIN);
++    peer.clock(600001U); REQUIRE(peer.getStatus()==network::NET_STAT_WAITING_CONNECT);
++    peer.clock(10001U); REQUIRE(peer.getStatus()==network::NET_STAT_WAITING_LOGIN);
++    peer.close();
++}
++
++TEST_CASE("Remote voice watchdog retires its local permit during zone loss", "[p25][multisite][site-trunking]") {
++    SiteNetwork net; ControllerFixture voice(true,false,false,false,false,&net); voice.voiceMode(false); voice.permitVoice("aaa:1");
++    net.incoming.push_back(net.encoded(DUID::LDU1)); MultiSiteTestAccess::process(*voice.controller);
++    net.incoming.push_back(net.encoded(DUID::LDU2)); MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE_FALSE(voice.drainVoice().empty()); REQUIRE(MultiSiteTestAccess::permitted(*voice.controller));
++    MultiSiteTestAccess::managed(*voice.controller); MultiSiteTestAccess::expireNetwork(*voice.controller);
++    voice.controller->clock();
++    REQUIRE_FALSE(MultiSiteTestAccess::permitted(*voice.controller)); REQUIRE(voice.rpc.releases==std::vector<uint32_t>{GROUP});
++}
+--- a/tests/p25/DispatchGrant_Tests.cpp
++++ b/tests/p25/DispatchGrant_Tests.cpp
+@@ -43,7 +43,7 @@
+         if (!reply) return false;
+         json::object response;
+         int status = allow ? OK : BAD_REQUEST; response["status"].set<int>(status);
+-        response["dstId"] = request.at("dstId"); response["permitToken"] = request.at("permitToken");
++        response["srcId"] = request.at("srcId"); response["dstId"] = request.at("dstId"); response["permitToken"] = request.at("permitToken");
+         if (wrongToken) response["permitToken"].set<std::string>("other:1");
+         // The real wire parser normalizes small JSON integers to int.
+         json::value parsed; REQUIRE(json::parse(parsed, json::value(response).serialize()).empty());

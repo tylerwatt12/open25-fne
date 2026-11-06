@@ -1,0 +1,193 @@
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -592,6 +592,20 @@
+                 VALID_SRCID(tsbk->toString(true), TSBKO::ISP_GRP_AFF_Q_RSP, srcId);
+                 VERIFY_SRCID_REG(tsbk->toString(true), TSBKO::ISP_GRP_AFF_Q_RSP, srcId);
+ 
++                ISP_GRP_AFF_Q_RSP* isp = static_cast<ISP_GRP_AFF_Q_RSP*>(tsbk.get());
++                // TIA-102.AABD-B 6.7.3.2: a query confirms stored AGID/WGID;
++                // it is not a request to join a different group. On mismatch,
++                // deny and require full registration without replacing state.
++                if (isp->getAnnounceGroup() != m_announcementGroup ||
++                    !m_p25->m_affiliations->isGroupAff(srcId, dstId)) {
++                    LogWarning(LOG_RF, P25_TSDU_STR ", affiliation query mismatch, srcId = %u, dstId = %u, anncId = %u",
++                        srcId, dstId, isp->getAnnounceGroup());
++                    writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_TGT_GROUP_NOT_VALID, TSBKO::ISP_GRP_AFF_Q_RSP);
++                    writeRF_TSDU_U_Reg_Cmd(srcId);
++                    m_inbound = false; m_p25->m_rfState = prevRfState;
++                    return false;
++                }
++
+                 // Preserve the normal affiliation path's null-group exception.
+                 if (dstId != 0U) {
+                     VALID_TGID(tsbk->toString(true), TSBKO::ISP_GRP_AFF_Q_RSP, srcId, dstId);
+@@ -611,11 +625,10 @@
+                     return false;
+                 }
+ 
+-                if (m_p25->m_ackTSBKRequests) {
+-                    writeRF_TSDU_ACK_FNE(srcId, TSBKO::ISP_GRP_AFF_Q_RSP, true, true);
+-                }
++                // The accepted query response requires its own acknowledgment
++                // (AABD-B 6.7.3.1), independently of optional request ACKs.
++                writeRF_TSDU_ACK_FNE(srcId, TSBKO::ISP_GRP_AFF_Q_RSP, true, true);
+ 
+-                ISP_GRP_AFF_Q_RSP* isp = static_cast<ISP_GRP_AFF_Q_RSP*>(tsbk.get());
+                 if (m_verbose) {
+                     LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, srcId = %u, dstId = %u, anncId = %u", 
+                         tsbk->toString(true).c_str(), srcId, dstId, isp->getAnnounceGroup());
+@@ -623,13 +636,6 @@
+ 
+                 ::ActivityLog("P25", true, "group affiliation query response from %u to %s %u", srcId, "TG ", dstId);
+ 
+-                if (!m_p25->m_affiliations->isGroupAff(srcId, dstId)) {
+-                    // update dynamic affiliation table
+-                    m_p25->m_affiliations->groupAff(srcId, dstId);
+-
+-                    if (m_p25->m_network != nullptr)
+-                        m_p25->m_network->announceGroupAffiliation(srcId, dstId);
+-                }
+             }
+             break;
+             case TSBKO::ISP_U_DEREG_REQ:
+@@ -3027,6 +3033,13 @@
+                 m_p25->m_rfLastSrcId = 0U;
+             }
+         }
++    }
++
++    // TIA-102.AABD-B 6.7.2.1: AFF_FAIL, AFF_DENY and AFF_REFUSED
++    // withdraw the previous affiliation as well as rejecting the new one.
++    if (iosp->getResponse() != ResponseCode::ACCEPT &&
++        m_p25->m_affiliations->groupUnaff(srcId) && m_p25->m_network != nullptr) {
++        m_p25->m_network->announceGroupAffiliationRemoval(srcId);
+     }
+ 
+     writeRF_TSDU_SBF_Imm(iosp.get(), noNet);
+--- a/tests/p25/ZeroCapacity_Tests.cpp
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -505,8 +505,9 @@
+         fixture.radios.eraseEntry(1001U);
+         fixture.groups.addEntry(1001U, 1U, true);
+         fixture.controller->affiliations()->unitReg(10001U);
++        fixture.controller->affiliations()->groupAff(10001U, 1001U);
+         const auto queryResponse = ControllerFixture::rawBlock(TSBKO::ISP_GRP_AFF_Q_RSP,
+-            (uint64_t(1001U) << 24U) | 10001U);
++            (uint64_t(0xFFFEU) << 40U) | (uint64_t(1001U) << 24U) | 10001U);
+         REQUIRE(fixture.receiveRaw(queryResponse));
+         REQUIRE(fixture.controller->affiliations()->isGroupAff(10001U, 1001U));
+         std::ofstream output(path, std::ios::trunc);
+@@ -588,16 +589,21 @@
+     SECTION("null TG preserves stock normal-affiliation exception") { target = 0U; }
+     SECTION("unconfigured all-system group is not an ordinary allowed TG") { target = 0xFFFFU; accepted = false; }
+     REQUIRE_FALSE(fixture.radios.find(group).radioEnabled());
++    if (source == radio && !needsRegistration)
++        fixture.controller->affiliations()->groupAff(source, target);
++    const bool hadAffiliation = fixture.controller->affiliations()->isGroupAff(source, target);
+     const auto response = ControllerFixture::rawBlock(TSBKO::ISP_GRP_AFF_Q_RSP,
+-        (uint64_t(target) << 24U) | source);
++        (uint64_t(0xFFFEU) << 40U) | (uint64_t(target) << 24U) | source);
+     REQUIRE(fixture.receiveRaw(response) == accepted);
+-    REQUIRE(fixture.controller->affiliations()->isGroupAff(source, target) == accepted);
+-    REQUIRE(fixture.controller->affiliations()->grpAffSize() == (accepted ? 1U : 0U));
++    REQUIRE(fixture.controller->affiliations()->isGroupAff(source, target) == hadAffiliation);
++    REQUIRE(fixture.controller->affiliations()->grpAffSize() == (hadAffiliation ? 1U : 0U));
+     REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
+     REQUIRE(fixture.channels.rfChDataSize() == 0U);
+     auto replies = fixture.drain();
+     if (accepted) {
+-        REQUIRE(replies.empty());
++        REQUIRE(replies.size() == 1U);
++        REQUIRE(replies.front()->getLCO() == TSBKO::IOSP_ACK_RSP);
++        REQUIRE(replies.front()->getService() == TSBKO::ISP_GRP_AFF_Q_RSP);
+     } else {
+         REQUIRE(replies.size() == (needsRegistration ? 2U : 1U));
+         REQUIRE(replies.front()->getLCO() == TSBKO::OSP_DENY_RSP);
+--- a/tests/p25/SubscriberAccess_Tests.cpp
++++ b/tests/p25/SubscriberAccess_Tests.cpp
+@@ -223,8 +223,9 @@
+ 
+ TEST_CASE("affiliation query responses cannot recreate a denied affiliation", "[p25][subscriber-access]") {
+     Fixture f(true); f.apply(true,{},false,{});
+-    REQUIRE_FALSE(f.signal(TSBKO::ISP_GRP_AFF_Q_RSP,(uint64_t(TG)<<24U)|RID));
+-    REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,TG));
++    f.controller->affiliations()->groupAff(RID,TG);
++    REQUIRE_FALSE(f.signal(TSBKO::ISP_GRP_AFF_Q_RSP,(uint64_t(0xFFFEU)<<40U)|(uint64_t(TG)<<24U)|RID));
++    REQUIRE(f.controller->affiliations()->isGroupAff(RID,TG));
+     REQUIRE(f.controller->affiliations()->isUnitReg(RID));
+     REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);
+     bool denied=false;
+@@ -233,7 +234,72 @@
+     }
+     REQUIRE(denied);
+     f.apply(true,{RID},true,{});
+-    REQUIRE(f.signal(TSBKO::ISP_GRP_AFF_Q_RSP,(uint64_t(TG)<<24U)|RID));
++    REQUIRE(f.signal(TSBKO::ISP_GRP_AFF_Q_RSP,(uint64_t(0xFFFEU)<<40U)|(uint64_t(TG)<<24U)|RID));
+     REQUIRE(f.controller->affiliations()->isGroupAff(RID,TG));
+     REQUIRE_FALSE(p25::acl::AccessControl::validateGroupTransmit(RID,TG));
++}
++
++
++// Inputs below are transcribed field octets, not generated by the message
++// encoder: AABC-E 6.1.8 / Figure 6.1.8-1, PDF 107, printed 88.
++// Expected state transitions come from AABD-B 6.7.3.1-.2, PDF 63-64,
++// printed 58-59; the shared framing/CRC helpers are not independent FEC tests.
++TEST_CASE("a query response confirms stored group identities without becoming an affiliation request", "[p25][subscriber-access][control-procedure]") {
++    Fixture f(true); f.apply(false,{},false,{});
++    const std::array<uint8_t,8> matching = {{0x00,0xFF,0xFE,0x03,0xE9,0x00,0x27,0x11}};
++    auto payload = matching;
++    bool accepted = false;
++    bool existing = true;
++    SECTION("matching WGID and AGID") { accepted = true; }
++    SECTION("different WGID") { payload[4] = 0xEA; }
++    SECTION("different AGID") { payload[2] = 0xFD; }
++    SECTION("no stored affiliation") { existing = false; }
++    if (existing) f.controller->affiliations()->groupAff(RID,TG);
++    uint64_t value=0U; for (auto octet:payload) value=(value<<8U)|octet;
++    REQUIRE(f.signal(0x29U,value)==accepted);
++    REQUIRE(f.controller->affiliations()->isGroupAff(RID,TG)==existing);
++    REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,1002U));
++    REQUIRE(f.controller->affiliations()->isUnitReg(RID));
++    REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);
++    auto replies=f.responses();
++    REQUIRE(replies.size()==(accepted ? 1U : 2U));
++    if (accepted) {
++        REQUIRE((replies[0][0]&0x3fU)==0x20U);
++        REQUIRE((replies[0][2]&0x3fU)==0x29U);
++    } else {
++        REQUIRE((replies[0][0]&0x3fU)==0x27U);
++        REQUIRE((replies[0][2]&0x3fU)==0x29U);
++        REQUIRE((replies[1][0]&0x3fU)==0x2DU);
++    }
++    for (const auto& reply:replies) {
++        // U_REG_CMD has target at octets 4-6 (AABC-E 6.2.20,
++        // Figure 6.2.20-1, PDF 192 / printed 173). ACK/DENY target
++        // this requesting SU at octets 7-9.
++        const unsigned targetOffset=(reply[0]&0x3fU)==0x2DU ? 4U : 7U;
++        REQUIRE(reply[targetOffset]==0x00U);
++        REQUIRE(reply[targetOffset+1U]==0x27U);
++        REQUIRE(reply[targetOffset+2U]==0x11U);
++    }
+ }
++
++// AABD-B 6.7.2.1, PDF 62 / printed 57 requires prior affiliation
++// removal on AFF_FAIL, AFF_DENY or AFF_REFUSED. Registration is separate.
++TEST_CASE("rejected affiliation withdraws the prior group without deregistering the unit", "[p25][subscriber-access][control-procedure]") {
++    Fixture f(true); f.apply(false,{},false,{});
++    REQUIRE(f.signal(0x28U,(uint64_t(1U)<<40U)|(uint64_t(1002U)<<24U)|RID));
++    REQUIRE(f.controller->affiliations()->isGroupAff(RID,1002U)); f.responses();
++    uint8_t response=0x02U; // AFF_DENY, AABC-E 6.2.8.1, PDF165 / printed146.
++    SECTION("new group denied by per-radio policy") { f.apply(true,{},false,{}); }
++    SECTION("new group disabled") { f.groups.addEntry(TG,1U,false); }
++    SECTION("unit refused") { f.radios.addEntry(RID,false,"Disabled subscriber"); response=0x03U; }
++    f.signal(0x28U,(uint64_t(1U)<<40U)|(uint64_t(TG)<<24U)|RID);
++    REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,1002U));
++    REQUIRE_FALSE(f.controller->affiliations()->isGroupAff(RID,TG));
++    REQUIRE(f.controller->affiliations()->grpAffSize()==0U);
++    REQUIRE(f.controller->affiliations()->isUnitReg(RID));
++    bool found=false;
++    for (const auto& reply:f.responses()) if ((reply[0]&0x3fU)==0x28U) {
++        REQUIRE((reply[2]&3U)==response); found=true;
++    }
++    REQUIRE(found);
++}

@@ -1,0 +1,37 @@
+--- a/tests/CWIDUART_Tests.cpp
++++ b/tests/CWIDUART_Tests.cpp
+@@ -224,13 +224,32 @@
+     LocalPTY pty;
+     PTYUART uart(pty.takeSlave());
+     REQUIRE(uart.boundedIO(true));
+-    REQUIRE(fillOutput(uart) > 0U);
++    // Keep output paused so the kernel cannot free room between setup and write.
++    REQUIRE(::tcflow(uart.descriptor(), TCOOFF) == 0);
++    size_t queued = fillOutput(uart);
++    const uint8_t filler = 0U;
++    bool blocked = false;
++    for (unsigned i = 0U; i < 4096U; ++i) {
++        const ssize_t count = ::write(uart.descriptor(), &filler, 1U);
++        if (count == 1) { ++queued; continue; }
++        REQUIRE(count == -1);
++        REQUIRE((errno == EAGAIN || errno == EWOULDBLOCK));
++        blocked = true;
++        break;
++    }
++    REQUIRE(blocked);
+     const std::array<uint8_t, 3U> marker{{0xFEU, 3U, 0U}};
+     const auto start = Clock::now();
+-    REQUIRE(uart.write(marker.data(), marker.size()) == 0);
++    const int written = uart.write(marker.data(), marker.size());
+     const auto elapsed = Clock::now() - start;
++    REQUIRE(::tcflow(uart.descriptor(), TCOON) == 0);
++    REQUIRE(written == 0);
+     REQUIRE(elapsed >= std::chrono::milliseconds(15));
+     REQUIRE(elapsed < std::chrono::milliseconds(200));
++    if (queued != 0U) readExactMaster(pty, queued);
++    REQUIRE(uart.write(marker.data(), marker.size()) == int(marker.size()));
++    const auto received = readExactMaster(pty, marker.size());
++    REQUIRE(std::equal(marker.begin(), marker.end(), received.begin()));
+ }
+ 
+ TEST_CASE("Bounded UART returns its first partial write without duplicating a frame prefix", "[modem][cwid][uart]") {

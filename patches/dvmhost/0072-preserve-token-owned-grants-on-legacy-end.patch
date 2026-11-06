@@ -1,0 +1,104 @@
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -1980,7 +1980,8 @@
+                     return;
+                 }
+ 
+-                if (m_affiliations->isGranted(dstId) && !dispatchOwnsGrant(dstId)) {
++                if (m_affiliations->isGranted(dstId) && !dispatchOwnsGrant(dstId) &&
++                    m_affiliations->grantPermitToken(dstId).empty()) {
+                     // validate source RID
+                     if (!acl::AccessControl::validateSrcId(srcId)) {
+                         return;
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -999,8 +999,11 @@
+                         case LCO::CALL_TERM:
+                         {
+                             if (m_p25->m_dedicatedControl) {
+-                                // is the specified channel granted?
+-                                if (/*m_p25->m_affiliations->isChBusy(chNo) &&*/ m_p25->m_affiliations->isGranted(dstId)) {
++                                std::lock_guard<std::recursive_mutex> permit(m_p25->m_permitMutex);
++                                auto grant = m_p25->m_affiliations->lockGrants();
++                                // Token-owned allocations retire through their exact-token release.
++                                if (m_p25->m_affiliations->isGranted(dstId) &&
++                                    m_p25->m_affiliations->grantPermitToken(dstId).empty()) {
+                                     uint32_t chNo = tsbk->getGrpVchNo();
+ 
+                                     if (m_verbose) {
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -2310,3 +2310,73 @@
+     MultiSiteTestAccess::advanceNetwork(*voice.controller,501U);voice.controller->clock();
+     CHECK(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_IDLE);CHECK_FALSE(MultiSiteTestAccess::permitted(*voice.controller));
+ }
++
++
++// Delayed legacy packets cannot retire a supervised replacement allocation.
++#include "common/p25/lc/tsbk/OSP_DVM_LC_CALL_TERM.h"
++TEST_CASE("A delayed legacy CC end cannot release a replacement token-owned allocation", "[p25][host-end-owner-fix][stale-cc-end]") {
++    for (const bool vendor : {false, true}) for (const uint32_t replacementSource : {SOURCE, TARGET}) {
++        DYNAMIC_SECTION("vendor=" << vendor << " replacement-source=" << replacementSource) {
++            HostOwnerWire wire;
++            SiteNetwork serializer;
++            ControllerFixture cc(true, false, false, false, true, &wire);
++            cc.registerAndAffiliate();
++            cc.receive<IOSP_GRP_AFF>(TARGET, GROUP); cc.drain();
++            cc.controller->setSupervisor(true);
++            cc.channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, VOICE_CHANNEL, "127.0.0.1", 48993U, "offline-test"));
++            cc.receive<IOSP_GRP_VCH>(SOURCE, GROUP); cc.drain();
++            REQUIRE(cc.controller->affiliations()->isGranted(GROUP));
++            const auto epochA = cc.controller->affiliations()->grantEpoch(GROUP);
++            const auto tokenA = cc.controller->affiliations()->grantPermitToken(GROUP);
++            REQUIRE_FALSE(tokenA.empty());
++            std::vector<uint8_t> oldEnd;
++            if (vendor) {
++                OSP_DVM_LC_CALL_TERM term; term.setSrcId(SOURCE); term.setDstId(GROUP);
++                term.setGrpVchId(2U); term.setGrpVchNo(VOICE_CHANNEL);
++                std::array<uint8_t,P25_TSDU_FRAME_LENGTH_BYTES> frame{}; term.encode(frame.data());
++                LC context; context.setLCO(LCO::CALL_TERM); context.setMFId(MFG_DVM_OCS);
++                context.setSrcId(SOURCE); context.setDstId(GROUP); context.setGroup(true);
++                uint32_t length=0U; auto body=serializer.createP25_TSDUMessage(length,context,frame.data());
++                oldEnd.assign(body.get(),body.get()+length);
++            } else oldEnd=serializer.encoded(DUID::TDU);
++            const auto delayed=wire.at(oldEnd,STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U);
++            auto release = [&](const std::string& token) {
++                json::object request,reply; setJSON<uint32_t>(request,"dstId",GROUP);
++                setJSON<uint32_t>(request,"srcId",SOURCE); request["permitToken"].set<std::string>(token);
++                request=wireObject(request); REQUIRE(cc.rpc.dispatchRequest(RPC_RELEASE_P25_TG,request,reply));
++                REQUIRE(reply["status"].get<int>()==network::NetRPC::OK);
++            };
++            release(tokenA);
++            REQUIRE_FALSE(cc.controller->affiliations()->isGranted(GROUP));
++            cc.receive<IOSP_GRP_VCH>(replacementSource,GROUP); cc.drain();
++            const auto epochB=cc.controller->affiliations()->grantEpoch(GROUP);
++            const auto tokenB=cc.controller->affiliations()->grantPermitToken(GROUP);
++            REQUIRE(epochB!=epochA); REQUIRE_FALSE(tokenB.empty()); REQUIRE(tokenB!=tokenA);
++            REQUIRE(cc.controller->affiliations()->ownsGrant(GROUP,replacementSource,VOICE_CHANNEL,epochB));
++            release(tokenA); // Existing exact-token path correctly leaves B untouched.
++            REQUIRE(cc.controller->affiliations()->ownsGrant(GROUP,replacementSource,VOICE_CHANNEL,epochB));
++            wire.ingest(delayed); REQUIRE(wire.chargedBytes()>0U);
++            MultiSiteTestAccess::process(*cc.controller);
++            REQUIRE_FALSE(wire.reads.empty()); REQUIRE(wire.reads.back().streamId==STREAM_A);
++            CHECK(cc.controller->affiliations()->ownsGrant(GROUP,replacementSource,VOICE_CHANNEL,epochB));
++            CHECK(cc.controller->affiliations()->grantPermitToken(GROUP)==tokenB);
++        }
++    }
++}
++
++TEST_CASE("Dedicated CC retains unleased vendor termination", "[p25][host-end-owner-fix][stale-cc-end]") {
++    HostOwnerWire wire; SiteNetwork serializer;
++    ControllerFixture cc(true,false,false,false,true,&wire); cc.registerAndAffiliate();
++    cc.receive<IOSP_GRP_VCH>(SOURCE,GROUP); cc.drain();
++    REQUIRE(cc.controller->affiliations()->isGranted(GROUP));
++    REQUIRE(cc.controller->affiliations()->grantPermitToken(GROUP).empty());
++    OSP_DVM_LC_CALL_TERM term; term.setSrcId(SOURCE); term.setDstId(GROUP);
++    term.setGrpVchId(2U); term.setGrpVchNo(VOICE_CHANNEL);
++    std::array<uint8_t,P25_TSDU_FRAME_LENGTH_BYTES> frame{}; term.encode(frame.data());
++    LC context; context.setLCO(LCO::CALL_TERM); context.setMFId(MFG_DVM_OCS);
++    context.setSrcId(SOURCE); context.setDstId(GROUP); context.setGroup(true);
++    uint32_t length=0U; auto body=serializer.createP25_TSDUMessage(length,context,frame.data());
++    wire.ingest(wire.at(std::vector<uint8_t>(body.get(),body.get()+length),STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U));
++    MultiSiteTestAccess::process(*cc.controller);
++    CHECK_FALSE(cc.controller->affiliations()->isGranted(GROUP));
++}

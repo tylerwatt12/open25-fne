@@ -1,0 +1,483 @@
+diff --git a/src/host/C4FMTest.cpp b/src/host/C4FMTest.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/host/C4FMTest.cpp
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "C4FMTest.h"
++#include "HostMain.h"
++#include "common/Log.h"
++#include "common/yaml/Yaml.h"
++#include "modem/Modem.h"
++#include "modem/port/ModemNullPort.h"
++#include "modem/port/UARTPort.h"
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <memory>
++#include <stdexcept>
++#include <thread>
++
++namespace {
++using Clock = std::chrono::steady_clock;
++void event(const char* text) {
++    std::printf("C4FM_TEST %s\n", text);
++    std::fflush(stdout);
++}
++// No normal Host, network, call allocator, station ID or firmware calibration.
++class TestModem final : public modem::Modem {
++public:
++    TestModem(modem::port::IModemPort* port, yaml::Node input) :
++        Modem(port, true, input["rxInvert"].as<bool>(), input["txInvert"].as<bool>(),
++            input["pttInvert"].as<bool>(), true, false, 0U, 0U, 0U,
++            3960U, 2592U, 1488U, true, true, false, false, false, false) {
++        setModeParams(false, true, false);
++        const float rx = input["rxLevel"].as<float>();
++        const float tx = input["txLevel"].as<float>();
++        setLevels(rx, tx, tx, tx, tx);
++        setDCOffsetParams(input["txDCOffset"].as<int>(), input["rxDCOffset"].as<int>());
++        setRFParams(input["rxFrequencyHz"].as<uint32_t>(), input["txFrequencyHz"].as<uint32_t>(),
++            input["rxOffsetHz"].as<int>(), input["txOffsetHz"].as<int>(),
++            static_cast<uint8_t>(input["powerPercent"].as<uint32_t>()), 0, 0, 0, 0, 0, 0,
++            modem::ADF_GAIN_AUTO, false, 11U, 4U, 1U);
++        suppressCWResets(true);
++    }
++};
++}
++
++int c4fmtest::run(const std::string& configuration, uint32_t durationMs) {
++    if (durationMs == 0U) { event("failed duration is zero"); return 1; }
++    ::LogInitialise("", "", 0U, 1U, true);
++    yaml::Node config;
++    std::unique_ptr<TestModem> modem;
++    bool opened = false, failed = false, observedTX = false;
++    try {
++        if (!yaml::Parse(config, configuration.c_str()))
++            throw std::runtime_error("configuration could not be read");
++        auto input = config["c4fmTest"];
++        std::unique_ptr<modem::port::IModemPort> port;
++        const auto type = input["portType"].as<std::string>();
++        if (type == "uart") {
++            port.reset(new modem::port::UARTPort(input["device"].as<std::string>(),
++                static_cast<modem::port::SERIAL_SPEED>(input["baud"].as<uint32_t>()), true, false));
++        } else if (type == "null") {
++            port.reset(new modem::port::ModemNullPort());
++            event("software null modem; no physical RF observation");
++        } else throw std::runtime_error("test modem transport is not implemented");
++        modem.reset(new TestModem(port.release(), input));
++        opened = modem->open();
++        if (!opened) throw std::runtime_error("modem did not initialize");
++        if (!modem->boundedCWOperation(true)) throw std::runtime_error("bounded serial operation failed");
++        if (modem->getVersion() != 4U) throw std::runtime_error("modem protocol is not current");
++        auto last = Clock::now();
++        auto pump = [&] {
++            const auto now = Clock::now();
++            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now-last).count();
++            modem->clock(static_cast<uint32_t>(ms));
++            last += std::chrono::milliseconds(ms);
++            std::this_thread::sleep_for(std::chrono::milliseconds(1U));
++        };
++        const auto readyBy = Clock::now()+std::chrono::seconds(3U);
++        while (!modem->gotModemStatus() && !modem->hasError() && Clock::now()<readyBy && !g_killed) pump();
++        if (!modem->gotModemStatus() || modem->hasError()) throw std::runtime_error("modem readiness missing");
++        if (!modem->setState(modem::STATE_P25)) throw std::runtime_error("P25 mode write incomplete");
++        if (modem->hasTX()) throw std::runtime_error("modem was already transmitting");
++        event("ready");
++        PRBS511 sequence;
++        //216 RF octets =1728bits =180ms at9600bit/s. Tag/reserved octets
++        //are USB metadata, excluded by the existing P25 writer.
++        std::array<uint8_t,218U> packet{};
++        packet[0U] = modem::TAG_DATA;
++        const auto rejectBefore = modem->p25WriteRejectGeneration();
++        const auto startBy = Clock::now()+std::chrono::seconds(3U);
++        auto until = startBy, next = Clock::now();
++        unsigned prefill = 2U;
++        bool wroteData = false;
++        uint64_t txAfter = 0U;
++        while (!g_killed) {
++            pump();
++            const auto now = Clock::now();
++            if (modem->hasError() || modem->p25WriteRejectGeneration()!=rejectBefore)
++                throw std::runtime_error("modem communication or P25 data failed");
++            if (observedTX && !modem->hasTX())
++                throw std::runtime_error("transmit state ended before the requested stop");
++            if (!observedTX && wroteData && modem->statusGeneration()>txAfter && modem->hasTX()) {
++                observedTX = true;
++                until = now+std::chrono::milliseconds(durationMs);
++                event("transmitting");
++            }
++            if (observedTX && now>=until) break;
++            if (!observedTX && now>=startBy) throw std::runtime_error("transmit state not observed");
++            if (now>=next && modem->hasP25Space(packet.size())) {
++                sequence.fill(packet.data()+2U,packet.size()-2U);
++                if (!modem->writeP25Frame(packet.data(),packet.size()))
++                    throw std::runtime_error("P25 write incomplete");
++                if (!wroteData) { wroteData = true; txAfter = modem->statusGeneration(); }
++                if (prefill>0U) {
++                    --prefill;
++                    if (prefill==0U) next = now+std::chrono::milliseconds(180U);
++                } else next += std::chrono::milliseconds(180U);
++            }
++        }
++    } catch (const std::exception& error) {
++        std::fprintf(stderr,"C4FM test: %s\n",error.what());
++        std::string detail = error.what();
++        for (auto& c : detail) if (c == '\n' || c == '\r') c = ' ';
++        detail.resize(std::min<size_t>(detail.size(), 400U));
++        event((std::string("failed ") + detail).c_str());
++        failed = true;
++    } catch (...) {
++        event("failed transmit operation did not complete");
++        failed = true;
++    }
++    if (!opened || !modem) { event("stopped unconfirmed"); return 1; }
++    event("draining");
++    // The FIFO clear leaves only an already-shifting packet and firmware tail.
++    // Ordered serial round-trip plus a later status confirms modem-reported idle.
++    // Physical RF disappearance still requires an independent RF observation.
++    bool stopped = false;
++    try {
++        const uint8_t clear[] = {0xFEU,3U,uint8_t(modem::CMD_P25_CLEAR)};
++        const bool cleared = modem->write(clear,sizeof(clear))==int(sizeof(clear));
++        const auto barrierBefore = modem->serialBarrierGeneration();
++        const bool barrierSent = modem->requestSerialBarrier();
++        bool fenced = false;
++        uint64_t idleAfter = 0U;
++        const auto drainBy = Clock::now()+std::chrono::seconds(5U);
++        auto last = Clock::now();
++        while (Clock::now()<drainBy) {
++            const auto now = Clock::now();
++            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now-last).count();
++            modem->clock(static_cast<uint32_t>(ms));
++            last += std::chrono::milliseconds(ms);
++            if (!fenced && modem->serialBarrierGeneration()>barrierBefore) {
++                fenced = true;
++                idleAfter = modem->statusGeneration();
++            }
++            if (cleared && barrierSent && fenced && modem->statusGeneration()>idleAfter && !modem->hasTX()) {
++                stopped = true;
++                break;
++            }
++            if (modem->hasError()) break;
++            std::this_thread::sleep_for(std::chrono::milliseconds(1U));
++        }
++        modem->close();
++    } catch (...) {
++        stopped = false;
++    }
++    event(stopped ? "stopped confirmed" : "stopped unconfirmed");
++    return stopped && !failed && (observedTX || g_killed) ? 0 : 1;
++}
+diff --git a/src/host/C4FMTest.h b/src/host/C4FMTest.h
+new file mode 100644
+--- /dev/null
++++ b/src/host/C4FMTest.h
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#ifndef __HOST_C4FM_TEST_H__
++#define __HOST_C4FM_TEST_H__
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++
++namespace c4fmtest {
++
++// TIA-102.CAAA-F (September 2021), 1.4.4.3, PDF34/printed19 refers to
++// ITU-T O.153 (10/1992), 2.1, PDF3-4/printed1-2: nine stages,
++// stage5 XOR stage9 into stage1, output beginning with nine ones.
++// Output bits remain continuous across byte, packet and511-bit boundaries.
++class PRBS511 {
++public:
++    bool nextBit() {
++        const bool bit = ((m_state >> 8U) & 1U) != 0U;
++        const uint16_t feedback = ((m_state >> 4U) ^ (m_state >> 8U)) & 1U;
++        m_state = uint16_t(((m_state << 1U) | feedback) & 0x1FFU);
++        return bit;
++    }
++    void fill(uint8_t* bytes, size_t count) {
++        for (size_t i = 0U; i < count; ++i) {
++            bytes[i] = 0U;
++            for (unsigned bit = 0U; bit < 8U; ++bit)
++                bytes[i] = uint8_t((bytes[i] << 1U) | (nextBit() ? 1U : 0U));
++        }
++    }
++private:
++    uint16_t m_state = 0x1FFU;
++};
++
++int run(const std::string& configuration, uint32_t durationMs);
++
++}
++#endif
+diff --git a/src/host/HostMain.cpp b/src/host/HostMain.cpp
+--- a/src/host/HostMain.cpp
++++ b/src/host/HostMain.cpp
+@@ -12,6 +12,9 @@
+ #include "common/Log.h"
+ #include "HostMain.h"
+ #include "Host.h"
++#include "C4FMTest.h"
++#include <cerrno>
++#include <limits>
+ #include "calibrate/HostCal.h"
+ #include "setup/HostSetup.h"
+ #include "ActivityLog.h"
+@@ -42,6 +45,7 @@
+ 
+ int g_signal = 0;
+ bool g_calibrate = false;
++uint32_t g_c4fmTestDurationMs = 0U;
+ bool g_setup = false;
+ std::string g_progExe = std::string(__EXE_NAME__);
+ std::string g_iniFile = std::string(DEFAULT_CONF_FILE);
+@@ -137,6 +141,7 @@
+         "  --setup   TUI setup and calibration mode\n"
+         "\n"
+ #endif
++        "  --c4fm-test <ms> bounded normal-path C4FM PRBS511 transmitter test\n"
+         "  --cal     simple calibration mode\n"
+         "  --boot    connects to modem and reboots into bootloader mode\n"
+         "\n"
+@@ -180,6 +185,22 @@
+         }
+         else if (IS("--syslog")) {
+             g_useSyslog = true;
++        }
++        else if (IS("--c4fm-test-check")) {
++            std::puts("C4FM_TEST available");
++            std::fflush(stdout);
++            exit(EXIT_SUCCESS);
++        }
++        else if (IS("--c4fm-test")) {
++            if (argv[i + 1] == nullptr) usage("error: %s", "must specify C4FM test duration in milliseconds");
++            const char* input = argv[++i];
++            char* end = nullptr;
++            errno = 0;
++            const auto value = ::strtoull(input, &end, 10);
++            if (errno != 0 || input[0] == '-' || *input == 0 || *end != 0 || value == 0 || value > std::numeric_limits<uint32_t>::max())
++                usage("error: %s", "C4FM test duration must be a positive uint32 millisecond value");
++            g_c4fmTestDurationMs = uint32_t(value);
++            p += 2;
+         }
+         else if (IS("--cal")) {
+             g_calibrate = true;
+@@ -306,7 +327,10 @@
+         g_signal = 0;
+         g_killed = false;
+ 
+-        if (g_calibrate || g_setup) {
++        if (g_c4fmTestDurationMs != 0U) {
++            ret = c4fmtest::run(g_iniFile, g_c4fmTestDurationMs);
++        }
++        else if (g_calibrate || g_setup) {
+ #if defined(ENABLE_SETUP_TUI)
+             if (g_setup) {
+                 HostSetup* setup = new HostSetup(g_iniFile);
+@@ -337,8 +361,8 @@
+             ::LogInfoEx(LOG_HOST, "[STOP] dvmhost:main SIGTERM");
+ 
+         if (g_signal == SIGHUP)
+-            ::LogInfoEx(LOG_HOST, "[RSTR] dvmhost:main SIGHUP");
+-    } while (g_signal == SIGHUP);
++            ::LogInfoEx(LOG_HOST, g_c4fmTestDurationMs == 0U ? "[RSTR] dvmhost:main SIGHUP" : "[STOP] dvmhost:main SIGHUP");
++    } while (g_signal == SIGHUP && g_c4fmTestDurationMs == 0U);
+ 
+     ::LogFinalise();
+     ::ActivityLogFinalise();
+diff --git a/src/host/modem/Modem.cpp b/src/host/modem/Modem.cpp
+--- a/src/host/modem/Modem.cpp
++++ b/src/host/modem/Modem.cpp
+@@ -2191,33 +2191,26 @@
+ 
+     buffer[1U] = lengthToWrite;
+ 
+-    int ret = m_port->write(buffer, lengthToWrite);
+-    if (ret <= 0)
++    const int ret = m_port->write(buffer, lengthToWrite);
++    if (ret != int(lengthToWrite))
+         return false;
+ 
+-    unsigned int count = 0U;
+-    RESP_TYPE_DVM resp;
+-    do {
++    // Serial submission is not a receipt that tuning and power were accepted.
++    // Only this command's complete ACK finishes this bounded request.
++    for (uint32_t count = 0U; count < MAX_RESPONSES; ++count) {
+         Thread::sleep(10U);
+-
+-        resp = getResponse();
+-        if (resp == RTM_OK && m_buffer[2U] != RSN_OK && m_buffer[2U] != RSN_NAK) {
+-            count++;
+-            if (count >= MAX_RESPONSES) {
+-                LogError(LOG_MODEM, "No response, %s command", cmdToString(CMD_SET_RFPARAMS).c_str());
+-                return false;
+-            }
+-        }
+-    } while (resp == RTM_OK && m_buffer[2U] != RSN_OK && m_buffer[2U] != RSN_NAK);
+-
+-    // CUtils::dump(1U, "Response", m_buffer, m_length);
+-
+-    if (resp == RTM_OK && m_buffer[2U] == RSN_NAK) {
+-        LogError(LOG_MODEM, "NAK, %s, command = 0x%02X, reason = %u (%s)", cmdToString(CMD_SET_RFPARAMS).c_str(), m_buffer[3U], m_buffer[4U], rsnToString(m_buffer[4U]).c_str());
+-        return false;
+-    }
+-
+-    return true;
++        const auto response = getResponse();
++        if (response != RTM_OK || m_rspDoubleLength || m_length < 4U || m_buffer[3U] != CMD_SET_RFPARAMS)
++            continue;
++        if (m_buffer[2U] == CMD_ACK)
++            return true;
++        if (m_buffer[2U] == CMD_NAK && m_length >= 5U) {
++            LogError(LOG_MODEM, "NAK, %s, command = 0x%02X, reason = %u (%s)", cmdToString(CMD_SET_RFPARAMS).c_str(), m_buffer[3U], m_buffer[4U], rsnToString(m_buffer[4U]).c_str());
++            return false;
++        }
++    }
++    LogError(LOG_MODEM, "No response, %s command", cmdToString(CMD_SET_RFPARAMS).c_str());
++    return false;
+ }
+ 
+ /* Retrieve the data from the configuration area on the air interface modem. */
+diff --git a/src/host/modem/port/ModemNullPort.cpp b/src/host/modem/port/ModemNullPort.cpp
+--- a/src/host/modem/port/ModemNullPort.cpp
++++ b/src/host/modem/port/ModemNullPort.cpp
+@@ -96,6 +96,13 @@
+         m_mode = buffer[6U];
+         writeAck(CMD_SET_CONFIG);
+         break;
++    case CMD_SET_RFPARAMS:
++        if (length != 22U) {
++            writeNAK(CMD_SET_RFPARAMS, RSN_ILLEGAL_LENGTH);
++            break;
++        }
++        writeAck(CMD_SET_RFPARAMS);
++        break;
+     case CMD_SET_MODE:
+         if (length != 4U)
+             return 0;
+diff --git a/tests/C4FMTest_Tests.cpp b/tests/C4FMTest_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/C4FMTest_Tests.cpp
+@@ -0,0 +1,119 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "host/C4FMTest.h"
++#include "host/modem/Modem.h"
++#include "host/modem/port/ModemNullPort.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <algorithm>
++#include <string>
++#include <vector>
++
++TEST_CASE("PRBS511 matches the independent published nine-stage prefix", "[c4fm-test][prbs511]") {
++    //CCITT Q.295 BlueBook1988/Geneva1989, AnnexA/Table11/Q.295,
++    //PDF120/printed109. First38 stage9 outputs, transcribed from original.
++    const std::string expected="11111111100000111101111100010111001100";
++    c4fmtest::PRBS511 bits;
++    for (char bit:expected) REQUIRE(bits.nextBit()==(bit=='1'));
++    c4fmtest::PRBS511 bytes;
++    std::array<uint8_t,4U> prefix{};
++    bytes.fill(prefix.data(),prefix.size());
++    const std::array<uint8_t,4U> packed{0xFFU,0x83U,0xDFU,0x17U};
++    REQUIRE(prefix==packed);
++}
++
++TEST_CASE("PRBS511 retains all511 bits without byte or dibit padding", "[c4fm-test][prbs511]") {
++    c4fmtest::PRBS511 bits;
++    std::vector<bool> period;
++    unsigned ones=0U;
++    for (unsigned i=0U;i<511U;++i) {
++        const bool b=bits.nextBit(); period.push_back(b); if(b)++ones;
++    }
++    REQUIRE(ones==256U); //ITU-T O.153(10/1992),2.1
++    for(unsigned i=0U;i<511U;++i) REQUIRE(bits.nextBit()==period[i]);
++    //An odd511-bit period must cross, rather than reset at, byte boundaries.
++    c4fmtest::PRBS511 packets;
++    std::array<uint8_t,216U> first{},second{};
++    packets.fill(first.data(),first.size());
++    packets.fill(second.data(),second.size());
++    for(size_t i=0U;i<first.size()+second.size();++i) {
++        const uint8_t byte=i<first.size()?first[i]:second[i-first.size()];
++        for(unsigned b=0U;b<8U;++b)
++            REQUIRE(((byte>>(7U-b))&1U)==unsigned(period[(i*8U+b)%511U]));
++    }
++}
++
++namespace {
++class PatternModem final:public modem::Modem {
++public:
++    std::vector<uint8_t> packet;
++    bool shortWrite=false;
++    PatternModem():Modem(new modem::port::ModemNullPort(),true,false,false,false,
++        true,false,0U,0U,0U,3960U,2592U,1488U,true,true,false,false,false,false) {
++        m_protoVer=4U;m_p25Space=2592U;setModeParams(false,true,false);
++    }
++    int write(const uint8_t* bytes,uint32_t count,bool=false)override {
++        packet.assign(bytes,bytes+count);return int(count)-(shortWrite?1:0);
++    }
++};
++}
++TEST_CASE("Normal P25_DATA writer preserves unframed PRBS511 octets", "[c4fm-test][modem]") {
++    PatternModem modem;
++    std::array<uint8_t,218U> data{};data[0U]=modem::TAG_DATA;
++    c4fmtest::PRBS511 sequence;sequence.fill(data.data()+2U,216U);
++    REQUIRE(modem.writeP25Frame(data.data(),data.size()));
++    REQUIRE(modem.packet.size()==220U);
++    REQUIRE(modem.packet[0U]==0xFEU);
++    REQUIRE(modem.packet[1U]==220U);
++    REQUIRE(modem.packet[2U]==0x31U);
++    REQUIRE(modem.packet[3U]==0U); //reserved host byte, removed by firmware
++    REQUIRE(std::equal(data.begin()+2U,data.end(),modem.packet.begin()+4U));
++    REQUIRE(modem.getP25Space()==2592U-data.size());
++    modem.shortWrite=true;
++    REQUIRE_FALSE(modem.writeP25Frame(data.data(),data.size()));
++}
++
++namespace {
++class RFReceiptPort final:public modem::port::IModemPort {
++public:
++    std::vector<uint8_t> response,request;
++    size_t offset=0U;
++    bool shortWrite=false;
++    bool open()override{return true;}
++    void close()override{}
++    int read(uint8_t* out,uint32_t length)override{
++        const auto count=std::min<size_t>(length,response.size()-offset);
++        if(count)std::copy_n(response.data()+offset,count,out);
++        offset+=count;return int(count);
++    }
++    int write(const uint8_t* data,uint32_t length)override{
++        request.assign(data,data+length);return int(length)-(shortWrite?1:0);
++    }
++};
++class RFReceiptModem final:public modem::Modem {
++public:
++    RFReceiptModem(modem::port::IModemPort* port):Modem(port,true,false,false,false,
++        true,false,0U,0U,0U,3960U,2592U,1488U,true,true,false,false,false,false){m_protoVer=4U;}
++    bool apply(){return writeRFParams();}
++};
++}
++TEST_CASE("RF configuration needs its own complete receipt before transmission", "[c4fm-test][modem][rf-receipt]") {
++    auto* port=new RFReceiptPort;RFReceiptModem modem(port);
++    SECTION("matching literal ACK succeeds") {port->response={0xFEU,4U,0x70U,6U};REQUIRE(modem.apply());}
++    SECTION("matching literal NAK fails") {port->response={0xFEU,5U,0x7FU,6U,4U};REQUIRE_FALSE(modem.apply());}
++    SECTION("timeout fails") {REQUIRE_FALSE(modem.apply());}
++    SECTION("another command ACK cannot authorize RF") {port->response={0xFEU,4U,0x70U,2U};REQUIRE_FALSE(modem.apply());}
++    SECTION("unrelated ACK is skipped before matching ACK") {port->response={0xFEU,4U,0x70U,2U,0xFEU,4U,0x70U,6U};REQUIRE(modem.apply());}
++    SECTION("truncated ACK cannot authorize RF") {port->response={0xFEU,3U,0x70U};REQUIRE_FALSE(modem.apply());}
++    SECTION("partial command write fails even when ACK bytes exist") {port->response={0xFEU,4U,0x70U,6U};port->shortWrite=true;REQUIRE_FALSE(modem.apply());}
++    REQUIRE(port->request.size()==22U);
++    REQUIRE(port->request[0U]==0xFEU);
++    REQUIRE(port->request[1U]==22U);
++    REQUIRE(port->request[2U]==6U);
++}
++TEST_CASE("Null protocol4 acknowledges RF parameters without claiming RF activity", "[c4fm-test][modem][rf-receipt]") {
++    modem::port::ModemNullPort port;REQUIRE(port.open());
++    std::array<uint8_t,22U> request{};request[0U]=0xFEU;request[1U]=22U;request[2U]=6U;
++    REQUIRE(port.write(request.data(),request.size())==22);
++    std::array<uint8_t,4U> reply{};REQUIRE(port.read(reply.data(),reply.size())==4);
++    const std::array<uint8_t,4U> expected{0xFEU,4U,0x70U,6U};REQUIRE(reply==expected);
++}

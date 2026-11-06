@@ -1,0 +1,595 @@
+diff --git a/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.cpp b/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.cpp
+index dee5173..9f9b4bf 100644
+--- a/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.cpp
++++ b/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.cpp
+@@ -23,7 +23,10 @@ using namespace p25::lc::tsbk;
+ 
+ /* Initializes a new instance of the OSP_SYS_SRV_BCAST class. */
+ 
+-OSP_SYS_SRV_BCAST::OSP_SYS_SRV_BCAST() : TSBK()
++OSP_SYS_SRV_BCAST::OSP_SYS_SRV_BCAST() : TSBK(),
++    m_overrideServices(false),
++    m_servicesAvailable(0U),
++    m_servicesSupported(0U)
+ {
+     m_lco = TSBKO::OSP_SYS_SRV_BCAST;
+ }
+@@ -49,8 +52,18 @@ void OSP_SYS_SRV_BCAST::encode(uint8_t* data, bool rawTSBK, bool noTrellis)
+ 
+     ulong64_t tsbkValue = 0U;
+ 
+-    tsbkValue = (tsbkValue << 16) + services;                                       // System Services Available
+-    tsbkValue = (tsbkValue << 24) + services;                                       // System Services Supported
++    if (m_overrideServices) {
++        // Payload octet 2 is reserved; octets 3-5 carry available services,
++        // octets 6-8 supported services, and octet 9 request priority (zero).
++        // TSBK::fromValue emits this 64-bit value in network byte order.
++        tsbkValue = (ulong64_t(m_servicesAvailable) << 32) |
++            (ulong64_t(m_servicesSupported) << 8);
++    } else {
++        // Preserve the existing encoder path for callers without an explicit
++        // site service profile.
++        tsbkValue = (tsbkValue << 16) + services;
++        tsbkValue = (tsbkValue << 24) + services;
++    }
+ 
+     std::unique_ptr<uint8_t[]> tsbk = TSBK::fromValue(tsbkValue);
+     TSBK::encode(data, tsbk.get(), rawTSBK, noTrellis);
+diff --git a/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h b/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h
+index dc7e130..cd899cd 100644
+--- a/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h
++++ b/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h
+@@ -60,6 +60,23 @@ namespace p25
+                  * @returns std::string String representation of the TSBK.
+                  */
+                 std::string toString(bool isp = false) override;
++
++                /**
++                 * @brief Set explicit 24-bit available and supported service masks.
++                 * @param available Services currently available.
++                 * @param supported Services supported by this site.
++                 */
++                void setServices(uint32_t available, uint32_t supported)
++                {
++                    m_servicesAvailable = available & 0xFFFFFFU;
++                    m_servicesSupported = supported & 0xFFFFFFU;
++                    m_overrideServices = true;
++                }
++
++            private:
++                bool m_overrideServices;
++                uint32_t m_servicesAvailable;
++                uint32_t m_servicesSupported;
+             };
+         } // namespace tsbk
+     } // namespace lc
+diff --git a/src/host/Host.Config.cpp b/src/host/Host.Config.cpp
+index 72c2121..0329e3d 100644
+--- a/src/host/Host.Config.cpp
++++ b/src/host/Host.Config.cpp
+@@ -229,11 +229,20 @@ bool Host::readParams()
+         */
+         yaml::Node& voiceChList = rfssConfig["voiceChNo"];
+ 
+-        if (voiceChList.size() == 0U) {
++        yaml::Node p25Control = protocolConf["p25"]["control"];
++        const bool zeroCapacityP25Control = m_p25Enabled && !m_dmrEnabled && !m_nxdnEnabled &&
++            m_duplex && m_authoritative && p25Control["enable"].as<bool>(false) &&
++            p25Control["dedicated"].as<bool>(false) && !p25Control["voiceOnControl"].as<bool>(false);
++
++        if (voiceChList.size() == 0U && !zeroCapacityP25Control) {
+             ::LogError(LOG_HOST, "No voice channel list defined!");
+             return false;
+         }
+ 
++        if (voiceChList.size() == 0U) {
++            ::LogInfoEx(LOG_HOST, "Dedicated P25 control channel with zero traffic resources; voice/data grants unavailable");
++        }
++
+         for (size_t i = 0; i < voiceChList.size(); i++) {
+             yaml::Node& channel = voiceChList[i];
+ 
+@@ -320,7 +329,11 @@ bool Host::readParams()
+             strVoiceChNo.append(std::string(hexStr));
+             strVoiceChNo.append(",");
+         }
+-        strVoiceChNo.erase(strVoiceChNo.find_last_of(","));
++        if (!strVoiceChNo.empty()) {
++            strVoiceChNo.pop_back();
++        } else {
++            strVoiceChNo = "None";
++        }
+ 
+         /*
+         ** Site Parameters
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+index 96e86cd..894944b 100644
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -428,6 +428,13 @@ void Control::setOptions(yaml::Node& conf, bool supervisor, const std::string cw
+         serviceClass |= ServiceClass::REG;
+     }
+ 
++    // A dedicated CC can register and affiliate units without any traffic
++    // resources. Use the configured inventory, not the free-channel pool: a
++    // fully occupied site still supports its configured traffic services.
++    if (m_enableControl && m_dedicatedControl && m_affiliations->rfCh()->rfChDataSize() == 0U) {
++        serviceClass = ServiceClass::REG;
++    }
++
+     /*
+     ** Site Data
+     */
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+index 448718f..c57f79e 100644
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -1235,6 +1235,11 @@ void ControlSignaling::writeRF_TSDU_Raw(const uint8_t* tsbk)
+ 
+ void ControlSignaling::setConvFallback(bool fallback)
+ {
++    if (fallback && m_p25->m_dedicatedControl && m_p25->m_affiliations->rfCh()->rfChDataSize() == 0U) {
++        LogWarning(LOG_P25, "Cannot enable conventional fallback without configured traffic resources.");
++        return;
++    }
++
+     m_convFallback = fallback;
+     if (m_convFallback && m_p25->m_enableControl) {
+         m_convFallbackPacketDelay = 0U;
+@@ -1846,7 +1851,11 @@ void ControlSignaling::writeRF_ControlData(uint8_t frameCnt, uint8_t n, bool adj
+         break;
+     /** extra data */
+     case 6:
+-        queueRF_TSBK_Ctrl(TSBKO::OSP_SNDCP_CH_ANN);
++        if (m_p25->m_dedicatedControl && m_p25->m_affiliations->rfCh()->rfChDataSize() == 0U) {
++            queueRF_TSBK_Ctrl(TSBKO::OSP_SYS_SRV_BCAST);
++        } else {
++            queueRF_TSBK_Ctrl(TSBKO::OSP_SNDCP_CH_ANN);
++        }
+         break;
+     case 7:
+         // write ADJSS
+@@ -2066,8 +2075,30 @@ void ControlSignaling::queueRF_TSBK_Ctrl(uint8_t lco)
+                 return; // don't create anything
+             }
+             break;
++        case TSBKO::OSP_SYS_SRV_BCAST:
++        {
++            // The zero-resource profile supports control-plane access only.
++            // Do not advertise voice or packet-data service, or the CC itself
++            // as a data resource. Ordinary capacity profiles keep their
++            // existing broadcast schedule and service-mask behavior.
++            if (!m_p25->m_dedicatedControl || m_p25->m_affiliations->rfCh()->rfChDataSize() != 0U) {
++                return;
++            }
++            uint32_t services = SystemService::UNIT_REG | SystemService::GROUP_AFF | SystemService::GROUP_AFF_Q;
++            if (m_p25->m_siteData.netActive()) {
++                services |= SystemService::NET_ACTIVE;
++            }
++            std::unique_ptr<OSP_SYS_SRV_BCAST> osp = std::make_unique<OSP_SYS_SRV_BCAST>();
++            osp->setServices(services, services);
++            tsbk = std::move(osp);
++            DEBUG_LOG_TSBK(tsbk->toString());
++        }
++        break;
+         case TSBKO::OSP_SNDCP_CH_ANN:
+         {
++            if (m_p25->m_dedicatedControl && m_p25->m_affiliations->rfCh()->rfChDataSize() == 0U) {
++                return;
++            }
+             // transmit SNDCP announcement
+             std::unique_ptr<OSP_SNDCP_CH_ANN> osp = std::make_unique<OSP_SNDCP_CH_ANN>();
+             osp->siteIdenEntry(m_p25->m_idenEntry);
+@@ -2247,7 +2278,7 @@ bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_
+                 else {
+                     if (!net) {
+                         LogWarning(LOG_RF, P25_TSDU_STR ", TSBKO, IOSP_UU_VCH (Unit-to-Unit Voice Channel Request) denied, no channels available, dstId = %u", dstId);
+-                        writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_NO_RF_RSRC_AVAIL, TSBKO::IOSP_GRP_VCH, grp, true);
++                        writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_NO_RF_RSRC_AVAIL, TSBKO::IOSP_UU_VCH, grp, true);
+ 
+                         ::ActivityLog("P25", true, "unit-to-unit grant request from %u to %u denied", srcId, dstId);
+                         m_p25->m_rfState = RS_RF_REJECTED;
+diff --git a/tests/p25/ZeroCapacity_Tests.cpp b/tests/p25/ZeroCapacity_Tests.cpp
+new file mode 100644
+index 0000000..53f8cc2
+--- /dev/null
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -0,0 +1,398 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Offline controller tests. No modem port or network socket is opened. */
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/lookups/AffiliationLookup.h"
++#include "common/edac/CRC.h"
++#include "common/p25/lc/tsbk/TSBKFactory.h"
++#include "common/Log.h"
++
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <vector>
++
++using namespace p25;
++using namespace p25::defines;
++using namespace p25::lc;
++using namespace p25::lc::tsbk;
++
++namespace {
++constexpr uint32_t SOURCE = 1001U;
++constexpr uint32_t TARGET = 1002U;
++constexpr uint32_t GROUP = 101U;
++constexpr uint32_t VOICE_CHANNEL = 25U;
++constexpr uint32_t DENIED_SOURCE = 1003U;
++constexpr uint32_t UNKNOWN_SOURCE = 1004U;
++constexpr uint32_t DENIED_GROUP = 102U;
++constexpr uint32_t UNKNOWN_GROUP = 103U;
++
++// Exercise the real scheduler without wall-clock sleeps or a running Host.
++class OfflineScheduler : public packet::ControlSignaling {
++public:
++    explicit OfflineScheduler(Control* controller) : ControlSignaling(controller, false, false, false) {
++        m_ctrlTSDUMBF = false;
++    }
++    using ControlSignaling::writeRF_ControlData;
++};
++
++// Some broadcast decoders in this upstream revision are stubs. Use the shared
++// FEC/CRC decoder and inspect the standardized octets instead of those stubs.
++class WireBlock : public OSP_DENY_RSP {
++public:
++    std::array<uint8_t, 8U> payload(const uint8_t* frame) {
++        std::array<uint8_t, 8U> result{};
++        REQUIRE(TSBK::decode(frame, result.data(), false));
++        return result;
++    }
++};
++
++struct ControllerFixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, false};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, false};
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "offline-test", false};
++    network::NetRPC* previousRPC = g_RPC;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U,
++        true, true, false, false, false, false};
++    std::unique_ptr<Control> controller;
++
++    explicit ControllerFixture(bool withCapacity = false, bool sndcp = false, bool strictACL = false) :
++        radios("", 0U, strictACL), groups("", 0U, strictACL) {
++        g_logDisplayLevel = 0U;
++        g_RPC = &rpc;
++        if (strictACL) {
++            radios.addEntry(SOURCE, true, "Allowed radio");
++            radios.addEntry(TARGET, true, "Allowed target");
++            radios.addEntry(DENIED_SOURCE, false, "Disabled radio");
++            groups.addEntry(GROUP, 1U, true);
++            groups.addEntry(DENIED_GROUP, 1U, false);
++        }
++        if (withCapacity) {
++            channels.setRFChData(VOICE_CHANNEL,
++                ::lookups::VoiceChData(2U, VOICE_CHANNEL, "", 0U, ""));
++            channels.addRFCh(VOICE_CHANNEL);
++        }
++        controller = std::make_unique<Control>(true, 0x293U, 1U, 16384U,
++            &modem, nullptr, 120U, 1U, true, &channels, &radios, &groups,
++            &identities, &rssi, false, false, false, false, false);
++        yaml::Node config;
++        const std::string configText = std::string(R"(
++protocols:
++    p25:
++        unitToUnitAvailCheck: false
++        verifyReg: true
++        verifyAff: true
++        inhibitUnauthorized: false
++        sndcpSupport: )") + (sndcp ? "true" : "false") + R"(
++        tduPreambleCount: 0
++        control:
++            enable: true
++            dedicated: true
++            ackRequests: false
++            disableTSDUMBF: true
++            redundantImmediate: false
++system:
++    config:
++        controlCh:
++            notifyEnable: false
++)";
++        REQUIRE(yaml::Parse(config, configText));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(),
++            1U, 1U, 1U, 1U, 2U, 1U, false);
++        controller->setCCRunning(true);
++    }
++
++    ~ControllerFixture() {
++        controller.reset();
++        g_RPC = previousRPC;
++    }
++
++    template<typename Request> void receive(uint32_t source, uint32_t target = 0U) {
++        auto request = std::make_unique<Request>();
++        request->setSrcId(source);
++        request->setDstId(target);
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES + 2U> frame{};
++        REQUIRE(controller->control()->process(frame.data(), frame.size(), std::move(request)));
++    }
++
++    std::vector<std::unique_ptr<TSBK>> drain() {
++        std::vector<std::unique_ptr<TSBK>> result;
++        std::array<uint8_t, 1024U> frame{};
++        uint32_t length;
++        while ((length = controller->getFrame(frame.data())) != 0U) {
++            REQUIRE(length >= P25_TSDU_FRAME_LENGTH_BYTES + 2U);
++            auto block = TSBKFactory::createTSBK(frame.data() + 2U);
++            REQUIRE(block != nullptr);
++            result.push_back(std::move(block));
++        }
++        return result;
++    }
++
++    void receiveRegistration(uint32_t source, uint32_t system = 1U) {
++        // IOSP_U_REG's decoder reads the inbound system ID; its encoder produces
++        // the outbound layout. Decode a raw request so the real handler sees 001.
++        auto request = std::make_unique<IOSP_U_REG>();
++        // Raw decode deliberately verifies its checksum as a real received block.
++        std::array<uint8_t, P25_TSBK_LENGTH_BYTES> raw{};
++        raw[0U] = TSBKO::IOSP_U_REG;
++        const uint64_t registration = (uint64_t(1U) << 36U) | (uint64_t(system) << 24U) | source;
++        for (uint32_t i = 0U; i < 8U; i++)
++            raw[2U + i] = uint8_t(registration >> ((7U - i) * 8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        REQUIRE(request->decode(raw.data(), true));
++        REQUIRE(request->getSysId() == system);
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES + 2U> frame{};
++        REQUIRE(controller->control()->process(frame.data(), frame.size(), std::move(request)));
++    }
++
++    void registerAndAffiliate() {
++        receiveRegistration(SOURCE);
++        REQUIRE(controller->affiliations()->isUnitReg(SOURCE));
++        drain();
++        receive<IOSP_GRP_AFF>(SOURCE, GROUP);
++        REQUIRE(controller->affiliations()->isGroupAff(SOURCE, GROUP));
++        drain();
++        controller->affiliations()->unitReg(TARGET);
++    }
++
++    void requireAccessResponse(uint8_t opcode, uint8_t response) {
++        auto replies = drain();
++        // Exactly one response also proves automatic radio inhibit was not sent.
++        REQUIRE(replies.size() == 1U);
++        REQUIRE(replies.front()->getLCO() == opcode);
++        const uint8_t* raw = replies.front()->getDecodedRaw();
++        REQUIRE(raw != nullptr);
++        REQUIRE(edac::CRC::checkCCITT162(raw, P25_TSBK_LENGTH_BYTES));
++        // These upstream IOSP decoders parse inbound request layouts, so inspect
++        // the response's actual transmitted bits rather than getResponse().
++        const uint8_t actual = opcode == TSBKO::IOSP_U_REG ? ((raw[2U] >> 4U) & 3U) : (raw[2U] & 3U);
++        REQUIRE(actual == response);
++        REQUIRE(controller->affiliations()->grantSize() == 0U);
++        REQUIRE(channels.rfChDataSize() == 0U);
++        REQUIRE(channels.rfChSize() == 0U);
++    }
++
++    void requireNoResources(uint8_t service) {
++        REQUIRE(controller->affiliations()->grantSize() == 0U);
++        REQUIRE(channels.rfChDataSize() == 0U);
++        REQUIRE(channels.rfChSize() == 0U);
++        auto responses = drain();
++        REQUIRE(responses.size() == 1U);
++        REQUIRE(responses.front()->getLCO() == TSBKO::OSP_DENY_RSP);
++        REQUIRE(responses.front()->getResponse() == ReasonCode::DENY_NO_RF_RSRC_AVAIL);
++        REQUIRE(responses.front()->getService() == service);
++    }
++};
++}
++
++TEST_CASE("An empty allocator preserves access state but never invents a channel", "[p25][zero-capacity]") {
++    ::lookups::ChannelLookup channels;
++    ::lookups::AffiliationLookup affiliations("offline", &channels, false);
++    affiliations.unitReg(SOURCE);
++    affiliations.groupAff(SOURCE, GROUP);
++    REQUIRE(affiliations.isUnitReg(SOURCE));
++    REQUIRE(affiliations.isGroupAff(SOURCE, GROUP));
++    for (bool group : {false, true}) {
++        for (bool network : {false, true}) {
++            REQUIRE_FALSE(affiliations.grantCh(GROUP, SOURCE, 1U, group, network));
++            REQUIRE(affiliations.grantSize() == 0U);
++            REQUIRE(affiliations.getGrantedRFChCnt() == 0U);
++            REQUIRE(channels.rfChDataSize() == 0U);
++            REQUIRE(channels.rfChSize() == 0U);
++        }
++    }
++    channels.setRFChData(VOICE_CHANNEL, ::lookups::VoiceChData(2U, VOICE_CHANNEL, "", 0U, ""));
++    REQUIRE(channels.addRFCh(VOICE_CHANNEL));
++    REQUIRE(affiliations.grantCh(GROUP, SOURCE, 1U, true, false));
++    REQUIRE(affiliations.getGrantedCh(GROUP) == VOICE_CHANNEL);
++    REQUIRE_FALSE(channels.isRFChAvailable());
++    REQUIRE(affiliations.releaseGrant(GROUP, false));
++    REQUIRE(channels.isRFChAvailable());
++    REQUIRE(affiliations.grantCh(TARGET, SOURCE, 1U, false, true));
++    affiliations.clock(1001U);
++    REQUIRE(affiliations.grantSize() == 0U);
++    REQUIRE(channels.rfChSize() == 1U);
++}
++
++TEST_CASE("Zero-capacity CC accepts access signaling and denies traffic on the wire", "[p25][zero-capacity]") {
++    ControllerFixture fixture(false, true);
++    fixture.registerAndAffiliate();
++    SECTION("group voice request") {
++        fixture.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++        fixture.requireNoResources(TSBKO::IOSP_GRP_VCH);
++    }
++    SECTION("individual voice request") {
++        fixture.receive<IOSP_UU_VCH>(SOURCE, TARGET);
++        fixture.requireNoResources(TSBKO::IOSP_UU_VCH);
++    }
++    SECTION("SNDCP request") {
++        fixture.receive<ISP_SNDCP_CH_REQ>(SOURCE);
++        fixture.requireNoResources(TSBKO::ISP_SNDCP_CH_REQ);
++    }
++}
++
++TEST_CASE("Network traffic cannot manufacture zero-capacity grants", "[p25][zero-capacity]") {
++    ControllerFixture fixture;
++    fixture.registerAndAffiliate();
++    bool group = true;
++    SECTION("group demand") { group = true; }
++    SECTION("individual demand") { group = false; }
++    std::unique_ptr<TSBK> request = group ? std::unique_ptr<TSBK>(new IOSP_GRP_VCH()) :
++        std::unique_ptr<TSBK>(new IOSP_UU_VCH());
++    request->setSrcId(SOURCE);
++    request->setDstId(group ? GROUP : TARGET);
++    request->setGrpVchId(2U);
++    request->setGrpVchNo(VOICE_CHANNEL);
++    request->setLastBlock(true);
++    std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES> frame{};
++    request->encode(frame.data());
++    lc::LC control;
++    data::LowSpeedData lsd;
++    DUID::E duid = DUID::TSDU;
++    REQUIRE(fixture.controller->control()->processNetwork(frame.data(), frame.size(), control, lsd, duid));
++    REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
++    REQUIRE(fixture.channels.rfChDataSize() == 0U);
++    REQUIRE(fixture.drain().empty());
++}
++
++TEST_CASE("A configured traffic resource produces and recycles a real grant", "[p25][zero-capacity]") {
++    ControllerFixture fixture(true);
++    fixture.registerAndAffiliate();
++    fixture.receive<IOSP_GRP_VCH>(SOURCE, GROUP);
++    REQUIRE(fixture.controller->affiliations()->getGrantedCh(GROUP) == VOICE_CHANNEL);
++    REQUIRE(fixture.controller->affiliations()->grantSize() == 1U);
++    auto responses = fixture.drain();
++    REQUIRE_FALSE(responses.empty());
++    for (const auto& response : responses) {
++        REQUIRE(response->getLCO() == TSBKO::IOSP_GRP_VCH);
++        REQUIRE(response->getGrpVchNo() == VOICE_CHANNEL);
++    }
++    REQUIRE(fixture.controller->affiliations()->releaseGrant(GROUP, false));
++    REQUIRE(fixture.channels.rfChSize() == 1U);
++    fixture.controller->reset();
++    fixture.receive<IOSP_UU_VCH>(SOURCE, TARGET);
++    REQUIRE(fixture.controller->affiliations()->getGrantedCh(TARGET) == VOICE_CHANNEL);
++    REQUIRE_FALSE(fixture.controller->affiliations()->isGroup(TARGET));
++}
++
++TEST_CASE("Broadcast services describe zero inventory rather than temporary congestion", "[p25][zero-capacity]") {
++    bool capacity = false;
++    SECTION("zero inventory") { capacity = false; }
++    SECTION("real inventory entirely busy") { capacity = true; }
++    ControllerFixture fixture(capacity);
++    if (capacity) {
++        REQUIRE(fixture.controller->affiliations()->grantCh(GROUP, SOURCE, 10U, true, false));
++        REQUIRE_FALSE(fixture.channels.isRFChAvailable());
++    }
++    OfflineScheduler scheduler(fixture.controller.get());
++    std::array<uint8_t, 1024U> frame{};
++    WireBlock block;
++    scheduler.writeRF_ControlData(2U, 2U, false);
++    REQUIRE(fixture.controller->getFrame(frame.data()) > 0U);
++    auto rfss = block.payload(frame.data() + 2U);
++    REQUIRE(block.getLCO() == TSBKO::OSP_RFSS_STS_BCAST);
++    REQUIRE(rfss[7U] == (capacity ? uint8_t(ServiceClass::REG | ServiceClass::VOICE) : uint8_t(ServiceClass::REG)));
++
++    scheduler.writeRF_ControlData(2U, 6U, false);
++    REQUIRE(fixture.controller->getFrame(frame.data()) > 0U);
++    auto services = block.payload(frame.data() + 2U);
++    if (capacity) {
++        REQUIRE(block.getLCO() == TSBKO::OSP_SNDCP_CH_ANN);
++    } else {
++        REQUIRE(block.getLCO() == TSBKO::OSP_SYS_SRV_BCAST);
++        // Full TSBK octet 2 is reserved; 3..5 are available, 6..8
++        // supported and octet 9 is the request-priority field.
++        REQUIRE(services[0U] == 0U);
++        REQUIRE(services[7U] == 0U);
++        const uint32_t available = (uint32_t(services[1U]) << 16U) | (uint32_t(services[2U]) << 8U) | services[3U];
++        const uint32_t supported = (uint32_t(services[4U]) << 16U) | (uint32_t(services[5U]) << 8U) | services[6U];
++        const uint32_t accessServices = SystemService::UNIT_REG | SystemService::GROUP_AFF | SystemService::GROUP_AFF_Q;
++        REQUIRE(available == accessServices);
++        REQUIRE(supported == accessServices);
++        scheduler.setConvFallback(true);
++        REQUIRE(fixture.controller->getFrame(frame.data()) == 0U);
++        scheduler.writeRF_ControlData(2U, 2U, false);
++        REQUIRE(fixture.controller->getFrame(frame.data()) > 0U);
++        block.payload(frame.data() + 2U);
++        REQUIRE(block.getLCO() == TSBKO::OSP_RFSS_STS_BCAST);
++    }
++}
++
++TEST_CASE("Explicit service masks occupy the standardized broadcast octets", "[p25][zero-capacity]") {
++    OSP_SYS_SRV_BCAST broadcast;
++    broadcast.setServices(SystemService::UNIT_REG,
++        SystemService::UNIT_REG | SystemService::GROUP_AFF | SystemService::GROUP_AFF_Q);
++    std::array<uint8_t, P25_TSBK_LENGTH_BYTES> raw{};
++    broadcast.encode(raw.data(), true, true);
++    REQUIRE((raw[0U] & 0x3FU) == TSBKO::OSP_SYS_SRV_BCAST);
++    const std::array<uint8_t, 8U> expected = {0U, 0U, 8U, 0U, 0U, 14U, 0U, 0U};
++    for (uint32_t i = 0U; i < expected.size(); i++)
++        REQUIRE(raw[2U + i] == expected[i]);
++    REQUIRE(edac::CRC::checkCCITT162(raw.data(), raw.size()));
++}
++
++TEST_CASE("Strict stock RID policy accepts only enabled radios without inhibiting rejected units", "[p25][zero-capacity]") {
++    ControllerFixture fixture(false, false, true);
++    REQUIRE(fixture.radios.getACL());
++    uint32_t source = SOURCE;
++    uint8_t response = ResponseCode::ACCEPT;
++    SECTION("enabled RID") {}
++    SECTION("disabled RID") { source = DENIED_SOURCE; response = ResponseCode::REFUSED; }
++    SECTION("unknown RID") { source = UNKNOWN_SOURCE; response = ResponseCode::REFUSED; }
++    fixture.receiveRegistration(source);
++    fixture.requireAccessResponse(TSBKO::IOSP_U_REG, response);
++    REQUIRE(fixture.controller->affiliations()->isUnitReg(source) == (response == ResponseCode::ACCEPT));
++    REQUIRE(fixture.controller->affiliations()->grpAffSize() == 0U);
++}
++
++TEST_CASE("Strict stock talkgroup policy controls affiliation independently of traffic inventory", "[p25][zero-capacity]") {
++    ControllerFixture fixture(false, false, true);
++    REQUIRE(fixture.groups.getACL());
++    fixture.receiveRegistration(SOURCE);
++    fixture.requireAccessResponse(TSBKO::IOSP_U_REG, ResponseCode::ACCEPT);
++    uint32_t group = GROUP;
++    uint8_t response = ResponseCode::ACCEPT;
++    SECTION("enabled talkgroup") {}
++    SECTION("disabled talkgroup") { group = DENIED_GROUP; response = ResponseCode::DENY; }
++    SECTION("unknown talkgroup") { group = UNKNOWN_GROUP; response = ResponseCode::DENY; }
++    fixture.receive<IOSP_GRP_AFF>(SOURCE, group);
++    fixture.requireAccessResponse(TSBKO::IOSP_GRP_AFF, response);
++    REQUIRE(fixture.controller->affiliations()->isUnitReg(SOURCE));
++    REQUIRE(fixture.controller->affiliations()->isGroupAff(SOURCE, group) == (response == ResponseCode::ACCEPT));
++}
++
++TEST_CASE("Registration domain rejection and expiration preserve the empty-capacity invariant", "[p25][zero-capacity]") {
++    ControllerFixture fixture(false, false, true);
++    SECTION("wrong system registration") {
++        fixture.receiveRegistration(SOURCE, 2U);
++        fixture.requireAccessResponse(TSBKO::IOSP_U_REG, ResponseCode::DENY);
++        REQUIRE_FALSE(fixture.controller->affiliations()->isUnitReg(SOURCE));
++    }
++    SECTION("registration expiry removes affiliation and permits fresh access") {
++        fixture.registerAndAffiliate();
++        const uint32_t timeout = fixture.controller->affiliations()->unitRegTimeout(SOURCE);
++        REQUIRE(timeout > 0U);
++        fixture.controller->reset();
++        REQUIRE(fixture.controller->affiliations()->isUnitReg(SOURCE));
++        REQUIRE(fixture.controller->affiliations()->isGroupAff(SOURCE, GROUP));
++        fixture.controller->affiliations()->clock(timeout * 1000U + 1U);
++        REQUIRE_FALSE(fixture.controller->affiliations()->isUnitReg(SOURCE));
++        REQUIRE_FALSE(fixture.controller->affiliations()->isGroupAff(SOURCE, GROUP));
++        REQUIRE(fixture.controller->affiliations()->grantSize() == 0U);
++        REQUIRE(fixture.channels.rfChDataSize() == 0U);
++        auto commands = fixture.drain();
++        REQUIRE_FALSE(commands.empty());
++        for (const auto& command : commands)
++            REQUIRE(command->getLCO() == TSBKO::OSP_U_REG_CMD);
++        fixture.receiveRegistration(SOURCE);
++        fixture.requireAccessResponse(TSBKO::IOSP_U_REG, ResponseCode::ACCEPT);
++        fixture.receive<IOSP_GRP_AFF>(SOURCE, GROUP);
++        fixture.requireAccessResponse(TSBKO::IOSP_GRP_AFF, ResponseCode::ACCEPT);
++        REQUIRE(fixture.controller->affiliations()->isGroupAff(SOURCE, GROUP));
++    }
++}

@@ -1,0 +1,254 @@
+/* Open25 administration: geometry and colors ported from the approved Network tree. */
+
+#open25-administration .ts-admin{--ts-bg:light-dark(#f3f6f8,#101b24);--ts-panel:light-dark(#fff,#172630);--ts-ink:light-dark(#20313e,#e9f1f5);--ts-muted:light-dark(#536776,#b0c1ce);--ts-line:light-dark(#d3dde4,#3a4d5a);--ts-soft:light-dark(#eaf1f5,#203540);--ts-active:light-dark(#d9eef5,#164354);--ts-blue:light-dark(#006b8d,#71d3ed);--ts-head:light-dark(#19394e,#112d3e);--ts-headink:light-dark(#f6fbfe,#f6fbfe);--ts-warn:light-dark(#805000,#ffd389);--ts-warnbg:light-dark(#fff4dc,#3c301c);--ts-row:16px;min-height:1050px;background:var(--ts-bg);color:var(--ts-ink);font:400 15px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-align:left;overflow-wrap:break-word}
+#open25-administration .ts-admin *{box-sizing:border-box}
+#open25-administration .ts-admin [hidden]{display:none!important}
+#open25-administration .ts-admin h1,#open25-administration .ts-admin h2,#open25-administration .ts-admin h3,#open25-administration .ts-admin p{margin:0}
+#open25-administration .ts-admin h1{font-size:24px;line-height:1.2;letter-spacing:-.6px;font-weight:600}
+#open25-administration .ts-admin h2{font-size:18px;line-height:1.3;font-weight:600}
+#open25-administration .ts-admin h3{font-size:15px;font-weight:600}
+#open25-administration .ts-admin button,#open25-administration .ts-admin input,#open25-administration .ts-admin select,#open25-administration .ts-admin textarea{font:inherit;color:inherit}
+#open25-administration .ts-admin input,#open25-administration .ts-admin select,#open25-administration .ts-admin textarea{font-size:15px}
+#open25-administration .ts-admin button{background:var(--ts-panel);border:1px solid var(--ts-line);border-radius:5px;min-height:40px;padding:8px 14px;display:inline-flex;align-items:center;justify-content:center;gap:8px;max-width:100%;text-align:left}
+#open25-administration .ts-admin button:hover{background:var(--ts-soft)}
+#open25-administration .ts-admin button.ts-primary{background:var(--ts-blue);color:var(--ts-panel);border-color:var(--ts-blue);font-weight:600}
+#open25-administration .ts-admin button.ts-link{color:var(--ts-blue);background:transparent;border-color:transparent;padding:4px 0;min-height:34px;justify-content:flex-start;text-decoration:underline;text-underline-offset:3px}
+#open25-administration .ts-admin button.ts-icon{padding:8px;min-width:40px}
+#open25-administration .ts-admin svg{flex-shrink:0}
+#open25-administration .ts-admin input:not([type=checkbox]),#open25-administration .ts-admin select,#open25-administration .ts-admin textarea{width:100%;min-width:0;border:1px solid var(--ts-line);background:var(--ts-panel);border-radius:4px;min-height:40px;padding:9px 11px;line-height:1.3}
+#open25-administration .ts-admin input[type=checkbox]{width:20px;height:20px;accent-color:var(--ts-blue);flex-shrink:0;margin:0}
+#open25-administration .ts-admin textarea{resize:vertical;min-height:88px}
+#open25-administration .ts-topbar{background:var(--ts-head);color:var(--ts-headink);padding:14px 22px;display:flex;gap:24px;align-items:center;flex-wrap:wrap}
+#open25-administration .ts-brand{font-size:19px;font-weight:600;letter-spacing:-.5px;display:flex;align-items:center;gap:10px}
+#open25-administration .ts-product{font-size:17px;display:flex;align-items:center;gap:10px}
+#open25-administration .ts-preview{font-size:13px;border:1px solid currentColor;border-radius:4px;padding:4px 9px;display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap}
+#open25-administration .ts-contextbar{background:var(--ts-panel);border-bottom:1px solid var(--ts-line);padding:12px 22px;display:flex;align-items:end;gap:18px;flex-wrap:wrap}
+#open25-administration .ts-contextbar label{min-width:210px;max-width:100%;display:grid;gap:4px;font-size:13px;color:var(--ts-muted)}
+#open25-administration .ts-contextbar select{font-size:15px;color:var(--ts-ink);min-width:230px}
+#open25-administration .ts-contextmeta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding-bottom:7px;min-width:0}
+#open25-administration .ts-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:4px;background:var(--ts-soft);color:var(--ts-muted);font-size:13px;white-space:nowrap}
+#open25-administration .ts-badge.ts-selected{background:var(--ts-active);color:var(--ts-blue)}
+#open25-administration .ts-badge.ts-amber{background:var(--ts-warnbg);color:var(--ts-warn)}
+#open25-administration .ts-search{margin-left:auto;min-width:200px;max-width:360px;flex:1}
+#open25-administration .ts-layout{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:930px}
+#open25-administration .ts-sidebar{background:var(--ts-panel);border-right:1px solid var(--ts-line);padding:20px 12px}
+#open25-administration .ts-navgroup{margin:21px 0 5px;padding:0 12px;color:var(--ts-muted);font-size:12px;letter-spacing:.65px;text-transform:uppercase;font-weight:600}
+#open25-administration .ts-sidebar button{display:flex;width:100%;border:0;background:transparent;justify-content:flex-start;padding:10px 12px;min-height:40px;font-size:14px;gap:9px;margin:2px 0}
+#open25-administration .ts-sidebar button[aria-current=page]{background:var(--ts-active);color:var(--ts-blue);font-weight:600}
+#open25-administration .ts-sidebar button[aria-current=location]{background:var(--ts-active);color:var(--ts-blue);font-weight:600}
+#open25-administration .ts-admin fieldset.ts-checkgrid{padding:0;margin:0;border:0;min-width:0}
+#open25-administration .ts-sidebar button:hover{background:var(--ts-soft)}
+#open25-administration .ts-main{min-width:0;padding:24px 28px 30px}
+#open25-administration .ts-breadcrumb{display:flex;align-items:center;flex-wrap:wrap;gap:7px;color:var(--ts-muted);font-size:13px;margin-bottom:10px}
+#open25-administration .ts-breadcrumb button{font-size:13px;min-height:28px;padding:0}
+#open25-administration .ts-heading{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:0;flex-wrap:wrap}
+#open25-administration .ts-heading p{color:var(--ts-muted);font-size:15px;margin-top:8px;max-width:620px}
+#open25-administration .ts-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+#open25-administration .ts-panel{background:var(--ts-panel);border:1px solid var(--ts-line);border-radius:7px;padding:22px;margin:18px 0}
+#open25-administration .ts-attention{border-left:4px solid var(--ts-warn)}
+#open25-administration .ts-panel:first-child{margin-top:0}
+#open25-administration .ts-panelhead{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:18px;flex-wrap:wrap}
+#open25-administration .ts-caption{font-size:13px;color:var(--ts-muted)}
+#open25-administration .ts-overview{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+#open25-administration .ts-overview .ts-panel{margin:0}
+#open25-administration .ts-list{margin:0;padding:0;list-style:none}
+#open25-administration .ts-list li{padding:13px 0;border-bottom:1px solid var(--ts-line)}
+#open25-administration .ts-list li:last-child{border-bottom:0;padding-bottom:0}
+#open25-administration .ts-itemline{display:flex;gap:12px;justify-content:space-between;align-items:center;flex-wrap:wrap}
+#open25-administration .ts-itemline strong{font-weight:600}
+#open25-administration .ts-muted{color:var(--ts-muted)}
+#open25-administration .ts-topology{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start;position:relative;padding-top:8px}
+#open25-administration .ts-node{border:1px solid var(--ts-line);border-radius:6px;background:var(--ts-panel);padding:12px;text-align:left;min-height:76px;display:flex;flex-direction:column;gap:3px}
+#open25-administration .ts-node:first-child{grid-column:1/-1;justify-self:center;min-width:220px}
+#open25-administration .ts-node:nth-child(2){grid-column:1/-1;justify-self:center;min-width:220px}
+#open25-administration .ts-node[aria-current=true]{border:2px solid var(--ts-blue);background:var(--ts-active)}
+#open25-administration .ts-node small{font-size:13px;color:var(--ts-muted)}
+#open25-administration .ts-topology-line{width:1px;height:14px;background:var(--ts-line);justify-self:center;grid-column:1/-1;margin-top:-14px;margin-bottom:-14px}
+#open25-administration .ts-network-diagram{display:grid;gap:0}
+#open25-administration .ts-network-tier{display:flex;justify-content:center;gap:16px}
+#open25-administration .ts-network-tier .ts-node{min-width:0;min-height:70px;flex:1;max-width:360px;align-items:flex-start;justify-content:center}
+#open25-administration .ts-network-edge{height:22px;width:1px;background:var(--ts-line);margin:0 auto}
+#open25-administration .ts-network-fork{margin:0 25%;border:1px solid var(--ts-line);border-bottom:0;height:20px}
+#open25-administration .ts-network-app{margin-top:18px;padding-top:16px;border-top:1px solid var(--ts-line);display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+#open25-administration .ts-network-app .ts-node{max-width:360px;flex:1;min-width:0}
+@media(max-width:600px){#open25-administration .ts-network-tier{flex-direction:column}#open25-administration .ts-network-tier .ts-node{width:100%;max-width:none}#open25-administration .ts-network-fork{display:none}#open25-administration .ts-network-app{display:grid}}
+#open25-administration .ts-nodebranch{display:flex;gap:7px;align-items:center;font-size:14px;margin:0 0 7px;color:var(--ts-muted)}
+#open25-administration .ts-tablescroll{overflow-x:auto;max-width:100%;margin:0 -1px}
+#open25-administration .ts-admin table{width:100%;border-collapse:collapse;text-align:left;font-size:15px}
+#open25-administration .ts-admin th{font-weight:600;color:var(--ts-muted);font-size:13px;background:var(--ts-soft);text-align:left;vertical-align:bottom;padding:12px 14px;white-space:nowrap}
+#open25-administration .ts-admin td{padding:var(--ts-row) 14px;border-bottom:1px solid var(--ts-line);vertical-align:top;min-width:80px;max-width:340px;overflow-wrap:normal;word-break:normal}
+#open25-administration .ts-admin td small{display:block;font-size:13px;color:var(--ts-muted);margin-top:3px}
+#open25-administration .ts-admin td code{white-space:normal;overflow-wrap:anywhere;font-size:13px}
+#open25-administration .ts-admin td button.ts-link{padding:0;min-height:24px;font-size:15px;text-align:left}
+#open25-administration .ts-admin tbody tr:hover{background:var(--ts-soft)}
+#open25-administration .ts-toolbar{display:flex;align-items:center;gap:12px;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap}
+#open25-administration .ts-toolbar input{max-width:300px}
+#open25-administration .ts-editor{max-width:1020px}
+#open25-administration .ts-formgrid+.ts-actions{margin-top:20px}
+#open25-administration .ts-editor-nav{display:flex;flex-wrap:wrap;gap:4px;margin:0 0 16px;padding-bottom:8px;border-bottom:1px solid var(--ts-line)}
+#open25-administration .ts-editor-nav button{background:transparent;border:0;border-bottom:2px solid var(--ts-line);border-radius:0;min-height:40px;padding:8px 10px;font-size:14px;color:var(--ts-muted)}
+#open25-administration .ts-formsection{scroll-margin-top:20px;background:var(--ts-panel);border:1px solid var(--ts-line);border-radius:7px;padding:20px;margin:0 0 16px}
+#open25-administration .ts-sectiontitle{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:22px;flex-wrap:wrap}
+#open25-administration .ts-formgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:23px 24px}
+#open25-administration .ts-field{min-width:0;display:grid;grid-row:span 2;grid-template-rows:subgrid;row-gap:7px}
+#open25-administration .ts-fieldbody{min-width:0;display:flex;flex-direction:column;gap:7px}
+#open25-administration .ts-field.ts-wide{grid-column:1/-1}
+#open25-administration .ts-fieldlabel{display:flex;min-height:26px;gap:8px;align-items:center;justify-content:space-between;font-weight:500;font-size:14px}
+#open25-administration .ts-fieldlabel label{min-width:0}
+#open25-administration .ts-hint{font-size:13px;color:var(--ts-muted)}
+#open25-administration .ts-check{display:flex;align-items:center;gap:10px;min-height:40px;font-size:15px;font-weight:400}
+#open25-administration .ts-numberpair{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;align-items:start}
+#open25-administration .ts-numberpair label{font-size:12px;color:var(--ts-muted);display:flex;flex-direction:column-reverse;gap:4px}
+#open25-administration .ts-numberpair input{font-variant-numeric:tabular-nums}
+#open25-administration .ts-help{position:relative;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;width:26px;height:26px;color:var(--ts-blue);border-radius:50%;cursor:help}
+#open25-administration .ts-help>svg{width:18px;height:18px}
+#open25-administration .ts-helpbody{display:none;position:absolute;right:0;top:100%;width:320px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow:auto;padding:16px;background:var(--ts-panel);color:var(--ts-ink);border:1px solid var(--ts-line);box-shadow:0 6px 24px color-mix(in srgb,var(--ts-ink) 18%,transparent);border-radius:6px;z-index:20;font-size:14px;font-weight:400;line-height:1.5;text-align:left}
+#open25-administration .ts-help:hover>.ts-helpbody,#open25-administration .ts-help:focus-visible>.ts-helpbody{display:grid;gap:8px}
+#open25-administration .ts-helpbody strong{font-weight:600}
+#open25-administration .ts-help:focus-visible{outline:2px solid var(--ts-blue);outline-offset:2px}
+#open25-administration .ts-checkgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px 16px}
+#open25-administration .ts-checkgrid label{display:flex;gap:9px;align-items:center;font-size:14px;min-height:40px}
+#open25-administration .ts-relation{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:start}
+#open25-administration .ts-chips{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
+#open25-administration .ts-picker{padding:14px;border:1px solid var(--ts-line);background:var(--ts-soft);border-radius:5px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:4px}
+#open25-administration .ts-gridrow{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.5fr) auto;grid-template-rows:auto auto auto;gap:6px 12px;align-items:start;padding:16px 0;border-bottom:1px solid var(--ts-line)}
+#open25-administration .ts-gridrow>button{grid-column:-2;grid-row:2;align-self:start}
+#open25-administration .ts-gridrow label.ts-check{display:flex;grid-column:-3;grid-row:2;align-self:start}
+#open25-administration .ts-gridrow label{font-size:13px;display:grid;gap:6px}
+#open25-administration .ts-gridrow>label:not(.ts-check){grid-row:span 3;grid-template-rows:subgrid}
+#open25-administration .ts-gridrow.ts-receiverow{grid-template-columns:1.1fr 1fr 1fr auto auto}
+#open25-administration [data-profile-add]{margin-top:12px}
+#open25-administration .ts-orderlist{display:grid;gap:8px;margin-top:12px}
+#open25-administration .ts-orderitem{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:8px 10px;background:var(--ts-soft);border-radius:4px}
+#open25-administration .ts-orderitem .ts-actions{gap:8px;flex-wrap:nowrap}
+#open25-administration .ts-orderitem button{min-width:40px;padding:8px}
+#open25-administration .ts-savebar{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;background:var(--ts-panel);border-top:2px solid var(--ts-line);padding:20px 22px;margin-top:24px}
+#open25-administration .ts-savebar .ts-muted{font-size:14px}
+#open25-administration .ts-notice{padding:12px 16px;background:var(--ts-active);border-left:3px solid var(--ts-blue);border-radius:4px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;gap:16px;font-size:14px}
+#open25-administration .ts-notice button{background:transparent;border:0;padding:8px 14px;min-height:40px}
+#open25-administration .ts-dirty{color:var(--ts-warn);background:var(--ts-warnbg);padding:12px 16px;border-radius:5px;margin-bottom:18px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+#open25-administration .ts-reference{border-left:3px solid var(--ts-line);background:var(--ts-soft);padding:16px 18px;margin:18px 0 24px;border-radius:0 5px 5px 0;font-size:14px}
+#open25-administration .ts-reference .ts-itemline{margin-bottom:9px}
+#open25-administration .ts-facts{display:grid;grid-template-columns:minmax(130px,1fr) 2fr;gap:12px;margin:0}
+#open25-administration .ts-facts dt{color:var(--ts-muted)}
+#open25-administration .ts-facts dd{margin:0;overflow-wrap:anywhere}
+#open25-administration .ts-instance-tree,#open25-administration .ts-instance-tree ul{list-style:none;margin:0;padding:0}
+#open25-administration .ts-instance-tree ul{margin-left:12px;padding-left:8px;border-left:2px solid var(--ts-line)}
+#open25-administration .ts-instance-tree .ts-treeitem{margin:0;padding:0;border:0;display:list-item}
+#open25-administration .ts-sidebar .ts-instance-tree a,#open25-administration .ts-instance-tree .ts-unavailable{display:grid;grid-template-columns:18px minmax(0,1fr) 16px;padding:9px 6px;font-size:14px;gap:6px;align-items:center}
+#open25-administration .ts-instance-tree .ts-external{grid-column:3;margin-left:0}
+#open25-administration .ts-instance-tree a>span,#open25-administration .ts-unavailable>span{min-width:0;overflow-wrap:anywhere}
+#open25-administration .ts-instance-tree{grid-column:1/-1}
+#open25-administration .ts-navbranch{grid-column:1/-1;margin-top:16px}
+#open25-administration .ts-navbranch>summary{padding:10px 12px;font-size:15px;font-weight:600;cursor:pointer}
+#open25-administration .ts-navbranch[open]>summary{margin-bottom:4px}
+#open25-administration .ts-navbranch>summary,#open25-administration .ts-advanced>summary{display:flex;gap:8px;align-items:center;list-style:none}
+#open25-administration .ts-navbranch>summary::-webkit-details-marker,#open25-administration .ts-advanced>summary::-webkit-details-marker{display:none}
+#open25-administration .ts-navbranch>summary>svg,#open25-administration .ts-advanced>summary>svg{transform:rotate(-90deg)}
+#open25-administration .ts-navbranch[open]>summary>svg,#open25-administration .ts-advanced[open]>summary>svg{transform:none}
+#open25-administration .ts-advanced{margin:0 0 20px;scroll-margin-top:20px}
+#open25-administration .ts-advanced>summary{padding:16px 22px;background:var(--ts-soft);border:1px solid var(--ts-line);border-radius:6px;font-weight:600;cursor:pointer}
+#open25-administration .ts-advanced[open]>summary{margin-bottom:16px}
+#open25-administration .ts-status{font-size:14px;font-weight:600;padding:5px 10px}
+#open25-administration .ts-status.ts-good{color:light-dark(#145c34,#96efb7);background:light-dark(#def4e5,#143e2b)}
+#open25-administration .ts-status.ts-bad{color:light-dark(#9d2020,#ffb6b6);background:light-dark(#fde7e7,#482429)}
+#open25-administration .ts-status.ts-amber{color:var(--ts-warn);background:var(--ts-warnbg)}
+#open25-administration .ts-treeowner{font-size:14px;color:var(--ts-muted);padding:12px 8px 4px}
+#open25-administration .ts-empty{padding:26px 22px;background:var(--ts-panel);border:1px dashed var(--ts-line);border-radius:6px;display:grid;gap:12px}
+#open25-administration .ts-roleline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+#open25-administration .ts-reviewgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+#open25-administration .ts-reviewgrid .ts-panel{margin:0}
+#open25-administration .ts-highlight{box-shadow:0 0 0 3px var(--ts-blue);border-radius:4px}
+#open25-administration .ts-foot{font-size:12px;color:var(--ts-muted);padding-top:25px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+#open25-administration .ts-sidebar nav{min-width:0}
+#open25-administration .ts-sidebar button span{min-width:0;overflow-wrap:anywhere}
+@media(max-width:600px){#open25-administration .ts-sidebar nav{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+@media(min-width:1280px){#open25-administration .ts-layout{grid-template-columns:224px minmax(0,1fr)}#open25-administration .ts-main{padding:26px 32px}}
+@media(max-width:850px){#open25-administration .ts-layout{grid-template-columns:192px minmax(0,1fr)}#open25-administration .ts-main{padding:24px 20px}#open25-administration .ts-overview,#open25-administration .ts-reviewgrid{grid-template-columns:1fr}#open25-administration .ts-formgrid{grid-template-columns:1fr}#open25-administration .ts-checkgrid{grid-template-columns:repeat(2,minmax(0,1fr))}#open25-administration .ts-gridrow.ts-receiverow{grid-template-columns:1fr;grid-template-rows:none}#open25-administration .ts-gridrow.ts-receiverow>label,#open25-administration .ts-gridrow.ts-receiverow>button{grid-column:auto;grid-row:auto;grid-template-rows:none;justify-self:start}#open25-administration .ts-gridrow.ts-receiverow>label{justify-self:stretch}}
+@media(max-width:600px){#open25-administration .ts-layout{grid-template-columns:1fr}#open25-administration .ts-sidebar{border-right:0;border-bottom:1px solid var(--ts-line);padding:12px}#open25-administration .ts-sidebar nav{display:grid;grid-template-columns:1fr 1fr;gap:0 8px}#open25-administration .ts-navgroup,#open25-administration .ts-treeowner{grid-column:1/-1;margin-top:12px}#open25-administration .ts-topbar,#open25-administration .ts-contextbar{padding:16px;gap:12px}#open25-administration .ts-contextbar label,#open25-administration .ts-contextbar select{min-width:0;width:100%}#open25-administration .ts-search{max-width:none;width:100%;margin:0;flex-basis:100%}#open25-administration .ts-main{padding:22px 16px}#open25-administration .ts-formsection{padding:18px}#open25-administration .ts-panel{padding:18px}#open25-administration .ts-gridrow{grid-template-columns:1fr;grid-template-rows:none}#open25-administration .ts-gridrow>label,#open25-administration .ts-gridrow>button{grid-column:auto;grid-row:auto;grid-template-rows:none}#open25-administration .ts-gridrow>button{justify-self:start}#open25-administration .ts-relation{grid-template-columns:1fr}#open25-administration .ts-relation>button{justify-self:start}#open25-administration .ts-picker{grid-template-columns:1fr}#open25-administration .ts-checkgrid{grid-template-columns:1fr}#open25-administration .ts-topology{grid-template-columns:1fr}#open25-administration .ts-node{grid-column:1!important;min-width:0!important;justify-self:stretch!important}#open25-administration .ts-facts{grid-template-columns:1fr;gap:4px}#open25-administration .ts-facts dd{margin-bottom:12px}#open25-administration .ts-product{flex-basis:100%;font-size:15px}#open25-administration .ts-admin h1{font-size:23px}}
+
+/* Native links and server-rendered observations use the same approved components. */
+body.administration{margin:0}
+#open25-administration a{color:var(--ts-blue);text-underline-offset:3px}
+#open25-administration a.ts-button,#open25-administration a.button{background:var(--ts-panel);border:1px solid var(--ts-line);border-radius:5px;min-height:40px;padding:8px 14px;display:inline-flex;align-items:center;justify-content:center;gap:8px;max-width:100%;text-decoration:none}
+#open25-administration a.ts-link{display:inline-flex;gap:8px;align-items:center;min-height:34px}
+#open25-administration .ts-sidebar a,#open25-administration .ts-unavailable{display:flex;width:100%;border:0;border-radius:5px;background:transparent;padding:10px 12px;min-height:40px;font-size:14px;gap:9px;margin:2px 0;text-decoration:none;color:inherit;align-items:center}
+#open25-administration .ts-sidebar a[aria-current]{background:var(--ts-active);color:var(--ts-blue);font-weight:600}
+#open25-administration .ts-sidebar a:hover{background:var(--ts-soft)}
+#open25-administration .ts-unavailable{color:var(--ts-muted)}
+#open25-administration .ts-editor-nav a{background:transparent;border:0;border-radius:0;min-height:40px;padding:8px 10px;font-size:14px;color:var(--ts-muted);text-decoration:none}
+#open25-administration .ts-account{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-left:auto;font-size:14px}
+#open25-administration .ts-account button{background:transparent;border-color:#597486;color:inherit}
+#open25-administration .ts-account form,#open25-administration .ts-actions form{margin:0;display:flex;gap:8px;flex-wrap:wrap}
+#open25-administration .ts-login-layout{display:block;min-height:calc(100vh - 80px)}
+#open25-administration .ts-login-layout .ts-main{max-width:540px;margin:0 auto}
+#open25-administration .ts-login-layout form{display:grid;gap:20px}
+#open25-administration .ts-login-layout label{display:grid;gap:7px}
+#open25-administration .ts-helpbody p{margin-top:8px}
+#open25-administration .notice,#open25-administration [role=alert]{padding:12px 16px;border-left:3px solid var(--ts-warn);background:var(--ts-warnbg);color:var(--ts-warn);border-radius:4px;margin:16px 0}
+#open25-administration .source-tag{display:inline-flex;padding:3px 8px;border-radius:4px;background:var(--ts-soft);color:var(--ts-muted);font-size:13px;margin-right:6px}
+#open25-administration .muted{color:var(--ts-muted)}
+#open25-administration .report-meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0;font-size:13px;color:var(--ts-muted)}
+#open25-administration .table-wrap{overflow-x:auto;max-width:100%;margin:16px 0}
+#open25-administration .record-detail{padding:22px;margin:20px 0;background:var(--ts-panel);border:1px solid var(--ts-line);border-radius:7px}
+#open25-administration .observation-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px 24px;margin:18px 0}
+#open25-administration .observation-list>div{min-width:0}
+#open25-administration .observation-list dt{font-size:13px;color:var(--ts-muted);margin-bottom:5px}
+#open25-administration .observation-list dd{margin:0;overflow-wrap:anywhere}
+#open25-administration .observation-list dd pre{white-space:pre-wrap;word-break:break-word}
+#open25-administration .section-heading{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0}
+#open25-administration .ts-page>h3{margin:26px 0 14px}
+#open25-administration .ts-page>p{margin:14px 0}
+#open25-administration .ts-page>form:not([data-config-form]){margin:18px 0}
+#open25-administration .ts-page pre{white-space:pre-wrap;overflow-wrap:anywhere}
+#open25-administration .modem-controls{display:flex;flex-wrap:wrap;align-items:center;gap:12px}
+#open25-administration .modem-controls>[role=status]{font-size:14px}
+#open25-administration .modem-table{min-width:1160px}
+#open25-administration .modem-table th:first-child{min-width:180px}
+#open25-administration .modem-table th:nth-child(2){min-width:190px}
+#open25-administration .modem-table th:last-child{min-width:220px}
+#open25-administration .modem-charts{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,620px),1fr));gap:20px;margin-top:20px}
+#open25-administration .modem-chart-card{min-width:0;border:1px solid var(--ts-line);border-radius:7px;padding:22px;scroll-margin-top:20px;background:var(--ts-panel)}
+#open25-administration .modem-chart-card h4{margin:0 0 16px;overflow-wrap:anywhere}
+#open25-administration .modem-chart p{margin:8px 0;font-size:14px}
+#open25-administration .modem-chart svg{display:block;width:100%;min-width:620px;height:auto}
+#open25-administration .modem-chart{overflow-x:auto}
+#open25-administration .modem-chart text{fill:var(--ts-ink);font:14px system-ui,sans-serif}
+#open25-administration .chart-grid{stroke:var(--ts-line);fill:none}
+#open25-administration .chart-series-0{fill:var(--ts-blue);stroke:var(--ts-panel);stroke-width:1px}
+#open25-administration .chart-series-1{fill:var(--ts-ink);stroke:var(--ts-panel);stroke-width:1px}
+#open25-administration .modem-chart .idle{fill:var(--ts-panel);stroke:var(--ts-muted);stroke-width:1.5px}
+#open25-administration [data-feed-stale]{border-left:3px solid var(--ts-warn);padding-left:12px}
+@media(max-width:850px){#open25-administration .observation-list{grid-template-columns:1fr}}
+#open25-administration a.ts-primary{background:var(--ts-blue);color:var(--ts-panel);border-color:var(--ts-blue);font-weight:600}
+#open25-administration .ts-toolbar .ts-caption{flex:1}
+
+#open25-administration .ts-account button:hover{background:color-mix(in srgb,var(--ts-headink) 12%,var(--ts-head));color:var(--ts-headink)}
+
+#open25-administration .ts-external{display:inline-flex;vertical-align:middle;flex-shrink:0;margin-left:5px}
+#open25-administration .ts-external svg{width:16px;height:16px}
+
+#open25-administration .ts-chooser{width:min(840px,calc(100vw - 32px));max-height:calc(100vh - 32px);padding:24px;border:1px solid var(--ts-line);border-radius:7px;background:var(--ts-panel);color:var(--ts-ink);overflow:auto}
+#open25-administration .ts-chooser::backdrop{background:#0008}
+#open25-administration .ts-chooser>form{display:flex;gap:12px;align-items:end;margin:20px 0}
+#open25-administration .ts-chooser>form label{flex:1}
+#open25-administration .ts-chooser-table{max-height:50vh;overflow:auto;margin:16px 0}
+#open25-administration .ts-chooser th{position:sticky;top:0}
+#open25-administration .ts-chooser td:first-child{width:60px;min-width:60px}
+#open25-administration .ts-chooser input[type=radio]{width:20px;height:20px;min-height:20px;accent-color:var(--ts-blue)}
+@media(max-width:600px){#open25-administration .ts-chooser{padding:16px}#open25-administration .ts-chooser>form{align-items:stretch;flex-direction:column}}
+
+#open25-administration .ts-calculated{display:flex;align-items:center;min-height:40px;padding:10px 12px;border:1px solid var(--ts-line);border-radius:3px;font-variant-numeric:tabular-nums;background:var(--ts-soft)}
+
+#open25-administration .ts-pageheader{border-bottom:1px solid var(--ts-line);padding-bottom:16px;margin-bottom:20px}
+#open25-administration .ts-titleline{display:flex;align-items:center;gap:12px;min-width:0}
+#open25-administration .ts-back{display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;border:1px solid var(--ts-line);border-radius:4px;background:var(--ts-panel);flex-shrink:0}
+#open25-administration .ts-select{position:relative;min-width:0}
+#open25-administration .ts-select select{appearance:none;padding-right:48px}
+#open25-administration .ts-select:after{content:"";position:absolute;right:16px;top:50%;width:20px;height:20px;transform:translateY(-50%);background:var(--ts-ink);mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m4 8 8 8 8-8' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/20px 20px no-repeat;pointer-events:none}
+#open25-administration .ts-editor-nav a:hover{background:var(--ts-soft);border-radius:4px}
+#open25-administration .ts-bulkbar{display:flex;gap:14px;align-items:end;flex-wrap:wrap}
+#open25-administration .ts-bulkbar>label{display:grid;gap:6px;flex:1;min-width:min(100%,280px)}
+#open25-administration .ts-bulkapply{display:inline-flex;gap:6px;align-items:center;margin-left:auto;font-size:12px;color:var(--ts-muted)}
+#open25-administration .ts-bulkapply input[type=checkbox]{width:16px;height:16px}
+#open25-administration .ts-admin svg[viewBox="0 0 24 24"]{width:17px;height:17px}

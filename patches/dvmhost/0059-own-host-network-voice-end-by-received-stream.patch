@@ -1,0 +1,1426 @@
+diff --git a/src/common/network/BaseNetwork.cpp b/src/common/network/BaseNetwork.cpp
+--- a/src/common/network/BaseNetwork.cpp
++++ b/src/common/network/BaseNetwork.cpp
+@@ -650,13 +650,19 @@
+         m_p25StreamId = createStreamId();
+     }
+ 
++    return writeP25TDUOnStream(control, lsd, m_p25StreamId, controlByte);
++}
++
++/* Serialize an End on its captured call stream, including after a local reset. */
++bool BaseNetwork::writeP25TDUOnStream(const p25::lc::LC& control, const p25::data::LowSpeedData& lsd,
++    uint32_t endingStreamId, uint8_t controlByte)
++{
++    if (endingStreamId == 0U || (m_status != NET_STAT_RUNNING && m_status != NET_STAT_MST_RUNNING)) return false;
+     uint32_t messageLength = 0U;
+     UInt8Array message = createP25_TDUMessage(messageLength, control, lsd, controlByte);
+-    if (message == nullptr) {
+-        return false;
+-    }
+-
+-    return writeMaster({ NET_FUNC::PROTOCOL, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25 }, message.get(), messageLength, RTP_END_OF_CALL_SEQ, m_p25StreamId);
++    if (message == nullptr) return false;
++    return writeMaster({ NET_FUNC::PROTOCOL, NET_SUBFUNC::PROTOCOL_SUBFUNC_P25 }, message.get(), messageLength,
++        RTP_END_OF_CALL_SEQ, endingStreamId);
+ }
+ 
+ /* Writes P25 TSDU frame data to the network. */
+diff --git a/src/common/network/BaseNetwork.h b/src/common/network/BaseNetwork.h
+--- a/src/common/network/BaseNetwork.h
++++ b/src/common/network/BaseNetwork.h
+@@ -830,6 +830,9 @@
+          * @returns bool True, if message was sent, otherwise false.
+          */
+         virtual bool writeP25TDU(const p25::lc::LC& control, const p25::data::LowSpeedData& lsd, const uint8_t controlByte = 0U);
++        // End a captured call without changing the current TX stream or RX queue.
++        bool writeP25TDUOnStream(const p25::lc::LC& control, const p25::data::LowSpeedData& lsd,
++            uint32_t endingStreamId, uint8_t controlByte = 0U);
+         /**
+          * @brief Writes P25 TSDU frame data to the network.
+          * @param[in] control Instance of p25::lc::LC containing link control data.
+diff --git a/src/host/p25/Control.Inhibit.cpp b/src/host/p25/Control.Inhibit.cpp
+--- a/src/host/p25/Control.Inhibit.cpp
++++ b/src/host/p25/Control.Inhibit.cpp
+@@ -27,6 +27,10 @@
+ {
+     const auto blocked=[&](uint32_t id){return newlyBlocked.count(id)!=0U||isRadioInhibited(id);};
+     std::lock_guard<std::recursive_mutex> permit(m_permitMutex);
++    if(m_receivedNetworkTailOwner.received.streamId!=0U&&
++        (blocked(m_receivedNetworkTailOwner.source)||(!m_receivedNetworkTailOwner.group&&blocked(m_receivedNetworkTailOwner.destination)))) {
++        m_receivedNetworkTailOwner=NetworkReceiveOwner{};m_tailOnIdle=false;m_voice->m_hadVoice=false;
++    }
+     const bool retirePermit=m_permittedSrcId!=0U&&blocked(m_permittedSrcId);
+     const bool retireRF=retirePermit||(m_rfLastSrcId!=0U&&blocked(m_rfLastSrcId));
+     if(retirePermit) {
+@@ -38,7 +42,7 @@
+         m_rfLastSrcId=m_rfLastDstId=0U;
+     }
+     if((m_netLastSrcId!=0U&&blocked(m_netLastSrcId))||
+-        (!m_voice->m_netLC.getGroup()&&blocked(m_voice->m_netLC.getDstId()))){m_voice->resetNet();m_netState=RS_NET_IDLE;m_netLastSrcId=m_netLastDstId=0U;}
++        (!m_voice->m_netLC.getGroup()&&blocked(m_voice->m_netLC.getDstId()))){m_receivedNetworkTailOwner=NetworkReceiveOwner{};retireNetworkVoiceReceive();m_voice->resetNet();m_netState=RS_NET_IDLE;m_netLastSrcId=m_netLastDstId=0U;}
+     auto guard=m_affiliations->lockGrants();
+     const auto grants=m_affiliations->grantTable();
+     for(const auto& item:grants){
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -17,6 +17,7 @@
+ #include "common/AESCrypto.h"
+ #include "common/Log.h"
+ #include "common/Utils.h"
++#include "common/p25/lc/tdulc/TDULCFactory.h"
+ #include "p25/Control.h"
+ #include "common/p25/lc/tsbk/TSBKFactory.h"
+ #include "modem/ModemV24.h"
+@@ -221,6 +222,8 @@
+ 
+ void Control::reset()
+ {
++    m_receivedNetworkTailOwner = NetworkReceiveOwner{};
++    retireNetworkVoiceReceive();
+     if (m_control != nullptr) { m_control->cancelRadioChecks(); m_control->cancelStatusQueries(); m_control->cancelInhibitions(); }
+     m_rfState = RS_RF_LISTENING;
+     m_ccHalted = false;
+@@ -308,6 +311,8 @@
+ void Control::clearIdentificationTraffic()
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
++    m_receivedNetworkTailOwner = NetworkReceiveOwner{};
++    retireNetworkVoiceReceive();
+     const uint32_t oldDestination = m_permittedDstId.load();
+     m_permittedDstId.store(0U);
+     m_permittedSrcId = 0U;
+@@ -320,7 +325,7 @@
+     m_rfTimeout.stop();
+     m_rfLossWatchdog.stop();
+     m_rfVoiceCallTermTimeout.stop();
+-    m_rfCallTermSrcId = m_rfCallTermDstId = 0U;
++    m_rfNetworkEnd = RFNetworkEnd{};
+     m_rfLastSrcId = m_rfLastDstId = 0U;
+     m_frameLossCnt = 0U;
+     m_voice->m_hadVoice = false;
+@@ -1042,6 +1047,7 @@
+ 
+ bool Control::writeRF_VoiceEnd(bool immediate)
+ {
++    std::lock_guard<std::recursive_mutex> permitLock(m_permitMutex);
+     if (identificationActive()) return false;
+     if (m_netState == RS_NET_IDLE && m_rfState == RS_RF_LISTENING) {
+         if (m_tailOnIdle) {
+@@ -1054,7 +1060,16 @@
+             }
+             bool ret = false;
+             if (m_netState == RS_NET_IDLE && m_rfState == RS_RF_LISTENING) {
+-                m_voice->writeRF_EndOfVoice(immediate);
++                // The received End already retired its exact transport owner.
++                // Keep the RF tail, without reflecting a cancellation or flushing
++                // the next stream while that old tail finishes.
++                const bool receivedCompletion = m_receivedNetworkTailOwner.received.streamId != 0U &&
++                    m_receivedNetworkTailOwner.source == m_voice->m_rfLC.getSrcId() &&
++                    m_receivedNetworkTailOwner.destination == m_voice->m_rfLC.getDstId() &&
++                    m_receivedNetworkTailOwner.group == m_voice->m_rfLC.getGroup() &&
++                    m_receivedNetworkTailOwner.manufacturer == m_voice->m_rfLC.getMFId();
++                m_receivedNetworkTailOwner = NetworkReceiveOwner{};
++                m_voice->writeRF_EndOfVoice(immediate, receivedCompletion);
+ 
+                 // this should have been cleared by writeRF_EndOfVoice; but if it hasn't clear it
+                 // to prevent badness
+@@ -1063,8 +1078,8 @@
+                 }
+ 
+                 m_tailOnIdle = false;
+-                if (m_network != nullptr)
+-                    m_network->resetP25();
++                if (!receivedCompletion && m_network != nullptr)
++                    resetNetworkReceive();
+ 
+                 ret = true;
+             }
+@@ -1215,7 +1230,7 @@
+                 if (m_affiliations->isGranted(m_netLastDstId)) {
+                     if (!m_dedicatedControl) {
+                         m_affiliations->releaseGrant(m_netLastDstId, false);
+-                        m_network->resetP25();
++                        resetNetworkReceive();
+                     }
+                 }
+ 
+@@ -1232,21 +1247,21 @@
+         m_rfVoiceCallTermTimeout.stop();
+ 
+ 
+-        p25::lc::LC lc = p25::lc::LC();
+-        lc.setLCO(P25DEF::LCO::GROUP);
+-        lc.setDstId(m_rfCallTermDstId);
+-        lc.setSrcId(m_rfCallTermSrcId);
+-
+-        p25::data::LowSpeedData lsd = p25::data::LowSpeedData();
+-
+-        uint8_t controlByte = 0x00U;
+-        if (m_network != nullptr && localMediaAvailable()) m_network->writeP25TDU(lc, lsd);
+-
+-        m_rfCallTermDstId = 0U;
+-        m_rfCallTermSrcId = 0U;
+-    }
+-
+-    if (m_netState == RS_NET_AUDIO || m_netState == RS_NET_DATA) {
++        const auto ending = m_rfNetworkEnd;
++        m_rfNetworkEnd = RFNetworkEnd{};
++        p25::lc::LC lc;
++        lc.setLCO(ending.group ? P25DEF::LCO::GROUP : P25DEF::LCO::PRIVATE);
++        lc.setGroup(ending.group);
++        lc.setMFId(ending.manufacturer);
++        lc.setDstId(ending.destination);
++        lc.setSrcId(ending.source);
++        p25::data::LowSpeedData lsd;
++        if (m_network != nullptr && localMediaAvailable())
++            m_network->writeP25TDUOnStream(lc, lsd, ending.stream);
++    }
++
++    const bool pendingNetworkVoice = m_networkVoiceOwner.received.streamId != 0U && m_netState == RS_NET_IDLE;
++    if (m_netState == RS_NET_AUDIO || m_netState == RS_NET_DATA || pendingNetworkVoice) {
+         m_networkWatchdog.clock(ms);
+ 
+         if (m_networkWatchdog.isRunning() && m_networkWatchdog.hasExpired()) {
+@@ -1261,16 +1276,17 @@
+             }
+ 
+             m_networkWatchdog.stop();
+-            const uint32_t expiredDestination = m_netLastDstId;
+-            m_affiliations->releaseGrant(m_voice->m_netLC.getDstId(), false);
++            const uint32_t expiredDestination = pendingNetworkVoice ? m_networkVoiceOwner.destination : m_netLastDstId;
++            if (!pendingNetworkVoice) m_affiliations->releaseGrant(m_voice->m_netLC.getDstId(), false);
+             if (!m_authoritative && m_rfState == RS_RF_LISTENING)
+                 notifyCC_ReleaseGrant(expiredDestination);
+ 
+             if (m_dedicatedControl) {
+                 if (m_network != nullptr)
+-                    m_network->resetP25();
+-            }
+-
++                    resetNetworkReceive();
++            }
++
++            retireNetworkVoiceReceive();
+             m_netState = RS_NET_IDLE;
+             m_tailOnIdle = true;
+ 
+@@ -1492,8 +1508,8 @@
+         m_rfLastSrcId = m_rfLastDstId = m_netLastSrcId = m_netLastDstId = 0U;
+         m_rfTimeout.stop(); m_netTimeout.stop(); m_rfTGHang.stop(); m_netTGHang.stop();
+         m_rfLossWatchdog.stop(); m_networkWatchdog.stop(); m_rfVoiceCallTermTimeout.stop();
+-        m_rfCallTermSrcId = m_rfCallTermDstId = 0U;
+-        if (m_network != nullptr) m_network->resetP25();
++        m_rfNetworkEnd = RFNetworkEnd{};
++        if (m_network != nullptr) resetNetworkReceive();
+         for (uint8_t i = 0; i < 2; i++)
+             writeRF_TDU(true, true);
+     }
+@@ -1537,7 +1553,7 @@
+         m_data->resetRF();
+ 
+         if (m_network != nullptr)
+-            m_network->resetP25();
++            resetNetworkReceive();
+ 
+         m_rfState = RS_RF_LISTENING;
+     }
+@@ -1611,10 +1627,64 @@
+     return imm ? m_txImmQueue.push(data, length, owner) : m_txQueue.push(data, length, owner);
+ }
+ 
++// A received packet is ordered within its own stream, never the current TX ID.
++bool Control::matchesNetworkOwner(const NetworkReceiveOwner& owner, const network::P25PacketMetadata& received,
++    uint32_t source, uint32_t destination, uint8_t manufacturer, bool group, bool terminal, bool sourceZeroTerminal) const
++{
++    if (owner.received.streamId == 0U || received.streamId != owner.received.streamId ||
++        destination != owner.destination || manufacturer != owner.manufacturer || group != owner.group ||
++        (source != owner.source && !(terminal && sourceZeroTerminal && group && source == 0U))) return false;
++    const uint32_t timeDelta = received.timestamp - owner.received.timestamp;
++    if (timeDelta >= 0x80000000U) return false;
++    if (terminal && received.sequence == RTP_END_OF_CALL_SEQ) return true;
++    const uint16_t sequenceDelta = uint16_t(received.sequence - owner.received.sequence);
++    return sequenceDelta != 0U && sequenceDelta < 0x8000U;
++}
++
++bool Control::permitsNetworkVoice(const network::P25PacketMetadata& received, uint32_t source,
++    uint32_t destination, uint8_t manufacturer, bool group) const
++{
++    if (received.streamId == 0U || std::find(m_retiredNetworkVoiceStreams.begin(),
++        m_retiredNetworkVoiceStreams.end(), received.streamId) != m_retiredNetworkVoiceStreams.end()) return false;
++    if (m_networkVoiceOwner.received.streamId == 0U) return true;
++    return matchesNetworkOwner(m_networkVoiceOwner, received, source, destination, manufacturer, group, false);
++}
++
++void Control::acceptNetworkVoice(const network::P25PacketMetadata& received, uint32_t source,
++    uint32_t destination, uint8_t manufacturer, bool group)
++{
++    if (m_receivedNetworkTailOwner.received.streamId != 0U) {
++        m_receivedNetworkTailOwner = NetworkReceiveOwner{};
++        m_tailOnIdle = false;
++        if (m_netState == RS_NET_IDLE) m_voice->m_hadVoice = false;
++    }
++    m_networkVoiceOwner = NetworkReceiveOwner{received, source, destination, manufacturer, group};
++}
++
++void Control::retireNetworkVoiceReceive()
++{
++    const uint32_t stream = m_networkVoiceOwner.received.streamId;
++    if (stream != 0U) {
++        if (std::find(m_retiredNetworkVoiceStreams.begin(), m_retiredNetworkVoiceStreams.end(), stream) ==
++            m_retiredNetworkVoiceStreams.end()) m_retiredNetworkVoiceStreams.push_back(stream);
++        while (m_retiredNetworkVoiceStreams.size() > 64U) m_retiredNetworkVoiceStreams.pop_front();
++        if (m_network != nullptr) m_network->retireP25Receive(stream);
++    }
++    m_networkVoiceOwner = NetworkReceiveOwner{};
++}
++
++void Control::resetNetworkReceive()
++{
++    m_receivedNetworkTailOwner = NetworkReceiveOwner{};
++    retireNetworkVoiceReceive();
++    if (m_network != nullptr) m_network->resetP25();
++}
++
+ /* Process a data frames from the network. */
+ 
+ void Control::processNetwork()
+ {
++    network::P25PacketMetadata received{};
+     std::unique_lock<std::recursive_mutex> permitLock(m_permitMutex, std::defer_lock);
+     if (!m_authoritative) permitLock.lock();
+     const auto read24 = [](const uint8_t* bytes, uint32_t offset) { return (uint32_t(bytes[offset]) << 16U) | (uint32_t(bytes[offset + 1U]) << 8U) | bytes[offset + 2U]; };
+@@ -1627,17 +1697,17 @@
+         if (!buffer && m_permittedDstId.load() != 0U && read24(it->bytes.data(), 8U) == m_permittedDstId.load() &&
+             read24(it->bytes.data(), 5U) == m_permittedSrcId) {
+             length = uint32_t(it->bytes.size()); buffer.reset(new uint8_t[length]);
+-            ::memcpy(buffer.get(), it->bytes.data(), length); it = m_pendingSiteFrames.erase(it); ret = true;
++            ::memcpy(buffer.get(), it->bytes.data(), length); received = it->transport; it = m_pendingSiteFrames.erase(it); ret = true;
+         } else ++it;
+     }
+-    if (!buffer) buffer = m_network->readP25(ret, length);
++    if (!buffer) buffer = m_network->readP25(ret, length, &received);
+     if (!ret)
+         return;
+     if (!localMediaAvailable()) { m_pendingSiteFrames.clear(); return; }
+     if (length < 24U)
+         return;
+     if (buffer == nullptr) {
+-        m_network->resetP25();
++        resetNetworkReceive();
+         return;
+     }
+ 
+@@ -1665,7 +1735,7 @@
+     const uint32_t networkNet = GET_UINT24(buffer, 16U);
+     if (networkSys != m_siteData.sysId() || networkNet != m_siteData.netId()) return;
+     const bool encodedVoice = duid == DUID::LDU1 || duid == DUID::LDU2;
+-    const bool encodedEnd = duid == DUID::TDU && !grantDemand;
++    const bool encodedEnd = (duid == DUID::TDU && !grantDemand) || duid == DUID::TDULC;
+     if (!m_authoritative && (encodedVoice || encodedEnd)) {
+         if (m_permittedDstId.load() == 0U) {
+             // Queue only encoded setup traffic. The native CC must positively
+@@ -1676,11 +1746,13 @@
+             if (!identificationUnavailable() && (encodedVoice || existingSetup) &&
+                 acl::AccessControl::validateSrcId(networkSrc) && acl::AccessControl::validateTGId(networkDst)) {
+                 if (m_pendingSiteFrames.size() >= 4U) m_pendingSiteFrames.pop_front();
+-                m_pendingSiteFrames.push_back({std::vector<uint8_t>(buffer.get(), buffer.get() + length), now});
++                m_pendingSiteFrames.push_back({std::vector<uint8_t>(buffer.get(), buffer.get() + length), now, received});
+             }
+             return;
+         }
+-        if (networkDst != m_permittedDstId.load() || networkSrc != m_permittedSrcId) return;
++        const bool sourceZeroTerminal = duid == DUID::TDULC && networkSrc == 0U && !unitToUnit &&
++            received.streamId == m_networkVoiceOwner.received.streamId && m_networkVoiceOwner.group;
++        if (networkDst != m_permittedDstId.load() || (networkSrc != m_permittedSrcId && !sourceZeroTerminal)) return;
+     }
+ 
+     // process raw P25 data bytes
+@@ -1688,7 +1760,9 @@
+     uint8_t frameLength = buffer[23U];
+ 
+     if (!m_network->validateP25FrameLength(frameLength, length, duid)) {
+-        m_network->resetP25();
++        // Rejected terminal packets cannot reset another accepted call or its queue.
++        if (encodedEnd) return;
++        resetNetworkReceive();
+         return;
+     }
+ 
+@@ -1736,6 +1810,9 @@
+ 
+     // handle LDU, TDU or TSDU frame
+     uint8_t lco = buffer[4U];
++    // Private TDUs retain PRIVATE in the LC header; the current RF sender
++    // does not repeat NET_CTRL_U2U on writeP25TDU.
++    const bool networkGroup = !unitToUnit && lco != LCO::PRIVATE && lco != LCO::PRIVATE_EXT;
+ 
+     uint32_t srcId = GET_UINT24(buffer, 5U);
+     uint32_t dstId = GET_UINT24(buffer, 8U);
+@@ -1791,6 +1868,7 @@
+     control.setSrcId(srcId);
+     control.setDstId(dstId);
+     control.setMFId(MFId);
++    control.setGroup(networkGroup);
+ 
+     control.setNetId(netId);
+     control.setSysId(sysId);
+@@ -1798,7 +1876,31 @@
+     lsd.setLSD1(lsd1);
+     lsd.setLSD2(lsd2);
+ 
+-    m_networkWatchdog.start();
++    const bool dedicatedNoVoice = m_dedicatedControl && !m_voiceOnControl;
++    if (encodedVoice && !dedicatedNoVoice && !permitsNetworkVoice(received, srcId, dstId, MFId, networkGroup)) return;
++    // This existing CC signaling procedure has standalone signaling streams.
++    // Its allocation-correlation limitation is separate from voice ownership.
++    const bool ccGrantEnd = duid == DUID::TDU && m_enableControl && m_dedicatedControl && m_explicitTDUGrantRelease;
++    bool networkVoiceEnd = false;
++    if (encodedEnd) {
++        bool sourceZeroTerminal = false;
++        uint8_t terminalManufacturer = MFId;
++        if (duid == DUID::TDULC) {
++            if (lco != LCO::CALL_TERM) return;
++            auto terminal = lc::tdulc::TDULCFactory::createTDULC(data.get());
++            if (!terminal || terminal->getLCO() != LCO::CALL_TERM || terminal->getMFId() != MFId ||
++                terminal->getDstId() != dstId) return;
++            if (MFId != MFG_STANDARD && MFId != MFG_STANDARD_ALT) return;
++            sourceZeroTerminal = srcId == 0U && networkGroup;
++            // Standard terminal signaling identity is separate from voice-header MFID.
++            terminalManufacturer = m_networkVoiceOwner.manufacturer;
++        }
++        networkVoiceEnd = matchesNetworkOwner(m_networkVoiceOwner, received, srcId, dstId, terminalManufacturer,
++            networkGroup, true, sourceZeroTerminal);
++        if (!networkVoiceEnd && !ccGrantEnd) return;
++    }
++
++    if (!encodedVoice) m_networkWatchdog.start();
+ 
+     if (m_debug) {
+         Utils::dump(2U, "* !!! P25 Network Frame", data.get(), frameLength);
+@@ -1818,7 +1920,10 @@
+                 break;
+             }
+ 
+-            m_voice->processNetwork(data.get(), frameLength, control, lsd, duid, frameType);
++            if (m_voice->processNetwork(data.get(), frameLength, control, lsd, duid, frameType) && encodedVoice && !dedicatedNoVoice) {
++                acceptNetworkVoice(received, srcId, dstId, MFId, networkGroup);
++                m_networkWatchdog.start();
++            }
+             // Initial DFSI setup resets the decoder. Arm after it commits
+             // audio so even a short remote call is bounded by the watchdog.
+             if (m_netState == RS_NET_AUDIO || m_netState == RS_NET_DATA) m_networkWatchdog.start();
+@@ -1865,7 +1970,7 @@
+                     return;
+                 }
+ 
+-                // perform grant response logic
++                // Preserve the current dedicated CC signaling allocation lifecycle.
+                 m_control->writeRF_TSDU_Grant(srcId, dstId, serviceOptions, !unitToUnit, true);
+ /*
+                 if (!m_control->writeRF_TSDU_Grant(srcId, dstId, serviceOptions, !unitToUnit, true))
+@@ -1903,7 +2008,14 @@
+                 }
+             }
+ 
+-            m_voice->processNetwork(data.get(), frameLength, control, lsd, duid, frameType);
++            if (networkVoiceEnd) {
++                if (m_netState == RS_NET_IDLE) {
++                    if (m_notifyCC) notifyCC_ReleaseGrant(dstId, received.streamId);
++                    retireNetworkVoiceReceive();
++                    m_voice->resetNet();
++                }
++                else m_voice->processNetwork(data.get(), frameLength, control, lsd, duid, frameType);
++            }
+             break;
+ 
+         case DUID::TSDU:
+@@ -1948,8 +2060,7 @@
+         m_rfTGHang.stop();
+ 
+         m_rfVoiceCallTermTimeout.stop();
+-        m_rfCallTermSrcId = 0U;
+-        m_rfCallTermDstId = 0U;
++        m_rfNetworkEnd = RFNetworkEnd{};
+ 
+         m_tailOnIdle = true;
+ 
+@@ -1957,7 +2068,7 @@
+         m_txQueue.clear();
+ 
+         if (m_network != nullptr)
+-            m_network->resetP25();
++            resetNetworkReceive();
+     }
+ 
+     if (m_rfState == RS_RF_DATA) {
+@@ -2023,7 +2134,7 @@
+ 
+ /* Helper to send a REST API request to the CC to release a channel grant at the end of a call. */
+ 
+-void Control::notifyCC_ReleaseGrant(uint32_t dstId)
++void Control::notifyCC_ReleaseGrant(uint32_t dstId, uint32_t endingReceiveStream)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
+     if (dstId == 0U || m_authoritative || m_permittedDstId.load() != dstId)
+@@ -2040,10 +2151,14 @@
+             LogError(LOG_P25, "voice release acknowledgement queue is full; identification remains blocked");
+         }
+     }
+-    requestIdentification();
++    // A permit or buffered setup alone did not transmit RF voice.
++    if (m_rfState == RS_RF_AUDIO || m_netState == RS_NET_AUDIO) requestIdentification();
+     m_permittedDstId.store(0U);
+     m_permittedSrcId = 0U;
+-    m_pendingSiteFrames.clear();
++    if (endingReceiveStream == 0U) m_pendingSiteFrames.clear();
++    else m_pendingSiteFrames.erase(std::remove_if(m_pendingSiteFrames.begin(), m_pendingSiteFrames.end(),
++        [endingReceiveStream](const PendingSiteFrame& frame) { return frame.transport.streamId == endingReceiveStream; }),
++        m_pendingSiteFrames.end());
+     m_permitToken.clear();
+     m_nextPermitRelease = std::chrono::steady_clock::time_point();
+     retryPermitReleases();
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -437,7 +437,21 @@
+ 
+         std::atomic<uint32_t> m_permittedDstId;
+         uint32_t m_permittedSrcId = 0U;
+-        struct PendingSiteFrame { std::vector<uint8_t> bytes; std::chrono::steady_clock::time_point received; };
++        // Receive ownership is transport provenance, not the locally generated TX stream.
++        struct NetworkReceiveOwner {
++            network::P25PacketMetadata received{};
++            uint32_t source = 0U, destination = 0U;
++            uint8_t manufacturer = 0U;
++            bool group = true;
++        };
++        NetworkReceiveOwner m_networkVoiceOwner{};
++        NetworkReceiveOwner m_receivedNetworkTailOwner{};
++        std::deque<uint32_t> m_retiredNetworkVoiceStreams;
++        struct PendingSiteFrame {
++            std::vector<uint8_t> bytes;
++            std::chrono::steady_clock::time_point received;
++            network::P25PacketMetadata transport{};
++        };
+         std::deque<PendingSiteFrame> m_pendingSiteFrames;
+         std::atomic<bool> m_identificationEnabled{false};
+         std::atomic<bool> m_identificationPending{false};
+@@ -475,8 +489,12 @@
+ 
+         Timer m_ccPacketInterval;
+ 
+-        uint32_t m_rfCallTermSrcId;
+-        uint32_t m_rfCallTermDstId;
++        struct RFNetworkEnd {
++            uint32_t source = 0U, destination = 0U, stream = 0U;
++            uint8_t manufacturer = 0U;
++            bool group = true;
++        };
++        RFNetworkEnd m_rfNetworkEnd{};
+         Timer m_rfVoiceCallTermTimeout;
+ 
+         StopWatch m_interval;
+@@ -533,6 +551,14 @@
+          * @brief Process a data frames from the network.
+          */
+         void processNetwork();
++        bool matchesNetworkOwner(const NetworkReceiveOwner& owner, const network::P25PacketMetadata& received,
++            uint32_t source, uint32_t destination, uint8_t manufacturer, bool group, bool terminal, bool sourceZeroTerminal = false) const;
++        bool permitsNetworkVoice(const network::P25PacketMetadata& received, uint32_t source,
++            uint32_t destination, uint8_t manufacturer, bool group) const;
++        void acceptNetworkVoice(const network::P25PacketMetadata& received, uint32_t source,
++            uint32_t destination, uint8_t manufacturer, bool group);
++        void retireNetworkVoiceReceive();
++        void resetNetworkReceive();
+         /**
+          * @brief Helper to process loss of frame stream from modem.
+          */
+@@ -548,7 +574,7 @@
+          * @brief Helper to send a REST API request to the CC to release a channel grant at the end of a call.
+          * @param dstId Destination ID.
+          */
+-        void notifyCC_ReleaseGrant(uint32_t dstId);
++        void notifyCC_ReleaseGrant(uint32_t dstId, uint32_t endingReceiveStream = 0U);
+         /**
+          * @brief Helper to send a REST API request to the CC to "touch" a channel grant to refresh grant timers.
+          * @param dstId Destination ID.
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -1702,7 +1702,7 @@
+ 
+     m_p25->m_network->writeP25TSDU(lc, data);
+     if (autoReset)
+-        m_p25->m_network->resetP25();
++        m_p25->resetNetworkReceive();
+ }
+ 
+ /* Write data processed from RF to the network. */
+@@ -1725,7 +1725,7 @@
+ 
+     m_p25->m_network->writeP25TDULC(lc, data);
+     if (autoReset)
+-        m_p25->m_network->resetP25();
++        m_p25->resetNetworkReceive();
+ }
+ 
+ /*
+@@ -1805,7 +1805,7 @@
+     }
+ 
+     if (m_p25->m_network != nullptr)
+-        m_p25->m_network->resetP25();
++        m_p25->resetNetworkReceive();
+ 
+     m_p25->m_netTimeout.stop();
+     m_p25->m_networkWatchdog.stop();
+@@ -1934,7 +1934,7 @@
+     m_p25->addFrame(buffer, P25_TSDU_FRAME_LENGTH_BYTES + 2U, true, false, serviceOwner);
+ 
+     if (m_p25->m_network != nullptr)
+-        m_p25->m_network->resetP25();
++        m_p25->resetNetworkReceive();
+ }
+ 
+ /* Helper to write a multi-block (3-block) P25 TSDU packet. */
+@@ -2106,7 +2106,7 @@
+ 
+ /* Helper to write a P25 TDU w/ link control channel release packet. */
+ 
+-void ControlSignaling::writeRF_TDULC_ChanRelease(bool grp, uint32_t srcId, uint32_t dstId)
++void ControlSignaling::writeRF_TDULC_ChanRelease(bool grp, uint32_t srcId, uint32_t dstId, bool noNetwork)
+ {
+     if (!m_p25->m_duplex) {
+         return;
+@@ -2150,11 +2150,11 @@
+     lc->setDstId(grp ? WUID_ALL : dstId);
+     writeRF_TDULC(lc.get(), true);
+ 
+-    if (m_p25->m_enableControl) {
++    if (!noNetwork && m_p25->m_enableControl) {
+         writeNet_TSDU_Call_Term(srcId, dstId);
+     }
+ 
+-    if (m_p25->m_notifyCC) {
++    if (!noNetwork && m_p25->m_notifyCC) {
+         m_p25->notifyCC_ReleaseGrant(dstId);
+     }
+ }
+diff --git a/src/host/p25/packet/ControlSignaling.h b/src/host/p25/packet/ControlSignaling.h
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -408,7 +408,7 @@
+              * @param srcId Source Radio ID.
+              * @param dstId Destination ID.
+              */
+-            void writeRF_TDULC_ChanRelease(bool grp, uint32_t srcId, uint32_t dstId);
++            void writeRF_TDULC_ChanRelease(bool grp, uint32_t srcId, uint32_t dstId, bool noNetwork = false);
+ 
+             /**
+              * @brief Helper to write control channel packet data.
+diff --git a/src/host/p25/packet/Data.cpp b/src/host/p25/packet/Data.cpp
+--- a/src/host/p25/packet/Data.cpp
++++ b/src/host/p25/packet/Data.cpp
+@@ -634,7 +634,7 @@
+ 
+                             m_netPduUserDataLength = 0U;
+                             m_p25->m_netState = RS_NET_IDLE;
+-                            m_p25->m_network->resetP25();
++                            m_p25->resetNetworkReceive();
+                             resetReceivedBlocks();
+                             break;
+                         }
+diff --git a/src/host/p25/packet/Voice.cpp b/src/host/p25/packet/Voice.cpp
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -48,6 +48,7 @@
+ 
+ void Voice::resetRF()
+ {
++    m_rfTransmitStreamId = 0U;
+     lc::LC lc = lc::LC();
+ 
+     m_rfLC = lc;
+@@ -176,7 +177,7 @@
+ 
+                 resetNet();
+                 if (m_p25->m_network != nullptr)
+-                    m_p25->m_network->resetP25();
++                    m_p25->resetNetworkReceive();
+ 
+                 if (m_p25->m_duplex) {
+                     m_p25->writeRF_TDU(true);
+@@ -467,6 +468,7 @@
+                 }
+             }
+ 
++            m_p25->m_receivedNetworkTailOwner = Control::NetworkReceiveOwner{};
+             m_hadVoice = true;
+ 
+             m_p25->m_rfState = RS_RF_AUDIO;
+@@ -939,6 +941,7 @@
+             m_lastRejectId = 0U;
+             ::ActivityLog("P25", true, "RF VSELP voice transmission");
+ 
++            m_p25->m_receivedNetworkTailOwner = Control::NetworkReceiveOwner{};
+             m_hadVoice = true;
+ 
+             m_p25->m_rfState = RS_RF_AUDIO;
+@@ -1109,8 +1112,8 @@
+                 m_p25->writeRF_TDU(false);
+             else {
+                 if (m_rfLC.getDstId() != 0U && m_rfLC.getSrcId() != 0U) {
+-                    m_p25->m_rfCallTermDstId = m_rfLC.getDstId();
+-                    m_p25->m_rfCallTermSrcId = m_rfLC.getSrcId();
++                    m_p25->m_rfNetworkEnd = Control::RFNetworkEnd{m_rfLC.getSrcId(), m_rfLC.getDstId(),
++                        m_rfTransmitStreamId, m_rfLC.getMFId(), m_rfLC.getGroup()};
+                     m_p25->m_rfVoiceCallTermTimeout.start();
+                     m_p25->writeRF_TDU(true);
+                 } else {
+@@ -1186,9 +1189,15 @@
+     uint32_t srcId = control.getSrcId();
+     if (m_p25->isRadioInhibited(srcId) || (!control.getGroup() && m_p25->isRadioInhibited(dstId))) return false;
+ 
++    // Setup is retained before the first complete LDU pair. Apply the same
++    // address admission used by the later RF enqueue boundary before owning it.
++    if ((duid == DUID::LDU1 || duid == DUID::LDU2) &&
++        (!acl::AccessControl::validateSrcId(srcId) ||
++         (control.getGroup() ? !acl::AccessControl::validateTGId(dstId) : !acl::AccessControl::validateSrcId(dstId)))) return false;
+     if (checkNetTrafficCollision(srcId, dstId, duid))
+         return false;
+ 
++    bool accepted = false;
+     uint32_t count = 0U;
+     switch (duid) {
+         case DUID::LDU1:
+@@ -1250,6 +1259,10 @@
+                     m_dfsiLC.control()->setDstId(control.getDstId());
+                 }
+ 
++                if (control.getLCO() == LCO::GROUP && frameType == FrameType::HDU_VALID &&
++                    !m_p25->rfSecurityPermitted(control.getDstId(), control.getAlgId() != ALGO_UNENCRYPT,
++                        control.getKId(), true, control.getAlgId())) return false;
++                accepted = true;
+                 m_netLastLDU1 = control;
+                 m_netLastFrameType = frameType;
+ 
+@@ -1337,6 +1350,7 @@
+                 if (candidateControl->getGroup() && !m_p25->rfSecurityPermitted(candidateControl->getDstId(),
+                     candidateControl->getAlgId() != ALGO_UNENCRYPT, candidateControl->getKId(), true,
+                     candidateControl->getAlgId())) return false;
++                accepted = true;
+                 m_dfsiLC = candidate;
+                 ::memcpy(m_netLDU2, candidateVoice, sizeof(candidateVoice));
+ 
+@@ -1393,6 +1407,7 @@
+                 std::unique_ptr<lc::TDULC> tdulc = lc::tdulc::TDULCFactory::createTDULC(data);
+                 if (tdulc == nullptr) {
+                     LogWarning(LOG_NET, P25_TDULC_STR ", undecodable TDULC");
++                    return false;
+                 }
+                 else {
+                     if (tdulc->getLCO() != LCO::CALL_TERM)
+@@ -1418,22 +1433,20 @@
+             }
+ 
+             if (m_p25->m_notifyCC) {
+-                m_p25->notifyCC_ReleaseGrant(m_netLC.getDstId());
++                m_p25->notifyCC_ReleaseGrant(m_netLC.getDstId(), m_p25->m_networkVoiceOwner.received.streamId);
+             }
+ 
+             if (m_p25->m_netState != RS_NET_IDLE) {
+-                if (duid == DUID::TDU)
+-                    writeNet_TDU();
+-
+-                resetNet();
+-            }
++                writeNet_TDU(true);
++            }
++            accepted = true;
+             break;
+ 
+         default:
+             break;
+     }
+ 
+-    return true;
++    return accepted;
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -1521,7 +1534,8 @@
+         case DUID::LDU1:
+             if (!m_rfLC.getGroup())
+                 controlByte = network::NET_CTRL_U2U;
+-            m_p25->m_network->writeP25LDU1(m_rfLC, m_rfLSD, data, frameType, controlByte);
++            if (m_p25->m_network->writeP25LDU1(m_rfLC, m_rfLSD, data, frameType, controlByte))
++                m_rfTransmitStreamId = m_p25->m_network->getP25StreamId();
+             break;
+         case DUID::VSELP1:
+             // ignore VSELP1
+@@ -1529,7 +1543,8 @@
+         case DUID::LDU2:
+             if (!m_rfLC.getGroup())
+                 controlByte = network::NET_CTRL_U2U;
+-            m_p25->m_network->writeP25LDU2(m_rfLC, m_rfLSD, data, controlByte);
++            if (m_p25->m_network->writeP25LDU2(m_rfLC, m_rfLSD, data, controlByte))
++                m_rfTransmitStreamId = m_p25->m_network->getP25StreamId();
+             break;
+         case DUID::VSELP2:
+             // ignore VSELP2
+@@ -1583,7 +1598,7 @@
+ 
+             resetNet();
+             if (m_p25->m_network != nullptr)
+-                m_p25->m_network->resetP25();
++                m_p25->resetNetworkReceive();
+ 
+             if (m_p25->m_duplex) {
+                 m_p25->writeRF_TDU(true);
+@@ -1616,7 +1631,7 @@
+         if (m_p25->m_rfLastDstId != dstId && (m_p25->m_rfTGHang.isRunning() && !m_p25->m_rfTGHang.hasExpired())) {
+             resetNet();
+             if (m_p25->m_network != nullptr)
+-                m_p25->m_network->resetP25();
++                m_p25->resetNetworkReceive();
+             if (m_debug) {
+                 LogDebugEx(LOG_NET, "Voice::checkNetTrafficCollision()", "dropping frames, because dstId does not match and RF TG hang timer is running, rfLastDstId = %u, dstId = %u",
+                     m_p25->m_rfLastDstId, dstId);
+@@ -1644,7 +1659,7 @@
+ 
+             resetNet();
+             if (m_p25->m_network != nullptr)
+-                m_p25->m_network->resetP25();
++                m_p25->resetNetworkReceive();
+             if (m_debug) {
+                 LogDebugEx(LOG_NET, "Voice::checkNetTrafficCollision()", "dropping frames, because dstId does not match default net idle talkgroup, defaultNetIdleTalkgroup = %u, dstId = %u",
+                     m_p25->m_defaultNetIdleTalkgroup, dstId);
+@@ -1686,7 +1701,7 @@
+                     srcId, dstId);
+                 resetNet();
+                 if (m_p25->m_network != nullptr)
+-                    m_p25->m_network->resetP25();
++                    m_p25->resetNetworkReceive();
+                 return true;
+             }
+             else {
+@@ -1694,7 +1709,7 @@
+                     dstId);
+                 resetNet();
+                 if (m_p25->m_network != nullptr)
+-                    m_p25->m_network->resetP25();
++                    m_p25->resetNetworkReceive();
+                 return true;
+             }
+         }
+@@ -1706,7 +1721,7 @@
+             LogWarning(LOG_NET, "[NON-AUTHORITATIVE] Ignoring network traffic, destination not permitted, dstId = %u", dstId);
+         resetNet();
+         if (m_p25->m_network != nullptr)
+-            m_p25->m_network->resetP25();
++            m_p25->resetNetworkReceive();
+         return true;
+     }
+ 
+@@ -1715,7 +1730,7 @@
+ 
+ /* Helper to write end of frame data. */
+ 
+-void Voice::writeRF_EndOfVoice(bool immediate)
++void Voice::writeRF_EndOfVoice(bool immediate, bool receivedCompletion)
+ {
+     if (!m_hadVoice) {
+         return;
+@@ -1730,12 +1745,12 @@
+ 
+     // transmit channelNo release burst
+     m_p25->writeRF_TDU(true, immediate);
+-    m_p25->m_control->writeRF_TDULC_ChanRelease(grp, srcId, dstId);
++    m_p25->m_control->writeRF_TDULC_ChanRelease(grp, srcId, dstId, receivedCompletion);
+ }
+ 
+ /* Helper to write a network P25 TDU packet. */
+ 
+-void Voice::writeNet_TDU()
++void Voice::writeNet_TDU(bool receivedEnd)
+ {
+     uint8_t buffer[P25_TDU_FRAME_LENGTH_BYTES + 2U];
+     ::memset(buffer, 0x00U, P25_TDU_FRAME_LENGTH_BYTES + 2U);
+@@ -1766,8 +1781,11 @@
+         ::ActivityLog("P25", false, "network end of transmission, %u frames", m_netFrames);
+     }
+ 
+-    if (m_p25->m_network != nullptr)
+-        m_p25->m_network->resetP25();
++    if (receivedEnd) {
++        m_p25->m_receivedNetworkTailOwner = m_p25->m_networkVoiceOwner;
++        m_p25->retireNetworkVoiceReceive();
++    }
++    else if (m_p25->m_network != nullptr) m_p25->resetNetworkReceive();
+ 
+     resetWithNullAudio(m_netLDU1, false);
+     resetWithNullAudio(m_netLDU2, false);
+@@ -1944,7 +1962,7 @@
+                     if ((!m_p25->m_networkWatchdog.isRunning() || m_p25->m_networkWatchdog.hasExpired()) &&
+                         m_p25->m_netLastDstId != 0U) {
+                         if (m_p25->m_network != nullptr)
+-                            m_p25->m_network->resetP25();
++                            m_p25->resetNetworkReceive();
+ 
+                         resetWithNullAudio(m_netLDU1, false);
+                         resetWithNullAudio(m_netLDU2, false);
+diff --git a/src/host/p25/packet/Voice.h b/src/host/p25/packet/Voice.h
+--- a/src/host/p25/packet/Voice.h
++++ b/src/host/p25/packet/Voice.h
+@@ -98,6 +98,7 @@
+             lc::LC m_rfLastLDU1;
+             lc::LC m_rfLastLDU2;
+             bool m_rfFirstLDU2;
++            uint32_t m_rfTransmitStreamId = 0U;
+ 
+             lc::LC m_netLC;
+             lc::LC m_netLastLDU1;
+@@ -170,12 +171,12 @@
+              * @brief Helper to write end of voice frame data.
+              */
+             // Keep queued voice before its normal terminal tail.
+-            void writeRF_EndOfVoice(bool immediate = false);
++            void writeRF_EndOfVoice(bool immediate = false, bool receivedCompletion = false);
+ 
+             /**
+              * @brief Helper to write a network P25 TDU packet.
+              */
+-            void writeNet_TDU();
++            void writeNet_TDU(bool receivedEnd = false);
+             /**
+              * @brief Helper to check for an unflushed LDU1 packet.
+              */
+diff --git a/tests/p25/CapacityPermit_Tests.cpp b/tests/p25/CapacityPermit_Tests.cpp
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -40,6 +40,16 @@
+ namespace p25 {
+ struct MultiSiteTestAccess {
+     static void process(Control& value) { value.processNetwork(); }
++    static RPT_NET_STATE networkState(Control& value) { return value.m_netState.load(); }
++    static uint32_t receiveOwner(Control& value) { return value.m_networkVoiceOwner.received.streamId; }
++    static uint32_t tailOwner(Control& value) { return value.m_receivedNetworkTailOwner.received.streamId; }
++    static void clearIDTraffic(Control& value) {value.clearIdentificationTraffic();}
++    static void controlOnlyRelease(Control& value) {value.m_explicitTDUGrantRelease=true;}
++    static void timeoutNetwork(Control& value) {value.m_networkWatchdog.clock(1501U);value.clock();}
++    static void destructiveReset(Control& value) {value.resetNetworkReceive();value.m_voice->resetNet();value.m_netState=RS_NET_IDLE;value.m_netLastSrcId=value.m_netLastDstId=0U;}
++
++    static uint32_t networkSource(Control& value) { return value.m_netLastSrcId; }
++    static uint32_t networkDestination(Control& value) { return value.m_netLastDstId; }
+     static bool permitted(Control& value) { return value.m_permittedDstId.load() != 0U; }
+     static size_t pending(Control& value) { return value.m_pendingSiteFrames.size(); }
+     static void expire(Control& value) { for (auto& frame : value.m_pendingSiteFrames) frame.received -= std::chrono::seconds(1); }
+@@ -52,6 +62,8 @@
+     static void startOldCallHang(Control& value) { value.m_rfTGHang.start(); }
+     static void advanceHang(Control& value, uint32_t ms) { value.m_rfTGHang.clock(ms); }
+     static void advanceCallTerm(Control& value, uint32_t ms) { value.m_rfVoiceCallTermTimeout.clock(ms); }
++    static void immediateRFEnd(Control& value, bool immediate) { value.m_immediateCallTerm=immediate; }
++    static void expireCallTerm(Control& v) {v.m_rfVoiceCallTermTimeout.clock((v.m_rfVoiceCallTermTimeout.getTimeout()+1U)*1000U);}
+     static void notifyEnd(Control& value, uint32_t destination) { value.notifyCC_ReleaseGrant(destination); }
+     static void retryRelease(Control& value) {
+         auto lock = permitGuard(value);
+@@ -288,7 +300,7 @@
+         REQUIRE(rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));
+         REQUIRE(reply["status"].get<int>() == network::NetRPC::OK);
+     }
+-    bool voiceFrame(DUID::E duid, uint32_t destination = GROUP, bool nonTerminationLC = false, bool groupCall = true, uint32_t source = SOURCE) {
++    bool voiceFrame(DUID::E duid, uint32_t destination = GROUP, bool nonTerminationLC = false, bool groupCall = true, uint32_t source = SOURCE, uint8_t manufacturer = MFG_STANDARD) {
+         const uint32_t length = duid == DUID::HDU ? P25_HDU_FRAME_LENGTH_BYTES :
+             (duid == DUID::LDU1 || duid == DUID::LDU2) ? P25_LDU_FRAME_LENGTH_BYTES :
+             duid == DUID::TDULC ? P25_TDULC_FRAME_LENGTH_BYTES : P25_TDU_FRAME_LENGTH_BYTES;
+@@ -296,7 +308,7 @@
+         frame[0U] = modem::TAG_DATA; frame[1U] = 1U;
+         LC control;
+         control.setSrcId(source); control.setDstId(destination);
+-        control.setGroup(groupCall); control.setLCO(groupCall ? LCO::GROUP : LCO::PRIVATE); control.setAlgId(ALGO_UNENCRYPT);
++        control.setGroup(groupCall); control.setLCO(groupCall ? LCO::GROUP : LCO::PRIVATE); control.setMFId(manufacturer); control.setAlgId(ALGO_UNENCRYPT);
+         if (duid == DUID::LDU1 || duid == DUID::LDU2) {
+             p25::Audio audio; for (uint32_t i=0U; i<9U; ++i) audio.encode(frame.data()+2U, NULL_IMBE, i);
+         }
+@@ -392,6 +404,14 @@
+         REQUIRE(controller->control()->process(frame.data(), frame.size(), std::move(request)));
+     }
+ 
++    std::vector<DUID::E> drainTail() {
++        std::vector<DUID::E> units;std::array<uint8_t,1024U> frame{};uint32_t length=0U;
++        while((length=controller->getFrame(frame.data()))!=0U) {
++            if(length==27U && std::all_of(frame.begin()+2U,frame.begin()+length,[](uint8_t b){return b==0U;})) continue; // specified RF null-bit tail
++            NID nid(0x293U);REQUIRE(nid.decode(frame.data()+2U));units.push_back(nid.getDUID());
++        }
++        return units;
++    }
+     void registerAndAffiliate() {
+         receiveRegistration(SOURCE);
+         REQUIRE(controller->affiliations()->isUnitReg(SOURCE));
+@@ -795,9 +815,12 @@
+ 
+ TEST_CASE("VC end records one event while the quiet period stays grantable", "[p25][cwid][idle-identification]") {
+     ControllerFixture voice(true, false, false, false, false);
+-    voice.controller->configureIdentification(true);
++    voice.voiceMode(true);
+     voice.permitVoice("abc:1");
+-    CapacityPermitTestAccess::notifyEnd(*voice.controller, GROUP);
++    REQUIRE(voice.voiceFrame(DUID::HDU));
++    REQUIRE(voice.voiceFrame(DUID::LDU1));
++    voice.drainVoice();
++    REQUIRE(voice.voiceFrame(DUID::TDU));
+     REQUIRE(voice.controller->identificationPending());
+     REQUIRE_FALSE(voice.controller->identificationUnavailable());
+     REQUIRE(voice.controller->consumeIdentificationEnd());
+@@ -1142,6 +1165,8 @@
+ class SiteNetwork : public network::Network {
+ public:
+     std::deque<std::vector<uint8_t>> incoming;
++    uint32_t fixtureStream = 1U, fixtureTimestamp = 1000U;
++    uint16_t fixtureSequence = 0U;
+     std::vector<std::vector<uint8_t>> outgoing;
+     std::vector<std::unordered_map<uint32_t,uint32_t>> snapshots;
+     bool announceAffiliationUpdate(const std::unordered_map<uint32_t,uint32_t> affiliations) override { snapshots.push_back(affiliations); return true; }
+@@ -1152,12 +1177,18 @@
+         if(received!=nullptr)*received={};
+         ret = !incoming.empty(); length = 0U; if (!ret) return nullptr;
+         auto bytes = std::move(incoming.front()); incoming.pop_front(); length = bytes.size();
++        const bool terminal = bytes.size() >= 24U && bytes[22U] == DUID::TDU && !(bytes[14U] & network::NET_CTRL_GRANT_DEMAND);
++        fixtureTimestamp += 60U;
++        if(received!=nullptr)*received={fixtureStream, uint16_t(terminal ? RTP_END_OF_CALL_SEQ : fixtureSequence++), fixtureTimestamp};
++        if(terminal){++fixtureStream;fixtureSequence=0U;}
+         UInt8Array result(new uint8_t[length]); std::copy(bytes.begin(), bytes.end(), result.get()); return result;
+     }
+-    void resetP25() override { incoming.clear(); }
++    void resetP25() override { incoming.clear(); ++fixtureStream; fixtureSequence=0U; }
+     using network::BaseNetwork::createP25_TDUMessage;
+     using network::BaseNetwork::createP25_LDU1Message;
+     using network::BaseNetwork::createP25_LDU2Message;
++    using network::BaseNetwork::createP25_TSDUMessage;
++    using network::BaseNetwork::createP25_TDULCMessage;
+     bool writeP25LDU1(const LC& control, const p25::data::LowSpeedData& lsd, const uint8_t* data, FrameType::E type, uint8_t flags) override {
+         uint32_t length; auto message=createP25_LDU1Message(length, control, lsd, data, type, flags);
+         outgoing.emplace_back(message.get(),message.get()+length); return true;
+@@ -1860,3 +1891,396 @@
+     REQUIRE(voice.voiceFrame(DUID::TDULC,GROUP));
+     return network.wire->outgoing;
+ }
++
++// Test-only appendix to the frozen CapacityPermit controller fixture.
++// The fake socket is the only network boundary: FrameQueue serialization,
++// Network::clock, typed P25 queue, Control and Voice remain production code.
++#include "common/network/RTPHeader.h"
++#include <iostream>
++
++namespace {
++class HostOwnerWire : public OpaqueWireNetwork {
++public:
++    std::vector<network::P25PacketMetadata> reads;
++    HostOwnerWire() : OpaqueWireNetwork(12345U, false) {}
++    UInt8Array readP25(bool& ret, uint32_t& length, network::P25PacketMetadata* received=nullptr) override {
++        network::P25PacketMetadata metadata;
++        auto result=network::BaseNetwork::readP25(ret,length,&metadata);
++        if(ret)reads.push_back(metadata);
++        if(received!=nullptr)*received=metadata;
++        return result;
++    }
++    std::vector<uint8_t> at(const std::vector<uint8_t>& body,uint32_t stream,uint16_t sequence,uint32_t timestamp) {
++        auto result=frame(body.data(),body.size(),stream,sequence);
++        network::frame::RTPHeader header;
++        REQUIRE(header.decode(result.data()));
++        REQUIRE(header.getSequence()==sequence);
++        header.setTimestamp(timestamp);header.encode(result.data());
++        network::frame::RTPHeader decoded;
++        REQUIRE(decoded.decode(result.data()));
++        REQUIRE(decoded.getTimestamp()==timestamp);
++        REQUIRE(decoded.getSequence()==sequence);
++        return result;
++    }
++};
++constexpr uint32_t STREAM_A=0x10101U,STREAM_B=0x20202U;
++
++void hostOwnerRecordWire(const char* name,const std::vector<uint8_t>& packet) {
++    const char* path=std::getenv("DVM_HOST_END_REVIEW_CAPTURE");
++    if(path==nullptr)return;
++    std::ofstream file(std::string(path)+"/"+name,std::ios::binary);
++    REQUIRE(file.good());file.write(reinterpret_cast<const char*>(packet.data()),packet.size());
++    REQUIRE(file.good());
++}
++void hostOwnerSnapshot(const char* phase,ControllerFixture& voice,HostOwnerWire& network,const std::vector<DUID::E>& frames) {
++    std::cout<<"HOST_END_OWNER {\"phase\":\""<<phase<<"\",\"network_state\":"<<int(MultiSiteTestAccess::networkState(*voice.controller))
++        <<",\"permitted\":"<<(MultiSiteTestAccess::permitted(*voice.controller)?"true":"false")
++        <<",\"source\":"<<MultiSiteTestAccess::networkSource(*voice.controller)
++        <<",\"destination\":"<<MultiSiteTestAccess::networkDestination(*voice.controller)
++        <<",\"receive_filter\":"<<network.receivedFilter()<<",\"queued_bytes\":"<<network.chargedBytes()
++        <<",\"release_count\":"<<voice.rpc.releases.size()<<",\"reads\":[";
++    bool first=true;for(const auto& packet:network.reads){if(!first)std::cout<<",";first=false;
++        std::cout<<"{\"stream\":"<<packet.streamId<<",\"sequence\":"<<packet.sequence<<",\"timestamp\":"<<packet.timestamp<<"}";}
++    std::cout<<"],\"rf_duids\":[";first=true;for(const auto duid:frames){if(!first)std::cout<<",";first=false;std::cout<<int(duid);}
++    std::cout<<"]}"<<std::endl;
++}
++void hostOwnerStart(ControllerFixture& voice,HostOwnerWire& network,SiteNetwork& serializer,
++    uint32_t stream,uint32_t timestamp,const std::string& token) {
++    voice.permitVoice(token);
++    auto packet=network.at(serializer.encoded(DUID::LDU1),stream,0U,timestamp);
++    hostOwnerRecordWire(stream==STREAM_A?"a-voice.bin":"b-voice.bin",packet);
++    network.ingest(packet);
++    REQUIRE(network.receivedFilter()==stream);
++    REQUIRE(network.chargedBytes()>0U);
++    MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE(network.reads.back().streamId==stream);
++    REQUIRE(network.reads.back().sequence==0U);
++    REQUIRE(network.reads.back().timestamp==timestamp);
++    // Native Host commits a complete first LDU1/LDU2 pair, not LDU1 alone.
++    auto ldu2=network.at(serializer.encoded(DUID::LDU2),stream,1U,timestamp+180U);
++    hostOwnerRecordWire(stream==STREAM_A?"a-ldu2.bin":"b-ldu2.bin",ldu2);
++    network.ingest(ldu2);MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE(network.reads.back().streamId==stream);
++    REQUIRE(network.reads.back().sequence==1U);
++    REQUIRE(network.reads.back().timestamp==timestamp+180U);
++    REQUIRE(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_AUDIO);
++    REQUIRE(MultiSiteTestAccess::networkSource(*voice.controller)==SOURCE);
++    REQUIRE(MultiSiteTestAccess::networkDestination(*voice.controller)==GROUP);
++    REQUIRE(MultiSiteTestAccess::permitted(*voice.controller));
++    auto output=voice.drainVoice();
++    REQUIRE(std::count(output.begin(),output.end(),DUID::LDU1)==1U);
++    // voiceMode config requests exactly two TDU preamble units.
++    REQUIRE(std::count(output.begin(),output.end(),DUID::TDU)==2U);
++    hostOwnerSnapshot(stream==STREAM_A?"A-started":"B-started",voice,network,output);
++}
++}
++
++TEST_CASE("Host rejects delayed old stream End after same RID TG replacement", "[p25][host-end-owner-review][delayed-old-end]") {
++    HostOwnerWire network;SiteNetwork serializer;
++    ControllerFixture voice(true,false,false,false,false,&network);voice.voiceMode(false);
++    hostOwnerStart(voice,network,serializer,STREAM_A,0x1000U,"ab12:9001");
++    auto oldEnd=network.at(serializer.encoded(DUID::TDU),STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U);
++    hostOwnerRecordWire("a-end.bin",oldEnd);
++    network.ingest(oldEnd);MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_IDLE);
++    REQUIRE_FALSE(MultiSiteTestAccess::permitted(*voice.controller));
++    auto aEnd=voice.drainVoice();REQUIRE(std::count(aEnd.begin(),aEnd.end(),DUID::TDU)==1U);
++    hostOwnerSnapshot("A-ended",voice,network,aEnd);
++    hostOwnerStart(voice,network,serializer,STREAM_B,0x2000U,"ab12:9002");
++    const auto releasesBefore=voice.rpc.releases.size();
++    network.ingest(oldEnd);
++    REQUIRE(network.receivedFilter()==STREAM_B);
++    REQUIRE(network.chargedBytes()>0U);
++    MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE(network.reads.back().streamId==STREAM_A);
++    REQUIRE(network.reads.back().sequence==RTP_END_OF_CALL_SEQ);
++    REQUIRE(network.reads.back().timestamp==0x1168U);
++    auto output=voice.drainVoice();hostOwnerSnapshot("late-A-End-after-B",voice,network,output);
++    // Independent contract: A's duplicate End cannot terminate/release B.
++    CHECK(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_AUDIO);
++    CHECK(MultiSiteTestAccess::permitted(*voice.controller));
++    CHECK(voice.rpc.releases.size()==releasesBefore);
++    CHECK(std::count(output.begin(),output.end(),DUID::TDU)==0U);
++    CHECK(network.receivedFilter()==STREAM_B);
++}
++
++TEST_CASE("Host normal End preserves already queued replacement stream", "[p25][host-end-owner-review][queued-replacement]") {
++    HostOwnerWire network;SiteNetwork serializer;
++    ControllerFixture voice(true,false,false,false,false,&network);voice.voiceMode(false);
++    hostOwnerStart(voice,network,serializer,STREAM_A,0x1000U,"ab12:9011");
++    auto aEnd=network.at(serializer.encoded(DUID::TDU),STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U);
++    auto bVoice=network.at(serializer.encoded(DUID::LDU1),STREAM_B,0U,0x2000U);
++    auto bLdu2=network.at(serializer.encoded(DUID::LDU2),STREAM_B,1U,0x20B4U);
++    hostOwnerRecordWire("queued-a-end.bin",aEnd);hostOwnerRecordWire("queued-b-voice.bin",bVoice);hostOwnerRecordWire("queued-b-ldu2.bin",bLdu2);
++    network.ingest(aEnd);REQUIRE(network.receivedFilter()==0U);
++    network.ingest(bVoice);network.ingest(bLdu2);REQUIRE(network.receivedFilter()==STREAM_B);
++    const auto beforeBytes=network.chargedBytes();REQUIRE(beforeBytes>bVoice.size());
++    MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE(network.reads.back().streamId==STREAM_A);
++    REQUIRE(network.reads.back().timestamp==0x1168U);
++    REQUIRE(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_IDLE);
++    auto output=voice.drainVoice();REQUIRE(std::count(output.begin(),output.end(),DUID::TDU)==1U);
++    hostOwnerSnapshot("A-ended-B-already-queued",voice,network,output);
++    REQUIRE(voice.controller->writeRF_VoiceEnd(false));
++    const auto tail=voice.drainTail();
++    REQUIRE(std::count(tail.begin(),tail.end(),DUID::TDULC)>0U);
++    // Independent contract: retiring A and its real deferred RF tail cannot discard B.
++    CHECK(network.chargedBytes()>0U);
++    CHECK(network.receivedFilter()==STREAM_B);
++    voice.permitVoice("ab12:9012");
++    MultiSiteTestAccess::process(*voice.controller);MultiSiteTestAccess::process(*voice.controller);
++    auto replacement=voice.drainVoice();hostOwnerSnapshot("read-queued-B",voice,network,replacement);
++    CHECK(network.reads.back().streamId==STREAM_B);
++    CHECK(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_AUDIO);
++    CHECK(std::count(replacement.begin(),replacement.end(),DUID::LDU1)==1U);
++}
++
++namespace {
++struct DecodedHostDatagram {std::vector<uint8_t> body;network::P25PacketMetadata received;};
++DecodedHostDatagram decodeHostDatagram(const std::vector<uint8_t>& packet) {
++    OpaqueWireSocket socket;socket.incoming.push_back(packet);network::FrameQueue queue(&socket,12345U,false);
++    int length=0;sockaddr_storage address{};uint32_t addressLength=0U;network::frame::RTPHeader rtp;network::frame::RTPFNEHeader fne;
++    auto body=queue.read(length,address,addressLength,&rtp,&fne);REQUIRE(body!=nullptr);REQUIRE(length>=24);
++    return {std::vector<uint8_t>(body.get(),body.get()+length),{fne.getStreamId(),rtp.getSequence(),rtp.getTimestamp()}};
++}
++}
++
++TEST_CASE("Actual RF group and private End retain call transport across local tails", "[p25][host-end-owner-fix][private-serializer]") {
++    for(const bool group:{true,false})for(const uint8_t manufacturer:{MFG_STANDARD,MFG_STANDARD_ALT})for(const bool immediate:{true,false}) {
++        for(const bool tailFirst:immediate?std::vector<bool>{false}:std::vector<bool>{false,true}) {
++            DYNAMIC_SECTION("group "<<group<<" MFID "<<int(manufacturer)<<" immediate "<<immediate<<" tail first "<<tailFirst) {
++                OpaqueWireNetwork sender;ControllerFixture radio(true,false,false,false,false,&sender);radio.voiceMode(false);radio.permitVoice("ab12:9201");
++                CapacityPermitTestAccess::immediateRFEnd(*radio.controller,immediate);
++                REQUIRE(radio.voiceFrame(DUID::HDU,GROUP,false,group,SOURCE,manufacturer));
++                REQUIRE(radio.voiceFrame(DUID::LDU1,GROUP,false,group,SOURCE,manufacturer));
++                REQUIRE(radio.voiceFrame(DUID::LDU2,GROUP,false,group,SOURCE,manufacturer));
++                REQUIRE(sender.wire->outgoing.size()==2U);
++                const auto first=decodeHostDatagram(sender.wire->outgoing[0]);const auto second=decodeHostDatagram(sender.wire->outgoing[1]);
++                REQUIRE(first.received.streamId!=0U);REQUIRE(second.received.streamId==first.received.streamId);
++                REQUIRE(first.body[15U]==manufacturer);REQUIRE(second.body[15U]==manufacturer);
++                HostOwnerWire wire;ControllerFixture receiver(true,false,false,false,false,&wire);receiver.voiceMode(false);receiver.permitVoice("ab12:9202");
++                wire.ingest(sender.wire->outgoing[0]);MultiSiteTestAccess::process(*receiver.controller);
++                wire.ingest(sender.wire->outgoing[1]);MultiSiteTestAccess::process(*receiver.controller);
++                REQUIRE(MultiSiteTestAccess::networkState(*receiver.controller)==RS_NET_AUDIO);receiver.drainVoice();
++                REQUIRE(radio.voiceFrame(DUID::TDU,GROUP,false,group,SOURCE,manufacturer));
++                if(tailFirst){REQUIRE(radio.controller->writeRF_VoiceEnd(false));radio.drainTail();}
++                if(!immediate){CapacityPermitTestAccess::expireCallTerm(*radio.controller);radio.controller->clock();}
++                const auto end=decodeHostDatagram(sender.wire->outgoing.back());
++                REQUIRE(end.body[22U]==DUID::TDU);CHECK(end.body[4U]==(group?LCO::GROUP:LCO::PRIVATE));CHECK(end.body[15U]==manufacturer);
++                CHECK((end.body[14U]&network::NET_CTRL_U2U)==0U);CHECK(end.received.streamId==first.received.streamId);CHECK(end.received.sequence==RTP_END_OF_CALL_SEQ);
++                wire.ingest(sender.wire->outgoing.back());MultiSiteTestAccess::process(*receiver.controller);
++                CHECK(MultiSiteTestAccess::networkState(*receiver.controller)==RS_NET_IDLE);CHECK_FALSE(MultiSiteTestAccess::permitted(*receiver.controller));
++                const auto output=receiver.drainVoice();CHECK(std::count(output.begin(),output.end(),DUID::TDU)==1U);
++            }
++        }
++    }
++}
++
++TEST_CASE("Host incomplete LDU setup expires without RF and permits a replacement", "[p25][host-end-owner-fix][pending-setup]") {
++    for(const auto first:{DUID::LDU1,DUID::LDU2}) {
++        DYNAMIC_SECTION("first unit "<<int(first)) {
++            HostOwnerWire wire;SiteNetwork serializer;ControllerFixture voice(true,false,false,false,false,&wire);voice.voiceMode(false);voice.permitVoice("ab12:9211");
++            wire.ingest(wire.at(serializer.encoded(first),STREAM_A,0U,0x1000U));MultiSiteTestAccess::process(*voice.controller);
++            REQUIRE(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_IDLE);
++            REQUIRE(MultiSiteTestAccess::receiveOwner(*voice.controller)==STREAM_A);
++            REQUIRE(voice.drainVoice().empty());
++            MultiSiteTestAccess::timeoutNetwork(*voice.controller);
++            CHECK(MultiSiteTestAccess::receiveOwner(*voice.controller)==0U);
++            CHECK_FALSE(MultiSiteTestAccess::permitted(*voice.controller));
++            CHECK(wire.receivedFilter()==0U);
++            CHECK(voice.drainVoice().empty());
++            hostOwnerStart(voice,wire,serializer,STREAM_B,0x2000U,"ab12:9212");
++        }
++    }
++}
++
++TEST_CASE("Host pending permit retains actual transport owner", "[p25][host-end-owner-fix][pending-metadata]") {
++    HostOwnerWire wire;SiteNetwork serializer;ControllerFixture voice(true,false,false,false,false,&wire);voice.voiceMode(false);
++    wire.ingest(wire.at(serializer.encoded(DUID::LDU1),STREAM_A,0U,0x1000U));MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE(MultiSiteTestAccess::pending(*voice.controller)==1U);REQUIRE(MultiSiteTestAccess::receiveOwner(*voice.controller)==0U);
++    voice.permitVoice("ab12:9221");MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE(MultiSiteTestAccess::receiveOwner(*voice.controller)==STREAM_A);
++    wire.ingest(wire.at(serializer.encoded(DUID::LDU2),STREAM_A,1U,0x10B4U));MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_AUDIO);voice.drainVoice();
++    wire.ingest(wire.at(serializer.encoded(DUID::TDU),STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U));MultiSiteTestAccess::process(*voice.controller);
++    CHECK(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_IDLE);CHECK_FALSE(MultiSiteTestAccess::permitted(*voice.controller));
++}
++
++TEST_CASE("Host rejects malformed foreign End without resetting accepted voice", "[p25][host-end-owner-fix][malformed-end]") {
++    HostOwnerWire wire;SiteNetwork serializer;ControllerFixture voice(true,false,false,false,false,&wire);voice.voiceMode(false);
++    hostOwnerStart(voice,wire,serializer,STREAM_B,0x2000U,"ab12:9231");
++    auto malformed=serializer.encoded(DUID::TDU);malformed[23U]=255U;
++    const auto releases=voice.rpc.releases.size();
++    wire.ingest(wire.at(malformed,STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U));MultiSiteTestAccess::process(*voice.controller);
++    CHECK(MultiSiteTestAccess::receiveOwner(*voice.controller)==STREAM_B);CHECK(wire.receivedFilter()==STREAM_B);
++    CHECK(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_AUDIO);CHECK(MultiSiteTestAccess::permitted(*voice.controller));
++    CHECK(voice.rpc.releases.size()==releases);CHECK(voice.drainVoice().empty());
++}
++
++TEST_CASE("Dedicated CC standalone grant signaling retains its existing independent End lifecycle", "[p25][host-end-owner-fix][cc-signaling]") {
++    for(const bool tsdu:{false,true}) {
++        DYNAMIC_SECTION("TSDU grant "<<tsdu) {
++            HostOwnerWire wire;SiteNetwork serializer;ControllerFixture cc(true,false,false,false,true,&wire);cc.registerAndAffiliate();
++            MultiSiteTestAccess::controlOnlyRelease(*cc.controller);
++            std::vector<uint8_t> demand;
++            if(tsdu) {
++                IOSP_GRP_VCH grant;grant.setSrcId(SOURCE);grant.setDstId(GROUP);grant.setGrpVchId(2U);grant.setGrpVchNo(VOICE_CHANNEL);
++                std::array<uint8_t,P25_TSDU_FRAME_LENGTH_BYTES> frame{};grant.encode(frame.data());
++                LC context;context.setLCO(TSBKO::IOSP_GRP_VCH);context.setSrcId(SOURCE);context.setDstId(GROUP);
++                uint32_t length=0U;auto body=serializer.createP25_TSDUMessage(length,context,frame.data());demand.assign(body.get(),body.get()+length);
++            } else { demand=serializer.encoded(DUID::TDU);demand[14U]=network::NET_CTRL_GRANT_DEMAND; }
++            uint64_t previousEpoch=0U;
++            for(uint32_t cycle=0;cycle<2U;++cycle) {
++                wire.ingest(wire.at(demand,STREAM_A+cycle,RTP_END_OF_CALL_SEQ,0x1000U+cycle*0x1000U));MultiSiteTestAccess::process(*cc.controller);
++                REQUIRE(cc.controller->affiliations()->isGranted(GROUP));
++                const auto epoch=cc.controller->affiliations()->grantEpoch(GROUP);CHECK(epoch!=previousEpoch);previousEpoch=epoch;
++                CHECK(MultiSiteTestAccess::receiveOwner(*cc.controller)==0U);CHECK(MultiSiteTestAccess::networkState(*cc.controller)==RS_NET_IDLE);
++                cc.drain();
++                // Existing FNE standalone signaling and voice/end streams differ.
++                wire.ingest(wire.at(serializer.encoded(DUID::TDU),STREAM_B+cycle,RTP_END_OF_CALL_SEQ,0x1200U+cycle*0x1000U));MultiSiteTestAccess::process(*cc.controller);
++                CHECK_FALSE(cc.controller->affiliations()->isGranted(GROUP));
++            }
++        }
++    }
++}
++
++
++TEST_CASE("Received End tail context cannot apply to replacement setup", "[p25][host-end-owner-fix][tail-context]") {
++    HostOwnerWire wire;SiteNetwork serializer;ControllerFixture voice(true,false,false,false,false,&wire);voice.voiceMode(false);
++    hostOwnerStart(voice,wire,serializer,STREAM_A,0x1000U,"ab12:9251");
++    wire.ingest(wire.at(serializer.encoded(DUID::TDU),STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U));MultiSiteTestAccess::process(*voice.controller);voice.drainVoice();
++    voice.permitVoice("ab12:9252");
++    wire.ingest(wire.at(serializer.encoded(DUID::LDU1),STREAM_B,0U,0x2000U));MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE(MultiSiteTestAccess::receiveOwner(*voice.controller)==STREAM_B);REQUIRE(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_IDLE);
++    CHECK_FALSE(voice.controller->writeRF_VoiceEnd(false));CHECK(voice.drainVoice().empty());
++    CHECK(MultiSiteTestAccess::permitted(*voice.controller));CHECK(wire.receivedFilter()==STREAM_B);
++    wire.ingest(wire.at(serializer.encoded(DUID::LDU2),STREAM_B,1U,0x20B4U));MultiSiteTestAccess::process(*voice.controller);
++    REQUIRE(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_AUDIO);voice.drainVoice();
++    wire.ingest(wire.at(serializer.encoded(DUID::TDU),STREAM_B,RTP_END_OF_CALL_SEQ,0x2168U));MultiSiteTestAccess::process(*voice.controller);voice.drainVoice();
++    CHECK(voice.controller->writeRF_VoiceEnd(false));const auto tail=voice.drainTail();CHECK(std::count(tail.begin(),tail.end(),DUID::TDULC)>0U);
++    CHECK_FALSE(voice.controller->writeRF_VoiceEnd(false));CHECK(voice.drainVoice().empty());
++}
++
++
++TEST_CASE("Source-zero group CALL_TERM completes only the accepted receive owner", "[p25][host-end-owner-fix][network-tdulc]") {
++    HostOwnerWire wire;SiteNetwork serializer;ControllerFixture voice(true,false,false,false,false,&wire);voice.voiceMode(false);
++    hostOwnerStart(voice,wire,serializer,STREAM_A,0x1000U,"ab12:9261");
++    std::array<uint8_t,P25_TDULC_FRAME_LENGTH_BYTES> frame{};lc::tdulc::LC_CALL_TERM terminal;terminal.setDstId(GROUP);terminal.encode(frame.data());
++    LC context;context.setLCO(LCO::CALL_TERM);context.setSrcId(0U);context.setDstId(GROUP);uint32_t length=0U;
++    auto encoded=serializer.createP25_TDULCMessage(length,context,frame.data());std::vector<uint8_t> body(encoded.get(),encoded.get()+length);
++    wire.ingest(wire.at(body,STREAM_B,RTP_END_OF_CALL_SEQ,0x2168U));MultiSiteTestAccess::process(*voice.controller);
++    CHECK(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_AUDIO);CHECK(voice.drainVoice().empty());
++    wire.ingest(wire.at(body,STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U));MultiSiteTestAccess::process(*voice.controller);
++    CHECK(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_IDLE);CHECK_FALSE(MultiSiteTestAccess::permitted(*voice.controller));
++    CHECK(MultiSiteTestAccess::tailOwner(*voice.controller)==STREAM_A);voice.drainVoice();
++    CHECK(voice.controller->writeRF_VoiceEnd(false));const auto tail=voice.drainTail();CHECK(std::count(tail.begin(),tail.end(),DUID::TDULC)>0U);
++    CHECK(MultiSiteTestAccess::tailOwner(*voice.controller)==0U);
++}
++
++TEST_CASE("Received completion context clears at reset identification and inhibition boundaries", "[p25][host-end-owner-fix][tail-reset]") {
++    for(uint32_t boundary=0U;boundary<4U;++boundary) {
++        DYNAMIC_SECTION("boundary "<<boundary) {
++            HostOwnerWire wire;SiteNetwork serializer;ControllerFixture voice(true,false,false,false,false,&wire);voice.voiceMode(false);
++            hostOwnerStart(voice,wire,serializer,STREAM_A,0x1000U,"ab12:9271");
++            wire.ingest(wire.at(serializer.encoded(DUID::TDU),STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U));MultiSiteTestAccess::process(*voice.controller);voice.drainVoice();
++            REQUIRE(MultiSiteTestAccess::tailOwner(*voice.controller)==STREAM_A);
++            if(boundary==0U)voice.controller->reset();
++            else if(boundary==1U)MultiSiteTestAccess::clearIDTraffic(*voice.controller);
++            else if(boundary==2U)voice.controller->revokeInhibitedServices({SOURCE});
++            else MultiSiteTestAccess::destructiveReset(*voice.controller);
++            CHECK(MultiSiteTestAccess::tailOwner(*voice.controller)==0U);
++        }
++    }
++}
++
++TEST_CASE("A local RF call cannot inherit a retired received-call completion context", "[p25][host-end-owner-fix][local-rf-tail]") {
++    HostOwnerWire wire;SiteNetwork serializer;ControllerFixture voice(true,false,false,false,false,&wire);voice.voiceMode(false);
++    hostOwnerStart(voice,wire,serializer,STREAM_A,0x1000U,"ab12:9281");
++    wire.ingest(wire.at(serializer.encoded(DUID::TDU),STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U));MultiSiteTestAccess::process(*voice.controller);voice.drainVoice();
++    REQUIRE(MultiSiteTestAccess::tailOwner(*voice.controller)==STREAM_A);voice.permitVoice("ab12:9282");
++    REQUIRE(voice.voiceFrame(DUID::HDU));REQUIRE(voice.voiceFrame(DUID::LDU1));REQUIRE(voice.voiceFrame(DUID::LDU2));voice.drainVoice();
++    CHECK(MultiSiteTestAccess::tailOwner(*voice.controller)==0U);
++    wire.ingest(wire.at(serializer.encoded(DUID::LDU1),STREAM_B,0U,0x2000U));REQUIRE(wire.chargedBytes()>0U);
++    REQUIRE(voice.voiceFrame(DUID::TDU));
++    CHECK(voice.controller->writeRF_VoiceEnd(false));const auto tail=voice.drainTail();CHECK(std::count(tail.begin(),tail.end(),DUID::TDULC)>0U);
++    CHECK(wire.chargedBytes()==0U);CHECK(wire.receivedFilter()==0U); // local RF tail retains its destructive reset
++}
++
++
++TEST_CASE("Delayed RF End keeps A transport while B is already transmitting", "[p25][host-end-owner-fix][delayed-tx-owner]") {
++    for(const bool group:{true,false}) {
++        OpaqueWireNetwork sender;ControllerFixture radio(true,false,false,false,false,&sender);radio.voiceMode(false);radio.permitVoice("ab12:9291");
++        REQUIRE(radio.voiceFrame(DUID::HDU,GROUP,false,group));REQUIRE(radio.voiceFrame(DUID::LDU1,GROUP,false,group));REQUIRE(radio.voiceFrame(DUID::LDU2,GROUP,false,group));
++        const auto ownerA=decodeHostDatagram(sender.wire->outgoing[0]).received.streamId;
++        HostOwnerWire wire;ControllerFixture receiver(true,false,false,false,false,&wire);receiver.voiceMode(false);receiver.permitVoice("ab12:9292");
++        for(const auto& p:sender.wire->outgoing){wire.ingest(p);MultiSiteTestAccess::process(*receiver.controller);}receiver.drainVoice();
++        REQUIRE(radio.voiceFrame(DUID::TDU,GROUP,false,group));REQUIRE(radio.controller->writeRF_VoiceEnd(false));radio.drainTail();
++        MultiSiteTestAccess::timeoutNetwork(*receiver.controller);receiver.permitVoice("ab12:9293");
++        sender.wire->outgoing.clear();radio.permitVoice("ab12:9294");
++        REQUIRE(radio.voiceFrame(DUID::HDU,GROUP,false,group));REQUIRE(radio.voiceFrame(DUID::LDU1,GROUP,false,group));REQUIRE(radio.voiceFrame(DUID::LDU2,GROUP,false,group));
++        REQUIRE(sender.wire->outgoing.size()==2U);const auto b0=decodeHostDatagram(sender.wire->outgoing[0]);const auto b1=decodeHostDatagram(sender.wire->outgoing[1]);
++        REQUIRE(b0.received.streamId!=ownerA);REQUIRE(b1.received.streamId==b0.received.streamId);
++        for(const auto& p:sender.wire->outgoing){wire.ingest(p);MultiSiteTestAccess::process(*receiver.controller);}receiver.drainVoice();
++        REQUIRE(MultiSiteTestAccess::networkState(*receiver.controller)==RS_NET_AUDIO);
++        const auto currentTX=sender.getP25StreamId();CapacityPermitTestAccess::expireCallTerm(*radio.controller);radio.controller->clock();
++        const auto end=decodeHostDatagram(sender.wire->outgoing.back());CHECK(end.received.streamId==ownerA);CHECK(end.body[22U]==DUID::TDU);CHECK(sender.getP25StreamId()==currentTX);
++        wire.ingest(sender.wire->outgoing.back());MultiSiteTestAccess::process(*receiver.controller);
++        CHECK(MultiSiteTestAccess::receiveOwner(*receiver.controller)==b0.received.streamId);CHECK(MultiSiteTestAccess::permitted(*receiver.controller));CHECK(receiver.drainVoice().empty());
++        REQUIRE(radio.voiceFrame(DUID::LDU1,GROUP,false,group));const auto next=decodeHostDatagram(sender.wire->outgoing.back());
++        CHECK(next.received.streamId==currentTX);CHECK(next.received.sequence==uint16_t(b1.received.sequence+1U));
++        // The explicit serializer also leaves a queued current RX stream untouched.
++        SiteNetwork serializer;HostOwnerWire framer;sender.ingest(framer.at(serializer.encoded(DUID::LDU1),STREAM_B,0U,0x3000U));
++        const auto rx=sender.receivedFilter(),bytes=sender.chargedBytes();REQUIRE(bytes>0U);
++        LC term;term.setLCO(group?LCO::GROUP:LCO::PRIVATE);term.setSrcId(SOURCE);term.setDstId(GROUP);data::LowSpeedData lsd;
++        REQUIRE(sender.writeP25TDUOnStream(term,lsd,ownerA));CHECK(sender.getP25StreamId()==currentTX);CHECK(sender.receivedFilter()==rx);CHECK(sender.chargedBytes()==bytes);
++    }
++}
++
++
++TEST_CASE("Actual group TDULC signaling MFID is separate from voice header MFID", "[p25][host-end-owner-fix][actual-group-tdulc]") {
++    OpaqueWireNetwork sender;ControllerFixture radio(true,false,false,false,false,&sender);radio.voiceMode(false);radio.permitVoice("ab12:9301");
++    REQUIRE(radio.voiceFrame(DUID::HDU,GROUP,false,true,SOURCE,MFG_STANDARD_ALT));
++    REQUIRE(radio.voiceFrame(DUID::LDU1,GROUP,false,true,SOURCE,MFG_STANDARD_ALT));
++    REQUIRE(radio.voiceFrame(DUID::LDU2,GROUP,false,true,SOURCE,MFG_STANDARD_ALT));
++    REQUIRE(sender.wire->outgoing.size()==2U);const auto voiceHeader=decodeHostDatagram(sender.wire->outgoing[0]);REQUIRE(voiceHeader.body[15U]==MFG_STANDARD_ALT);
++    HostOwnerWire wire;ControllerFixture receiver(true,false,false,false,false,&wire);receiver.voiceMode(false);receiver.permitVoice("ab12:9302");
++    for(const auto& p:sender.wire->outgoing){wire.ingest(p);MultiSiteTestAccess::process(*receiver.controller);}receiver.drainVoice();
++    // The inherited network routing target is GROUP. Existing separate RF-tail
++    // tests enforce the RFSS broadcast termination address on over-air output.
++    REQUIRE(radio.voiceFrame(DUID::TDULC,GROUP,false,true,SOURCE,MFG_STANDARD_ALT));
++    const auto terminal=decodeHostDatagram(sender.wire->outgoing.back());REQUIRE(terminal.body[22U]==DUID::TDULC);
++    CHECK(terminal.body[15U]==MFG_STANDARD);CHECK(terminal.received.streamId==voiceHeader.received.streamId);
++    wire.ingest(sender.wire->outgoing.back());MultiSiteTestAccess::process(*receiver.controller);
++    CHECK(MultiSiteTestAccess::networkState(*receiver.controller)==RS_NET_IDLE);CHECK_FALSE(MultiSiteTestAccess::permitted(*receiver.controller));
++    receiver.drainVoice();CHECK(receiver.controller->writeRF_VoiceEnd(false));CHECK_FALSE(receiver.drainTail().empty());
++}
++
++
++TEST_CASE("Incomplete network setup releases its permit without inventing identification", "[p25][host-end-owner-fix][network-setup-no-id]") {
++    for(const auto first:{DUID::LDU1,DUID::LDU2})for(const bool end:{false,true}) {
++        DYNAMIC_SECTION("first "<<int(first)<<" end "<<end) {
++            HostOwnerWire wire;SiteNetwork serializer;ControllerFixture voice(true,false,false,false,false,&wire);voice.voiceMode(true);voice.permitVoice("ab12:9401");
++            REQUIRE_FALSE(voice.controller->identificationPending());
++            wire.ingest(wire.at(serializer.encoded(first),STREAM_A,0U,0x1000U));MultiSiteTestAccess::process(*voice.controller);
++            REQUIRE(MultiSiteTestAccess::networkState(*voice.controller)==RS_NET_IDLE);REQUIRE(voice.drainVoice().empty());
++            REQUIRE_FALSE(voice.controller->identificationPending());
++            if(end){wire.ingest(wire.at(serializer.encoded(DUID::TDU),STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U));MultiSiteTestAccess::process(*voice.controller);}
++            else MultiSiteTestAccess::timeoutNetwork(*voice.controller);
++            CHECK_FALSE(MultiSiteTestAccess::permitted(*voice.controller));CHECK(MultiSiteTestAccess::receiveOwner(*voice.controller)==0U);
++            CHECK(voice.rpc.releases==std::vector<uint32_t>{GROUP});CHECK(voice.drainVoice().empty());
++            CHECK_FALSE(voice.controller->identificationPending());CHECK_FALSE(voice.controller->consumeIdentificationEnd());
++        }
++    }
++}
++
++TEST_CASE("A completed network voice call still creates its identification obligation", "[p25][host-end-owner-fix][network-voice-id]") {
++    HostOwnerWire wire;SiteNetwork serializer;ControllerFixture voice(true,false,false,false,false,&wire);voice.voiceMode(true);
++    hostOwnerStart(voice,wire,serializer,STREAM_A,0x1000U,"ab12:9411");
++    REQUIRE_FALSE(voice.controller->identificationPending());
++    wire.ingest(wire.at(serializer.encoded(DUID::TDU),STREAM_A,RTP_END_OF_CALL_SEQ,0x1168U));MultiSiteTestAccess::process(*voice.controller);
++    CHECK_FALSE(MultiSiteTestAccess::permitted(*voice.controller));CHECK(voice.controller->identificationPending());
++    CHECK(voice.controller->consumeIdentificationEnd());CHECK_FALSE(voice.controller->consumeIdentificationEnd());
++    const auto end=voice.drainVoice();CHECK(std::count(end.begin(),end.end(),DUID::TDU)==1U);
++    CHECK(voice.controller->writeRF_VoiceEnd(false));CHECK_FALSE(voice.drainTail().empty());
++    CHECK_FALSE(voice.controller->consumeIdentificationEnd());
++}
+diff --git a/tests/p25/MultiAlgorithmVoice_Tests.cpp b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+--- a/tests/p25/MultiAlgorithmVoice_Tests.cpp
++++ b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+@@ -47,6 +47,8 @@
+ class VoiceNetwork : public network::Network {
+ public:
+     std::deque<std::vector<uint8_t>> incoming;
++    uint32_t fixtureStream=1U,fixtureTimestamp=1000U;
++    uint16_t fixtureSequence=0U;
+     std::vector<std::vector<uint8_t>> outgoing;
+     VoiceNetwork() : Network("127.0.0.1", 49991U, 0U, 100101001U, "unopened-voice-test", true, false,
+         false, true, false, false, false, false, false, false, false, false) { m_status = network::NET_STAT_RUNNING; }
+@@ -55,9 +57,10 @@
+         available = !incoming.empty(); length = 0U;
+         if (!available) return nullptr;
+         auto bytes = std::move(incoming.front()); incoming.pop_front(); length = bytes.size();
++        if(received!=nullptr)*received={fixtureStream,fixtureSequence++,fixtureTimestamp+=60U};
+         UInt8Array result(new uint8_t[length]); std::copy(bytes.begin(), bytes.end(), result.get()); return result;
+     }
+-    void resetP25() override { incoming.clear(); }
++    void resetP25() override { incoming.clear();++fixtureStream;fixtureSequence=0U; }
+     using network::BaseNetwork::createP25_LDU1Message;
+     using network::BaseNetwork::createP25_LDU2Message;
+     bool writeP25LDU1(const lc::LC& control, const p25::data::LowSpeedData& lsd, const uint8_t* data,

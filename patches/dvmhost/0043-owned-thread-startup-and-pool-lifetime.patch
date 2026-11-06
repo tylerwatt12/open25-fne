@@ -1,0 +1,1001 @@
+diff --git a/src/common/Thread.cpp b/src/common/Thread.cpp
+--- a/src/common/Thread.cpp
++++ b/src/common/Thread.cpp
+@@ -12,6 +12,8 @@
+ #include "Log.h"
+ 
+ #include <cerrno>
++#include <memory>
++#include <mutex>
+ #include <signal.h>
+ #if !defined(_WIN32)
+ #include <unistd.h>
+@@ -109,14 +111,34 @@
+ 
+ /* Executes the specified start routine to run as a thread. */
+ 
++#if !defined(_WIN32)
++void* Thread::publishedThreadEntry(void* argument)
++{
++    auto* startup = static_cast<Startup*>(argument);
++    thread_t* record;
++    void* (*routine)(void*);
++    {
++        // pthread_create may run this entry before publishing its output handle.
++        // The creator owns this lock until that publication is complete.
++        std::lock_guard<std::mutex> published(startup->publication);
++        record = startup->record;
++        routine = startup->routine;
++    }
++    delete startup;
++    return routine(record);
++}
++#endif // !defined(_WIN32)
++
+ bool Thread::runAsThread(void* obj, void *(*startRoutine)(void *), thread_t* thread)
+ {
+-    if (thread == nullptr)
+-        thread = new thread_t();
+-
++#if defined(_WIN32)
++    std::unique_ptr<thread_t> owned;
++    if (thread == nullptr) {
++        owned.reset(new thread_t());
++        thread = owned.get();
++    }
+     thread->obj = obj;
+ 
+-#if defined(_WIN32)
+     HANDLE hnd = ::CreateThread(NULL, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>((void*)startRoutine), thread, CREATE_SUSPENDED, NULL);
+     if (hnd == NULL) {
+         LogError(LOG_HOST, "Error returned from CreateThread, err: %lu", ::GetLastError());
+@@ -124,16 +146,41 @@
+     }
+ 
+     thread->thread = hnd;
++    owned.release();
+     ::ResumeThread(hnd);
+-#else
+-    if (::pthread_create(&thread->thread, NULL, startRoutine, thread) != 0) {
+-        LogError(LOG_HOST, "Error returned from pthread_create, err: %d", errno);
+-        return false;
+-    }
+-#endif // defined(_WIN32)
+-
+     return true;
+-}
++#else
++    return runAsThreadPOSIX(obj, startRoutine, thread, ::pthread_create);
++#endif // defined(_WIN32)
++}
++
++#if !defined(_WIN32)
++bool Thread::runAsThreadPOSIX(void* obj, void *(*startRoutine)(void *), thread_t* thread, CreateThreadRoutine createThread)
++{
++    std::unique_ptr<thread_t> owned;
++    if (thread == nullptr) {
++        owned.reset(new thread_t());
++        thread = owned.get();
++    }
++    thread->obj = obj;
++
++    std::unique_ptr<Startup> startup(new Startup(thread, startRoutine));
++    std::unique_lock<std::mutex> publisher(startup->publication);
++    const int error = createThread(&thread->thread, nullptr, publishedThreadEntry, startup.get());
++    if (error != 0) {
++        LogError(LOG_HOST, "Error returned from pthread_create, err: %d", error);
++        return false;
++    }
++
++    // The callback may release the record immediately. Relinquish the creator
++    // ownership before unlocking; neither object may be accessed afterward.
++    owned.release();
++    startup.release();
++    publisher.unlock();
++    // Do not access the record or startup state after this ownership handoff.
++    return true;
++}
++#endif // !defined(_WIN32)
+ 
+ /* Suspends the current thread for the specified amount of time. */
+ 
+diff --git a/src/common/Thread.h b/src/common/Thread.h
+--- a/src/common/Thread.h
++++ b/src/common/Thread.h
+@@ -30,6 +30,7 @@
+ #include <Windows.h>
+ #else
+ #include <pthread.h>
++#include <mutex>
+ #endif // defined(_WIN32)
+ 
+ #if defined(_WIN32)
+@@ -100,8 +101,9 @@
+ 
+     /**
+      * @brief Executes the specified start routine to run as a thread.
+-     *  On POSIX, if the thread fails to spawn for any reason, the caller should clean up the passed thread_t
+-     *  argument. This shouldn't be used for spawning threads used for things like packet processing.
++     *  The callback receives a fully published handle and may release the record before this function returns.
++     *  On failure, a supplied record remains owned by the caller; an internally allocated record is freed.
++     *  This should not be used for spawning threads used for things like packet processing.
+      * @param obj Instance of a object to pass to the threaded function.
+      * @param startRoutine Represents the function that executes on a thread.
+      * @param[out] thread Instance of the thread data.
+@@ -117,6 +119,18 @@
+     static void sleep(uint32_t ms, uint32_t us = 0U);
+ 
+ private:
++#if !defined(_WIN32)
++    friend struct ThreadStartupTestAccess;
++    using CreateThreadRoutine = int (*)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
++    struct Startup {
++        thread_t* record;
++        void* (*routine)(void*);
++        std::mutex publication;
++        Startup(thread_t* value, void* (*callback)(void*)) : record(value), routine(callback), publication() {}
++    };
++    static void* publishedThreadEntry(void* argument);
++    static bool runAsThreadPOSIX(void* obj, void* (*startRoutine)(void*), thread_t* thread, CreateThreadRoutine createThread);
++#endif
+     pthread_t m_thread;
+ 
+     /**
+diff --git a/src/common/ThreadPool.cpp b/src/common/ThreadPool.cpp
+--- a/src/common/ThreadPool.cpp
++++ b/src/common/ThreadPool.cpp
+@@ -10,11 +10,8 @@
+ #include "ThreadPool.h"
+ #include "Log.h"
+ 
+-#include <cerrno>
+-#include <signal.h>
+-#if !defined(_WIN32)
+-#include <unistd.h>
+-#endif // !defined(_WIN32)
++#include <algorithm>
++#include <exception>
+ 
+ // ---------------------------------------------------------------------------
+ //  Constants
+@@ -26,211 +23,136 @@
+ //  Public Class Members
+ // ---------------------------------------------------------------------------
+ 
+-/* Initializes a new instance of the ThreadPool class. */
+-
+ ThreadPool::ThreadPool(uint16_t workerCnt, std::string name) :
+-    m_maxWorkerCnt(workerCnt),
++    m_maxWorkerCnt(std::max<uint16_t>(workerCnt, MIN_WORKER_CNT)),
+     m_maxQueuedTasks(0U),
+     m_poolState(STOP),
+     m_workers(),
+     m_tasks(),
+-    m_workerMutex(),
++    m_lifecycleMutex(),
+     m_queueMutex(),
+     m_cond(),
+     m_name(name)
+ {
+-    if (m_maxWorkerCnt < MIN_WORKER_CNT)
+-        m_maxWorkerCnt = MIN_WORKER_CNT;
+ }
+ 
+-/* Finalizes a instance of the ThreadPool class. */
+-
+-ThreadPool::~ThreadPool() = default;
+-
+-/* Enqueue a thread pool task. */
++ThreadPool::~ThreadPool()
++{
++    stop();
++    wait();
++}
+ 
+ bool ThreadPool::enqueue(ThreadPoolTask* task)
+ {
+-    // scope is intentional
++    if (task == nullptr) return false;
+     {
+-        std::unique_lock<std::mutex> lock(m_workerMutex);
+-        if (m_poolState == RUNNING && m_workers.size() < m_maxWorkerCnt) {
+-            thread_t* thread = new thread_t();
+-            thread->obj = this;
+-        
+-#if defined(_WIN32)
+-            HANDLE hnd = ::CreateThread(NULL, 0, worker, thread, CREATE_SUSPENDED, NULL);
+-            if (hnd == NULL) {
+-                LogError(LOG_HOST, "Error returned from CreateThread, err: %lu", ::GetLastError());
+-                return false;
+-            }
+-
+-            thread->thread = hnd;
+-            ::ResumeThread(hnd);
+-#else
+-            if (::pthread_create(&thread->thread, NULL, worker, thread) != 0) {
+-                LogError(LOG_HOST, "Error returned from pthread_create, err: %d", errno);
+-                return false;
+-            }
+-#endif // defined(_WIN32)
+-
+-            m_workers.emplace_back(thread->thread);
+-        }
++        std::lock_guard<std::mutex> lock(m_queueMutex);
++        if (m_poolState != RUNNING) return false;
++        if (m_maxQueuedTasks > 0U && m_tasks.size() >= m_maxQueuedTasks) return false;
++        m_tasks.emplace(task);
+     }
+-
+-    // scope is intentional
+-    {
+-        std::unique_lock<std::mutex> lock(m_queueMutex);
+-        if (m_poolState == STOP) {
+-            LogError(LOG_HOST, "Cannot enqueue task on a stopped thread pool!");
+-            return false;
+-        }
+-
+-        if (m_maxQueuedTasks > 0U && m_tasks.size() >= m_maxQueuedTasks) {
+-            LogError(LOG_HOST, "Cannot enqueue task, thread pool queue is full!");
+-            return false;
+-        }
+-
+-        m_tasks.emplace(std::unique_ptr<ThreadPoolTask>(task));
+-    }
+-
+     m_cond.notify_one();
+     return true;
+ }
+ 
+-/* Starts the thread pool. */
+-
+ void ThreadPool::start()
+ {
+-    // scope is intentional
++    std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+     {
+-        std::unique_lock<std::mutex> lock(m_queueMutex);
+-        m_poolState = RUNNING;
+-
+-        for (uint32_t i = m_workers.size(); i < m_maxWorkerCnt; i++) {
+-            thread_t* thread = new thread_t();
+-            thread->obj = this;
+-        
+-#if defined(_WIN32)
+-            HANDLE hnd = ::CreateThread(NULL, 0, worker, thread, CREATE_SUSPENDED, NULL);
+-            if (hnd == NULL) {
+-                LogError(LOG_HOST, "Error returned from CreateThread, err: %lu", ::GetLastError());
+-                continue;
+-            }
+-        
+-            thread->thread = hnd;
+-            ::ResumeThread(hnd);
+-#else
+-            if (::pthread_create(&thread->thread, NULL, worker, thread) != 0) {
+-                LogError(LOG_HOST, "Error returned from pthread_create, err: %d", errno);
+-                continue;
+-            }
+-#endif // defined(_WIN32)
+-
+-            m_workers.emplace_back(thread->thread);
+-        }
+-      }
+-
+-      m_cond.notify_all();
++        std::lock_guard<std::mutex> lock(m_queueMutex);
++        if (m_poolState == RUNNING) return;
++    }
++    // A stopped generation may still be draining. Retire it before reopening.
++    joinWorkers();
++    uint16_t count;
++    {
++        std::lock_guard<std::mutex> lock(m_queueMutex);
++        m_poolState = IDLE; // New work is rejected until workers are published.
++        count = m_maxWorkerCnt;
++    }
++    try {
++        m_workers.reserve(count);
++        for (uint16_t index = 0U; index < count; ++index)
++            m_workers.emplace_back(&ThreadPool::worker, this);
++    }
++    catch (const std::exception& error) {
++        // Existing workers still form a usable pool; an empty pool stays closed.
++        LogError(LOG_HOST, "Thread pool %s worker creation failed: %s", m_name.c_str(), error.what());
++    }
++    {
++        std::lock_guard<std::mutex> lock(m_queueMutex);
++        // stop() may have sealed this generation while workers were created.
++        if (m_poolState == IDLE) m_poolState = m_workers.empty() ? STOP : RUNNING;
++    }
++    m_cond.notify_all();
+ }
+-
+-/* Stops the thread pool. */
+ 
+ void ThreadPool::stop()
+ {
+-    // scope is intentional
+     {
+-        std::unique_lock<std::mutex> lock(m_queueMutex);
++        std::lock_guard<std::mutex> lock(m_queueMutex);
+         m_poolState = STOP;
+     }
+-
+     m_cond.notify_all();
+ }
+ 
+-/* Make calling thread wait for termination of any remaining thread pool tasks. */
+-
+ void ThreadPool::wait()
+ {
+-    m_cond.notify_all();
++    std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
++    stop();
++    joinWorkers();
++}
+ 
+-    for (pthread_t worker : m_workers) {
+-#if defined(_WIN32)
+-        ::WaitForSingleObject(worker, INFINITE);
+-        ::CloseHandle(worker);
+-#else
+-        ::pthread_join(worker, NULL);
+-#endif // defined(_WIN32)
+-    }
++uint16_t ThreadPool::getMaxWorkerCnt() const
++{
++    std::lock_guard<std::mutex> lock(m_queueMutex);
++    return m_maxWorkerCnt;
++}
++
++void ThreadPool::setMaxWorkerCnt(uint16_t value)
++{
++    std::lock_guard<std::mutex> lock(m_queueMutex);
++    m_maxWorkerCnt = std::max<uint16_t>(value, MIN_WORKER_CNT);
++}
++
++uint16_t ThreadPool::getMaxQueuedTasks() const
++{
++    std::lock_guard<std::mutex> lock(m_queueMutex);
++    return m_maxQueuedTasks;
++}
++
++void ThreadPool::setMaxQueuedTasks(uint16_t value)
++{
++    std::lock_guard<std::mutex> lock(m_queueMutex);
++    m_maxQueuedTasks = value;
+ }
+ 
+ // ---------------------------------------------------------------------------
+ //  Private Class Members
+ // ---------------------------------------------------------------------------
+ 
+-/* Internal worker thread that is used to execute task functions. */
++void ThreadPool::joinWorkers()
++{
++    for (auto& worker : m_workers)
++        if (worker.joinable()) worker.join();
++    m_workers.clear();
++}
+ 
+-#if defined(_WIN32)
+-DWORD ThreadPool::worker(LPVOID arg)
+-#else
+-void* ThreadPool::worker(void* arg)
+-#endif // defined(_WIN32)
++void ThreadPool::worker()
+ {
+-    thread_t* thread = (thread_t*)arg;
+-    if (thread == nullptr) {
+-        LogError(LOG_HOST, "Fatal error starting thread pool worker! No thread!");
+-#if defined(_WIN32)
+-        return 0UL;
+-#else
+-        return nullptr;
+-#endif // defined(_WIN32)
++#ifdef _GNU_SOURCE
++    const std::string name = m_name + ":worker";
++    ::pthread_setname_np(::pthread_self(), name.c_str());
++#endif
++    for (;;) {
++        std::unique_ptr<ThreadPoolTask> task;
++        {
++            std::unique_lock<std::mutex> lock(m_queueMutex);
++            m_cond.wait(lock, [this] { return m_poolState == STOP || !m_tasks.empty(); });
++            if (m_tasks.empty()) return; // STOP and fully drained.
++            task = std::move(m_tasks.front());
++            m_tasks.pop();
++        }
++        task->run();
+     }
+-
+-    ThreadPool* threadPool = (ThreadPool*)thread->obj;
+-    if (threadPool == nullptr) {
+-        LogError(LOG_HOST, "Fatal error starting thread pool worker! No thread pool owner!");
+-        delete thread;
+-#if defined(_WIN32)
+-        return 0UL;
+-#else
+-        return nullptr;
+-#endif // defined(_WIN32)
+-    }
+-
+-    std::stringstream threadName;
+-    threadName << threadPool->m_name << ":worker";
+-#ifdef _GNU_SOURCE
+-    ::pthread_setname_np(thread->thread, threadName.str().c_str());
+-#endif // _GNU_SOURCE
+-
+-    ThreadPoolTask* task = nullptr;
+-    while (threadPool->m_poolState != STOP) {
+-        // scope is intentional
+-        {
+-            std::unique_lock<std::mutex> lock(threadPool->m_queueMutex);
+-            threadPool->m_cond.wait(lock, [=] { return threadPool->m_poolState == STOP || !threadPool->m_tasks.empty(); });
+-            if (threadPool->m_poolState == STOP && threadPool->m_tasks.empty()) {
+-                delete thread;
+-#if defined(_WIN32)
+-                return 0UL;
+-#else
+-                return nullptr;
+-#endif // defined(_WIN32)
+-            }
+-
+-            task = (threadPool->m_tasks.front()).release();
+-            threadPool->m_tasks.pop();
+-        }
+-
+-        if (task == nullptr)
+-            continue;
+-
+-        task->run();
+-        delete task;
+-    }
+-
+-#if defined(_WIN32)
+-    return 0UL;
+-#else
+-    return nullptr;
+-#endif // defined(_WIN32)
+ }
+diff --git a/src/common/ThreadPool.h b/src/common/ThreadPool.h
+--- a/src/common/ThreadPool.h
++++ b/src/common/ThreadPool.h
+@@ -20,6 +20,7 @@
+ #include "common/Thread.h"
+ 
+ #include <vector>
++#include <thread>
+ #include <queue>
+ #include <mutex>
+ #include <condition_variable>
+@@ -93,21 +94,22 @@
+     /**
+      * @brief Enqueues a thread pool task.
+      * @param task Task to enqueue.
+-     * @returns bool True, if task enqueued otherwise false.
++     * @returns bool True, if ownership was accepted; false leaves ownership with the caller.
+      */
+     bool enqueue(ThreadPoolTask* task);
+ 
+     /**
+-     * @brief Starts the thread pool.
++     * @brief Starts configured workers; a repeated start while running has no effect.
++     *  Lifecycle methods must be called outside this pool's own task functions.
+      */
+     void start();
+     /**
+-     * @brief Stops the thread pool.
++     * @brief Seals admission; workers finish all previously accepted tasks.
+      */
+     void stop();
+ 
+     /**
+-     * @brief Make calling thread wait for termination of any remaining thread pool tasks.
++     * @brief Seals admission, drains accepted tasks, then joins and clears all workers.
+      */
+     void wait();
+ 
+@@ -115,13 +117,17 @@
+     /**
+      * @brief Maximum number of worker threads.
+      */
+-    DECLARE_PROPERTY(uint16_t, maxWorkerCnt, MaxWorkerCnt);
++    uint16_t getMaxWorkerCnt() const;
++    void setMaxWorkerCnt(uint16_t value);
+     /**
+      * @brief Maximum number of queued tasks.
+      */
+-    DECLARE_PROPERTY(uint16_t, maxQueuedTasks, MaxQueuedTasks);
++    uint16_t getMaxQueuedTasks() const;
++    void setMaxQueuedTasks(uint16_t value);
+ 
+ private:
++    uint16_t m_maxWorkerCnt;
++    uint16_t m_maxQueuedTasks;
+ 
+     /**
+      * @brief Thread pool state.
+@@ -134,25 +140,21 @@
+ 
+     PoolState m_poolState;
+ 
+-    std::vector<pthread_t> m_workers;
++    std::vector<std::thread> m_workers;
+     std::queue<std::unique_ptr<ThreadPoolTask>> m_tasks;
+ 
+-    std::mutex m_workerMutex;
+-    std::mutex m_queueMutex;
++    std::mutex m_lifecycleMutex;
++    mutable std::mutex m_queueMutex;
+     std::condition_variable m_cond;
+ 
+     std::string m_name;
+ 
+     /**
+-     * @brief Internal worker thats used as the entry point for the worker threads.
+-     * @param arg 
+-     * @returns void* 
++     * @brief Runs accepted tasks until stopped and fully drained.
+      */
+-#if defined(_WIN32)
+-    static DWORD __stdcall worker(LPVOID arg);
+-#else
+-    static void* worker(void* arg);
+-#endif // defined(_WIN32)
++    void worker();
++    // Called only with lifecycle ownership, and never from a pool worker.
++    void joinWorkers();
+ };
+ 
+ #endif // __THREAD_POOL_H__
+diff --git a/tests/ThreadPoolLifetime_Tests.cpp b/tests/ThreadPoolLifetime_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/ThreadPoolLifetime_Tests.cpp
+@@ -0,0 +1,206 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "common/ThreadPool.h"
++#include <catch2/catch_test_macros.hpp>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <future>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace {
++using namespace std::chrono;
++struct Held {
++    std::mutex mutex;
++    std::condition_variable changed;
++    unsigned entered = 0U;
++    bool release = false;
++    void run() {
++        std::unique_lock<std::mutex> lock(mutex);
++        ++entered;
++        changed.notify_all();
++        changed.wait(lock, [&] { return release; });
++    }
++    void await(unsigned count) {
++        std::unique_lock<std::mutex> lock(mutex);
++        if (!changed.wait_for(lock, seconds(5), [&] { return entered == count; })) std::abort();
++    }
++    void open() {
++        { std::lock_guard<std::mutex> lock(mutex); release = true; }
++        changed.notify_all();
++    }
++};
++struct TrackedTask : ThreadPoolTask {
++    std::atomic<unsigned>& destroyed;
++    template<class F> TrackedTask(std::atomic<unsigned>& count, F callback) : ThreadPoolTask(callback), destroyed(count) {}
++    ~TrackedTask() override { ++destroyed; }
++};
++struct RawArgument {
++    std::atomic<unsigned>& freed;
++    std::atomic<unsigned>& executed;
++    RawArgument(std::atomic<unsigned>& f, std::atomic<unsigned>& e) : freed(f), executed(e) {}
++    ~RawArgument() { ++freed; }
++};
++ThreadPoolTask* rawTask(RawArgument* argument) {
++    return new_pooltask([](RawArgument* value) {
++        ++value->executed;
++        delete value;
++    }, argument);
++}
++}
++
++TEST_CASE("pool stop drains every accepted task and reopen never replays old work", "[thread-pool-lifetime]") {
++    std::atomic<unsigned> freed{0U}, executed{0U};
++    unsigned accepted = 0U;
++    ThreadPool pool(4U, "lifetime");
++    for (unsigned generation = 0; generation < 20U; ++generation) {
++        pool.start();
++        pool.start(); // Idempotent healthy start.
++        for (unsigned index = 0; index < 32U; ++index) {
++            auto* argument = new RawArgument(freed, executed);
++            auto* task = rawTask(argument);
++            const bool added = pool.enqueue(task);
++            if (!added) { delete task; delete argument; }
++            REQUIRE(added);
++            ++accepted;
++        }
++        pool.stop();
++        pool.wait();
++        pool.wait(); // No stale native handle may be joined a second time.
++        REQUIRE(executed == accepted);
++        REQUIRE(freed == accepted + generation);
++        auto* argument = new RawArgument(freed, executed);
++        auto* task = rawTask(argument);
++        const bool stopped = pool.enqueue(task);
++        if (!stopped) { delete task; delete argument; }
++        REQUIRE_FALSE(stopped);
++        REQUIRE(freed == accepted + generation + 1U);
++    }
++}
++
++TEST_CASE("pool queue limit and stopped admission preserve rejected task ownership", "[thread-pool-lifetime]") {
++    Held held;
++    std::atomic<unsigned> destroyed{0U}, queuedRan{0U};
++    ThreadPool pool;
++    pool.start();
++    bool admitted = true;
++    for (unsigned index = 0; index < 4U; ++index) {
++        auto* task = new TrackedTask(destroyed, [&] { held.run(); });
++        if (!pool.enqueue(task)) { delete task; admitted = false; }
++    }
++    if (!admitted) std::abort();
++    held.await(4U);
++    pool.setMaxQueuedTasks(2U);
++    for (unsigned index = 0; index < 2U; ++index) {
++        auto* task = new TrackedTask(destroyed, [&] { ++queuedRan; });
++        if (!pool.enqueue(task)) { delete task; std::abort(); }
++    }
++    auto* fullTask = new TrackedTask(destroyed, [&] { ++queuedRan; });
++    const bool full = pool.enqueue(fullTask);
++    const unsigned beforeCallerDelete = destroyed;
++    if (!full) delete fullTask;
++    pool.stop();
++    auto* stoppedTask = new TrackedTask(destroyed, [&] { ++queuedRan; });
++    const bool stopped = pool.enqueue(stoppedTask);
++    if (!stopped) delete stoppedTask;
++    auto waiter = std::async(std::launch::async, [&] { pool.wait(); });
++    const bool waiting = waiter.wait_for(milliseconds(0)) != std::future_status::ready;
++    held.open();
++    waiter.get();
++    REQUIRE_FALSE(full);
++    REQUIRE_FALSE(stopped);
++    REQUIRE(beforeCallerDelete == 0U);
++    REQUIRE(waiting);
++    REQUIRE(queuedRan == 2U);
++    REQUIRE(destroyed == 8U);
++}
++
++TEST_CASE("pool destruction joins held workers and executes raw-argument cleanup", "[thread-pool-lifetime]") {
++    Held held;
++    std::atomic<unsigned> freed{0U}, executed{0U};
++    auto pool = std::unique_ptr<ThreadPool>(new ThreadPool());
++    pool->start();
++    for (unsigned index = 0; index < 4U; ++index) {
++        auto* task = new_pooltask([&] { held.run(); });
++        if (!pool->enqueue(task)) { delete task; std::abort(); }
++    }
++    held.await(4U);
++    for (unsigned index = 0; index < 8U; ++index) {
++        auto* argument = new RawArgument(freed, executed);
++        auto* task = rawTask(argument);
++        if (!pool->enqueue(task)) { delete task; delete argument; std::abort(); }
++    }
++    std::promise<void> destroying;
++    auto began = destroying.get_future();
++    auto destroyer = std::async(std::launch::async, [&] { destroying.set_value(); pool.reset(); });
++    began.get();
++    const bool waited = destroyer.wait_for(milliseconds(0)) != std::future_status::ready;
++    const unsigned pendingFreed = freed;
++    held.open();
++    destroyer.get();
++    REQUIRE(waited);
++    REQUIRE(pendingFreed == 0U);
++    REQUIRE(executed == 8U);
++    REQUIRE(freed == 8U);
++}
++
++TEST_CASE("configured worker count applies at the next fresh pool start", "[thread-pool-lifetime]") {
++    Held held;
++    ThreadPool pool(1U);
++    REQUIRE(pool.getMaxWorkerCnt() == 4U);
++    pool.setMaxWorkerCnt(7U);
++    REQUIRE(pool.getMaxWorkerCnt() == 7U);
++    pool.setMaxQueuedTasks(9U);
++    REQUIRE(pool.getMaxQueuedTasks() == 9U);
++    pool.start();
++    for (unsigned index = 0; index < 7U; ++index) {
++        auto* task = new_pooltask([&] { held.run(); });
++        if (!pool.enqueue(task)) { delete task; std::abort(); }
++    }
++    held.await(7U);
++    held.open();
++    pool.stop(); pool.wait();
++    pool.setMaxWorkerCnt(0U);
++    REQUIRE(pool.getMaxWorkerCnt() == 4U);
++}
++
++TEST_CASE("concurrent pool lifecycle admission and queue limits retain exact ownership", "[thread-pool-lifetime]") {
++    std::atomic<unsigned> accepted{0U}, created{0U}, freed{0U}, executed{0U};
++    ThreadPool pool;
++    pool.start();
++    std::vector<std::future<void>> publishers;
++    for (unsigned publisher = 0; publisher < 4U; ++publisher) {
++        publishers.emplace_back(std::async(std::launch::async, [&] {
++            for (unsigned index = 0; index < 256U; ++index) {
++                auto* argument = new RawArgument(freed, executed);
++                ++created;
++                auto* task = rawTask(argument);
++                if (pool.enqueue(task)) ++accepted;
++                else { delete task; delete argument; }
++            }
++        }));
++    }
++    auto settings = std::async(std::launch::async, [&] {
++        for (unsigned index = 0; index < 256U; ++index) {
++            pool.setMaxQueuedTasks(index % 17U);
++            (void)pool.getMaxQueuedTasks();
++            pool.setMaxWorkerCnt(4U + index % 3U);
++            (void)pool.getMaxWorkerCnt();
++        }
++    });
++    auto stopStart = std::async(std::launch::async, [&] {
++        for (unsigned index = 0; index < 16U; ++index) { pool.stop(); pool.start(); }
++    });
++    auto waitStart = std::async(std::launch::async, [&] {
++        for (unsigned index = 0; index < 16U; ++index) { pool.wait(); pool.start(); }
++    });
++    for (auto& publisher : publishers) publisher.get();
++    settings.get(); stopStart.get(); waitStart.get();
++    pool.stop(); pool.wait();
++    REQUIRE(created == 1024U);
++    REQUIRE(executed == accepted);
++    REQUIRE(freed == created);
++}
+diff --git a/tests/ThreadStartup_Tests.cpp b/tests/ThreadStartup_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/ThreadStartup_Tests.cpp
+@@ -0,0 +1,235 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Exercise real Thread startup without starting a host, transport or device.
++#include "common/Thread.h"
++#include <catch2/catch_test_macros.hpp>
++
++#if !defined(_WIN32)
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <future>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++struct ThreadStartupTestAccess {
++    static bool start(void* obj, void* (*routine)(void*), thread_t* record,
++        int (*create)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*)) {
++        return Thread::runAsThreadPOSIX(obj, routine, record, create);
++    }
++    static bool publicationHeld(void* (*entry)(void*), void* argument) {
++        if (entry != Thread::publishedThreadEntry) return false;
++        auto* startup = static_cast<Thread::Startup*>(argument);
++        if (startup->publication.try_lock()) {
++            startup->publication.unlock();
++            return false;
++        }
++        return true;
++    }
++};
++
++namespace {
++using namespace std::chrono;
++struct Result {
++    std::mutex mutex;
++    std::condition_variable changed;
++    bool done = false;
++    bool validHandle = false;
++    bool validRecord = false;
++    bool freeRecord = true;
++    thread_t* expected = nullptr;
++    pthread_t self{};
++    unsigned calls = 0;
++    int sentinel = 73;
++};
++void* finish(void* argument) {
++    auto* record = static_cast<thread_t*>(argument);
++    auto* result = static_cast<Result*>(record->obj);
++    const bool valid = ::pthread_equal(record->thread, ::pthread_self()) != 0;
++    const bool same = result->expected == nullptr || result->expected == record;
++    const bool release = result->freeRecord;
++    if (release) delete record;
++    {
++        std::lock_guard<std::mutex> lock(result->mutex);
++        result->self = ::pthread_self();
++        result->validHandle = valid;
++        result->validRecord = same;
++        ++result->calls;
++        result->done = true;
++    }
++    result->changed.notify_all();
++    return &result->sentinel;
++}
++void awaitResult(Result& result) {
++    std::unique_lock<std::mutex> lock(result.mutex);
++    // A broken test must fail instead of leaving a live joinable thread behind.
++    if (!result.changed.wait_for(lock, seconds(5), [&] { return result.done; })) std::abort();
++}
++struct Delay {
++    std::mutex mutex;
++    std::condition_variable changed;
++    bool childEntered = false;
++    bool gateHeld = false;
++    bool allowOutput = false;
++    bool outputPublished = false;
++    pthread_t child{};
++};
++thread_local Delay* currentDelay = nullptr;
++struct DelayedEntry {
++    void* (*entry)(void*);
++    void* argument;
++    Delay* state;
++};
++void* delayedChild(void* argument) {
++    std::unique_ptr<DelayedEntry> packet(static_cast<DelayedEntry*>(argument));
++    const bool held = ThreadStartupTestAccess::publicationHeld(packet->entry, packet->argument);
++    {
++        std::lock_guard<std::mutex> lock(packet->state->mutex);
++        packet->state->gateHeld = held;
++        packet->state->childEntered = true;
++    }
++    packet->state->changed.notify_all();
++    auto routine = packet->entry;
++    auto data = packet->argument;
++    packet.reset();
++    return routine(data);
++}
++int delayedCreate(pthread_t* output, const pthread_attr_t* attributes, void* (*entry)(void*), void* argument) {
++    Delay& state = *currentDelay;
++    auto packet = std::unique_ptr<DelayedEntry>(new DelayedEntry{entry, argument, &state});
++    pthread_t child{};
++    const int error = ::pthread_create(&child, attributes, delayedChild, packet.get());
++    if (error != 0) return error;
++    packet.release();
++    std::unique_lock<std::mutex> lock(state.mutex);
++    state.child = child;
++    if (!state.changed.wait_for(lock, seconds(5), [&] { return state.allowOutput; })) std::abort();
++    // Deliberately model an implementation publishing its output only after
++    // the real child has begun. The caller cannot touch/free that output yet.
++    *output = child;
++    state.outputPublished = true;
++    return 0;
++}
++int failedCreate(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*) {
++    errno = ENOENT; // pthread_create reports its own error, not this errno.
++    return EAGAIN;
++}
++}
++
++TEST_CASE("POSIX startup holds callback ownership until delayed output publication", "[thread-startup]") {
++    for (bool supplied : {false, true}) {
++        Delay delay;
++        Result result;
++        thread_t* record = supplied ? new thread_t() : nullptr;
++        result.expected = record;
++        auto creator = std::async(std::launch::async, [&] {
++            currentDelay = &delay;
++            return ThreadStartupTestAccess::start(&result, finish, record, delayedCreate);
++        });
++        bool entered, held, unpublished, untouched;
++        {
++            std::unique_lock<std::mutex> lock(delay.mutex);
++            entered = delay.changed.wait_for(lock, seconds(5), [&] { return delay.childEntered; });
++            held = delay.gateHeld;
++            unpublished = !delay.outputPublished;
++            {
++                std::lock_guard<std::mutex> resultLock(result.mutex);
++                untouched = !result.done;
++            }
++            if (entered && !held) {
++                // A preserved old direct-callback body must finish/free first,
++                // forcing its late output write instead of relying on scheduling.
++                lock.unlock();
++                awaitResult(result);
++                lock.lock();
++            }
++            // Always release and join before assertions can unwind the fixture.
++            delay.allowOutput = true;
++        }
++        delay.changed.notify_all();
++        const bool created = creator.get();
++        awaitResult(result);
++        void* returned = nullptr;
++        const int joined = ::pthread_join(delay.child, &returned);
++        REQUIRE(entered);
++        REQUIRE(held);
++        REQUIRE(unpublished);
++        REQUIRE(untouched);
++        REQUIRE(created);
++        REQUIRE(joined == 0);
++        REQUIRE(returned == &result.sentinel);
++        REQUIRE(result.validHandle);
++        REQUIRE(result.validRecord);
++        REQUIRE(result.calls == 1U);
++    }
++}
++
++TEST_CASE("real fast callbacks can immediately free their fully published record", "[thread-startup]") {
++    for (unsigned index = 0; index < 256U; ++index) {
++        Result result;
++        thread_t* record = index % 2U ? new thread_t() : nullptr;
++        result.expected = record;
++        REQUIRE(Thread::runAsThread(&result, finish, record));
++        awaitResult(result);
++        void* returned = nullptr;
++        REQUIRE(::pthread_join(result.self, &returned) == 0);
++        REQUIRE(returned == &result.sentinel);
++        REQUIRE(result.validHandle);
++        REQUIRE(result.validRecord);
++        REQUIRE(result.calls == 1U);
++    }
++}
++
++TEST_CASE("supplied startup record remains caller owned when creation fails", "[thread-startup]") {
++    Result result;
++    thread_t record{};
++    REQUIRE_FALSE(ThreadStartupTestAccess::start(&result, finish, &record, failedCreate));
++    REQUIRE(record.obj == &result);
++    REQUIRE(errno == ENOENT);
++    REQUIRE(result.calls == 0U);
++    record.obj = nullptr; // Still valid caller storage; must never have been deleted.
++}
++
++TEST_CASE("failed implicit startup records are reclaimed without invoking callbacks", "[thread-startup]") {
++    Result result;
++    for (unsigned index = 0; index < 64U; ++index)
++        REQUIRE_FALSE(ThreadStartupTestAccess::start(&result, finish, nullptr, failedCreate));
++    REQUIRE(result.calls == 0U);
++}
++
++TEST_CASE("successful callback may retain a supplied record for the caller", "[thread-startup]") {
++    Result result;
++    result.freeRecord = false;
++    thread_t record{};
++    result.expected = &record;
++    REQUIRE(Thread::runAsThread(&result, finish, &record));
++    awaitResult(result);
++    void* returned = nullptr;
++    REQUIRE(::pthread_join(record.thread, &returned) == 0);
++    REQUIRE(record.obj == &result);
++    REQUIRE(returned == &result.sentinel);
++    REQUIRE(result.validHandle);
++    REQUIRE(result.validRecord);
++}
++
++TEST_CASE("independent concurrent startup publishers release exactly their own records", "[thread-startup]") {
++    std::vector<std::future<bool>> publishers;
++    for (unsigned publisher = 0; publisher < 8U; ++publisher) {
++        publishers.emplace_back(std::async(std::launch::async, [] {
++            for (unsigned count = 0; count < 32U; ++count) {
++                Result result;
++                if (!Thread::runAsThread(&result, finish)) return false;
++                awaitResult(result);
++                void* returned = nullptr;
++                if (::pthread_join(result.self, &returned) != 0 || returned != &result.sentinel ||
++                    !result.validHandle || !result.validRecord || result.calls != 1U) return false;
++            }
++            return true;
++        }));
++    }
++    for (auto& publisher : publishers) REQUIRE(publisher.get());
++}
++#endif // !defined(_WIN32)

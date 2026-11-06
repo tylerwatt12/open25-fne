@@ -1,0 +1,623 @@
+--- a/src/fne/network/TrafficNetwork.cpp
++++ b/src/fne/network/TrafficNetwork.cpp
+@@ -24,6 +24,9 @@
+ #include "fne/ActivityLog.h"
+ #include "HostFNE.h"
+ #include "FNEMain.h"
++
++#include <memory>
++#include <exception>
+ 
+ using namespace network;
+ using namespace network::callhandler;
+@@ -139,6 +142,10 @@
+     m_jitterMaxSize(4U),
+     m_jitterMaxWait(40000U),
+     m_threadPool(workerCnt, "fne"),
++    m_lifecycleMutex(),
++    m_open(false),
++    m_parrotStop(true),
++    m_parrotThread(),
+     m_disablePacketData(false),
+     m_dumpPacketData(false),
+     m_verbosePacketData(false),
+@@ -157,6 +164,15 @@
+     assert(port > 0U);
+     assert(!password.empty());
+ 
++    // Configure the socket once, before the caller can install its PSK. Its
++    // no-argument error recovery must retain this network's listen endpoint.
++    std::unique_ptr<udp::Socket> socket(new udp::Socket(m_address, m_port));
++    std::unique_ptr<FrameQueue> queue(new FrameQueue(socket.get(), m_peerId, m_debug));
++    delete m_frameQueue;
++    delete m_socket;
++    m_socket = socket.release();
++    m_frameQueue = queue.release();
++
+     m_peers.reserve(MAX_HARD_CONN_CAP);
+     m_peerReplicaPeers.reserve(MAX_HARD_CONN_CAP);
+     m_peerAffiliations.reserve(MAX_HARD_CONN_CAP);
+@@ -173,17 +189,13 @@
+     m_treeRoot = new SpanningTree(peerId, peerId, nullptr);
+     m_treeRoot->identity(identity);
+ 
+-    /*
+-    ** Initialize Threads
+-    */
+-
+-    Thread::runAsThread(this, threadParrotHandler);
+ }
+ 
+ /* Finalizes a instance of the TrafficNetwork class. */
+ 
+ TrafficNetwork::~TrafficNetwork()
+ {
++    close();
+     if (m_kmfServicesEnabled) {
+         m_p25OTARService->close();
+     }
+@@ -710,77 +722,87 @@
+ 
+ bool TrafficNetwork::open()
+ {
++    std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
++    if (m_open) return true;
+     if (m_p25Enabled && !m_p25Sites.valid()) return false;
+-    if (m_debug)
+-        LogInfoEx(LOG_MASTER, "Opening Network");
+-
+-    // start thread pool
+-    m_threadPool.start();
+-
+-    // start FluxQL thread pool
+-    if (m_enableInfluxDB) {
+-        influxdb::detail::TSCaller::start();
+-    }
+-
+-    m_status = NET_STAT_MST_RUNNING;
+-    m_maintainenceTimer.start();
+-    m_updateLookupTimer.start();
+-    
+-    if (m_haEnabled) {
+-        m_haUpdateTimer.start();
+-    }
+-
+-    m_socket = new udp::Socket(m_address, m_port);
+-
+-    // reinitialize the frame queue
+-    if (m_frameQueue != nullptr) {
++    if (m_debug) LogInfoEx(LOG_MASTER, "Opening Network");
++
++    // The BaseNetwork socket owns its configured PSK and outlives FrameQueue.
++    // Bind before starting any worker; a failed open has no running owner.
++    if (!m_socket->open()) {
++        m_socket->close();
++        m_status = NET_STAT_INVALID;
++        return false;
++    }
++    m_open = true;
++    try {
++        std::unique_ptr<FrameQueue> queue(new FrameQueue(m_socket, m_peerId, m_debug));
+         delete m_frameQueue;
+-        m_frameQueue = new FrameQueue(m_socket, m_peerId, m_debug);
+-    }
+-
+-    bool ret = m_socket->open();
+-    if (!ret) {
+-        m_socket->recvBufSize(524288U); // 512K recv buffer
+-        m_socket->sendBufSize(524288U); // 512K send buffer
+-        m_status = NET_STAT_INVALID;
+-    }
+-
+-    return ret;
++        m_frameQueue = queue.release();
++        m_socket->recvBufSize(524288U);
++        m_socket->sendBufSize(524288U);
++        m_threadPool.start();
++        if (m_enableInfluxDB) influxdb::detail::TSCaller::start();
++
++        m_status = NET_STAT_MST_RUNNING;
++        m_maintainenceTimer.start();
++        m_updateLookupTimer.start();
++        if (m_haEnabled) m_haUpdateTimer.start();
++
++        m_parrotStop.store(false);
++        m_parrotThread = std::thread(&TrafficNetwork::parrotLoop, this);
++    } catch (const std::exception& error) {
++        LogError(LOG_MASTER, "Cannot start network workers: %s", error.what());
++        closeLocked();
++        return false;
++    }
++    return true;
+ }
+ 
+ /* Closes connection to the network. */
+ 
+ void TrafficNetwork::close()
+ {
+-    if (m_debug)
+-        LogInfoEx(LOG_MASTER, "Closing Network");
++    std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
++    closeLocked();
++}
++
++void TrafficNetwork::stopParrot()
++{
++    m_parrotStop.store(true);
++#if defined(CATCH2_TEST_COMPILATION)
++    if (m_parrotBeforeJoinTestHook) m_parrotBeforeJoinTestHook();
++#endif
++    if (m_parrotThread.joinable()) m_parrotThread.join();
++}
++
++void TrafficNetwork::closeLocked()
++{
++    // A worker can still be inside playback when stop is requested. Its join
++    // precedes socket, queue, handler and base-class dependency retirement.
++    stopParrot();
++    if (!m_open) return;
++    m_open = false;
++    if (m_debug) LogInfoEx(LOG_MASTER, "Closing Network");
+ 
+     if (m_status == NET_STAT_MST_RUNNING) {
+-        uint8_t buffer[1U];
+-        ::memset(buffer, 0x00U, 1U);
+-
+-        uint32_t streamId = createStreamId();
++        uint8_t buffer[1U] = {0U};
++        const uint32_t streamId = createStreamId();
+         for (auto& peer : m_peers) {
+-            writePeer(peer.first, m_peerId, { NET_FUNC::MST_DISC, NET_SUBFUNC::NOP }, buffer, 1U, RTP_END_OF_CALL_SEQ, 
+-                streamId);
+-        }
+-    }
+-
++            writePeer(peer.first, m_peerId, { NET_FUNC::MST_DISC, NET_SUBFUNC::NOP }, buffer, 1U,
++                RTP_END_OF_CALL_SEQ, streamId);
++        }
++    }
+     m_maintainenceTimer.stop();
+     m_updateLookupTimer.stop();
+-
+-    // stop thread pool
++    m_haUpdateTimer.stop();
+     m_threadPool.stop();
+     m_threadPool.wait();
+-
+-    // stop FluxQL thread pool
+     if (m_enableInfluxDB) {
+         influxdb::detail::TSCaller::stop();
+         influxdb::detail::TSCaller::wait();
+     }
+-
+     m_socket->close();
+-
+     m_status = NET_STAT_INVALID;
+ }
+ 
+@@ -790,112 +812,88 @@
+ 
+ /* Entry point to parrot handler thread. */
+ 
+-void* TrafficNetwork::threadParrotHandler(void* arg)
+-{
+-    thread_t* th = (thread_t*)arg;
+-    if (th != nullptr) {
+-#if defined(_WIN32)
+-        ::CloseHandle(th->thread);
+-#else
+-        ::pthread_detach(th->thread);
+-#endif // defined(_WIN32)
+-
+-        std::string threadName("fne:parrot");
+-        TrafficNetwork* fne = static_cast<TrafficNetwork*>(th->obj);
+-        if (fne == nullptr) {
+-            g_killed = true;
+-            LogError(LOG_HOST, "[FAIL] %s", threadName.c_str());
+-        }
+-
+-        if (g_killed) {
+-            delete th;
+-            return nullptr;
+-        }
+-
+-        LogInfoEx(LOG_HOST, "[ OK ] %s", threadName.c_str());
++void TrafficNetwork::parrotLoop()
++{
++    const std::string threadName("fne:parrot");
++    LogInfoEx(LOG_HOST, "[ OK ] %s", threadName.c_str());
+ #ifdef _GNU_SOURCE
+-        ::pthread_setname_np(th->thread, threadName.c_str());
+-#endif // _GNU_SOURCE
+-
+-        StopWatch stopWatch;
++    ::pthread_setname_np(::pthread_self(), threadName.c_str());
++#endif
++    StopWatch stopWatch;
++    stopWatch.start();
++    while (!m_parrotStop.load()) {
++#if defined(CATCH2_TEST_COMPILATION)
++        if (m_parrotIterationTestHook) m_parrotIterationTestHook();
++#endif
++        if (m_parrotStop.load()) break;
++        uint32_t ms = stopWatch.elapsed();
+         stopWatch.start();
+ 
+-        if (fne != nullptr) {
+-            while (!g_killed) {
+-                uint32_t ms = stopWatch.elapsed();
+-                stopWatch.start();
+-
+-                fne->m_parrotDelayTimer.clock(ms);
+-                if (fne->m_parrotDelayTimer.isRunning() && fne->m_parrotDelayTimer.hasExpired()) {
+-                    // if the DMR handler has parrot frames to playback, playback a frame
+-                    if (fne->m_tagDMR->hasParrotFrames()) {
+-                        fne->m_tagDMR->playbackParrot();
+-                    }
+-
+-                    // if the P25 handler has parrot frames to playback, playback a frame
+-                    if (fne->m_tagP25->hasParrotFrames()) {
+-                        fne->m_tagP25->playbackParrot();
+-                    }
+-
+-                    // if the NXDN handler has parrot frames to playback, playback a frame
+-                    if (fne->m_tagNXDN->hasParrotFrames()) {
+-                        fne->m_tagNXDN->playbackParrot();
+-                    }
+-
+-                    // if the analog handler has parrot frames to playback, playback a frame
+-                    if (fne->m_tagAnalog->hasParrotFrames()) {
+-                        fne->m_tagAnalog->playbackParrot();
+-                    }
+-                }
+-
+-                if (!fne->m_tagDMR->hasParrotFrames() && !fne->m_tagP25->hasParrotFrames() && !fne->m_tagNXDN->hasParrotFrames() && !fne->m_tagAnalog->hasParrotFrames() &&
+-                    fne->m_parrotDelayTimer.isRunning() && fne->m_parrotDelayTimer.hasExpired()) {
+-                    fne->m_parrotDelayTimer.stop();
+-                }
+-
+-                if (!fne->m_parrotDelayTimer.isRunning()) {
+-                    // if the DMR handle is marked as playing back parrot frames, but has no more frames in the queue
+-                    // clear the playback flag
+-                    if (fne->m_tagDMR->isParrotPlayback() && !fne->m_tagDMR->hasParrotFrames()) {
+-                        LogInfoEx(LOG_MASTER, "DMR, Parrot Call End, peer = %u, srcId = %u, dstId = %u",
+-                                   fne->m_tagDMR->lastParrotPeerId(), fne->m_tagDMR->lastParrotSrcId(), fne->m_tagDMR->lastParrotDstId());
+-                        fne->m_tagDMR->clearParrotPlayback();
+-                    }
+-
+-                    // if the P25 handle is marked as playing back parrot frames, but has no more frames in the queue
+-                    // clear the playback flag
+-                    if (fne->m_tagP25->isParrotPlayback() && !fne->m_tagP25->hasParrotFrames()) {
+-                        LogInfoEx(LOG_MASTER, "P25, Parrot Call End, peer = %u, srcId = %u, dstId = %u",
+-                                   fne->m_tagP25->lastParrotPeerId(), fne->m_tagP25->lastParrotSrcId(), fne->m_tagP25->lastParrotDstId());
+-                        fne->m_tagP25->clearParrotPlayback();
+-                    }
+-
+-                    // if the NXDN handle is marked as playing back parrot frames, but has no more frames in the queue
+-                    // clear the playback flag
+-                    if (fne->m_tagNXDN->isParrotPlayback() && !fne->m_tagNXDN->hasParrotFrames()) {
+-                        LogInfoEx(LOG_MASTER, "NXDN, Parrot Call End, peer = %u, srcId = %u, dstId = %u",
+-                                   fne->m_tagNXDN->lastParrotPeerId(), fne->m_tagNXDN->lastParrotSrcId(), fne->m_tagNXDN->lastParrotDstId());
+-                        fne->m_tagNXDN->clearParrotPlayback();
+-                    }
+-
+-                    // if the analog handle is marked as playing back parrot frames, but has no more frames in the queue
+-                    // clear the playback flag
+-                    if (fne->m_tagAnalog->isParrotPlayback() && !fne->m_tagAnalog->hasParrotFrames()) {
+-                        LogInfoEx(LOG_MASTER, "Analog, Parrot Call End, peer = %u, srcId = %u, dstId = %u",
+-                                   fne->m_tagAnalog->lastParrotPeerId(), fne->m_tagAnalog->lastParrotSrcId(), fne->m_tagAnalog->lastParrotDstId());
+-                        fne->m_tagAnalog->clearParrotPlayback();
+-                    }
+-                }
+-
+-                Thread::sleep(1U);
+-            }
+-        }
+-
+-        LogInfoEx(LOG_HOST, "[STOP] %s", threadName.c_str());
+-        delete th;
+-    }
+-
+-    return nullptr;
++        m_parrotDelayTimer.clock(ms);
++        if (m_parrotDelayTimer.isRunning() && m_parrotDelayTimer.hasExpired()) {
++            // if the DMR handler has parrot frames to playback, playback a frame
++            if (m_tagDMR->hasParrotFrames()) {
++                m_tagDMR->playbackParrot();
++            }
++
++            // if the P25 handler has parrot frames to playback, playback a frame
++            if (m_tagP25->hasParrotFrames()) {
++                m_tagP25->playbackParrot();
++            }
++
++            // if the NXDN handler has parrot frames to playback, playback a frame
++            if (m_tagNXDN->hasParrotFrames()) {
++                m_tagNXDN->playbackParrot();
++            }
++
++            // if the analog handler has parrot frames to playback, playback a frame
++            if (m_tagAnalog->hasParrotFrames()) {
++                m_tagAnalog->playbackParrot();
++            }
++        }
++
++        if (!m_tagDMR->hasParrotFrames() && !m_tagP25->hasParrotFrames() && !m_tagNXDN->hasParrotFrames() && !m_tagAnalog->hasParrotFrames() &&
++            m_parrotDelayTimer.isRunning() && m_parrotDelayTimer.hasExpired()) {
++            m_parrotDelayTimer.stop();
++        }
++
++        if (!m_parrotDelayTimer.isRunning()) {
++            // if the DMR handle is marked as playing back parrot frames, but has no more frames in the queue
++            // clear the playback flag
++            if (m_tagDMR->isParrotPlayback() && !m_tagDMR->hasParrotFrames()) {
++                LogInfoEx(LOG_MASTER, "DMR, Parrot Call End, peer = %u, srcId = %u, dstId = %u",
++                           m_tagDMR->lastParrotPeerId(), m_tagDMR->lastParrotSrcId(), m_tagDMR->lastParrotDstId());
++                m_tagDMR->clearParrotPlayback();
++            }
++
++            // if the P25 handle is marked as playing back parrot frames, but has no more frames in the queue
++            // clear the playback flag
++            if (m_tagP25->isParrotPlayback() && !m_tagP25->hasParrotFrames()) {
++                LogInfoEx(LOG_MASTER, "P25, Parrot Call End, peer = %u, srcId = %u, dstId = %u",
++                           m_tagP25->lastParrotPeerId(), m_tagP25->lastParrotSrcId(), m_tagP25->lastParrotDstId());
++                m_tagP25->clearParrotPlayback();
++            }
++
++            // if the NXDN handle is marked as playing back parrot frames, but has no more frames in the queue
++            // clear the playback flag
++            if (m_tagNXDN->isParrotPlayback() && !m_tagNXDN->hasParrotFrames()) {
++                LogInfoEx(LOG_MASTER, "NXDN, Parrot Call End, peer = %u, srcId = %u, dstId = %u",
++                           m_tagNXDN->lastParrotPeerId(), m_tagNXDN->lastParrotSrcId(), m_tagNXDN->lastParrotDstId());
++                m_tagNXDN->clearParrotPlayback();
++            }
++
++            // if the analog handle is marked as playing back parrot frames, but has no more frames in the queue
++            // clear the playback flag
++            if (m_tagAnalog->isParrotPlayback() && !m_tagAnalog->hasParrotFrames()) {
++                LogInfoEx(LOG_MASTER, "Analog, Parrot Call End, peer = %u, srcId = %u, dstId = %u",
++                           m_tagAnalog->lastParrotPeerId(), m_tagAnalog->lastParrotSrcId(), m_tagAnalog->lastParrotDstId());
++                m_tagAnalog->clearParrotPlayback();
++            }
++        }
++
++        Thread::sleep(1U);
++    }
++    LogInfoEx(LOG_HOST, "[STOP] %s", threadName.c_str());
+ }
+ 
+ /* Process a data frames from the network. */
+--- a/src/fne/network/TrafficNetwork.h
++++ b/src/fne/network/TrafficNetwork.h
+@@ -48,6 +48,11 @@
+ #include <cstdint>
+ #include <unordered_map>
+ #include <mutex>
++#include <atomic>
++#include <thread>
++#if defined(CATCH2_TEST_COMPILATION)
++#include <functional>
++#endif
+ 
+ // ---------------------------------------------------------------------------
+ //  Class Prototypes
+@@ -292,6 +297,7 @@
+     private:
+ #if defined(CATCH2_TEST_COMPILATION)
+         friend struct KeyIngressTestAccess;
++        friend struct ParrotWorkerTestAccess;
+ #endif
+         friend class MetadataNetwork;
+         friend class callhandler::TagDMRData;
+@@ -404,6 +410,14 @@
+         uint32_t m_jitterMaxWait;
+ 
+         ThreadPool m_threadPool;
++        std::mutex m_lifecycleMutex;
++        bool m_open;
++        std::atomic<bool> m_parrotStop;
++        std::thread m_parrotThread;
++#if defined(CATCH2_TEST_COMPILATION)
++        std::function<void()> m_parrotIterationTestHook;
++        std::function<void()> m_parrotBeforeJoinTestHook;
++#endif
+ 
+         bool m_disablePacketData;
+         bool m_dumpPacketData;
+@@ -421,12 +435,12 @@
+         bool m_reportPeerPing;
+         bool m_verbose;
+ 
+-        /**
+-         * @brief Entry point to parrot handler thread.
+-         * @param arg Instance of the thread_t structure.
+-         * @returns void* (Ignore)
+-         */
+-        static void* threadParrotHandler(void* arg);
++        /** @brief Parrot worker body, owned and joined by this network. */
++        void parrotLoop();
++        /** @brief Request local worker stop and join before retiring dependencies. */
++        void stopParrot();
++        /** @brief Close while the lifecycle mutex is held. */
++        void closeLocked();
+         /**
+          * @brief Entry point to process a given network packet.
+          * @param req Instance of the NetPacketRequest structure.
+--- a/tests/fne/KeylessIngress_Tests.cpp
++++ b/tests/fne/KeylessIngress_Tests.cpp
+@@ -48,7 +48,6 @@
+     EKCKeyItem find(uint32_t) override { ++lookups; return EKCKeyItem(); }
+ };
+ struct Fixture {
+-    bool stopped = (g_killed = true);
+     HostFNE host{"unused-test-configuration"};
+     ::lookups::PeerListLookup peers{"", 0U, false};
+     CountingKeys keys;
+--- a/tests/fne/SubscriberAccessIngress_Tests.cpp
++++ b/tests/fne/SubscriberAccessIngress_Tests.cpp
+@@ -23,15 +23,12 @@
+     using network::BaseNetwork::createP25_TDUMessage;
+ };
+ struct Fixture {
+-    // The constructor creates a detached parrot worker; keep its normal stop
+-    // flag set so this unopened fixture never runs a background media loop.
+-    bool stopBackgroundThreads = (g_killed = true);
+     HostFNE host{"unused-test-configuration"};
+     ::lookups::RadioIdLookup radios{"",0U,true};
+     ::lookups::TalkgroupRulesLookup groups{"",0U,true};
+-    IngressNetwork network{&host,"127.0.0.1",49994U,100101001U,"unopened-test-secret","Unopened test",false,false,false,false,
+-        false,true,false,false,0U,false,false,false,5U,0U,1U};
+-    Fixture() {
++    IngressNetwork network;
++    explicit Fixture(uint16_t port=49994U) : network{&host,"127.0.0.1",port,100101001U,"unopened-test-secret","Unopened test",false,false,false,false,
++        false,true,false,false,0U,false,false,false,5U,0U,1U} {
+         g_logDisplayLevel=0U; radios.addEntry(RID,true,"Subscriber"); radios.addEntry(APP,true,"Console"); radios.addEntry(DISABLED,false,"Disabled");
+         network.setLookups(&radios,&groups,nullptr,nullptr,nullptr);
+         yaml::Node config; REQUIRE(yaml::Parse(config,std::string(R"(
+@@ -142,3 +139,146 @@
+     REQUIRE_FALSE(grants.network.p25TrafficHandler()->processGrantReq(19999U,TG,false,CONSOLE,1U,2U));
+     REQUIRE(grants.network.p25TrafficHandler()->processGrantReq(APP,TG,false,CONSOLE,1U,3U));
+ }
++
++// Owner-lifetime fixtures execute the actual FNE open/close and parrot loop.
++// Successful test sockets are unbound local UDP descriptors (port0), with no
++// peers or packet I/O. A bound loopback reservation makes failure deterministic.
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <future>
++#include <mutex>
++#include <thread>
++
++namespace network {
++struct ParrotWorkerTestAccess {
++    static void unbound(TrafficNetwork& n) {
++        // Test-only endpoint selection before any owner exists. No UDP bind or
++        // send is needed to exercise the actual successful-open lifecycle.
++        std::lock_guard<std::mutex> lock(n.m_lifecycleMutex);
++        n.m_port=0U; n.m_socket->close(); delete n.m_frameQueue; delete n.m_socket;
++        n.m_socket=new udp::Socket(n.m_address,n.m_port);
++        n.m_frameQueue=new FrameQueue(n.m_socket,n.m_peerId,n.m_debug);
++    }
++    static bool reopenSocket(TrafficNetwork& n) { const bool opened=n.m_socket->open(); n.m_socket->close(); return opened; }
++    static bool joined(TrafficNetwork& n) {
++        std::lock_guard<std::mutex> lock(n.m_lifecycleMutex);
++        return !n.m_open && !n.m_parrotThread.joinable();
++    }
++    static const void* socket(TrafficNetwork& n) { return n.m_socket; }
++    static void iteration(TrafficNetwork& n, std::function<void()> hook) { n.m_parrotIterationTestHook = std::move(hook); }
++    static void beforeJoin(TrafficNetwork& n, std::function<void()> hook) { n.m_parrotBeforeJoinTestHook = std::move(hook); }
++    static void delay(TrafficNetwork& n) { n.m_parrotDelayTimer.setTimeout(0U,1U); n.m_parrotDelayTimer.start(); }
++    static bool delayRunning(TrafficNetwork& n) { return n.m_parrotDelayTimer.isRunning(); }
++};
++}
++namespace {
++using WorkerAccess = network::ParrotWorkerTestAccess;
++struct WorkerGate {
++    std::mutex mutex;
++    std::condition_variable changed;
++    bool entered = false, release = false, stopping = false, dependencyRead = false;
++    bool wait(bool WorkerGate::*field) {
++        std::unique_lock<std::mutex> lock(mutex);
++        return changed.wait_for(lock,std::chrono::seconds(2),[&]{ return this->*field; });
++    }
++    void signal(bool WorkerGate::*field) {
++        std::lock_guard<std::mutex> lock(mutex);
++        this->*field = true; changed.notify_all();
++    }
++};
++void observeWorker(Fixture& f, const std::shared_ptr<WorkerGate>& gate) {
++    WorkerAccess::iteration(f.network,[gate]{gate->signal(&WorkerGate::entered);});
++}
++#if !defined(_WIN32)
++struct ReservedLoopbackPort {
++    int descriptor = ::socket(AF_INET,SOCK_DGRAM,0);
++    uint16_t port = 0U;
++    ReservedLoopbackPort() {
++        REQUIRE(descriptor >= 0);
++        sockaddr_in address{}; address.sin_family = AF_INET;
++        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++        REQUIRE(::bind(descriptor,reinterpret_cast<sockaddr*>(&address),sizeof(address)) == 0);
++        socklen_t length = sizeof(address);
++        REQUIRE(::getsockname(descriptor,reinterpret_cast<sockaddr*>(&address),&length) == 0);
++        port = ntohs(address.sin_port); REQUIRE(port != 0U);
++    }
++    ~ReservedLoopbackPort() { if(descriptor >= 0) ::close(descriptor); }
++};
++#endif
++}
++
++TEST_CASE("unopened FNE owns no parrot worker and rapid open retirement joins each owner", "[fne-worker]") {
++    for(unsigned n=0;n<32U;++n) {
++        Fixture f;
++        REQUIRE(WorkerAccess::joined(f.network));
++        if(n%2U == 0U) continue; // destructor of an unopened network is safe.
++        WorkerAccess::unbound(f.network);
++        auto gate=std::make_shared<WorkerGate>(); observeWorker(f,gate);
++        const auto socket=WorkerAccess::socket(f.network);
++        REQUIRE(f.network.open()); const bool entered=gate->wait(&WorkerGate::entered);
++        REQUIRE(f.network.open()); // same owner, no replacement worker/socket.
++        REQUIRE(WorkerAccess::socket(f.network)==socket);
++        f.network.close(); f.network.close();
++        REQUIRE(entered); REQUIRE(WorkerAccess::joined(f.network));
++    }
++}
++
++TEST_CASE("FNE close and destruction join a blocked actual worker before dependencies retire", "[fne-worker]") {
++    for(bool destroy:{false,true}) {
++        auto f=std::make_unique<Fixture>(); WorkerAccess::unbound(f->network);
++        auto gate=std::make_shared<WorkerGate>(); auto* raw=f.get();
++        WorkerAccess::iteration(f->network,[gate,raw]{
++            std::unique_lock<std::mutex> lock(gate->mutex);
++            gate->entered=true; gate->changed.notify_all();
++            gate->changed.wait(lock,[&]{return gate->release;}); lock.unlock();
++            // This accesses the actual handler after close/destructor requested
++            // stop. Joining must retain that dependency until this returns.
++            const bool valid=!raw->network.p25TrafficHandler()->hasParrotFrames();
++            lock.lock(); gate->dependencyRead=valid; gate->changed.notify_all();
++        });
++        WorkerAccess::beforeJoin(f->network,[gate]{gate->signal(&WorkerGate::stopping);});
++        REQUIRE(f->network.open()); const bool entered=gate->wait(&WorkerGate::entered);
++        auto retire=std::async(std::launch::async,[&]{if(destroy)f.reset();else f->network.close();});
++        const bool stopping=gate->wait(&WorkerGate::stopping);
++        const bool blocked=retire.wait_for(std::chrono::milliseconds(0))==std::future_status::timeout;
++        gate->signal(&WorkerGate::release); retire.get(); // cleanup before assertions
++        REQUIRE(entered); REQUIRE(stopping); REQUIRE(blocked); REQUIRE(gate->dependencyRead);
++        if(!destroy) REQUIRE(WorkerAccess::joined(f->network));
++    }
++}
++
++TEST_CASE("failed FNE opens start no worker and the same owner can reopen cleanly", "[fne-worker]") {
++    {
++        Fixture f; auto gate=std::make_shared<WorkerGate>(); observeWorker(f,gate);
++        yaml::Node invalid; REQUIRE(yaml::Parse(invalid,std::string("p25Sites: true\n")));
++        f.network.setOptions(invalid,false);
++        REQUIRE_FALSE(f.network.open()); REQUIRE(WorkerAccess::joined(f.network)); REQUIRE_FALSE(gate->entered);
++    }
++#if !defined(_WIN32)
++    ReservedLoopbackPort reserved;
++    Fixture f(reserved.port); auto gate=std::make_shared<WorkerGate>(); observeWorker(f,gate);
++    REQUIRE_FALSE(f.network.open()); REQUIRE(WorkerAccess::joined(f.network)); REQUIRE_FALSE(gate->entered);
++    // Socket::read uses this same no-argument open for error recovery. It must
++    // still name the configured occupied endpoint, rather than empty/port0.
++    REQUIRE_FALSE(WorkerAccess::reopenSocket(f.network));
++    f.network.close(); WorkerAccess::unbound(f.network);
++    for(unsigned n=0;n<16U;++n) {
++        gate=std::make_shared<WorkerGate>(); observeWorker(f,gate);
++        REQUIRE(f.network.open()); const bool entered=gate->wait(&WorkerGate::entered);
++        f.network.close(); REQUIRE(entered); REQUIRE(WorkerAccess::joined(f.network));
++    }
++#endif
++}
++
++TEST_CASE("owned parrot worker preserves normal empty-playback timer retirement", "[fne-worker]") {
++    Fixture f; WorkerAccess::unbound(f.network); WorkerAccess::delay(f.network);
++    auto gate=std::make_shared<WorkerGate>();
++    WorkerAccess::iteration(f.network,[&f,gate]{
++        // Only the worker reads the timer while it runs; the preserved loop
++        // stops an expired playback timer when every protocol queue is empty.
++        if(!WorkerAccess::delayRunning(f.network)) gate->signal(&WorkerGate::entered);
++    });
++    REQUIRE(f.network.open()); const bool processed=gate->wait(&WorkerGate::entered);
++    f.network.close(); REQUIRE(processed); REQUIRE(WorkerAccess::joined(f.network));
++}

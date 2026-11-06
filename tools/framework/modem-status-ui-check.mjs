@@ -1,0 +1,98 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+
+const [fixturePath, outputPath] = process.argv.slice(2);
+const fixture = JSON.parse(await fs.readFile(fixturePath, 'utf8'));
+const output = path.resolve(outputPath);
+await fs.mkdir(output, {recursive:true});
+const module = process.env.TRUNKSYSTEM_PLAYWRIGHT || 'playwright';
+const {chromium} = await import(module);
+const browser = await chromium.launch({headless:true, channel:'chrome'});
+const report = {scope:'Disposable real Go services with explicitly synthetic telemetry fixtures. Browser/presentation qualification only; no RF, USB or production endpoints.', instances:[]};
+try {
+  for (const role of fixture.roles) {
+    assert.ok(['127.0.0.1','localhost'].includes(new URL(role.origin).hostname));
+    const context = await browser.newContext({viewport:{width:1440,height:1000}});
+    const page = await context.newPage(), errors = [], requests = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.goto(role.origin + '/login');
+    await page.locator('[name=username]').fill(role.username);
+    await page.locator('[name=password]').fill(role.password);
+    await Promise.all([page.waitForURL(role.origin + '/'), page.locator('form[action="/login"] button').click()]);
+    page.on('request', request => requests.push({url:request.url(), method:request.method()}));
+    await page.goto(role.origin + '/modem-status');
+    await page.getByRole('button', {name:'Pause updates', exact:true}).waitFor();
+    assert.ok(await page.locator('.modem-chart circle').count() >= 4);
+    assert.ok((await page.locator('[data-modem-reports]').innerText()).includes('0.1400%'));
+    assert.equal(await page.locator('#admin-content input, #admin-content select, #admin-content textarea, #admin-content form').count(), 0);
+    await page.waitForResponse(response => response.url().includes('fragment=1') && response.status() === 200);
+    await page.getByRole('button', {name:'Pause updates', exact:true}).click();
+    await page.waitForTimeout(100);
+    const pausedCount = requests.filter(request => request.url.includes('fragment=1')).length;
+    await page.waitForTimeout(2300);
+    assert.equal(requests.filter(request => request.url.includes('fragment=1')).length, pausedCount, 'paused page stops refresh requests');
+    assert.ok((await page.locator('[data-modem-update]').innerText()).includes('Paused'));
+    assert.ok((await page.locator('[data-modem-live-state]').first().innerText()).includes('Unavailable'));
+    await Promise.all([page.waitForResponse(response => response.url().includes('fragment=1')), page.getByRole('button',{name:'Resume updates',exact:true}).click()]);
+    const fragmentRoute = '**/modem-status?fragment=1';
+    await page.route(fragmentRoute, route => route.abort());
+    await page.waitForFunction(() => document.querySelector('[data-modem-update]').textContent.includes('failed'));
+    assert.ok((await page.locator('[data-modem-live-state]').first().innerText()).includes('Unavailable'));
+    assert.ok(await page.locator('.modem-chart circle').count() >= 4, 'failure retains historical samples');
+    await page.unroute(fragmentRoute);
+    await page.waitForFunction(() => document.querySelector('[data-modem-update]').textContent === 'Updating automatically');
+    const help = page.locator('.modem-site .ts-help').first();
+    await help.hover();await help.locator('.ts-helpbody').waitFor({state:'visible'});
+    await page.mouse.move(1,1);await help.locator('.ts-helpbody').waitFor({state:'hidden'});
+    await help.focus();await page.keyboard.press('Shift+Tab');await page.keyboard.press('Tab');
+    await page.waitForResponse(response => response.url().includes('fragment=1'));
+    assert.ok(await page.evaluate(() => document.activeElement.matches('.ts-help')), 'refresh preserves information keyboard focus');
+    const link = page.locator('.modem-table a').first();
+    await link.focus();
+    await page.waitForResponse(response => response.url().includes('fragment=1'));
+    assert.ok(await page.evaluate(() => document.activeElement.closest('.modem-table') !== null), 'refresh preserves table keyboard focus');
+    await page.keyboard.press('Enter');
+    assert.match(new URL(page.url()).hash, /modem-chart/);
+    await page.getByRole('button',{name:'Pause updates',exact:true}).click();
+    const layouts = [];
+    for (const width of [1440,1024,736,320]) {
+      await page.setViewportSize({width,height:1000});
+      const size = await page.evaluate(() => ({scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth}));
+      assert.ok(size.scroll <= size.client + 1, JSON.stringify({role:role.role,width,...size}));
+      layouts.push({width,...size});
+      await page.screenshot({path:path.join(output,role.role + '-' + width + '-light.png'),fullPage:true});
+    }
+    await page.setViewportSize({width:1440,height:1000});
+    await page.locator('[data-admin-theme]').click();
+    await page.screenshot({path:path.join(output,role.role + '-dark.png'),fullPage:true});
+    await page.evaluate(() => {document.documentElement.style.zoom='2';});
+    const zoom = await page.evaluate(() => ({scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth}));
+    assert.ok(zoom.scroll <= zoom.client + 1, JSON.stringify(zoom));
+    await page.screenshot({path:path.join(output,role.role + '-zoom-200.png'),fullPage:true});
+    await page.evaluate(() => {document.documentElement.style.zoom='';});
+    assert.deepEqual(errors, []);
+    assert.deepEqual(requests.filter(request => request.method !== 'GET'), [], 'live status never writes or issues a command');
+    assert.deepEqual(requests.filter(request => new URL(request.url).origin !== role.origin), [], 'browser only uses its serving service');
+    const fragments = requests.filter(request => request.url.includes('fragment=1')).length;
+    await page.goto(role.origin + '/modems');
+    assert.equal(await page.locator('script[src="/modem-status.js"]').count(), 0, 'configuration does not load telemetry polling');
+    await page.waitForTimeout(2300);
+    assert.equal(requests.filter(request => request.url.includes('fragment=1')).length, fragments);
+    report.instances.push({role:role.role,layouts,zoom,fragment_requests:fragments,errors});
+    await context.close();
+    const plain = await browser.newContext({javaScriptEnabled:false});
+    const nojs = await plain.newPage();
+    await nojs.goto(role.origin + '/login');
+    await nojs.locator('[name=username]').fill(role.username);
+    await nojs.locator('[name=password]').fill(role.password);
+    await Promise.all([nojs.waitForURL(role.origin + '/'), nojs.locator('form[action="/login"] button').click()]);
+    await nojs.goto(role.origin + '/modem-status');
+    assert.ok(await nojs.locator('.modem-chart circle').count() >= 4, 'server-rendered charts work without JavaScript');
+    await plain.close();
+  }
+  await fs.writeFile(path.join(output,'browser-receipt.json'),JSON.stringify(report,null,2)+'\n');
+  console.log(JSON.stringify(report));
+} finally {
+  await browser.close();
+}

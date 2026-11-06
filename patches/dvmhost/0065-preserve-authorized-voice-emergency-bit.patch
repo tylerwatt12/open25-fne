@@ -1,0 +1,269 @@
+--- a/src/bridge/HostBridge.Opaque.cpp
++++ b/src/bridge/HostBridge.Opaque.cpp
+@@ -34,7 +34,7 @@
+     write32(packet+12,src);write32(packet+16,dst);write64(packet+24,++m_opaqueRxSequence);
+     std::memcpy(packet+32,m_opaqueRxToken,16);
+     if (supportedSecure(m_opaqueRxAlgorithm)) std::memcpy(packet+48,m_opaqueRxMI,9);
+-    packet[57]=m_opaqueRxMFId;
++    packet[57]=m_opaqueRxMFId;packet[60]=m_opaqueRxEmergency?1:0;
+     write16(packet+58,end?0:11);
+     if (!end) std::memcpy(packet+packetHeader,imbe,11);
+     if (!end) std::memcpy(m_opaqueRxVoiceHeader,packet,packetHeader);
+@@ -104,12 +104,14 @@
+         if(active)endOpaqueP25Receive(true);
+         for(auto& previous:m_opaqueRxRetired)if(previous.first!=received.streamId)previous.second.terminal=true;
+     m_opaqueRxSequence=0;m_opaqueRxControlSequence=0;m_opaqueRxAlgorithm=0;m_opaqueRxKey=0;
+-        m_opaqueRxMFId=manufacturer;
++        m_opaqueRxMFId=manufacturer;m_opaqueRxEmergency=false;
+         std::memset(m_opaqueRxMI,0,9);std::memset(m_opaqueRxToken,0,16);
+         const uint64_t now=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+         write64(m_opaqueRxToken,now);write32(m_opaqueRxToken+8,received.streamId);write32(m_opaqueRxToken+12,src);
+         m_rxStreamId=received.streamId;m_opaqueRxSource=src;m_callInProgress=true;
+     }
++    if(duid==DUID::LDU1 && dfsiLC.control()->getLCO()==LCO::GROUP)
++        m_opaqueRxEmergency=dfsiLC.control()->getEmergency();
+     m_opaqueRxReceived=received;
+     m_opaqueRxLastFrame=std::chrono::steady_clock::now();
+     m_opaqueRxNextActivity=m_opaqueRxLastFrame+std::chrono::milliseconds(100);
+@@ -169,7 +171,7 @@
+         if(m_opaqueRxRetiredOrder.size()>64U){m_opaqueRxRetired.erase(m_opaqueRxRetiredOrder.front());m_opaqueRxRetiredOrder.pop_front();}
+         if(m_network!=nullptr)m_network->retireP25Receive(m_rxStreamId);
+     }
+-    m_opaqueRxSequence=0;m_opaqueRxControlSequence=0;m_opaqueRxAlgorithm=0;
++    m_opaqueRxSequence=0;m_opaqueRxControlSequence=0;m_opaqueRxAlgorithm=0;m_opaqueRxEmergency=false;
+     m_opaqueRxLastFrame={};m_opaqueRxNextActivity={};
+     std::memset(m_opaqueRxVoiceHeader,0,packetHeader);
+     m_rxStreamId=0;
+@@ -182,12 +184,13 @@
+ {
+     using namespace p25;
+     using namespace p25::defines;
+-    if (length<packetHeader || std::memcmp(packet,"DV25",4) || packet[4]!=16 || packet[5] || length!=packetHeader+read16(packet+58)) return;
++    if (length<packetHeader || std::memcmp(packet,"DV25",4) || packet[4]!=16 || packet[5] || length!=packetHeader+read16(packet+58) || packet[60]>1 || packet[61] || packet[62] || packet[63]) return;
+     uint32_t src=read32(packet+12),dst=read32(packet+16);uint16_t flags=read16(packet+10),key=read16(packet+8);
+     uint64_t sequence=read64(packet+24);uint8_t algorithm=packet[6],index=packet[7],manufacturer=packet[57];
+     if (!src || src>0xfffffb || dst!=m_dstId || (flags&~1U) || manufacturer>1) return;
++    const bool emergency=packet[60]!=0;
+     if (flags&1) {
+-        if (length==packetHeader && m_trafficFromUDP && manufacturer==m_opaqueTxMFId && std::memcmp(packet+32,m_opaqueTxToken,16)==0) callEnd(src,dst);
++        if (length==packetHeader && m_trafficFromUDP && manufacturer==m_opaqueTxMFId && emergency==m_opaqueTxEmergency && std::memcmp(packet+32,m_opaqueTxToken,16)==0) callEnd(src,dst);
+         return;
+     }
+     if (length!=packetHeader+11 || !sequence || index>17 || !((algorithm==0x80 && key==0)||supportedSecure(algorithm))) return;
+@@ -204,10 +207,10 @@
+         }
+         m_callInProgress=false;m_networkWatchdog.stop();
+         m_p25N=0;m_opaqueTxSequence=0;m_opaqueTxAlgorithm=algorithm;m_opaqueTxKey=key;
+-        m_opaqueTxMFId=manufacturer;
++        m_opaqueTxMFId=manufacturer;m_opaqueTxEmergency=emergency;
+         std::memcpy(m_opaqueTxToken,packet+32,16);
+     }
+-    if (sequence<=m_opaqueTxSequence || algorithm!=m_opaqueTxAlgorithm || key!=m_opaqueTxKey || manufacturer!=m_opaqueTxMFId) return;
++    if (sequence<=m_opaqueTxSequence || algorithm!=m_opaqueTxAlgorithm || key!=m_opaqueTxKey || manufacturer!=m_opaqueTxMFId || emergency!=m_opaqueTxEmergency) return;
+     if (index!=m_p25N) {
+         // A partial LDU is discarded on a network gap. Rejoin on a complete
+         // LDU boundary; never fill encrypted gaps with clear silence.
+@@ -220,7 +223,7 @@
+     m_udpInactivity.received();m_udpDropTime.start();
+     if (index==8 || index==17) {
+         lc::LC control;control.setLCO(LCO::GROUP);control.setGroup(true);control.setPriority(4);
+-        control.setMFId(m_opaqueTxMFId);
++        control.setMFId(m_opaqueTxMFId);control.setEmergency(m_opaqueTxEmergency);
+         control.setSrcId(src);control.setDstId(dst);control.setAlgId(algorithm);control.setKId(key);control.setEncrypted(algorithm!=0x80);
+         uint8_t mi[9]{};if (algorithm!=0x80) std::memcpy(mi,packet+48,9);
+         if (index==17 && algorithm!=0x80) {
+--- a/src/bridge/HostBridge.cpp
++++ b/src/bridge/HostBridge.cpp
+@@ -1819,6 +1819,7 @@
+     m_trafficFromUDP = false;
+     m_udpFrameCnt = 0U;
+     m_opaqueTxSequence = 0;
++    m_opaqueTxEmergency = false;
+     ::memset(m_opaqueTxToken, 0, 16);
+ 
+     // ensure PTT is dropped at call end
+--- a/src/bridge/HostBridge.h
++++ b/src/bridge/HostBridge.h
+@@ -229,6 +229,7 @@
+     uint64_t m_opaqueRxSequence = 0, m_opaqueTxSequence = 0;
+     uint8_t m_opaqueRxAlgorithm = 0, m_opaqueTxAlgorithm = 0;
+     uint8_t m_opaqueRxMFId = 0, m_opaqueTxMFId = 0;
++    bool m_opaqueRxEmergency = false, m_opaqueTxEmergency = false;
+     uint16_t m_opaqueRxKey = 0, m_opaqueTxKey = 0;
+     std::mutex m_opaqueRxMutex;
+     std::chrono::steady_clock::time_point m_opaqueRxLastFrame{}, m_opaqueRxNextActivity{};
+--- a/src/bridge/PacketCodec.cpp
++++ b/src/bridge/PacketCodec.cpp
+@@ -155,7 +155,7 @@
+     uint16_t keyID = u16(request.data() + 8), flags = u16(request.data() + 10), size = u16(request.data() + 58);
+     uint32_t source = u32(request.data() + 12), group = u32(request.data() + 16);
+     uint64_t sequence = u64(request.data() + 24);
+-    if (request.size() != Header + size || !source || source > 0xfffffb || !group || group > 65534 || (flags & ~1U) || manufacturer > 1) return reject(1);
++    if (request.size() != Header + size || !source || source > 0xfffffb || !group || group > 65534 || (flags & ~1U) || manufacturer > 1 || request[60] > 1 || request[61] || request[62] || request[63]) return reject(1);
+     std::string identity(reinterpret_cast<char*>(request.data() + 32), 16);
+     identity.append(reinterpret_cast<char*>(request.data() + 12), 8);
+     if (flags & 1) {
+--- a/tests/BridgeOpaqueContinuity_Tests.cpp
++++ b/tests/BridgeOpaqueContinuity_Tests.cpp
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Offline production-method regression. The only replaced boundaries are the
+-// constructor (no devices/threads), outbound Socket::write, and unused TX end.
++// constructor (no devices/threads), outbound Socket::write, and recorded TX end.
+ // Compile this standalone file; it includes the unmodified production .cpp.
+ #if defined(DVM_BRIDGE_OPAQUE_CONTINUITY_STANDALONE)
+ #include <algorithm>
+@@ -23,6 +23,10 @@
+ #include "bridge/HostBridge.Opaque.cpp"
+ #include <catch2/catch_test_macros.hpp>
+ 
++namespace {
++std::function<void(HostBridge*,uint32_t,uint32_t)> txEndRecorder;
++}
++
+ HostBridge::HostBridge(const std::string& conf) :
+     m_confFile(conf), m_inputAudio(1,"test-in"), m_outputAudio(1,"test-out"),
+     m_networkWatchdog(1000U,1U)
+@@ -33,7 +37,10 @@
+     m_udpSendAddress="127.0.0.1";m_udpSendPort=1;
+ }
+ HostBridge::~HostBridge() {}
+-void HostBridge::callEnd(uint32_t,uint32_t) { FAIL("Offline RX fixture must not enter TX callEnd"); }
++void HostBridge::callEnd(uint32_t src,uint32_t dst) {
++    if (txEndRecorder) { txEndRecorder(this,src,dst);return; }
++    FAIL("Offline RX fixture must not enter TX callEnd");
++}
+ 
+ namespace {
+ using namespace p25;
+@@ -50,9 +57,9 @@
+ class TestPeer : public network::PeerNetwork {
+ public:
+     TestPeer():PeerNetwork("127.0.0.1",1,0,12345,"offline-only",true,false,false,true,false,false,false,false,false,false,false,false) {m_p25StreamId=0x12345678;}
+-    UInt8Array packet(uint32_t& size,uint8_t lco,DUID::E duid,unsigned marker,bool header=true,uint8_t mfid=0,uint8_t algorithm=0x80,uint16_t key=0) {
++    UInt8Array packet(uint32_t& size,uint8_t lco,DUID::E duid,unsigned marker,bool header=true,uint8_t mfid=0,uint8_t algorithm=0x80,uint16_t key=0,bool emergency=false) {
+         lc::LC control;control.setLCO(lco);control.setGroup(true);control.setSrcId(10001);control.setDstId(1001);control.setMFId(mfid);
+-        control.setAlgId(algorithm);control.setKId(key);uint8_t mi[9]={1,2,3,4,5,6,7,8,9};control.setMI(mi);
++        control.setEmergency(emergency);control.setPriority(4);control.setAlgId(algorithm);control.setKId(key);uint8_t mi[9]={1,2,3,4,5,6,7,8,9};control.setMI(mi);
+         control.setGrpVchNo(81);data::LowSpeedData lsd;
+         if(duid==DUID::TDU) return createP25_TDUMessage(size,control,lsd,0);
+         uint8_t air[P25_LDU_FRAME_LENGTH_BYTES]{};Audio audio;
+@@ -70,8 +77,8 @@
+     uint16_t packetSequence=0;uint32_t packetTime=0;
+     void deliver(uint8_t* p,uint32_t n) {packetTime+=1440;bridge.processOpaqueP25Network(p,n,network::P25PacketMetadata{0x12345678,packetSequence++,packetTime});}
+ 
+-    void send(uint8_t lco,DUID::E duid,unsigned marker,bool header=true,uint8_t mfid=0,uint8_t algorithm=0x80,uint16_t key=0) {
+-        uint32_t n=0;auto p=peer.packet(n,lco,duid,marker,header,mfid,algorithm,key);
++    void send(uint8_t lco,DUID::E duid,unsigned marker,bool header=true,uint8_t mfid=0,uint8_t algorithm=0x80,uint16_t key=0,bool emergency=false) {
++        uint32_t n=0;auto p=peer.packet(n,lco,duid,marker,header,mfid,algorithm,key,emergency);
+         REQUIRE(p[4]==lco);REQUIRE(p[22]==duid);deliver(p.get(),n);
+     }
+     void assertWords(unsigned offset,unsigned marker,unsigned firstIndex=0,uint8_t algorithm=0x80,uint16_t key=0,uint8_t manufacturer=0) {
+@@ -164,4 +171,75 @@
+     }
+ }
+ 
++
++// AABF-D7.3.1 PDF20/9,7.4 PDF45/34; AABC-E2.3.24 PDF36-38/17-19.
++namespace {
++class EmergencyTransmitPeer : public TestPeer {
++public:
++    std::vector<std::vector<uint8_t>> emitted;
++    bool writeP25LDU1(const lc::LC& control,const data::LowSpeedData& lsd,const uint8_t* data,
++        FrameType::E frameType,uint8_t controlByte) override {
++        uint32_t size=0;auto body=createP25_LDU1Message(size,control,lsd,data,frameType,controlByte);
++        emitted.emplace_back(body.get(),body.get()+size);return true;
++    }
++};
++}
++TEST_CASE("Opaque TX emergency reaches literal DFSI LC without changing priority or crypto", "[bridge-opaque-emergency]") {
++    for(bool emergency:{false,true})for(bool secure:{false,true}) {
++      DYNAMIC_SECTION("emergency "<<emergency<<" secure "<<secure) {
++        std::string conf="offline-emergency-tx";EmergencyTransmitPeer peer;HostBridge bridge(conf);
++        std::array<uint8_t,225> ldu1{},ldu2{};bridge.m_netLDU1=ldu1.data();bridge.m_netLDU2=ldu2.data();bridge.m_network=&peer;
++        std::array<uint8_t,75> packet{};std::memcpy(packet.data(),"DV25",4);packet[4]=16;
++        packet[6]=secure?0x84:0x80;write16(packet.data()+8,secure?7:0);
++        write32(packet.data()+12,10001);write32(packet.data()+16,1001);
++        packet[32]=0xAA;packet[60]=emergency?1:0;write16(packet.data()+58,11);
++        if(secure)for(unsigned i=0;i<9;i++)packet[48+i]=i+1;
++        for(unsigned i=0;i<9;i++){packet[7]=i;write64(packet.data()+24,i+1);bridge.processOpaqueP25UDP(packet.data(),packet.size());}
++        REQUIRE(peer.emitted.size()==1U);const auto& body=peer.emitted[0];REQUIRE(body.size()>=98U);
++        const uint8_t service=emergency?(secure?0xC4:0x84):(secure?0x44:0x04);
++        const std::array<uint8_t,9> expected{{0x00,0x00,service,0x00,0x03,0xE9,0x00,0x27,0x11}};
++        const std::array<size_t,9> offsets{{61,62,63,78,79,80,95,96,97}};
++        for(size_t i=0;i<expected.size();i++)REQUIRE(body[offsets[i]]==expected[i]);
++        const auto sequence=bridge.m_opaqueTxSequence;
++        packet[7]=9;write64(packet.data()+24,10);packet[60]^=1;
++        bridge.processOpaqueP25UDP(packet.data(),packet.size());
++        REQUIRE(bridge.m_opaqueTxSequence==sequence);REQUIRE(peer.emitted.size()==1U);
++        write16(packet.data()+10,1);write16(packet.data()+58,0);
++        bridge.processOpaqueP25UDP(packet.data(),64);REQUIRE(bridge.m_trafficFromUDP);
++        // Admission/owner dispatch proof only: this records the callEnd boundary.
++        // The real callEnd retirement, final LDU/TDU and physical tail need integration.
++        unsigned endCalls=0;
++        REQUIRE_FALSE(bool(txEndRecorder));
++        txEndRecorder=[&](HostBridge* owner,uint32_t src,uint32_t dst) {
++            ++endCalls;CHECK(owner==&bridge);CHECK(src==10001U);CHECK(dst==1001U);
++            CHECK(owner->m_opaqueTxSequence==sequence);CHECK(owner->m_p25N==9U);
++        };
++        packet[60]^=1;
++        CHECK_NOTHROW(bridge.processOpaqueP25UDP(packet.data(),64));
++        txEndRecorder={};
++        REQUIRE(endCalls==1U);REQUIRE(peer.emitted.size()==1U);
++      }
++    }
++    for(unsigned offset:{60U,61U,62U,63U}) {
++        std::string conf="offline-bad-emergency";EmergencyTransmitPeer peer;HostBridge bridge(conf);bridge.m_network=&peer;
++        std::array<uint8_t,225> ldu1{},ldu2{};bridge.m_netLDU1=ldu1.data();bridge.m_netLDU2=ldu2.data();
++        std::array<uint8_t,75> packet{};std::memcpy(packet.data(),"DV25",4);packet[4]=16;packet[6]=0x80;
++        write32(packet.data()+12,10001);write32(packet.data()+16,1001);write64(packet.data()+24,1);write16(packet.data()+58,11);packet[offset]=2;
++        bridge.processOpaqueP25UDP(packet.data(),packet.size());REQUIRE_FALSE(bridge.m_trafficFromUDP);REQUIRE(peer.emitted.empty());
++    }
++}
++TEST_CASE("Opaque RX emergency survives LDU2 update LC and terminal metadata", "[bridge-opaque-emergency]") {
++    for(bool secure:{false,true}) {
++        Fixture f;const uint8_t algorithm=secure?0x84:0x80;const uint16_t key=secure?7:0;
++        f.send(LCO::GROUP,DUID::LDU1,1,true,0,algorithm,key,true);
++        f.send(LCO::GROUP,DUID::LDU2,2,true,0,algorithm,key);
++        f.send(LCO::GROUP_UPDT,DUID::LDU1,3,false,0,algorithm,key);
++        f.send(LCO::GROUP_UPDT,DUID::LDU2,4,false,0,algorithm,key);
++        REQUIRE(f.output.packets.size()==36U);
++        for(const auto& packet:f.output.packets){REQUIRE(packet[60]==1);REQUIRE(packet[6]==algorithm);REQUIRE(packet[57]==0);REQUIRE(read16(packet.data()+8)==key);}
++        f.send(LCO::GROUP_UPDT,DUID::TDU,5);REQUIRE(f.output.packets.size()==37U);
++        REQUIRE(f.output.packets.back()[60]==1);REQUIRE(read16(f.output.packets.back().data()+10)==1);
++    }
++}
++
+ #endif // DVM_BRIDGE_OPAQUE_CONTINUITY_STANDALONE
+--- a/tests/BridgeOpaqueLiveness_Tests.cpp
++++ b/tests/BridgeOpaqueLiveness_Tests.cpp
+@@ -19,8 +19,8 @@
+     uint32_t receivedStream=0x12345678,packetTime=0;uint16_t packetSequence=0;
+     network::P25PacketMetadata metadata(){packetTime+=1440;return {receivedStream,packetSequence++,packetTime};}
+     void stream(uint32_t value){receivedStream=value;packetSequence=0;}
+-    void send(DUID::E duid,unsigned marker,uint8_t algorithm=0x80,uint16_t key=0) {
+-        uint32_t n=0;auto p=peer.packet(n,LCO::GROUP,duid,marker,true,0,algorithm,key);
++    void send(DUID::E duid,unsigned marker,uint8_t algorithm=0x80,uint16_t key=0,bool emergency=false) {
++        uint32_t n=0;auto p=peer.packet(n,LCO::GROUP,duid,marker,true,0,algorithm,key,emergency);
+         bridge.processOpaqueP25Network(p.get(),n,metadata());
+     }
+ };
+@@ -274,6 +274,18 @@
+ }
+ #endif
+ 
++TEST_CASE("Opaque emergency liveness and timeout keep only the current receive header", "[bridge-opaque-emergency]") {
++    LiveFixture f;f.send(DUID::LDU1,1,0x80,0,true);
++    REQUIRE(f.output.packets.size()==9U);const auto token=f.output.packets.front();
++    f.bridge.clockOpaqueP25Receive(f.bridge.m_opaqueRxLastFrame+std::chrono::milliseconds(100));
++    REQUIRE(f.output.packets.size()==10U);REQUIRE(f.output.packets.back()[4]==17);REQUIRE(f.output.packets.back()[60]==1);
++    f.bridge.clockOpaqueP25Receive(f.bridge.m_opaqueRxLastFrame+std::chrono::milliseconds(1500));
++    REQUIRE(f.output.packets.size()==11U);REQUIRE(f.output.packets.back()[60]==1);REQUIRE(read16(f.output.packets.back().data()+10)==1);
++    f.stream(0x87654321);f.send(DUID::LDU1,2);
++    REQUIRE(f.output.packets.size()==20U);REQUIRE(f.output.packets.back()[60]==0);
++    REQUIRE(std::memcmp(f.output.packets.back().data()+32,token.data()+32,16)!=0);
++}
++
+ TEST_CASE("Receive activity is bounded metadata and never consumes a voice sequence", "[opaque-receive-liveness]") {
+     LiveFixture f;f.send(DUID::LDU1,1);
+     const auto first=f.output.packets.front();

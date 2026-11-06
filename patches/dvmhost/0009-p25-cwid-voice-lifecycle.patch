@@ -1,0 +1,1717 @@
+diff --git a/src/host/CWIDDrain.h b/src/host/CWIDDrain.h
+new file mode 100644
+index 0000000..c3217be
+--- /dev/null
++++ b/src/host/CWIDDrain.h
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Bounded completion of already queued normal traffic before identification. */
++#ifndef DVM_HOST_CWID_DRAIN_H
++#define DVM_HOST_CWID_DRAIN_H
++
++#include "CWIDPolicy.h"
++
++namespace identification {
++
++class DrainTransport {
++public:
++    virtual ~DrainTransport() {}
++    virtual uint64_t nowMs() const = 0;
++    virtual bool hasQueued() const = 0;
++    // Submit at most one already queued normal frame. False is a write error;
++    // true may also mean temporary backpressure with the queue left unchanged.
++    virtual bool sendOne() = 0;
++    // Fresh modem status must show no TX after drain began AND after the last
++    // actual frame submission. A transport invalidates its status baseline on
++    // each submission; cached idle from before that write cannot complete drain.
++    virtual bool idleReady() const = 0;
++    virtual bool healthy() const = 0;
++    virtual void pump(uint32_t milliseconds) = 0;
++};
++
++enum class DrainResult { Completed, Fault, Timeout, WriteFailed };
++
++// The caller has closed new permits/readers and exclusively owns the normal
++// modem writer. This executor only finishes its existing queue; it never clears
++// the queue, changes mode, generates an end marker, or begins identification.
++inline DrainResult drain(DrainTransport& transport, uint32_t totalTimeoutMs) {
++    uint64_t previous = transport.nowMs();
++    const uint64_t until = detail::deadline(previous, totalTimeoutMs);
++    uint64_t pumps = uint64_t(totalTimeoutMs) / 20U + 8U;
++    uint64_t now = previous;
++    auto check = [&]() {
++        if (!transport.healthy())
++            return DrainResult::Fault;
++        now = transport.nowMs();
++        if (now < previous)
++            return DrainResult::Fault;
++        previous = now;
++        return now > until ? DrainResult::Timeout : DrainResult::Completed;
++    };
++
++    for (;;) {
++        DrainResult state = check();
++        if (state != DrainResult::Completed)
++            return state;
++        bool queued = transport.hasQueued();
++        state = check();
++        if (state != DrainResult::Completed)
++            return state;
++        if (queued) {
++            // At the exact deadline an observed idle may complete, but no new
++            // normal frame may begin once the remaining drain budget is zero.
++            if (now == until)
++                return DrainResult::Timeout;
++            const bool written = transport.sendOne();
++            state = check();
++            if (state != DrainResult::Completed)
++                return state;
++            if (!written)
++                return DrainResult::WriteFailed;
++            queued = transport.hasQueued();
++            state = check();
++            if (state != DrainResult::Completed)
++                return state;
++        }
++        if (!queued) {
++            const bool idle = transport.idleReady();
++            state = check();
++            if (state != DrainResult::Completed)
++                return state;
++            if (idle) {
++                // Be robust to a transport discovering queued work while it
++                // refreshes status. Both conditions must hold at completion.
++                const bool stillQueued = transport.hasQueued();
++                state = check();
++                if (state != DrainResult::Completed)
++                    return state;
++                if (!stillQueued)
++                    return DrainResult::Completed;
++            }
++        }
++        if (now == until)
++            return DrainResult::Timeout;
++        if (pumps == 0U)
++            return DrainResult::Fault;
++        --pumps;
++        transport.pump(uint32_t(std::min<uint64_t>(20U, until - now)));
++    }
++}
++
++} // namespace identification
++#endif
+diff --git a/src/host/CWIDPolicy.h b/src/host/CWIDPolicy.h
+index 13c8109..f10e06f 100644
+--- a/src/host/CWIDPolicy.h
++++ b/src/host/CWIDPolicy.h
+@@ -15,24 +15,29 @@ namespace identification {
+ class Policy {
+ public:
+     Policy() : m_enabled(false), m_startup(false), m_pending(false),
+-        m_dirty(false), m_previousRF(false), m_intervalMs(0U), m_completedAt(0U) {}
++        m_dirty(false), m_previousRF(false), m_intervalMs(0U), m_completedAt(0U), m_activityAt(0U) {}
+ 
+     void configure(bool enabled, uint32_t intervalSeconds) {
+         m_enabled = enabled;
+         m_startup = enabled;
+         m_pending = m_dirty = m_previousRF = false;
+         m_intervalMs = uint64_t(intervalSeconds) * 1000U;
+-        m_completedAt = 0U;
++        m_completedAt = m_activityAt = 0U;
+     }
+     bool enabled() const { return m_enabled; }
+ 
+     // The caller excludes the identification transmission itself. Only real
+     // non-ID RF activity creates a new periodic/final identification obligation.
+-    void observeRF(bool tx) {
++    void observeRF(bool tx, uint64_t nowMs) {
+         if (!m_enabled)
+             return;
+-        if (tx)
++        if (tx) {
++            // Silence does not consume a communication's identification interval.
++            // After an ID, anchor the next period to its first real RF activity.
++            if (!m_dirty)
++                m_activityAt = std::max(nowMs, m_completedAt);
+             m_dirty = true;
++        }
+         if (m_previousRF && !tx)
+             m_pending = true;
+         m_previousRF = tx;
+@@ -44,7 +49,7 @@ public:
+     }
+     bool due(uint64_t nowMs) const {
+         return m_enabled && (m_startup || m_pending ||
+-            (m_dirty && nowMs >= m_completedAt && nowMs - m_completedAt >= m_intervalMs));
++            (m_dirty && nowMs >= m_activityAt && nowMs - m_activityAt >= m_intervalMs));
+     }
+     const char* reason(uint64_t nowMs) const {
+         if (!due(nowMs))
+@@ -60,12 +65,12 @@ public:
+         if (!m_enabled)
+             return;
+         m_startup = m_pending = m_dirty = m_previousRF = false;
+-        m_completedAt = nowMs;
++        m_completedAt = m_activityAt = nowMs;
+     }
+ 
+ private:
+     bool m_enabled, m_startup, m_pending, m_dirty, m_previousRF;
+-    uint64_t m_intervalMs, m_completedAt;
++    uint64_t m_intervalMs, m_completedAt, m_activityAt;
+ };
+ 
+ // Shared by the actual P25 reader/site updater and the CW quiesce path.
+diff --git a/src/host/Host.cpp b/src/host/Host.cpp
+index b9b8c64..13e2acf 100644
+--- a/src/host/Host.cpp
++++ b/src/host/Host.cpp
+@@ -18,6 +18,7 @@
+ #include "common/Utils.h"
+ #include "modem/port/specialized/V24UDPPort.h"
+ #include "host/Host.h"
++#include "host/CWIDDrain.h"
+ #include "ActivityLog.h"
+ #include "HostMain.h"
+ 
+@@ -1008,11 +1009,11 @@ int Host::run()
+         // ------------------------------------------------------
+ 
+         if (m_identification.enabled() && !g_killed) {
+-            m_identification.observeRF(m_modem->hasTX());
+-            if (m_p25 != nullptr && m_p25->identificationPending())
+-                m_identification.noteVoiceEnd();
+             const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch()).count();
++            m_identification.observeRF(m_modem->hasTX(), uint64_t(now));
++            if (m_p25 != nullptr && m_p25->identificationPending())
++                m_identification.noteVoiceEnd();
+             if (m_identification.due(uint64_t(now)))
+                 sendIdentification(m_identification.reason(uint64_t(now)), true);
+         }
+@@ -1585,6 +1586,80 @@ uint64_t identificationNow() {
+     return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+         std::chrono::steady_clock::now().time_since_epoch()).count());
+ }
++// Finish the already accepted voice queue under the Host writer lock. A
++// version reply fences prior serial responses before quiet status is accepted.
++class CWVoiceDrainTransport final : public identification::DrainTransport {
++public:
++    CWVoiceDrainTransport(p25::Control& controller, modem::Modem& modem, std::function<void()> heartbeat) :
++        m_controller(controller), m_modem(modem), m_heartbeat(std::move(heartbeat)),
++        m_lastPump(identificationNow()), m_lastStatus(modem.statusGeneration()),
++        m_barrierGeneration(modem.serialBarrierGeneration()), m_rejectGeneration(modem.p25WriteRejectGeneration()), m_quietSamples(0U),
++        m_barrierRequested(false), m_barrierPassed(false), m_failed(false) {}
++    uint64_t nowMs() const override { return identificationNow(); }
++    bool hasQueued() const override { return m_controller.peekFrameLength() != 0U; }
++    bool sendOne() override {
++        const uint32_t next = m_controller.peekFrameLength();
++        if (next == 0U) return true;
++        if (!m_modem.hasP25Space(next)) return true; // Backpressure; do not pop.
++        uint8_t data[P25DEF::P25_PDU_FRAME_LENGTH_BYTES * 2U];
++        if (next > sizeof(data)) return false;
++        bool immediate = false;
++        const uint32_t length = m_controller.getFrame(data, &immediate);
++        if (length == 0U || length != next) return false;
++        m_lastStatus = m_modem.statusGeneration();
++        m_quietSamples = 0U;
++        m_barrierRequested = m_barrierPassed = false;
++        return m_modem.writeP25Frame(data, length, immediate);
++    }
++    bool idleReady() const override {
++        if (hasQueued()) return false;
++        if (!m_barrierRequested) {
++            m_barrierGeneration = m_modem.serialBarrierGeneration();
++            m_barrierRequested = true;
++            if (!m_modem.requestSerialBarrier()) m_failed = true;
++            return false;
++        }
++        if (m_modem.serialBarrierGeneration() <= m_barrierGeneration) return false;
++        if (!m_barrierPassed) {
++            m_barrierPassed = true;
++            m_lastStatus = m_modem.statusGeneration();
++            m_quietSamples = 0U;
++            return false;
++        }
++        const uint64_t generation = m_modem.statusGeneration();
++        if (generation != m_lastStatus) {
++            m_lastStatus = generation;
++            if (!m_modem.hasTX() && m_modem.getState() == modem::STATE_P25)
++                ++m_quietSamples;
++            else
++                m_quietSamples = 0U;
++        }
++        return m_quietSamples >= 2U;
++    }
++    bool healthy() const override {
++        const bool hardStop = g_killed && g_signal != SIGINT && g_signal != SIGHUP;
++        return !m_failed && !hardStop && !m_modem.hasError() && !m_modem.hasLockout() &&
++            m_modem.p25WriteRejectGeneration() == m_rejectGeneration;
++    }
++    void pump(uint32_t milliseconds) override {
++        Thread::sleep(milliseconds);
++        const uint64_t now = nowMs();
++        m_heartbeat();
++        m_modem.clock(uint32_t(now - m_lastPump));
++        m_lastPump = now;
++        m_modem.clearP25Receive(); // Drop RF while quiesced; preserve parser/status framing.
++    }
++private:
++    p25::Control& m_controller;
++    modem::Modem& m_modem;
++    std::function<void()> m_heartbeat;
++    uint64_t m_lastPump;
++    mutable uint64_t m_lastStatus, m_barrierGeneration;
++    const uint64_t m_rejectGeneration;
++    mutable uint32_t m_quietSamples;
++    mutable bool m_barrierRequested, m_barrierPassed, m_failed;
++};
++
+ class CWModemTransport final : public identification::Transport {
+ public:
+     CWModemTransport(modem::Modem& value, std::function<void()> heartbeat) :
+@@ -1624,7 +1699,7 @@ bool Host::sendIdentification(const char* reason, bool resume)
+     const uint64_t operationStarted = identificationNow();
+     const uint64_t operationDeadline = operationStarted + 10000U;
+     m_isTxCW.store(true);
+-    m_modem->boundedCWOperation(true);
++    m_modem->suppressCWResets(true); // Atomic only; descriptor changes wait for ownership.
+     LogInfoEx(LOG_HOST, "CW, identification reason %s", reason);
+     LogInfoEx(LOG_HOST, "CW, start transmitting");
+     auto healthy = [this]() {
+@@ -1635,9 +1710,14 @@ bool Host::sendIdentification(const char* reason, bool resume)
+         // A blocked reader/owner must not be reset concurrently. Abort only
+         // when the modem writer is ours; process exit alone is no RF guarantee.
+         std::unique_lock<std::mutex> lock(m_clockingMutex, std::defer_lock);
+-        if (modemOwned || lock.try_lock())
+-            m_modem->abortCWId();
+-        m_modem->boundedCWOperation(false);
++        if (modemOwned || lock.try_lock()) {
++            // Descriptor mode changes and abort writes require writer ownership.
++            // If bounded mode cannot be established, do not attempt a write.
++            if (m_modem->boundedCWOperation(true)) {
++                m_modem->abortCWId();
++                m_modem->boundedCWOperation(false);
++            }
++        }
+         m_identificationFailed = true;
+         g_killed = true;
+         LogError(LOG_HOST, "CW, identification failed");
+@@ -1659,8 +1739,25 @@ bool Host::sendIdentification(const char* reason, bool resume)
+             operationDeadline, identificationNow, wait, healthy)) {
+         return fault(true);
+     }
++    if (!m_modem->boundedCWOperation(true)) return fault(true);
+     const bool wasControlRunning = m_p25 != nullptr && m_p25->getCCRunning();
+     m_p25DedicatedTxTestTimer.stop();
++    const bool normalVoiceEnd = !m_p25CtrlChannel &&
++        (std::string(reason) == "voice-end" || std::string(reason) == "shutdown");
++    if (normalVoiceEnd && m_p25 != nullptr) {
++        if (!m_modem->setState(modem::STATE_P25)) return fault(true);
++        m_p25->queueIdentificationTail();
++        CWVoiceDrainTransport drainTransport(*m_p25, *m_modem, [this]() { m_mainLoopWatchdogTimer.start(); });
++        const uint64_t now = identificationNow();
++        const uint32_t remaining = now >= operationDeadline ? 0U :
++            uint32_t(std::min(uint64_t(2000U), operationDeadline - now));
++        const auto drained = identification::drain(drainTransport, remaining);
++        if (drained != identification::DrainResult::Completed) {
++            LogError(LOG_HOST, "CW, voice drain failed code %u", unsigned(drained));
++            return fault(true);
++        }
++        LogInfoEx(LOG_HOST, "CW, normal voice queue drained");
++    }
+     if (m_p25 != nullptr) {
+         m_p25->clearIdentificationTraffic();
+         m_p25->setCCRunning(false);
+@@ -1674,17 +1771,12 @@ bool Host::sendIdentification(const char* reason, bool resume)
+     const uint64_t elapsed = identificationNow() - operationStarted;
+     const uint32_t remaining = elapsed >= 10000U ? 0U : uint32_t(10000U - elapsed);
+     const auto result = identification::transmit(transport, m_cwCallsign, true, 2000U, 2000U, remaining);
+-    m_modem->boundedCWOperation(false);
+     if (result != identification::Result::Completed) {
+         // In this firmware IDLE alone does not cancel CW: first select P25 to
+         // reset cwIdTX, clear its normal FIFO, then return to IDLE. Queued IO
+         // bits may still drain (~107ms); a killed host alone is no RF guarantee.
+-        m_modem->abortCWId();
+-        m_identificationFailed = true;
+-        g_killed = true;
+         LogError(LOG_HOST, "CW, identification failure code %u", unsigned(result));
+-        LogError(LOG_HOST, "CW, identification failed");
+-        return false;
++        return fault(true);
+     }
+     m_identification.complete(identificationNow());
+     m_nonIdentificationFrames.store(false);
+@@ -1694,6 +1786,20 @@ bool Host::sendIdentification(const char* reason, bool resume)
+         m_p25->setCCRunning(wasControlRunning);
+         m_p25->setCCHalted(false);
+     }
++    if (resume && !g_killed && m_p25 != nullptr) {
++        if (!m_modem->setState(modem::STATE_P25)) return fault(true);
++        CWVoiceDrainTransport resumeTransport(*m_p25, *m_modem, [this]() { m_mainLoopWatchdogTimer.start(); });
++        const uint64_t now = identificationNow();
++        const uint32_t remaining = now >= operationDeadline ? 0U : uint32_t(operationDeadline - now);
++        if (identification::drain(resumeTransport, remaining) != identification::DrainResult::Completed) {
++            LogError(LOG_HOST, "CW, P25 resume fence failed");
++            return fault(true);
++        }
++        m_modem->clearP25Receive();
++        m_p25->reset();
++    }
++    if (!m_modem->boundedCWOperation(false) || m_modem->hasError())
++        return fault(true); // Failed port-mode restoration must not reopen admission.
+     m_p25TxWatchdogTimer.start();
+     m_p25TxLoopMS = 0U;
+     m_mainLoopWatchdogTimer.start();
+diff --git a/src/host/modem/Modem.cpp b/src/host/modem/Modem.cpp
+index aed7225..50cad00 100644
+--- a/src/host/modem/Modem.cpp
++++ b/src/host/modem/Modem.cpp
+@@ -19,6 +19,7 @@
+ #include "common/Thread.h"
+ #include "common/Utils.h"
+ #include "modem/Modem.h"
++#include "modem/port/UARTPort.h"
+ 
+ using namespace modem;
+ 
+@@ -854,11 +855,25 @@ void Modem::clock(uint32_t ms)
+         break;
+ 
+         case CMD_GET_VERSION:
++            // GET_VERSION is otherwise ignored during normal clocking. Only a
++            // requested, valid round trip can fence older queued status data.
++            if (m_serialBarrierPending.exchange(false)) {
++                if (m_rspDoubleLength || m_length < 21U || m_protoVer < 2U || m_buffer[3U] != m_protoVer) {
++                    m_error = true;
++                    break;
++                }
++                ++m_serialBarrierGeneration;
++            }
++            break;
+         case CMD_ACK:
+             break;
+ 
+         case CMD_NAK:
+         {
++            if (m_buffer[3U] == CMD_P25_DATA)
++                ++m_p25WriteRejectGeneration;
++            if (m_buffer[3U] == CMD_GET_VERSION && m_serialBarrierPending.exchange(false))
++                m_error = true;
+             if (m_buffer[3U] == CMD_SEND_CWID)
+                 m_cwIdRejected.store(true);
+             LogWarning(LOG_MODEM, "NAK, command = 0x%02X (%s), reason = %u (%s)", m_buffer[3U], cmdToString(m_buffer[3U]).c_str(), m_buffer[4U], rsnToString(m_buffer[4U]).c_str());
+@@ -1815,6 +1830,37 @@ bool Modem::abortCWId()
+     return resetGenerator && idle;
+ }
+ 
++/* Fences preceding serial commands through the normal response parser. */
++
++bool Modem::requestSerialBarrier()
++{
++    if (m_protoVer < 2U || m_error || m_serialBarrierPending.exchange(true))
++        return false;
++
++    const uint8_t request[3U] = {DVM_SHORT_FRAME_START, 3U, CMD_GET_VERSION};
++    if (write(request, sizeof(request)) != int(sizeof(request))) {
++        m_serialBarrierPending.store(false);
++        return false;
++    }
++    return true;
++}
++
++/* The CW owner excludes normal serial IO and restores its original mode. */
++
++bool Modem::boundedCWOperation(bool active)
++{
++    auto* uart = dynamic_cast<port::UARTPort*>(m_port);
++    if (uart != nullptr && !uart->boundedIO(active)) {
++        m_error = true;
++        // Never re-enter an unbounded reset/reconnect path after a failed
++        // transition into or out of bounded serial operation.
++        m_boundedCWOperation.store(true);
++        return false;
++    }
++    m_boundedCWOperation.store(active);
++    return true;
++}
++
+ /* Returns the protocol version of the connected modem. */
+ 
+ uint8_t Modem::getVersion() const
+diff --git a/src/host/modem/Modem.h b/src/host/modem/Modem.h
+index a90c69e..14cbb78 100644
+--- a/src/host/modem/Modem.h
++++ b/src/host/modem/Modem.h
+@@ -692,8 +692,16 @@ namespace modem
+         bool sendCWId(const std::string& callsign);
+         bool abortCWId();
+         uint64_t statusGeneration() const { return m_statusGeneration.load(); }
++        // Ordered serial round trip, without reopening or logging identity text.
++        // The caller captures the generation before requesting this once.
++        bool requestSerialBarrier();
++        uint64_t serialBarrierGeneration() const { return m_serialBarrierGeneration.load(); }
++        // A normal frame may be written to serial yet rejected by firmware.
++        // Drain callers compare this counter without changing legacy NAK policy.
++        uint64_t p25WriteRejectGeneration() const { return m_p25WriteRejectGeneration.load(); }
+         bool cwIdRejected() const { return m_cwIdRejected.load(); }
+-        void boundedCWOperation(bool active) { m_boundedCWOperation.store(active); }
++        bool boundedCWOperation(bool active);
++        void suppressCWResets(bool active) { m_boundedCWOperation.store(active); }
+ 
+         /**
+          * @brief Returns the protocol version of the connected modem.
+@@ -838,6 +846,9 @@ namespace modem
+ 
+         bool m_gotModemStatus;
+         std::atomic<uint64_t> m_statusGeneration{0U};
++        std::atomic<uint64_t> m_serialBarrierGeneration{0U};
++        std::atomic<bool> m_serialBarrierPending{false};
++        std::atomic<uint64_t> m_p25WriteRejectGeneration{0U};
+         std::atomic<bool> m_cwIdRejected{false};
+         std::atomic<bool> m_boundedCWOperation{false};
+ 
+diff --git a/src/host/modem/port/UARTPort.cpp b/src/host/modem/port/UARTPort.cpp
+index 83b7366..8196adf 100644
+--- a/src/host/modem/port/UARTPort.cpp
++++ b/src/host/modem/port/UARTPort.cpp
+@@ -23,6 +23,7 @@ using namespace modem::port;
+ #include <winioctl.h>
+ #else
+ #include <sys/types.h>
++#include <sys/select.h>
+ 
+ #include <sys/ioctl.h>
+ #include <cerrno>
+@@ -164,6 +165,33 @@ bool UARTPort::open()
+ 
+ /* Reads data from the serial port. */
+ 
++bool UARTPort::boundedIO(bool active)
++{
++#if defined(_WIN32)
++    // The existing synchronous Windows writer has no bounded cancellation
++    // contract. Refuse enabled CW rather than claim nonblocking operation.
++    return !active;
++#else
++    if (m_boundedIO.load() == active)
++        return true;
++    if (m_fd == -1)
++        return false;
++    if (active) {
++        const int flags = ::fcntl(m_fd, F_GETFL, 0);
++        if (flags == -1 || ::fcntl(m_fd, F_SETFL, flags | O_NONBLOCK) == -1)
++            return false;
++        m_savedBoundedFlags = flags;
++        m_boundedIO.store(true);
++        return true;
++    }
++    if (m_savedBoundedFlags == -1 || ::fcntl(m_fd, F_SETFL, m_savedBoundedFlags) == -1)
++        return false;
++    m_savedBoundedFlags = -1;
++    m_boundedIO.store(false);
++    return true;
++#endif
++}
++
+ int UARTPort::read(uint8_t* buffer, uint32_t length)
+ {
+     assert(buffer != nullptr);
+@@ -192,6 +220,24 @@ int UARTPort::read(uint8_t* buffer, uint32_t length)
+     if (length == 0U)
+         return 0;
+ 
++    if (m_boundedIO.load()) {
++        fd_set fds;
++        FD_ZERO(&fds);
++        FD_SET(m_fd, &fds);
++        struct timeval timeout = {0, 0};
++        const int ready = ::select(m_fd + 1, &fds, NULL, NULL, &timeout);
++        if (ready == 0 || (ready < 0 && errno == EINTR))
++            return 0;
++        if (ready < 0)
++            return -1;
++        // One nonblocking read returns the actual partial body. getResponse
++        // retains its offset and can parse the remainder on a later clock.
++        const ssize_t count = ::read(m_fd, buffer, length);
++        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
++            return 0;
++        return int(count);
++    }
++
+     uint32_t offset = 0U;
+ 
+     while (offset < length) {
+@@ -270,6 +316,24 @@ int UARTPort::write(const uint8_t* buffer, uint32_t length)
+     if (length == 0U)
+         return 0;
+ 
++    if (m_boundedIO.load()) {
++        fd_set fds;
++        FD_ZERO(&fds);
++        FD_SET(m_fd, &fds);
++        struct timeval timeout = {0, 0};
++        const int ready = ::select(m_fd + 1, NULL, &fds, NULL, &timeout);
++        if (ready == 0 || (ready < 0 && errno == EINTR))
++            return 0;
++        if (ready < 0)
++            return -1;
++        // No EAGAIN/zero-write retry loop is allowed in bounded mode. A short
++        // serial frame is an explicit failure for the modem transaction owner.
++        const ssize_t count = ::write(m_fd, buffer, length);
++        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
++            return 0;
++        return int(count);
++    }
++
+     uint32_t ptr = 0U;
+     while (ptr < length) {
+         ssize_t n = 0U;
+@@ -311,6 +375,10 @@ void UARTPort::close()
+     m_fd = -1;
+ #endif // defined(_WIN32)
+     m_isOpen = false;
++    m_boundedIO.store(false);
++#if !defined(_WIN32)
++    m_savedBoundedFlags = -1;
++#endif
+ }
+ 
+ #if defined(__APPLE__)
+diff --git a/src/host/modem/port/UARTPort.h b/src/host/modem/port/UARTPort.h
+index c8411b9..6ab6b94 100644
+--- a/src/host/modem/port/UARTPort.h
++++ b/src/host/modem/port/UARTPort.h
+@@ -23,6 +23,7 @@
+ #include "modem/port/ISerialPort.h"
+ 
+ #include <string>
++#include <atomic>
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
+@@ -103,6 +104,10 @@ namespace modem
+              */
+             int write(const uint8_t* buffer, uint32_t length) override;
+ 
++            // Temporary nonblocking operations for the bounded CW lifecycle.
++            // The caller owns/excludes the normal modem IO while toggling this.
++            bool boundedIO(bool active);
++
+             /**
+              * @brief Closes the connection to the serial port.
+              */
+@@ -141,6 +146,10 @@ namespace modem
+             SERIAL_SPEED m_speed;
+             bool m_assertRTS;
+             bool m_rtsBoot;
++            std::atomic<bool> m_boundedIO{false};
++#if !defined(_WIN32)
++            int m_savedBoundedFlags = -1;
++#endif
+ #if defined(_WIN32)
+             HANDLE m_fd;
+ #else
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+index 40aceac..c070dc2 100644
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -264,6 +264,17 @@ void Control::setIdentificationActive(bool active)
+         m_identificationActive.store(active);
+ }
+ 
++// Host holds RF-reader, modem-writer and state ownership here. Admission
++// stays closed while the existing valid call's terminal tail is appended.
++void Control::queueIdentificationTail()
++{
++    std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
++    const bool active = m_identificationActive.load();
++    m_identificationActive.store(false);
++    writeRF_VoiceEnd(false); // Append after queued audio; immediate queue would preempt it.
++    m_identificationActive.store(active);
++}
++
+ void Control::clearIdentificationTraffic()
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_permitMutex);
+@@ -271,6 +282,19 @@ void Control::clearIdentificationTraffic()
+     m_permittedDstId.store(0U);
+     m_permitToken.clear();
+     m_rfTGHang.stop();
++    // A completed/preempted session must not recreate a tail after CW reset.
++    // resetRF intentionally retains these fields for normal tail generation.
++    m_tailOnIdle = false;
++    m_rfTimeout.stop();
++    m_rfLossWatchdog.stop();
++    m_rfVoiceCallTermTimeout.stop();
++    m_rfCallTermSrcId = m_rfCallTermDstId = 0U;
++    m_rfLastSrcId = m_rfLastDstId = 0U;
++    m_frameLossCnt = 0U;
++    m_voice->m_hadVoice = false;
++    m_voice->m_rfLastHDU = lc::LC();
++    m_voice->m_rfLastHDUValid = false;
++    m_voice->m_lastDUID = DUID::TDU;
+     if (!m_authoritative && oldDestination != 0U)
+         notifyCC_ReleaseGrant(oldDestination);
+ }
+@@ -919,14 +943,21 @@ uint32_t Control::getFrame(uint8_t* data, bool *imm)
+ 
+ /* Helper to write end of voice call frame data. */
+ 
+-bool Control::writeRF_VoiceEnd()
++bool Control::writeRF_VoiceEnd(bool immediate)
+ {
+     if (identificationActive()) return false;
+     if (m_netState == RS_NET_IDLE && m_rfState == RS_RF_LISTENING) {
+         if (m_tailOnIdle) {
++            // A reset/lost-session tail has no identity to announce. In
++            // particular, never generate a zero-TG release after an ID reset.
++            if (!m_voice->m_hadVoice || m_voice->m_rfLC.getDstId() == 0U) {
++                m_tailOnIdle = false;
++                m_voice->m_hadVoice = false;
++                return false;
++            }
+             bool ret = false;
+             if (m_netState == RS_NET_IDLE && m_rfState == RS_RF_LISTENING) {
+-                m_voice->writeRF_EndOfVoice();
++                m_voice->writeRF_EndOfVoice(immediate);
+ 
+                 // this should have been cleared by writeRF_EndOfVoice; but if it hasn't clear it
+                 // to prevent badness
+@@ -1881,6 +1912,8 @@ void Control::processInCallCtrl(network::NET_ICC::ENUM command, uint32_t dstId)
+ 
+ void Control::notifyCC_ReleaseGrant(uint32_t dstId)
+ {
++    if (dstId == 0U)
++        return;
+     // Latch before notifying/releasing the CC so the next permit cannot race
+     // the end-of-transmission identification obligation on this VC.
+     if (!m_authoritative && dstId != 0U)
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+index 12b7aad..5c4ad1a 100644
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -185,7 +185,7 @@ namespace p25
+          * @brief Helper to write end of voice call frame data.
+          * @returns bool True, if end of voice call was written, otherwise false.
+          */
+-        bool writeRF_VoiceEnd();
++        bool writeRF_VoiceEnd(bool immediate = true);
+ 
+         /** @name Data Clocking */
+         /**
+@@ -209,6 +209,7 @@ namespace p25
+         void requestIdentification();
+         bool tryBeginIdentification();
+         void clearIdentificationTraffic();
++        void queueIdentificationTail();
+         bool identificationPending() const { return m_identificationEnabled.load() && m_identificationPending.load(); }
+         bool identificationUnavailable() const { return m_identificationEnabled.load() && m_identificationUnavailable.load(); }
+         bool identificationActive() const { return m_identificationEnabled.load() && m_identificationActive.load(); }
+diff --git a/src/host/p25/packet/Voice.cpp b/src/host/p25/packet/Voice.cpp
+index e0f22aa..179f447 100644
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -1071,13 +1071,30 @@ bool Voice::process(uint8_t* data, uint32_t len)
+         }
+     }
+     else if (duid == DUID::TDU || duid == DUID::TDULC) {
++        std::unique_ptr<lc::TDULC> receivedLC;
++        if (duid == DUID::TDULC) {
++            receivedLC = lc::tdulc::TDULCFactory::createTDULC(data + 2U);
++            // Preserve standalone non-termination LC messages without ending
++            // a voice session or inventing an identification obligation.
++            if (receivedLC != nullptr && receivedLC->getLCO() != LCO::CALL_TERM) {
++                m_p25->m_control->writeRF_TDULC(receivedLC.get(), false);
++                return true;
++            }
++        }
++        const uint32_t endedDestination = m_rfLC.getDstId() != 0U ? m_rfLC.getDstId() :
++            (m_rfLastHDUValid ? m_rfLastHDU.getDstId() : 0U);
++        const bool currentSession = (m_p25->m_rfState == RS_RF_AUDIO || m_rfLastHDUValid) && endedDestination != 0U;
++        if (!currentSession || (duid == DUID::TDULC &&
++                (receivedLC == nullptr || receivedLC->getDstId() != endedDestination)))
++            return false; // Orphan/stale ends have no release, RF or RPC effects.
+         if (!m_p25->m_enableControl) {
+-            m_p25->m_affiliations->releaseGrant(m_rfLC.getDstId(), false);
++            m_p25->m_affiliations->releaseGrant(endedDestination, false);
+         }
+ 
+         if (m_p25->m_notifyCC) {
+-            m_p25->notifyCC_ReleaseGrant(m_rfLC.getDstId());
++            m_p25->notifyCC_ReleaseGrant(endedDestination);
+         }
++        m_rfLastHDUValid = false;
+ 
+         if (duid == DUID::TDU) {
+             if (m_p25->m_immediateCallTerm)
+@@ -1098,13 +1115,7 @@ bool Voice::process(uint8_t* data, uint32_t len)
+             m_p25->m_rfTimeout.stop();
+         }
+         else {
+-            std::unique_ptr<lc::TDULC> tdulc = lc::tdulc::TDULCFactory::createTDULC(data + 2U);
+-            if (tdulc == nullptr) {
+-                LogWarning(LOG_RF, P25_TDULC_STR ", undecodable TDULC");
+-            }
+-            else {
+-                m_p25->m_control->writeRF_TDULC(tdulc.get(), false);
+-            }
++            m_p25->m_control->writeRF_TDULC(receivedLC.get(), false);
+         }
+ 
+         if (m_p25->m_rfState == RS_RF_AUDIO) {
+@@ -1672,7 +1683,7 @@ bool Voice::checkNetTrafficCollision(uint32_t srcId, uint32_t dstId, defines::DU
+ 
+ /* Helper to write end of frame data. */
+ 
+-void Voice::writeRF_EndOfVoice()
++void Voice::writeRF_EndOfVoice(bool immediate)
+ {
+     if (!m_hadVoice) {
+         return;
+@@ -1686,7 +1697,7 @@ void Voice::writeRF_EndOfVoice()
+     resetNet();
+ 
+     // transmit channelNo release burst
+-    m_p25->writeRF_TDU(true, true);
++    m_p25->writeRF_TDU(true, immediate);
+     m_p25->m_control->writeRF_TDULC_ChanRelease(grp, srcId, dstId);
+ }
+ 
+diff --git a/src/host/p25/packet/Voice.h b/src/host/p25/packet/Voice.h
+index a5bb238..7decd01 100644
+--- a/src/host/p25/packet/Voice.h
++++ b/src/host/p25/packet/Voice.h
+@@ -169,7 +169,7 @@ namespace p25
+             /**
+              * @brief Helper to write end of voice frame data.
+              */
+-            void writeRF_EndOfVoice();
++            void writeRF_EndOfVoice(bool immediate = true);
+ 
+             /**
+              * @brief Helper to write a network P25 TDU packet.
+diff --git a/tests/CWIDDrain_Tests.cpp b/tests/CWIDDrain_Tests.cpp
+new file mode 100644
+index 0000000..22c097a
+--- /dev/null
++++ b/tests/CWIDDrain_Tests.cpp
+@@ -0,0 +1,211 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Pure queue/status fixtures. No Host, modem, network, RF, or wall clock. */
++#include "host/CWIDDrain.h"
++#include <catch2/catch_test_macros.hpp>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace {
++using identification::DrainResult;
++
++struct DrainFixture final : identification::DrainTransport {
++    mutable uint64_t clock = 0U;
++    unsigned queued = 2U, writes = 0U, pumps = 0U;
++    mutable unsigned statusChecks = 0U;
++    uint64_t fifoIdleAt = 100U, freshAfterWriteAt = 0U;
++    uint32_t sendCost = 0U, queueCost = 0U, statusCost = 0U;
++    bool fault = false, writeOK = true, advance = true, consume = true;
++    bool refreshStatus = true;
++    mutable bool discovered = false;
++    mutable std::vector<std::string> phases;
++    std::function<void(DrainFixture&)> afterWrite, afterPump;
++    std::function<void(const DrainFixture&)> afterStatus;
++
++    uint64_t nowMs() const override { return clock; }
++    bool hasQueued() const override {
++        clock += queueCost;
++        phases.push_back(queued ? "queued" : "empty");
++        return queued != 0U;
++    }
++    bool sendOne() override {
++        ++writes;
++        phases.push_back("write");
++        clock += sendCost;
++        if (writeOK && consume && queued != 0U) {
++            --queued;
++            // Even if the FIFO formerly looked idle, this write requires a
++            // later status report before the fixture can prove completion.
++            freshAfterWriteAt = clock + 20U;
++        }
++        if (afterWrite) afterWrite(*this);
++        return writeOK;
++    }
++    bool idleReady() const override {
++        ++statusChecks;
++        clock += statusCost;
++        phases.push_back("status");
++        if (afterStatus) afterStatus(*this);
++        return refreshStatus && clock >= fifoIdleAt && clock >= freshAfterWriteAt;
++    }
++    bool healthy() const override { return !fault; }
++    void pump(uint32_t ms) override {
++        REQUIRE(ms > 0U);
++        REQUIRE(ms <= 20U);
++        ++pumps;
++        phases.push_back("pump");
++        if (advance) clock += ms;
++        if (afterPump) afterPump(*this);
++    }
++};
++}
++
++TEST_CASE("CW drain finishes normal frames then waits for fresh actual FIFO idle", "[cwid][drain]") {
++    DrainFixture transport;
++    REQUIRE(identification::drain(transport, 200U) == DrainResult::Completed);
++    REQUIRE(transport.queued == 0U);
++    REQUIRE(transport.writes == 2U);
++    REQUIRE(transport.clock == 100U);
++    unsigned seenWrites = 0U;
++    for (const auto& phase : transport.phases) {
++        if (phase == "write") ++seenWrites;
++        if (phase == "status") REQUIRE(seenWrites == 2U);
++    }
++    REQUIRE(transport.statusChecks > 0U);
++}
++
++TEST_CASE("A bare CW drain does not invent a TX-start requirement", "[cwid][drain]") {
++    DrainFixture transport;
++    transport.queued = 0U;
++    transport.fifoIdleAt = 40U;
++    REQUIRE(identification::drain(transport, 100U) == DrainResult::Completed);
++    REQUIRE(transport.writes == 0U);
++    REQUIRE(transport.clock == 40U);
++}
++
++TEST_CASE("CW drain does not mistake cached idle or an empty software queue for finished RF", "[cwid][drain]") {
++    DrainFixture transport;
++    SECTION("empty software queue but firmware FIFO still active") {
++        transport.queued = 0U;
++        transport.fifoIdleAt = 121U;
++        REQUIRE(identification::drain(transport, 120U) == DrainResult::Timeout);
++        REQUIRE(transport.clock == 120U);
++    }
++    SECTION("last write invalidates a formerly idle report") {
++        transport.queued = 1U;
++        transport.fifoIdleAt = 0U;
++        REQUIRE(identification::drain(transport, 100U) == DrainResult::Completed);
++        REQUIRE(transport.clock == 20U);
++        REQUIRE(transport.writes == 1U);
++    }
++    SECTION("fresh status never arrives") {
++        transport.queued = 0U;
++        transport.refreshStatus = false;
++        REQUIRE(identification::drain(transport, 65U) == DrainResult::Timeout);
++        REQUIRE(transport.clock == 65U);
++    }
++}
++
++TEST_CASE("CW drain reports failures without retransmitting failed frames", "[cwid][drain]") {
++    DrainFixture transport;
++    SECTION("initial health failure does not write") {
++        transport.fault = true;
++        REQUIRE(identification::drain(transport, 200U) == DrainResult::Fault);
++        REQUIRE(transport.writes == 0U);
++    }
++    SECTION("short or failed normal frame write") {
++        transport.writeOK = false;
++        REQUIRE(identification::drain(transport, 200U) == DrainResult::WriteFailed);
++        REQUIRE(transport.writes == 1U);
++        REQUIRE(transport.queued == 2U);
++    }
++    SECTION("health failure in write callback") {
++        transport.afterWrite = [](DrainFixture& t) { t.fault = true; };
++        REQUIRE(identification::drain(transport, 200U) == DrainResult::Fault);
++        REQUIRE(transport.writes == 1U);
++    }
++    SECTION("health failure during FIFO drain") {
++        transport.queued = 0U;
++        transport.afterPump = [](DrainFixture& t) { t.fault = true; };
++        REQUIRE(identification::drain(transport, 200U) == DrainResult::Fault);
++        REQUIRE(transport.writes == 0U);
++    }
++}
++
++TEST_CASE("CW drain absolute deadline includes transport callback work", "[cwid][drain]") {
++    DrainFixture transport;
++    SECTION("queue inspection consumes all budget") {
++        transport.queueCost = 101U;
++        REQUIRE(identification::drain(transport, 100U) == DrainResult::Timeout);
++        REQUIRE(transport.writes == 0U);
++    }
++    SECTION("frame write consumes all budget") {
++        transport.sendCost = 101U;
++        REQUIRE(identification::drain(transport, 100U) == DrainResult::Timeout);
++        REQUIRE(transport.writes == 1U);
++    }
++    SECTION("status callback finishes after deadline") {
++        transport.queued = 0U;
++        transport.fifoIdleAt = 0U;
++        transport.statusCost = 101U;
++        REQUIRE(identification::drain(transport, 100U) == DrainResult::Timeout);
++        REQUIRE(transport.writes == 0U);
++    }
++    SECTION("idle at exact deadline completes") {
++        transport.queued = 0U;
++        transport.fifoIdleAt = 60U;
++        REQUIRE(identification::drain(transport, 60U) == DrainResult::Completed);
++        REQUIRE(transport.clock == 60U);
++    }
++    SECTION("zero budget cannot start queued frame") {
++        REQUIRE(identification::drain(transport, 0U) == DrainResult::Timeout);
++        REQUIRE(transport.writes == 0U);
++    }
++    SECTION("zero budget may observe already fresh empty idle") {
++        transport.queued = 0U;
++        transport.fifoIdleAt = 0U;
++        REQUIRE(identification::drain(transport, 0U) == DrainResult::Completed);
++        REQUIRE(transport.writes == 0U);
++    }
++}
++
++TEST_CASE("CW drain remains bounded with backpressure or a broken clock", "[cwid][drain]") {
++    DrainFixture transport;
++    SECTION("normal backpressure can clear without a false write failure") {
++        transport.consume = false;
++        transport.afterPump = [](DrainFixture& t) { if (t.clock >= 40U) t.consume = true; };
++        REQUIRE(identification::drain(transport, 200U) == DrainResult::Completed);
++        REQUIRE(transport.queued == 0U);
++    }
++    SECTION("persistent backpressure times out with existing queue intact") {
++        transport.consume = false;
++        REQUIRE(identification::drain(transport, 65U) == DrainResult::Timeout);
++        REQUIRE(transport.clock == 65U);
++        REQUIRE(transport.queued == 2U);
++    }
++    SECTION("nonadvancing clock cannot spin forever") {
++        transport.advance = false;
++        REQUIRE(identification::drain(transport, 100U) == DrainResult::Fault);
++        REQUIRE(transport.pumps < 20U);
++    }
++    SECTION("clock regression is a fault") {
++        transport.clock = 10U;
++        transport.afterPump = [](DrainFixture& t) { t.clock = 9U; };
++        REQUIRE(identification::drain(transport, 100U) == DrainResult::Fault);
++        REQUIRE(transport.pumps == 1U);
++    }
++}
++
++TEST_CASE("CW drain rechecks queue after idle observation", "[cwid][drain]") {
++    DrainFixture transport;
++    transport.queued = 0U;
++    transport.fifoIdleAt = 0U;
++    transport.afterStatus = [](const DrainFixture& value) {
++        auto& t = const_cast<DrainFixture&>(value);
++        if (!t.discovered) { t.discovered = true; t.queued = 1U; }
++    };
++    REQUIRE(identification::drain(transport, 200U) == DrainResult::Completed);
++    REQUIRE(transport.writes == 1U);
++    REQUIRE(transport.queued == 0U);
++    REQUIRE(transport.clock >= transport.freshAfterWriteAt);
++}
+diff --git a/tests/CWIDModem_Tests.cpp b/tests/CWIDModem_Tests.cpp
+index 7a9707e..c086d24 100644
+--- a/tests/CWIDModem_Tests.cpp
++++ b/tests/CWIDModem_Tests.cpp
+@@ -5,6 +5,8 @@
+ #include <catch2/catch_test_macros.hpp>
+ #include <vector>
+ #include <string>
++#include <deque>
++#include <algorithm>
+ 
+ namespace {
+ class CWWriteModem : public modem::Modem {
+@@ -46,3 +48,184 @@ TEST_CASE("CW abort cancels via P25 before IDLE and attempts every command on wr
+         REQUIRE(modem.commands[2] == idle);
+     }
+ }
++
++namespace {
++// Feed complete or fragmented actual serial packets through Modem::clock and
++// getResponse. No modem open/firmware handshake, socket, or wall-clock sleeps.
++class FeedModemPort final : public modem::port::IModemPort {
++public:
++    std::deque<uint8_t> input;
++    std::vector<std::vector<uint8_t>> writes;
++    bool shortWrite = false;
++    unsigned opens = 0U, closes = 0U;
++    bool open() override { ++opens; return true; }
++    void close() override { ++closes; }
++    int read(uint8_t* out, uint32_t length) override {
++        const uint32_t count = std::min<uint32_t>(length, uint32_t(input.size()));
++        for (uint32_t i = 0U; i < count; ++i) {
++            out[i] = input.front();
++            input.pop_front();
++        }
++        return int(count);
++    }
++    int write(const uint8_t* data, uint32_t length) override {
++        writes.emplace_back(data, data + length);
++        return int(length) - (shortWrite ? 1 : 0);
++    }
++    void feed(const std::vector<uint8_t>& bytes) { input.insert(input.end(), bytes.begin(), bytes.end()); }
++};
++
++class BarrierModem final : public modem::Modem {
++public:
++    explicit BarrierModem(FeedModemPort* port) : Modem(port, true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U,
++        true, true, false, false, false, false) {
++        // Represents the protocol already established by ordinary open().
++        m_protoVer = 4U;
++    }
++};
++
++std::vector<uint8_t> versionReply(uint8_t protocol = 4U, size_t size = 21U) {
++    std::vector<uint8_t> packet(size, 0U);
++    packet[0U] = 0xFEU;
++    packet[1U] = uint8_t(size);
++    packet[2U] = 0x00U;
++    if (size > 3U) packet[3U] = protocol;
++    return packet;
++}
++std::vector<uint8_t> idleStatus() {
++    return {0xFEU, 12U, 0x01U, 0x08U, uint8_t(modem::STATE_P25), 0U, 0U, 0U, 0U, 0U, 10U, 0U};
++}
++}
++
++TEST_CASE("Serial barrier is one text-free GET_VERSION request with no reopen or retry", "[modem][cwid][serial-barrier]") {
++    auto* port = new FeedModemPort;
++    BarrierModem modem(port);
++    REQUIRE(modem.serialBarrierGeneration() == 0U);
++    REQUIRE(modem.requestSerialBarrier());
++    REQUIRE_FALSE(modem.requestSerialBarrier());
++    REQUIRE(port->writes.size() == 1U);
++    const std::vector<uint8_t> expected{0xFEU, 3U, 0x00U};
++    REQUIRE(port->writes.front() == expected);
++    REQUIRE(port->opens == 0U);
++    REQUIRE(port->closes == 0U);
++    // Receipt, not submission, advances the fence.
++    REQUIRE(modem.serialBarrierGeneration() == 0U);
++    port->feed(versionReply());
++    modem.clock(0U);
++    REQUIRE(modem.serialBarrierGeneration() == 1U);
++    REQUIRE_FALSE(modem.hasError());
++    REQUIRE(modem.requestSerialBarrier());
++    REQUIRE(port->writes.size() == 2U);
++    port->feed(versionReply());
++    modem.clock(0U);
++    REQUIRE(modem.serialBarrierGeneration() == 2U);
++}
++
++TEST_CASE("Serial barrier rejects unsolicited, malformed, or mismatched version replies", "[modem][cwid][serial-barrier]") {
++    auto* port = new FeedModemPort;
++    BarrierModem modem(port);
++    SECTION("unsolicited valid reply cannot advance the generation") {
++        port->feed(versionReply());
++        modem.clock(0U);
++        REQUIRE(modem.serialBarrierGeneration() == 0U);
++        REQUIRE_FALSE(modem.hasError());
++    }
++    SECTION("short reply clears pending and fails closed") {
++        REQUIRE(modem.requestSerialBarrier());
++        port->feed(versionReply(4U, 4U));
++        modem.clock(0U);
++        REQUIRE(modem.serialBarrierGeneration() == 0U);
++        REQUIRE(modem.hasError());
++        // A late valid version after failure is no longer a pending fence.
++        port->feed(versionReply());
++        modem.clock(0U);
++        REQUIRE(modem.serialBarrierGeneration() == 0U);
++        REQUIRE_FALSE(modem.requestSerialBarrier());
++    }
++    SECTION("protocol mismatch cannot satisfy the barrier") {
++        REQUIRE(modem.requestSerialBarrier());
++        port->feed(versionReply(3U));
++        modem.clock(0U);
++        REQUIRE(modem.serialBarrierGeneration() == 0U);
++        REQUIRE(modem.hasError());
++    }
++    SECTION("version command NAK fails closed") {
++        REQUIRE(modem.requestSerialBarrier());
++        port->feed({0xFEU, 5U, 0x7FU, 0x00U, 1U});
++        modem.clock(0U);
++        REQUIRE(modem.serialBarrierGeneration() == 0U);
++        REQUIRE(modem.hasError());
++    }
++}
++
++TEST_CASE("Serial barrier observes preceding packets and waits for a complete framed reply", "[modem][cwid][serial-barrier]") {
++    auto* port = new FeedModemPort;
++    BarrierModem modem(port);
++    REQUIRE(modem.requestSerialBarrier());
++    port->feed(idleStatus());
++    port->feed({0xFEU, 21U, 0x00U, 4U});
++    modem.clock(0U); // The older idle status is not the command's fence.
++    REQUIRE(modem.statusGeneration() == 1U);
++    REQUIRE(modem.serialBarrierGeneration() == 0U);
++    modem.clock(0U); // Incomplete version payload remains pending.
++    REQUIRE(modem.serialBarrierGeneration() == 0U);
++    const auto version = versionReply();
++    port->feed(std::vector<uint8_t>(version.begin() + 4U, version.end()));
++    modem.clock(0U);
++    REQUIRE(modem.serialBarrierGeneration() == 1U);
++    REQUIRE(modem.statusGeneration() == 1U);
++    // Duplicate unsolicited version packets cannot create another barrier.
++    port->feed(versionReply());
++    modem.clock(0U);
++    REQUIRE(modem.serialBarrierGeneration() == 1U);
++    port->feed(idleStatus());
++    modem.clock(0U);
++    REQUIRE(modem.statusGeneration() == 2U);
++    REQUIRE_FALSE(modem.hasError());
++}
++
++TEST_CASE("Serial barrier short writes clear the pending reservation without retry", "[modem][cwid][serial-barrier]") {
++    auto* port = new FeedModemPort;
++    BarrierModem modem(port);
++    port->shortWrite = true;
++    REQUIRE_FALSE(modem.requestSerialBarrier());
++    REQUIRE(port->writes.size() == 1U);
++    port->feed(versionReply());
++    modem.clock(0U);
++    REQUIRE(modem.serialBarrierGeneration() == 0U);
++    port->shortWrite = false;
++    REQUIRE(modem.requestSerialBarrier());
++    REQUIRE(port->writes.size() == 2U);
++    port->feed(versionReply());
++    modem.clock(0U);
++    REQUIRE(modem.serialBarrierGeneration() == 1U);
++}
++
++TEST_CASE("Normal P25 firmware NAKs advance the drain rejection generation only", "[modem][cwid][drain-nak]") {
++    auto* port = new FeedModemPort;
++    BarrierModem modem(port);
++    REQUIRE(modem.p25WriteRejectGeneration() == 0U);
++    // Both a FIFO refusal and another firmware reason invalidate a drain
++    // attempt; a full serial write is insufficient evidence of acceptance.
++    for (uint8_t reason : {uint8_t(8U), uint8_t(1U)}) {
++        const auto before = modem.p25WriteRejectGeneration();
++        port->feed({0xFEU, 5U, 0x7FU, 0x31U, reason});
++        modem.clock(0U);
++        REQUIRE(modem.p25WriteRejectGeneration() == before + 1U);
++        REQUIRE_FALSE(modem.hasError());
++        REQUIRE(modem.serialBarrierGeneration() == 0U);
++    }
++    const auto rejected = modem.p25WriteRejectGeneration();
++    port->feed({0xFEU, 5U, 0x7FU, 0x18U, 1U}); // Unrelated DMR command NAK.
++    modem.clock(0U);
++    REQUIRE(modem.p25WriteRejectGeneration() == rejected);
++    REQUIRE_FALSE(modem.hasError());
++    port->feed(idleStatus());
++    modem.clock(0U);
++    REQUIRE(modem.p25WriteRejectGeneration() == rejected);
++    REQUIRE(modem.statusGeneration() == 1U);
++    REQUIRE(port->writes.empty()); // No retry or reopen was triggered.
++    REQUIRE(port->opens == 0U);
++    REQUIRE(port->closes == 0U);
++}
+diff --git a/tests/CWIDPolicy_Tests.cpp b/tests/CWIDPolicy_Tests.cpp
+index 9696d15..233e4e5 100644
+--- a/tests/CWIDPolicy_Tests.cpp
++++ b/tests/CWIDPolicy_Tests.cpp
+@@ -73,9 +73,9 @@ TEST_CASE("CW policy identifies startup and real RF without self-generating idle
+     policy.complete(100U);
+     REQUIRE_FALSE(policy.finalDue());
+     REQUIRE_FALSE(policy.due(10000000U)); // An unused capacity channel stays silent.
+-    policy.observeRF(false);
++    policy.observeRF(false, 100U);
+     REQUIRE_FALSE(policy.due(10000000U));
+-    policy.observeRF(true);
++    policy.observeRF(true, 100U);
+     REQUIRE(policy.finalDue());
+     REQUIRE_FALSE(policy.due(540099U));
+     REQUIRE(policy.due(540100U));
+@@ -83,13 +83,13 @@ TEST_CASE("CW policy identifies startup and real RF without self-generating idle
+     policy.complete(540100U);
+     REQUIRE_FALSE(policy.due(540100U));
+     REQUIRE_FALSE(policy.finalDue());
+-    policy.observeRF(false); // Completion reset the old TX edge.
++    policy.observeRF(false, 540100U); // Completion reset the old TX edge.
+     REQUIRE_FALSE(policy.due(540101U));
+-    policy.observeRF(true);
++    policy.observeRF(true, 540101U);
+     REQUIRE_FALSE(policy.due(540101U));
+-    policy.observeRF(false);
+-    REQUIRE(policy.due(540101U));
+-    REQUIRE(std::string(policy.reason(540101U)) == "voice-end");
++    policy.observeRF(false, 540102U);
++    REQUIRE(policy.due(540102U));
++    REQUIRE(std::string(policy.reason(540102U)) == "voice-end");
+ }
+ 
+ TEST_CASE("CW policy explicit end, reset and disabled observations preserve eligibility", "[cwid][policy]") {
+@@ -101,10 +101,10 @@ TEST_CASE("CW policy explicit end, reset and disabled observations preserve elig
+     REQUIRE(policy.finalDue());
+     REQUIRE(std::string(policy.reason(901U)) == "voice-end");
+     policy.complete(1000U);
+-    policy.observeRF(true);
++    policy.observeRF(true, 1000U);
+     REQUIRE_FALSE(policy.due(999U)); // Clock regression must not wrap elapsed time.
+     policy.configure(false, 1U);
+-    policy.observeRF(true); policy.observeRF(false); policy.noteVoiceEnd(); policy.complete(0U);
++    policy.observeRF(true, 0U); policy.observeRF(false, 0U); policy.noteVoiceEnd(); policy.complete(0U);
+     REQUIRE_FALSE(policy.enabled());
+     REQUIRE_FALSE(policy.due(~uint64_t(0U)));
+     REQUIRE_FALSE(policy.finalDue());
+@@ -326,3 +326,27 @@ TEST_CASE("CW ownership acquisition shares the absolute operation deadline", "[c
+         REQUIRE(attempts <= 10002U);
+     }
+ }
++
++TEST_CASE("First RF after a long idle gets its own continuous identification interval", "[cwid][lifecycle]") {
++    Policy policy;
++    policy.configure(true, 540U);
++    policy.complete(1000U);
++    const uint64_t firstRF = 29U * 60U * 1000U;
++    REQUIRE_FALSE(policy.due(firstRF));
++    policy.observeRF(true, firstRF);
++    REQUIRE_FALSE(policy.due(firstRF));
++    policy.observeRF(true, firstRF + 539999U);
++    REQUIRE_FALSE(policy.due(firstRF + 539999U));
++    REQUIRE(policy.due(firstRF + 540000U));
++    REQUIRE(std::string(policy.reason(firstRF + 540000U)) == "periodic");
++    policy.complete(firstRF + 545000U);
++    policy.observeRF(true, firstRF + 545001U); // Same continuing communication after its ID.
++    REQUIRE_FALSE(policy.due(firstRF + 545001U));
++    REQUIRE(policy.due(firstRF + 1085001U));
++    policy.observeRF(false, firstRF + 1085002U);
++    REQUIRE(std::string(policy.reason(firstRF + 1085002U)) == "voice-end");
++    policy.complete(firstRF + 1090000U);
++    policy.observeRF(true, firstRF + 1090001U); // A rapid new communication remains eligible.
++    policy.observeRF(false, firstRF + 1090002U);
++    REQUIRE(std::string(policy.reason(firstRF + 1090002U)) == "voice-end");
++}
+diff --git a/tests/CWIDUART_Tests.cpp b/tests/CWIDUART_Tests.cpp
+new file mode 100644
+index 0000000..fcc8e07
+--- /dev/null
++++ b/tests/CWIDUART_Tests.cpp
+@@ -0,0 +1,169 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Actual POSIX PTYs and UART/parser methods; no physical modem or network. */
++#include "host/modem/Modem.h"
++#include "host/modem/port/UARTPort.h"
++#include <catch2/catch_test_macros.hpp>
++
++#if !defined(_WIN32)
++#if defined(__APPLE__)
++#include <util.h>
++#else
++#include <pty.h>
++#endif
++#include <unistd.h>
++#include <fcntl.h>
++#include <termios.h>
++#include <array>
++#include <chrono>
++#include <future>
++#include <vector>
++#include <algorithm>
++
++namespace {
++using Clock = std::chrono::steady_clock;
++
++struct LocalPTY {
++    int master = -1, slave = -1;
++    LocalPTY() {
++        REQUIRE(::openpty(&master, &slave, nullptr, nullptr, nullptr) == 0);
++        termios attributes{};
++        REQUIRE(::tcgetattr(slave, &attributes) == 0);
++        ::cfmakeraw(&attributes);
++        attributes.c_cc[VMIN] = 0;
++        attributes.c_cc[VTIME] = 0;
++        REQUIRE(::tcsetattr(slave, TCSANOW, &attributes) == 0);
++    }
++    ~LocalPTY() { if (master != -1) ::close(master); if (slave != -1) ::close(slave); }
++    int takeSlave() { const int result = slave; slave = -1; return result; }
++    void feed(const uint8_t* data, size_t size) {
++        REQUIRE(::write(master, data, size) == ssize_t(size));
++    }
++};
++
++class PTYUART final : public modem::port::UARTPort {
++public:
++    explicit PTYUART(int descriptor) : UARTPort(modem::port::SERIAL_115200) {
++        m_fd = descriptor;
++        m_isOpen = descriptor != -1;
++    }
++    ~PTYUART() override { close(); }
++    int descriptor() const { return m_fd; }
++};
++
++class PTYModem final : public modem::Modem {
++public:
++    explicit PTYModem(PTYUART* port) : Modem(port, true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U,
++        true, true, false, false, false, false) { m_protoVer = 4U; }
++};
++}
++
++TEST_CASE("Bounded UART restores the original POSIX descriptor flags", "[modem][cwid][uart]") {
++    LocalPTY pty;
++    PTYUART uart(pty.takeSlave());
++    int original = ::fcntl(uart.descriptor(), F_GETFL, 0);
++    REQUIRE(original != -1);
++    SECTION("original blocking mode") { original &= ~O_NONBLOCK; }
++    SECTION("original nonblocking mode") { original |= O_NONBLOCK; }
++    REQUIRE(::fcntl(uart.descriptor(), F_SETFL, original) == 0);
++    original = ::fcntl(uart.descriptor(), F_GETFL, 0);
++    REQUIRE(uart.boundedIO(true));
++    REQUIRE((::fcntl(uart.descriptor(), F_GETFL, 0) & O_NONBLOCK) != 0);
++    REQUIRE(uart.boundedIO(true)); // A repeated enable cannot replace saved flags.
++    REQUIRE(uart.boundedIO(false));
++    REQUIRE(::fcntl(uart.descriptor(), F_GETFL, 0) == original);
++    REQUIRE(uart.boundedIO(false));
++}
++
++TEST_CASE("Bounded UART returns a partial actual PTY read without waiting for the remainder", "[modem][cwid][uart]") {
++    LocalPTY pty;
++    PTYUART uart(pty.takeSlave());
++    REQUIRE(uart.boundedIO(true));
++    const std::array<uint8_t, 8U> first{{1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U}};
++    pty.feed(first.data(), first.size());
++    std::array<uint8_t, 172U> out{};
++    auto read = std::async(std::launch::async, [&]() { return uart.read(out.data(), out.size()); });
++    const bool promptly = read.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
++    if (!promptly) {
++        // Release a regressed blocking reader so the assertion can report the
++        // failure without leaving the whole offline suite hung indefinitely.
++        std::array<uint8_t, 164U> rest{};
++        pty.feed(rest.data(), rest.size());
++    }
++    const int got = read.get();
++    REQUIRE(promptly);
++    REQUIRE(got == int(first.size()));
++    REQUIRE(std::equal(first.begin(), first.end(), out.begin()));
++    REQUIRE(uart.read(out.data(), out.size()) == 0);
++}
++
++TEST_CASE("Bounded modem parses a fragmented 172-byte GET_VERSION on a real PTY", "[modem][cwid][uart]") {
++    LocalPTY pty;
++    auto* uart = new PTYUART(pty.takeSlave());
++    const int original = ::fcntl(uart->descriptor(), F_GETFL, 0);
++    PTYModem modem(uart);
++    modem.suppressCWResets(true); // Early latch changes no descriptor state.
++    REQUIRE(::fcntl(uart->descriptor(), F_GETFL, 0) == original);
++    REQUIRE_FALSE(modem.hasError());
++    REQUIRE(modem.boundedCWOperation(true)); // Exercises the actual Modem-to-UART hook under ownership.
++    REQUIRE_FALSE(modem.hasError());
++    REQUIRE((::fcntl(uart->descriptor(), F_GETFL, 0) & O_NONBLOCK) != 0);
++    REQUIRE(modem.requestSerialBarrier());
++    std::array<uint8_t, 172U> reply{};
++    reply[0U] = 0xFEU; reply[1U] = 172U; reply[2U] = 0x00U; reply[3U] = 4U;
++    constexpr size_t firstSize = 24U;
++    pty.feed(reply.data(), firstSize);
++    auto clock = std::async(std::launch::async, [&]() { modem.clock(0U); });
++    const bool promptly = clock.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready;
++    if (!promptly) pty.feed(reply.data() + firstSize, reply.size() - firstSize);
++    clock.get();
++    REQUIRE(promptly);
++    REQUIRE(modem.serialBarrierGeneration() == 0U);
++    pty.feed(reply.data() + firstSize, reply.size() - firstSize);
++    modem.clock(0U);
++    REQUIRE(modem.serialBarrierGeneration() == 1U);
++    REQUIRE_FALSE(modem.hasError());
++    REQUIRE(modem.boundedCWOperation(false));
++    REQUIRE_FALSE(modem.hasError());
++    const int restored = ::fcntl(uart->descriptor(), F_GETFL, 0);
++    REQUIRE(restored != -1);
++    // Darwin may add an unrelated kernel flag after actual PTY IO. Verify
++    // every mutable mode flag here; the no-IO test above checks full equality.
++    const int mutableFlags = O_NONBLOCK | O_ASYNC | O_APPEND;
++    REQUIRE((restored & mutableFlags) == (original & mutableFlags));
++}
++
++TEST_CASE("Bounded UART stops promptly at PTY backpressure and EOF", "[modem][cwid][uart]") {
++    LocalPTY pty;
++    PTYUART uart(pty.takeSlave());
++    REQUIRE(uart.boundedIO(true));
++    SECTION("backpressure returns a short write or zero without retrying forever") {
++        std::array<uint8_t, 1024U> data{};
++        bool limited = false;
++        for (unsigned i = 0U; i < 4096U; ++i) {
++            const auto start = Clock::now();
++            const int written = uart.write(data.data(), data.size());
++            REQUIRE(Clock::now() - start < std::chrono::milliseconds(200));
++            REQUIRE(written >= 0);
++            REQUIRE(written <= int(data.size()));
++            if (written < int(data.size())) { limited = true; break; }
++        }
++        REQUIRE(limited);
++    }
++    SECTION("closed peer does not cause a read or write spin") {
++        REQUIRE(::close(pty.master) == 0);
++        pty.master = -1;
++        uint8_t byte = 0U;
++        const auto start = Clock::now();
++        REQUIRE(uart.read(&byte, 1U) <= 0);
++        REQUIRE(uart.write(&byte, 1U) <= 0);
++        REQUIRE(Clock::now() - start < std::chrono::milliseconds(200));
++    }
++}
++
++TEST_CASE("A UART bounded-mode hook failure marks the modem unhealthy", "[modem][cwid][uart]") {
++    PTYModem modem(new PTYUART(-1));
++    REQUIRE_FALSE(modem.boundedCWOperation(true));
++    REQUIRE(modem.hasError());
++}
++#endif // !defined(_WIN32)
+diff --git a/tests/p25/CapacityPermit_Tests.cpp b/tests/p25/CapacityPermit_Tests.cpp
+index 51d1326..e6d682c 100644
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Offline controller tests. No modem port or network socket is opened. */
+ #include "host/Host.h"
++#include "host/CWIDDrain.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+ #include "common/lookups/AffiliationLookup.h"
+@@ -9,11 +10,14 @@
+ #include "common/p25/NID.h"
+ #include "common/p25/P25Utils.h"
+ #include "common/p25/Sync.h"
++#include "common/p25/lc/tdulc/LC_CALL_TERM.h"
++#include "common/p25/lc/tdulc/LC_GROUP.h"
+ #include "common/p25/lc/tsbk/TSBKFactory.h"
+ #include "common/Log.h"
+ 
+ #include <catch2/catch_test_macros.hpp>
+ #include <array>
++#include <algorithm>
+ #include <memory>
+ #include <cstdlib>
+ #include <fstream>
+@@ -33,6 +37,7 @@ namespace p25 {
+ struct CapacityPermitTestAccess {
+     static void startOldCallHang(Control& value) { value.m_rfTGHang.start(); }
+     static void advanceHang(Control& value, uint32_t ms) { value.m_rfTGHang.clock(ms); }
++    static void advanceCallTerm(Control& value, uint32_t ms) { value.m_rfVoiceCallTermTimeout.clock(ms); }
+     static void notifyEnd(Control& value, uint32_t destination) { value.notifyCC_ReleaseGrant(destination); }
+     static std::unique_lock<std::recursive_mutex> permitGuard(Control& value) { return std::unique_lock<std::recursive_mutex>(value.m_permitMutex); }
+ };
+@@ -84,6 +89,7 @@ class PermitRPC : public network::NetRPC {
+ public:
+     PermitMode mode = PermitMode::Accepted;
+     unsigned permits = 0;
++    std::vector<uint32_t> releases;
+     std::function<void()> beforeReply;
+     RPCType late;
+     json::object lateRequest;
+@@ -91,6 +97,8 @@ public:
+     using NetRPC::dispatchRequest;
+     PermitRPC() : NetRPC("127.0.0.1", 48991U, 0U, "offline-test", false) {}
+     bool req(uint16_t func, const json::object& request, RPCType callback, std::string, uint16_t, bool blocking = false) override {
++        if (func == RPC_RELEASE_P25_TG)
++            releases.push_back(request.at("dstId").get<uint32_t>());
+         if (func != RPC_PERMIT_P25_TG || request.at("dstId").get<uint32_t>() == 0U)
+             return true; // asynchronous unpermit after rollback
+         ++permits;
+@@ -198,6 +206,70 @@ system:
+         g_RPC = previousRPC;
+     }
+ 
++    void voiceMode(bool identification = true) {
++        yaml::Node config;
++        REQUIRE(yaml::Parse(config, std::string(R"(
++protocols:
++    p25:
++        verifyReg: false
++        verifyAff: false
++        immediateCallTerm: false
++        tduPreambleCount: 2
++        control:
++            enable: false
++            dedicated: false
++system:
++    config:
++        controlCh:
++            notifyEnable: true
++)")));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(2U, 1U, "127.0.0.1", 48993U, "offline-test"),
++            1U, 1U, 1U, 1U, 2U, VOICE_CHANNEL, false);
++        controller->setCCRunning(false);
++        controller->configureIdentification(identification);
++    }
++    void permitVoice(const std::string& token) {
++        json::object request, reply;
++        setJSON<uint32_t>(request, "dstId", GROUP);
++        request["permitToken"].set<std::string>(token);
++        request = wireObject(request);
++        REQUIRE(rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));
++        REQUIRE(reply["status"].get<int>() == network::NetRPC::OK);
++    }
++    bool voiceFrame(DUID::E duid, uint32_t destination = GROUP, bool nonTerminationLC = false) {
++        const uint32_t length = duid == DUID::HDU ? P25_HDU_FRAME_LENGTH_BYTES :
++            (duid == DUID::LDU1 || duid == DUID::LDU2) ? P25_LDU_FRAME_LENGTH_BYTES :
++            duid == DUID::TDULC ? P25_TDULC_FRAME_LENGTH_BYTES : P25_TDU_FRAME_LENGTH_BYTES;
++        std::vector<uint8_t> frame(length + 2U, 0U);
++        frame[0U] = modem::TAG_DATA; frame[1U] = 1U;
++        LC control;
++        control.setSrcId(SOURCE); control.setDstId(destination);
++        control.setGroup(true); control.setLCO(LCO::GROUP); control.setAlgId(ALGO_UNENCRYPT);
++        if (duid == DUID::HDU) control.encodeHDU(frame.data() + 2U);
++        if (duid == DUID::LDU1) control.encodeLDU1(frame.data() + 2U);
++        if (duid == DUID::LDU2) control.encodeLDU2(frame.data() + 2U);
++        if (duid == DUID::TDULC) {
++            if (nonTerminationLC) {
++                lc::tdulc::LC_GROUP value; value.setSrcId(SOURCE); value.setDstId(destination); value.encode(frame.data() + 2U);
++            } else {
++                lc::tdulc::LC_CALL_TERM value; value.setDstId(destination); value.encode(frame.data() + 2U);
++            }
++        }
++        Sync::addP25Sync(frame.data() + 2U);
++        NID nid(0x293U); nid.encode(frame.data() + 2U, duid);
++        P25Utils::addStatusBits(frame.data() + 2U, length * 8U, true, false);
++        return controller->processFrame(frame.data(), frame.size());
++    }
++    std::vector<DUID::E> drainVoice() {
++        std::vector<DUID::E> frames;
++        std::array<uint8_t, 1024U> frame{};
++        while (controller->getFrame(frame.data()) != 0U) {
++            NID nid(0x293U); REQUIRE(nid.decode(frame.data() + 2U));
++            frames.push_back(nid.getDUID());
++        }
++        return frames;
++    }
++
+     template<typename Request> void receive(uint32_t source, uint32_t target = 0U) {
+         auto request = std::make_unique<Request>();
+         request->setSrcId(source);
+@@ -661,3 +733,134 @@ TEST_CASE("CW pending latch is serialized with a permit already being committed"
+     REQUIRE(voice.controller->tryBeginIdentification());
+     REQUIRE(voice.controller->identificationActive());
+ }
++
++TEST_CASE("Real RF call end cannot regenerate a zero-ID tail after identification", "[p25][cwid][lifecycle]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.voiceMode();
++    voice.permitVoice("abcdef:1");
++    REQUIRE_FALSE(voice.controller->identificationPending()); // A permit alone is not RF.
++    REQUIRE(voice.voiceFrame(DUID::HDU));
++    voice.drainVoice(); // This native HDU handler defers HDU repetition until the LDU.
++    REQUIRE(voice.voiceFrame(DUID::LDU1));
++    REQUIRE(voice.controller->getRFState() == RS_RF_AUDIO);
++    REQUIRE_FALSE(voice.drainVoice().empty());
++    REQUIRE(voice.voiceFrame(DUID::TDU));
++    REQUIRE(voice.controller->identificationPending());
++    REQUIRE(voice.rpc.releases == std::vector<uint32_t>{GROUP});
++    // Match Host's real CW quiescence/reset/completion sequence. A queued
++    // terminal tail and delayed explicit-call-term timer both exist here.
++    REQUIRE(voice.controller->tryBeginIdentification());
++    voice.controller->clearIdentificationTraffic();
++    voice.controller->reset();
++    voice.controller->completeIdentification();
++    REQUIRE(voice.drainVoice().empty());
++    REQUIRE_FALSE(voice.controller->writeRF_VoiceEnd());
++    const auto releases = voice.rpc.releases;
++    for (auto duid : {DUID::TDU, DUID::TDULC}) {
++        REQUIRE_FALSE(voice.voiceFrame(duid, 0U));
++        REQUIRE_FALSE(voice.voiceFrame(duid, GROUP));
++        REQUIRE(voice.drainVoice().empty());
++        REQUIRE(voice.rpc.releases == releases);
++        REQUIRE_FALSE(voice.controller->identificationPending());
++    }
++    CapacityPermitTestAccess::advanceHang(*voice.controller, 100000U);
++    CapacityPermitTestAccess::advanceCallTerm(*voice.controller, 100000U);
++    voice.controller->clock();
++    REQUIRE_FALSE(voice.controller->writeRF_VoiceEnd());
++    REQUIRE(voice.drainVoice().empty());
++    // No time cooldown: a fresh permit and immediate next accepted RF call
++    // must end and identify normally, even on the same RID and talkgroup.
++    voice.permitVoice("abcdef:2");
++    REQUIRE(voice.voiceFrame(DUID::HDU));
++    REQUIRE(voice.voiceFrame(DUID::LDU1));
++    voice.drainVoice();
++    REQUIRE(voice.voiceFrame(DUID::TDULC));
++    REQUIRE(voice.controller->identificationPending());
++    REQUIRE(voice.rpc.releases.back() == GROUP);
++}
++
++TEST_CASE("Orphan ends preserve standalone LC and master-off voice behavior", "[p25][cwid][lifecycle]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.voiceMode(false);
++    REQUIRE_FALSE(voice.voiceFrame(DUID::TDU));
++    REQUIRE_FALSE(voice.voiceFrame(DUID::TDULC, 0U));
++    REQUIRE(voice.rpc.releases.empty());
++    REQUIRE(voice.drainVoice().empty());
++    REQUIRE(voice.voiceFrame(DUID::TDULC, GROUP, true)); // A supported standalone group LC still relays.
++    REQUIRE_FALSE(voice.drainVoice().empty());
++    REQUIRE(voice.rpc.releases.empty());
++    voice.permitVoice("fedcba:1");
++    REQUIRE(voice.voiceFrame(DUID::HDU));
++    REQUIRE(voice.voiceFrame(DUID::TDU)); // HDU/preamble-only communication still ends.
++    REQUIRE(voice.rpc.releases == std::vector<uint32_t>{GROUP});
++    REQUIRE_FALSE(voice.controller->identificationUnavailable());
++    REQUIRE_FALSE(voice.controller->identificationPending());
++}
++
++TEST_CASE("Normal end drains every actual queued LDU and valid terminal tail before CW cleanup", "[p25][cwid][lifecycle]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.voiceMode();
++    voice.permitVoice("ab12:1");
++    REQUIRE(voice.voiceFrame(DUID::HDU));
++    REQUIRE(voice.voiceFrame(DUID::LDU1));
++    REQUIRE(voice.voiceFrame(DUID::LDU2));
++    REQUIRE(voice.voiceFrame(DUID::LDU1));
++    REQUIRE(voice.voiceFrame(DUID::TDU));
++    REQUIRE(voice.controller->identificationUnavailable());
++    REQUIRE(voice.controller->tryBeginIdentification());
++    voice.controller->queueIdentificationTail();
++    struct ActualQueueDrain : identification::DrainTransport {
++        Control& control;
++        uint64_t clock = 0U, lastWrite = 0U;
++        std::vector<DUID::E> output;
++        std::vector<uint32_t> terminalDestinations;
++        explicit ActualQueueDrain(Control& value) : control(value) {}
++        uint64_t nowMs() const override { return clock; }
++        bool hasQueued() const override { return control.peekFrameLength() != 0U; }
++        bool sendOne() override {
++            std::array<uint8_t, 1024U> frame{};
++            const uint32_t length = control.getFrame(frame.data());
++            REQUIRE(length > 0U);
++            NID nid(0x293U);
++            if (!nid.decode(frame.data() + 2U)) {
++                REQUIRE(std::all_of(frame.begin() + 2U, frame.begin() + length,
++                    [](uint8_t value) { return value == 0U; })); // Native tail padding is not a P25 data unit.
++                lastWrite = clock;
++                return true;
++            }
++            output.push_back(nid.getDUID());
++            if (nid.getDUID() == DUID::TDULC) {
++                lc::tdulc::LC_CALL_TERM end;
++                REQUIRE(end.decode(frame.data() + 2U));
++                terminalDestinations.push_back(end.getDstId());
++            }
++            lastWrite = clock;
++            return true;
++        }
++        bool idleReady() const override { return clock >= lastWrite + 750U; }
++        bool healthy() const override { return true; }
++        void pump(uint32_t milliseconds) override { clock += milliseconds; }
++    } drain(*voice.controller);
++    REQUIRE(identification::drain(drain, 2000U) == identification::DrainResult::Completed);
++    REQUIRE(std::count(drain.output.begin(), drain.output.end(), DUID::LDU1) == 2U);
++    REQUIRE(std::count(drain.output.begin(), drain.output.end(), DUID::LDU2) == 1U);
++    const auto lastAudio = std::find_if(drain.output.rbegin(), drain.output.rend(), [](DUID::E duid) {
++        return duid == DUID::LDU1 || duid == DUID::LDU2;
++    }).base();
++    const auto firstTerm = std::find_if(drain.output.begin(), drain.output.end(), [](DUID::E duid) {
++        return duid == DUID::TDU || duid == DUID::TDULC;
++    });
++    REQUIRE(firstTerm != drain.output.end());
++    REQUIRE(lastAudio <= firstTerm); // Every accepted LDU precedes terminal RF; presence alone is insufficient.
++    REQUIRE_FALSE(drain.terminalDestinations.empty());
++    for (const auto target : drain.terminalDestinations) REQUIRE(target == GROUP);
++    REQUIRE(drain.clock >= drain.lastWrite + 750U); // Software-empty alone was insufficient.
++    voice.controller->clearIdentificationTraffic();
++    voice.controller->reset();
++    voice.controller->completeIdentification();
++    REQUIRE_FALSE(voice.controller->writeRF_VoiceEnd());
++    REQUIRE(voice.drainVoice().empty());
++    REQUIRE_FALSE(voice.voiceFrame(DUID::TDU));
++    REQUIRE(voice.drainVoice().empty());
++    REQUIRE_FALSE(voice.controller->identificationPending());
++}

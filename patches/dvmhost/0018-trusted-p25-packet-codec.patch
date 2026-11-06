@@ -1,0 +1,468 @@
+--- a/src/bridge/BridgeMain.cpp
++++ b/src/bridge/BridgeMain.cpp
+@@ -12,6 +12,7 @@
+ #include "bridge/ActivityLog.h"
+ #include "BridgeMain.h"
+ #include "HostBridge.h"
++#include "PacketCodec.h"
+ 
+ using namespace network;
+ using namespace lookups;
+@@ -249,6 +250,8 @@
+ #if !defined(CATCH2_TEST_COMPILATION)
+ int main(int argc, char** argv)
+ {
++    if (argc == 3 && ::strcmp(argv[1], "--packet-codec") == 0)
++        return packetCodecMain(argv[2]);
+     g_gitHashBytes = new uint8_t[4U];
+     ::memset(g_gitHashBytes, 0x00U, 4U);
+ 
+@@ -322,4 +325,4 @@
+ 
+     return ret;
+ }
+-#endif
+\ No newline at end of file
++#endif
+--- a/src/bridge/HostBridge.h
++++ b/src/bridge/HostBridge.h
+@@ -220,6 +220,11 @@
+     
+     bool m_udpAudio;
+     bool m_udpMetadata;
++    bool m_opaqueP25 = false;
++    uint8_t m_opaqueRxToken[16]{}, m_opaqueTxToken[16]{}, m_opaqueRxMI[9]{};
++    uint64_t m_opaqueRxSequence = 0, m_opaqueTxSequence = 0;
++    uint8_t m_opaqueRxAlgorithm = 0, m_opaqueTxAlgorithm = 0;
++    uint16_t m_opaqueRxKey = 0, m_opaqueTxKey = 0;
+     uint16_t m_udpSendPort;
+     std::string m_udpSendAddress;
+     uint16_t m_udpReceivePort;
+@@ -454,6 +459,9 @@
+      * @brief Helper to process UDP audio.
+      */
+     void processUDPAudio();
++    void processOpaqueP25UDP(const uint8_t* packet, uint32_t length);
++    void processOpaqueP25Network(uint8_t* packet, uint32_t length);
++    void writeOpaqueP25(uint32_t src, uint32_t dst, const uint8_t* imbe, uint8_t index, bool end);
+ 
+     /**
+      * @brief Helper to write UDP audio to the UDP audio socket.
+--- a/src/bridge/HostBridge.cpp
++++ b/src/bridge/HostBridge.cpp
+@@ -1042,6 +1042,7 @@
+ 
+     m_udpAudio = systemConf["udpAudio"].as<bool>(false);
+     m_udpMetadata = systemConf["udpMetadata"].as<bool>(false);
++    m_opaqueP25 = systemConf["opaqueP25"].as<bool>(false);
+     m_udpSendPort = (uint16_t)systemConf["udpSendPort"].as<uint32_t>(34001);
+     m_udpSendAddress = systemConf["udpSendAddress"].as<std::string>();
+     m_udpReceivePort = (uint16_t)systemConf["udpReceivePort"].as<uint32_t>(34001);
+@@ -1385,6 +1386,11 @@
+         return;
+     }
+ 
++    if (m_opaqueP25) {
++        if (length > 0) { std::lock_guard<std::mutex> lock(s_audioMutex); processOpaqueP25UDP(buffer, uint32_t(length)); }
++        return;
++    }
++
+     if (length > (int)(AUDIO_SAMPLES_LENGTH_BYTES * 2U)) {
+         LogWarning(LOG_NET, "UDP audio packet too large (%d bytes), dropping", length);
+         return;
+@@ -1757,8 +1763,10 @@
+         case TX_MODE_P25:
+             {
+                 // insert 2 silence LDUs at call end for clean transition
+-                padSilenceAudio(srcId, dstId);
+-                padSilenceAudio(srcId, dstId);
++                if (!m_opaqueP25) {
++                    padSilenceAudio(srcId, dstId);
++                    padSilenceAudio(srcId, dstId);
++                }
+ 
+                 p25::lc::LC lc = p25::lc::LC();
+                 lc.setLCO(P25DEF::LCO::GROUP);
+@@ -1804,6 +1812,8 @@
+     m_udpDstId = 0;
+     m_trafficFromUDP = false;
+     m_udpFrameCnt = 0U;
++    m_opaqueTxSequence = 0;
++    ::memset(m_opaqueTxToken, 0, 16);
+ 
+     // ensure PTT is dropped at call end
+     if (m_rtsPttEnable) {
+--- a/src/bridge/HostBridge.P25.cpp
++++ b/src/bridge/HostBridge.P25.cpp
+@@ -53,6 +53,7 @@
+ void HostBridge::processP25Network(uint8_t* buffer, uint32_t length)
+ {
+     assert(buffer != nullptr);
++    if (m_opaqueP25) { processOpaqueP25Network(buffer, length); return; }
+     using namespace p25;
+     using namespace p25::defines;
+     using namespace p25::dfsi::defines;
+--- /dev/null
++++ b/src/bridge/HostBridge.Opaque.cpp
+@@ -0,0 +1,140 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Keyless P25 media transport. Neither vocoding nor traffic-key processing runs
++// in this Site-facing path; encrypted IMBE and its public metadata stay opaque.
++#include "HostBridge.h"
++#include "common/p25/dfsi/LC.h"
++#include "common/p25/dfsi/DFSIDefines.h"
++#include "common/Utils.h"
++#include <chrono>
++#include <cstring>
++
++namespace {
++const unsigned packetHeader = 64;
++const unsigned voiceOffsets[9] = {10,26,55,80,105,130,155,180,204};
++const unsigned dfsiOffsets[9] = {24,46,60,77,94,111,128,145,162};
++const unsigned dfsiLengths[9] = {22,14,17,17,17,17,17,17,16};
++uint16_t read16(const uint8_t* p) { return (uint16_t(p[0])<<8)|p[1]; }
++uint32_t read32(const uint8_t* p) { return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3]; }
++uint64_t read64(const uint8_t* p) { return (uint64_t(read32(p))<<32)|read32(p+4); }
++void write16(uint8_t* p,uint16_t n) { p[0]=n>>8;p[1]=n; }
++void write32(uint8_t* p,uint32_t n) { p[0]=n>>24;p[1]=n>>16;p[2]=n>>8;p[3]=n; }
++void write64(uint8_t* p,uint64_t n) { write32(p,n>>32);write32(p+4,n); }
++}
++
++void HostBridge::writeOpaqueP25(uint32_t src,uint32_t dst,const uint8_t* imbe,uint8_t index,bool end)
++{
++    uint8_t packet[packetHeader+11]{};
++    std::memcpy(packet,"DV25",4);packet[4]=16;packet[6]=m_opaqueRxAlgorithm;packet[7]=index;
++    write16(packet+8,m_opaqueRxKey);write16(packet+10,end?1:0);
++    write32(packet+12,src);write32(packet+16,dst);write64(packet+24,++m_opaqueRxSequence);
++    std::memcpy(packet+32,m_opaqueRxToken,16);
++    if (m_opaqueRxAlgorithm==0x84) std::memcpy(packet+48,m_opaqueRxMI,9);
++    write16(packet+58,end?0:11);
++    if (!end) std::memcpy(packet+packetHeader,imbe,11);
++    sockaddr_storage address;uint32_t addressLength;
++    if (network::udp::Socket::lookup(m_udpSendAddress,m_udpSendPort,address,addressLength)==0)
++        m_udpAudioSocket->write(packet,end?packetHeader:packetHeader+11,address,addressLength);
++}
++
++void HostBridge::processOpaqueP25Network(uint8_t* buffer,uint32_t length)
++{
++    using namespace p25;
++    using namespace p25::defines;
++    using namespace p25::dfsi::defines;
++    if (length<24 || m_txMode!=TX_MODE_P25 || m_trafficFromUDP || buffer[4]!=LCO::GROUP) return;
++    uint32_t src=GET_UINT24(buffer,5);
++    uint32_t dst=GET_UINT24(buffer,8);
++    if (!src || src>0xfffffb || dst!=m_dstId || dst>65534) return;
++    auto duid=static_cast<DUID::E>(buffer[22]);
++    if (duid==DUID::TDU || duid==DUID::TDULC) {
++        if (buffer[14]&network::NET_CTRL_GRANT_DEMAND) return;
++        if (m_opaqueRxSequence) writeOpaqueP25(src,dst,nullptr,0,true);
++        m_opaqueRxSequence=0;m_opaqueRxAlgorithm=0;m_rxStreamId=0;m_callInProgress=false;
++        m_networkWatchdog.stop();m_network->resetP25();return;
++    }
++    if ((duid!=DUID::LDU1 && duid!=DUID::LDU2) || length<178) return;
++    uint32_t stream=m_network->getP25StreamId();
++    if (stream!=m_rxStreamId || !m_callInProgress) {
++        m_opaqueRxSequence=0;m_opaqueRxAlgorithm=0;m_opaqueRxKey=0;
++        std::memset(m_opaqueRxMI,0,9);std::memset(m_opaqueRxToken,0,16);
++        uint64_t now=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        write64(m_opaqueRxToken,now);write32(m_opaqueRxToken+8,stream);write32(m_opaqueRxToken+12,src);
++        m_rxStreamId=stream;m_callInProgress=true;
++    }
++    m_networkWatchdog.start();
++    // HDU metadata contains the current superframe's MI. Late entry without
++    // this metadata waits for LDU2's next MI rather than guessing clear audio.
++    if (duid==DUID::LDU1 && length>=193 && buffer[180]==FrameType::HDU_VALID) {
++        m_opaqueRxAlgorithm=buffer[181];m_opaqueRxKey=GET_UINT16(buffer,182);
++        std::memcpy(m_opaqueRxMI,buffer+184,9);
++    }
++    lc::LC control;control.setLCO(LCO::GROUP);control.setSrcId(src);control.setDstId(dst);
++    data::LowSpeedData lsd;
++    dfsi::LC dfsiLC(control,lsd);
++    uint8_t words[9][11]{};
++    const uint8_t first=duid==DUID::LDU1?DFSIFrameType::LDU1_VOICE1:DFSIFrameType::LDU2_VOICE10;
++    for (unsigned i=0;i<9;i++) {
++        if (length<dfsiOffsets[i]+dfsiLengths[i] || buffer[dfsiOffsets[i]]!=first+i) return;
++        dfsiLC.setFrameType(static_cast<DFSIFrameType::E>(first+i));
++        if (duid==DUID::LDU1) dfsiLC.decodeLDU1(buffer+dfsiOffsets[i],words[i]);
++        else dfsiLC.decodeLDU2(buffer+dfsiOffsets[i],words[i]);
++    }
++    const bool known=(m_opaqueRxAlgorithm==0x80 && m_opaqueRxKey==0) || (m_opaqueRxAlgorithm==0x84 && m_opaqueRxKey!=0);
++    if (known) for (unsigned i=0;i<9;i++) writeOpaqueP25(src,dst,words[i],uint8_t(i+(duid==DUID::LDU2?9:0)),false);
++    // The LDU2 encryption sync applies to the NEXT superframe, never the nine
++    // encrypted codewords just exported above.
++    if (duid==DUID::LDU2) {
++        m_opaqueRxAlgorithm=dfsiLC.control()->getAlgId();m_opaqueRxKey=dfsiLC.control()->getKId();
++        dfsiLC.control()->getMI(m_opaqueRxMI);
++    }
++}
++
++void HostBridge::processOpaqueP25UDP(const uint8_t* packet,uint32_t length)
++{
++    using namespace p25;
++    using namespace p25::defines;
++    if (length<packetHeader || std::memcmp(packet,"DV25",4) || packet[4]!=16 || packet[5] || length!=packetHeader+read16(packet+58)) return;
++    uint32_t src=read32(packet+12),dst=read32(packet+16);uint16_t flags=read16(packet+10),key=read16(packet+8);
++    uint64_t sequence=read64(packet+24);uint8_t algorithm=packet[6],index=packet[7];
++    if (!src || src>0xfffffb || dst!=m_dstId || (flags&~1U)) return;
++    if (flags&1) {
++        if (length==packetHeader && m_trafficFromUDP && std::memcmp(packet+32,m_opaqueTxToken,16)==0) callEnd(src,dst);
++        return;
++    }
++    if (length!=packetHeader+11 || !sequence || index>17 || !((algorithm==0x80 && key==0)||(algorithm==0x84 && key!=0))) return;
++    bool fresh=!m_trafficFromUDP || std::memcmp(packet+32,m_opaqueTxToken,16)!=0 || m_udpSrcId!=src;
++    if (fresh) {
++        if (index!=0) return;
++        if (m_trafficFromUDP) callEnd(m_udpSrcId,m_dstId);
++        m_callInProgress=false;m_networkWatchdog.stop();m_rxStreamId=0;m_opaqueRxSequence=0;
++        m_p25N=0;m_opaqueTxSequence=0;m_opaqueTxAlgorithm=algorithm;m_opaqueTxKey=key;
++        std::memcpy(m_opaqueTxToken,packet+32,16);
++    }
++    if (sequence<=m_opaqueTxSequence || algorithm!=m_opaqueTxAlgorithm || key!=m_opaqueTxKey) return;
++    if (index!=m_p25N) {
++        // A partial LDU is discarded on a network gap. Rejoin on a complete
++        // LDU boundary; never fill encrypted gaps with clear silence.
++        if (index!=0 && index!=9) return;
++        m_p25N=index;
++    }
++    if (index==0 || index==9) std::memset(index<9?m_netLDU1:m_netLDU2,0,225);
++    std::memcpy((index<9?m_netLDU1:m_netLDU2)+voiceOffsets[index%9],packet+packetHeader,11);
++    m_udpSrcId=src;m_udpDstId=dst;m_trafficFromUDP=true;m_opaqueTxSequence=sequence;
++    m_udpInactivity.received();m_udpDropTime.start();
++    if (index==8 || index==17) {
++        lc::LC control;control.setLCO(LCO::GROUP);control.setGroup(true);control.setPriority(4);
++        control.setSrcId(src);control.setDstId(dst);control.setAlgId(algorithm);control.setKId(key);control.setEncrypted(algorithm!=0x80);
++        uint8_t mi[9]{};if (algorithm!=0x80) std::memcpy(mi,packet+48,9);
++        if (index==17 && algorithm!=0x80) {
++            // LDU2 transports the next MI. Advancing its public LFSR needs no key.
++            p25::crypto::P25Crypto miSync;miSync.setMI(mi);miSync.generateNextMI();miSync.getMI(mi);
++        }
++        control.setMI(mi);data::LowSpeedData lsd;
++        uint8_t controlByte=network::NET_CTRL_SWITCH_OVER;
++        if (algorithm!=0x80) controlByte|=network::NET_CTRL_GRANT_ENCRYPT;
++        if (index==8) m_network->writeP25LDU1(control,lsd,m_netLDU1,FrameType::HDU_VALID,controlByte);
++        else m_network->writeP25LDU2(control,lsd,m_netLDU2,controlByte);
++        m_txStreamId=m_network->getP25StreamId();
++    }
++    m_p25N=(index+1)%18;
++}
+--- /dev/null
++++ b/src/bridge/PacketCodec.h
+@@ -0,0 +1,6 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// TrunkSystem local packet codec. Uses the DVM vocoder and P25 crypto routines.
++#ifndef TRUNKSYSTEM_PACKET_CODEC_H
++#define TRUNKSYSTEM_PACKET_CODEC_H
++int packetCodecMain(const char* keyFile);
++#endif
+--- /dev/null
++++ b/src/bridge/PacketCodec.cpp
+@@ -0,0 +1,209 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Local, length-framed codec interface. Traffic keys are read only from a
++// private runtime file; the wire format contains identifiers, never key bytes.
++#include "PacketCodec.h"
++#include "common/p25/Crypto.h"
++#include "common/p25/P25Defines.h"
++#include "vocoder/MBEEncoder.h"
++#include "vocoder/MBEDecoder.h"
++#include <openssl/crypto.h>
++#include <openssl/rand.h>
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <map>
++#include <memory>
++#include <sstream>
++#include <string>
++#include <vector>
++#if !defined(_WIN32)
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
++namespace {
++constexpr size_t Header = 64;
++constexpr uint8_t Clear = 0x80, AES256 = 0x84;
++uint16_t u16(const uint8_t* p) { return (uint16_t(p[0]) << 8) | p[1]; }
++uint32_t u32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
++uint64_t u64(const uint8_t* p) { return (uint64_t(u32(p)) << 32) | u32(p + 4); }
++void put16(uint8_t* p, uint16_t n) { p[0] = n >> 8; p[1] = n; }
++void put32(uint8_t* p, uint32_t n) { p[0] = n >> 24; p[1] = n >> 16; p[2] = n >> 8; p[3] = n; }
++using Key = std::array<uint8_t, 32>;
++struct Keys {
++    std::map<uint16_t, Key> values;
++    ~Keys() { for (auto& entry : values) OPENSSL_cleanse(entry.second.data(), entry.second.size()); }
++    bool load(const char* path) {
++        if (std::strcmp(path, "-") == 0) return true;
++#if !defined(_WIN32)
++        int fd = ::open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
++        if (fd < 0) return false;
++        struct stat info{};
++        if (::fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_uid != ::geteuid() || (info.st_mode & 0077) || info.st_size > 65536) { ::close(fd); return false; }
++        std::string text;
++        char buffer[1024];
++        ssize_t count;
++        while ((count = ::read(fd, buffer, sizeof(buffer))) > 0) text.append(buffer, size_t(count));
++        ::close(fd);
++        OPENSSL_cleanse(buffer, sizeof(buffer));
++        if (count < 0) return false;
++        std::istringstream input(text);
++#else
++        std::ifstream input(path);
++        if (!input) return false;
++#endif
++        std::string line;
++        while (std::getline(input, line)) {
++            if (line.empty()) continue;
++            auto first = line.find(':'), second = line.find(':', first == std::string::npos ? first : first + 1);
++            if (first == std::string::npos || second == std::string::npos || line.size() - second - 1 != 64) return false;
++            std::string alg = line.substr(0, first), kid = line.substr(first + 1, second - first - 1);
++            if (alg != "132" || kid.empty() || kid.find_first_not_of("0123456789") != std::string::npos) return false;
++            unsigned long id;
++            try { id = std::stoul(kid); } catch (...) { return false; }
++            if (!id || id > 65535 || values.count(uint16_t(id))) return false;
++            Key key{};
++            for (size_t i = 0; i < key.size(); i++) {
++                auto digit = [](char c) -> int { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; };
++                int a = digit(line[second + 1 + 2*i]), b = digit(line[second + 2 + 2*i]);
++                if (a < 0 || b < 0) return false;
++                key[i] = uint8_t(a * 16 + b);
++            }
++            values[uint16_t(id)] = key;
++            OPENSSL_cleanse(key.data(), key.size());
++            if (!line.empty()) OPENSSL_cleanse(&line[0], line.size());
++            if (values.size() > 256) return false;
++        }
++#if !defined(_WIN32)
++        if (!text.empty()) OPENSSL_cleanse(&text[0], text.size());
++#endif
++        return true;
++    }
++};
++struct Call {
++    std::unique_ptr<vocoder::MBEEncoder> encoder;
++    std::unique_ptr<vocoder::MBEDecoder> decoder;
++    std::array<uint8_t,9> mi{};
++    uint64_t encodedSequence = 0, decodedSequence = 0, superframe = 0;
++    uint8_t algorithm = Clear;
++    uint16_t key = 0;
++    std::chrono::steady_clock::time_point seen = std::chrono::steady_clock::now();
++};
++void crypt(uint8_t* imbe, const Key& key, const uint8_t* mi, uint8_t index) {
++    p25::crypto::P25Crypto crypto;
++    crypto.setTEKAlgoId(AES256);
++    crypto.setKey(key.data(), 32);
++    crypto.setMI(mi);
++    crypto.generateKeystream();
++    uint8_t skipped[11]{};
++    auto duid = index < 9 ? p25::defines::DUID::LDU1 : p25::defines::DUID::LDU2;
++    for (unsigned i = 0; i < unsigned(index % 9); i++) crypto.cryptAES_IMBE(skipped, duid);
++    crypto.cryptAES_IMBE(imbe, duid);
++    crypto.clearKey();
++}
++std::vector<uint8_t> process(std::vector<uint8_t> request, const Keys& keys, std::map<std::string, Call>& calls) {
++    std::vector<uint8_t> response(request.begin(), request.begin() + Header);
++    response[4] |= 0x80;
++    response[5] = 1;
++    put16(response.data() + 58, 0);
++    auto reject = [&](uint8_t status) { response[5] = status; return response; };
++    if (std::memcmp(request.data(), "DV25", 4) || request[5] || (request[4] != 1 && request[4] != 2 && request[4] != 3)) return reject(1);
++    uint8_t op = request[4], algorithm = request[6], index = request[7];
++    uint16_t keyID = u16(request.data() + 8), flags = u16(request.data() + 10), size = u16(request.data() + 58);
++    uint32_t source = u32(request.data() + 12), group = u32(request.data() + 16);
++    uint64_t sequence = u64(request.data() + 24);
++    if (request.size() != Header + size || !source || source > 0xfffffb || !group || group > 65534 || (flags & ~1U)) return reject(1);
++    std::string identity(reinterpret_cast<char*>(request.data() + 32), 16);
++    identity.append(reinterpret_cast<char*>(request.data() + 12), 8);
++    if (flags & 1) {
++        if (size) return reject(1);
++        calls.erase(identity);
++        response[5] = 0;
++        return response;
++    }
++    if (!sequence || index > 17 || (algorithm != Clear && algorithm != AES256) || (algorithm == Clear && keyID)) return reject(1);
++    if (algorithm == AES256 && (!keyID || !keys.values.count(keyID))) return reject(2);
++    if ((op == 1 && size != 320) || (op != 1 && size != 11)) return reject(1);
++    auto now = std::chrono::steady_clock::now();
++    for (auto it = calls.begin(); it != calls.end();) {
++        if (now - it->second.seen > std::chrono::minutes(2)) it = calls.erase(it); else ++it;
++    }
++    if (!calls.count(identity) && calls.size() >= 128) return reject(4);
++    Call& call = calls[identity];
++    call.seen = now;
++    if ((call.encodedSequence || call.decodedSequence) && (call.algorithm != algorithm || call.key != keyID)) return reject(3);
++    call.algorithm = algorithm;
++    call.key = keyID;
++    uint8_t imbe[11]{};
++    if (op == 1) {
++        if (sequence <= call.encodedSequence) return reject(3);
++        if (!call.encoder) {
++            call.encoder = std::make_unique<vocoder::MBEEncoder>(vocoder::ENCODE_88BIT_IMBE);
++            call.encoder->setGainAdjust(1.0f);
++            if (algorithm == AES256 && RAND_bytes(call.mi.data(), int(call.mi.size())) != 1) return reject(5);
++        }
++        uint64_t superframe = (sequence - 1) / 18;
++        if (superframe - call.superframe > 10000) return reject(3);
++        while (call.superframe < superframe) {
++            p25::crypto::P25Crypto mi;
++            mi.setMI(call.mi.data());
++            mi.generateNextMI();
++            mi.getMI(call.mi.data());
++            call.superframe++;
++        }
++        index = uint8_t((sequence - 1) % 18);
++        response[7] = index;
++        std::memcpy(response.data() + 48, call.mi.data(), 9);
++        int16_t pcm[160];
++        for (size_t i = 0; i < 160; i++) pcm[i] = int16_t(uint16_t(request[Header + i*2]) | uint16_t(request[Header + i*2+1]) << 8);
++        call.encoder->encode(pcm, imbe);
++        OPENSSL_cleanse(pcm, sizeof(pcm));
++        call.encodedSequence = sequence;
++    } else {
++        if (op == 2 && sequence <= call.decodedSequence) return reject(3);
++        std::memcpy(imbe, request.data() + Header, 11);
++    }
++    if (algorithm == AES256) crypt(imbe, keys.values.at(keyID), op == 1 ? call.mi.data() : request.data() + 48, index);
++    if (op == 2) {
++        if (!call.decoder) {
++            call.decoder = std::make_unique<vocoder::MBEDecoder>(vocoder::DECODE_88BIT_IMBE);
++            call.decoder->setGainAdjust(1.0f);
++            call.decoder->setAutoGain(false);
++        }
++        int16_t pcm[160]{};
++        call.decoder->decode(imbe, pcm);
++        response.resize(Header + 320);
++        for (size_t i = 0; i < 160; i++) { response[Header + i*2] = uint8_t(pcm[i]); response[Header + i*2+1] = uint8_t(uint16_t(pcm[i]) >> 8); }
++        OPENSSL_cleanse(pcm, sizeof(pcm));
++        call.decodedSequence = sequence;
++    } else {
++        response.insert(response.end(), imbe, imbe + 11);
++    }
++    OPENSSL_cleanse(imbe, sizeof(imbe));
++    response[5] = 0;
++    put16(response.data() + 58, uint16_t(response.size() - Header));
++    return response;
++}
++}
++
++int packetCodecMain(const char* keyFile) {
++    Keys keys;
++    if (!keys.load(keyFile)) { std::fprintf(stderr, "Packet codec requires an owner-only regular key file with valid AES-256 entries.\n"); return 2; }
++    std::map<std::string, Call> calls;
++    uint8_t prefix[4];
++    while (true) {
++        size_t n = std::fread(prefix, 1, 4, stdin);
++        if (!n && std::feof(stdin)) return 0;
++        if (n != 4) return 3;
++        uint32_t length = u32(prefix);
++        if (length < Header || length > Header + 320) return 3;
++        std::vector<uint8_t> request(length);
++        if (std::fread(request.data(), 1, length, stdin) != length) return 3;
++        auto response = process(std::move(request), keys, calls);
++        put32(prefix, uint32_t(response.size()));
++        if (std::fwrite(prefix, 1, 4, stdout) != 4 || std::fwrite(response.data(), 1, response.size(), stdout) != response.size() || std::fflush(stdout)) return 4;
++    }
++}

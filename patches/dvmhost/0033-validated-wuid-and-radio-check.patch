@@ -1,0 +1,982 @@
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -220,6 +220,7 @@
+ 
+ void Control::reset()
+ {
++    if (m_control != nullptr) m_control->cancelRadioChecks();
+     m_rfState = RS_RF_LISTENING;
+     m_ccHalted = false;
+ 
+@@ -1083,6 +1084,18 @@
+     return false;
+ }
+ 
++void Control::setCCRunning(bool ccRunning)
++{
++    m_ccPrevRunning = m_ccRunning; m_ccRunning = ccRunning;
++    if (!ccRunning && m_control != nullptr) m_control->cancelRadioChecks();
++}
++
++void Control::setCCHalted(bool ccHalted)
++{
++    m_ccHalted = ccHalted;
++    if (ccHalted && m_control != nullptr) m_control->cancelRadioChecks();
++}
++
+ /* Updates the processor. */
+ 
+ void Control::clock()
+@@ -1093,6 +1106,7 @@
+     clockDispatch();
+     uint32_t ms = m_interval.elapsed();
+     m_interval.start();
++    if (m_control != nullptr) m_control->clockRadioChecks(ms);
+ 
+     if (m_network != nullptr) {
+         processNetwork();
+@@ -1584,19 +1598,19 @@
+ 
+ /* Add data frame to the data ring buffer. */
+ 
+-void Control::addFrame(const uint8_t* data, uint32_t length, bool net, bool imm)
++bool Control::addFrame(const uint8_t* data, uint32_t length, bool net, bool imm)
+ {
+     assert(data != nullptr);
+ 
+     std::lock_guard<std::mutex> lock(s_queueLock);
+-    if (identificationActive()) return;
++    if (identificationActive()) return false;
+ 
+     if (!net) {
+         if (m_rfTimeout.isRunning() && m_rfTimeout.hasExpired())
+-            return;
++            return false;
+     } else {
+         if (m_netTimeout.isRunning() && m_netTimeout.hasExpired())
+-            return;
++            return false;
+     }
+ 
+     if (m_debug) {
+@@ -1611,16 +1625,16 @@
+     if (imm) {
+         // resize immediate queue if necessary (this shouldn't really ever happen)
+         uint32_t space = m_txImmQueue.freeSpace();
+-        if (space < (length + 1U)) {
++        if (space < (length + 2U)) {
+             if (!net) {
+                 uint32_t queueLen = m_txImmQueue.length();
+                 m_txImmQueue.resize(queueLen + P25_LDU_FRAME_LENGTH_BYTES);
+                 LogError(LOG_P25, "overflow in the P25 queue while writing imm data; queue free is %u, needed %u; resized was %u is %u, fifoSpace = %u", space, length, queueLen, m_txImmQueue.length(), fifoSpace);
+-                return;
++                return false;
+             }
+             else {
+                 LogError(LOG_P25, "overflow in the P25 queue while writing imm network data; queue free is %u, needed %u, fifoSpace = %u", space, length, fifoSpace);
+-                return;
++                return false;
+             }
+         }
+ 
+@@ -1633,21 +1647,21 @@
+         m_txImmQueue.addData(lenBuffer, 2U);
+ 
+         m_txImmQueue.addData(data, length);
+-        return;
++        return true;
+     }
+ 
+     // resize queue if necessary (this shouldn't really ever happen)
+     uint32_t space = m_txQueue.freeSpace();
+-    if (space < (length + 1U)) {
++    if (space < (length + 2U)) {
+         if (!net) {
+             uint32_t queueLen = m_txQueue.length();
+             m_txQueue.resize(queueLen + P25_LDU_FRAME_LENGTH_BYTES);
+             LogError(LOG_P25, "overflow in the P25 queue while writing data; queue free is %u, needed %u; resized was %u is %u, fifoSpace = %u", space, length, queueLen, m_txQueue.length(), fifoSpace);
+-            return;
++            return false;
+         }
+         else {
+             LogError(LOG_P25, "overflow in the P25 queue while writing network data; queue free is %u, needed %u, fifoSpace = %u", space, length, fifoSpace);
+-            return;
++            return false;
+         }
+     }
+ 
+@@ -1660,6 +1674,7 @@
+     m_txQueue.addData(lenBuffer, 2U);
+ 
+     m_txQueue.addData(data, length);
++    return true;
+ }
+ 
+ /* Process a data frames from the network. */
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -142,7 +142,7 @@
+          * @brief Sets a flag indicating whether the control channel is running.
+          * @param ccRunning Flag indicating whether the control channel is running.
+          */
+-        void setCCRunning(bool ccRunning) { m_ccPrevRunning = m_ccRunning; m_ccRunning = ccRunning; }
++        void setCCRunning(bool ccRunning);
+         /**
+          * @brief Gets a flag indicating whether the control channel is running.
+          * @returns bool Flag indicating whether the control channel is running.
+@@ -152,7 +152,7 @@
+          * @brief Sets a flag indicating whether the control channel is halted.
+          * @param ccHalted Flag indicating whether the control channel is halted.
+          */
+-        void setCCHalted(bool ccHalted) { m_ccHalted = ccHalted; }
++        void setCCHalted(bool ccHalted);
+         /** @} */
+ 
+         /** @name Frame Processing */
+@@ -311,6 +311,7 @@
+ #if defined(CATCH2_TEST_COMPILATION)
+         friend struct CapacityPermitTestAccess;
+         friend struct DispatchGrantTestAccess;
++        friend struct RadioCheckTestAccess;
+         friend struct MultiSiteTestAccess;
+         friend struct NIDReceiveTestAccess;
+         friend struct AMBTIngressTestAccess;
+@@ -514,7 +515,7 @@
+          * @param net Flag indicating whether the data came from the network or not
+          * @param imm Flag indicating whether or not the data is priority and is added to the immediate queue.
+          */
+-        void addFrame(const uint8_t* data, uint32_t length, bool net = false, bool imm = false);
++        bool addFrame(const uint8_t* data, uint32_t length, bool net = false, bool imm = false);
+ 
+         /**
+          * @brief Process a data frames from the network.
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -160,6 +160,10 @@
+ const uint32_t GRANT_TIMER_TIMEOUT = 15U;
+ const uint8_t CONV_FALLBACK_PACKET_DELAY = 8U;
+ 
++// RF reader and protocol clock are different host threads. A command writer
++// on another thread cannot acknowledge the RF reader's in-flight transaction.
++thread_local ControlSignaling::WUIDTransaction ControlSignaling::s_wuidTransaction{nullptr, 0U};
++
+ // ---------------------------------------------------------------------------
+ //  Public Class Members
+ // ---------------------------------------------------------------------------
+@@ -235,7 +239,13 @@
+             m_inbound = false; m_p25->m_rfState = prevRfState;
+             return false;
+         }
+-        m_p25->m_affiliations->touchUnitReg(srcId);
++        // AABD-B 6.6.1: only a validated transaction acknowledged by this
++        // RFSS restarts validity. The guard also clears on every rejection.
++        struct ValidityGuard {
++            WUIDTransaction& context; WUIDTransaction previous;
++            ~ValidityGuard() { context = previous; }
++        } validityGuard{s_wuidTransaction, s_wuidTransaction};
++        s_wuidTransaction = WUIDTransaction{this, 0U};
+ 
+         // handle standard P25 reference opcodes
+         switch (tsbk->getLCO()) {
+@@ -249,6 +259,7 @@
+ 
+                 // validate the talkgroup ID
+                 VALID_TGID(tsbk->toString(true), TSBKO::IOSP_GRP_VCH, srcId, dstId);
++                markValidatedWUID(srcId);
+ 
+                 if (!acl::AccessControl::validateGroupTransmit(srcId, dstId)) {
+                     LogWarning(LOG_RF, P25_TSDU_STR ", subscriber transmit denial, srcId = %u, dstId = %u", srcId, dstId);
+@@ -291,6 +302,7 @@
+ 
+                 // verify the source RID is registered
+                 VERIFY_SRCID_REG(tsbk->toString(true), TSBKO::IOSP_UU_VCH, srcId);
++                markValidatedWUID(srcId);
+ 
+                 VERBOSE_LOG_TSBK(tsbk->toString(true), srcId, dstId);
+                 if (m_unitToUnitAvailCheck) {
+@@ -320,6 +332,7 @@
+ 
+                 // validate the target RID
+                 VALID_DSTID(tsbk->toString(true), TSBKO::IOSP_UU_ANS, srcId, dstId);
++                markValidatedWUID(srcId);
+ 
+                 IOSP_UU_ANS* iosp = static_cast<IOSP_UU_ANS*>(tsbk.get());
+                 if (m_verbose) {
+@@ -354,6 +367,7 @@
+ 
+                 // validate the source RID
+                 VALID_SRCID(tsbk->toString(true), TSBKO::IOSP_TELE_INT_ANS, srcId);
++                markValidatedWUID(srcId);
+ 
+                 writeRF_TSDU_Deny(srcId, WUID_FNE, ReasonCode::DENY_SYS_UNSUPPORTED_SVC, TSBKO::IOSP_TELE_INT_ANS);
+             }
+@@ -365,6 +379,7 @@
+ 
+                 // validate the source RID
+                 VALID_SRCID(tsbk->toString(true), TSBKO::ISP_SNDCP_CH_REQ, srcId);
++                markValidatedWUID(srcId);
+ 
+                 ISP_SNDCP_CH_REQ* isp = static_cast<ISP_SNDCP_CH_REQ*>(tsbk.get());
+                 if (m_verbose) {
+@@ -387,6 +402,7 @@
+ 
+                 // validate the source RID
+                 VALID_SRCID(tsbk->toString(true), TSBKO::ISP_SNDCP_CH_REQ, srcId);
++                markValidatedWUID(srcId);
+ 
+                 ISP_SNDCP_CH_REQ* isp = static_cast<ISP_SNDCP_CH_REQ*>(tsbk.get());
+                 if (m_verbose) {
+@@ -406,6 +422,7 @@
+             {
+                 // validate the source RID
+                 VALID_SRCID(tsbk->toString(true), TSBKO::IOSP_STS_UPDT, srcId);
++                markValidatedWUID(srcId);
+ 
+                 IOSP_STS_UPDT* iosp = static_cast<IOSP_STS_UPDT*>(tsbk.get());
+                 if (m_verbose) {
+@@ -426,6 +443,7 @@
+             {
+                 // validate the source RID
+                 VALID_SRCID(tsbk->toString(true), TSBKO::IOSP_MSG_UPDT, srcId);
++                markValidatedWUID(srcId);
+ 
+                 IOSP_MSG_UPDT* iosp = static_cast<IOSP_MSG_UPDT*>(tsbk.get());
+                 if (m_verbose) {
+@@ -449,6 +467,7 @@
+ 
+                 // validate the target RID
+                 VALID_DSTID(tsbk->toString(true), TSBKO::IOSP_RAD_MON, srcId, dstId);
++                markValidatedWUID(srcId);
+ 
+                 IOSP_RAD_MON* iosp = static_cast<IOSP_RAD_MON*>(tsbk.get());
+                 if (m_verbose) {
+@@ -468,6 +487,7 @@
+ 
+                 // validate the target RID
+                 VALID_DSTID(tsbk->toString(true), TSBKO::IOSP_CALL_ALRT, srcId, dstId);
++                markValidatedWUID(srcId);
+ 
+                 VERBOSE_LOG_TSBK(tsbk->toString(true), srcId, dstId);
+                 ::ActivityLog("P25", true, "call alert request from %u to %u", srcId, dstId);
+@@ -518,6 +538,27 @@
+             case TSBKO::IOSP_EXT_FNCT:
+             {
+                 IOSP_EXT_FNCT* iosp = static_cast<IOSP_EXT_FNCT*>(tsbk.get());
++                const uint32_t respondingSU = dstId; // AABC-E 6.1.7.1, octets 7-9
++                if (!m_p25->physicalSubscriberPermitted(respondingSU) ||
++                    !m_p25->m_affiliations->isUnitReg(respondingSU)) {
++                    LogWarning(LOG_RF, P25_TSDU_STR ", invalid extended function source, arg = %u, tgt = %u", srcId, respondingSU);
++                    m_inbound = false; m_p25->m_rfState = prevRfState;
++                    return false;
++                }
++                const uint32_t function = iosp->getExtendedFunction();
++                if (function == ExtendedFunctions::CHECK_ACK &&
++                    !acceptRadioCheckResponse(function, srcId, respondingSU, iosp->getMFId())) {
++                    LogWarning(LOG_RF, P25_TSDU_STR ", unmatched radio check response, arg = %u, tgt = %u", srcId, respondingSU);
++                    m_inbound = false; m_p25->m_rfState = prevRfState;
++                    return false;
++                }
++                // Only a procedure-correlated response establishes validity.
++                // Inhibit/uninhibit still lack a native tracked procedure; their
++                // opcode alone must not refresh this or another pending check.
++                if (function == ExtendedFunctions::CHECK_ACK) {
++                    markValidatedWUID(respondingSU);
++                    refreshAcknowledgedWUID();
++                }
+                 if (m_verbose) {
+                     LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, op = $%02X, arg = %u, tgt = %u",
+                         tsbk->toString(true).c_str(), iosp->getExtendedFunction(), srcId, dstId);
+@@ -566,6 +607,7 @@
+ 
+                     // Native ACK confirms FNE receipt. The Site's observed event
+                     // notifies consoles; human acknowledgment remains separate.
++                    markValidatedWUID(srcId);
+                     writeRF_TSDU_ACK_FNE(srcId, TSBKO::ISP_EMERG_ALRM_REQ, false, true);
+                 }
+             }
+@@ -576,11 +618,10 @@
+                 IS_SUPPORT_CONTROL_CHECK(tsbk->toString(true), TSBKO::IOSP_GRP_AFF, srcId);
+ 
+                 VERBOSE_LOG_TSBK(tsbk->toString(true), srcId, dstId);
+-                if (m_p25->m_ackTSBKRequests) {
++                const auto response = writeRF_TSDU_Grp_Aff_Rsp(srcId, dstId);
++                if (response == ResponseCode::ACCEPT && m_p25->m_ackTSBKRequests)
+                     writeRF_TSDU_ACK_FNE(srcId, TSBKO::IOSP_GRP_AFF, true, true);
+-                }
+-
+-                if (writeRF_TSDU_Grp_Aff_Rsp(srcId, dstId) == ResponseCode::REFUSED) {
++                if (response == ResponseCode::REFUSED) {
+                     if (m_p25->m_demandUnitRegForRefusedAff) {
+                         writeRF_TSDU_U_Reg_Cmd(srcId);
+                     }
+@@ -629,6 +670,8 @@
+                     m_inbound = false; m_p25->m_rfState = prevRfState;
+                     return false;
+                 }
++
++                markValidatedWUID(srcId);
+ 
+                 // The accepted query response requires its own acknowledgment
+                 // (AABD-B 6.7.3.1), independently of optional request ACKs.
+@@ -1181,7 +1224,7 @@
+ 
+ /* Helper to write a extended function packet. */
+ 
+-void ControlSignaling::writeRF_TSDU_Ext_Func(uint32_t func, uint32_t arg, uint32_t dstId)
++bool ControlSignaling::writeRF_TSDU_Ext_Func(uint32_t func, uint32_t arg, uint32_t dstId)
+ {
+     std::unique_ptr<IOSP_EXT_FNCT> iosp = std::make_unique<IOSP_EXT_FNCT>();
+     iosp->setExtendedFunction(func);
+@@ -1193,10 +1236,16 @@
+         m_lastMFID = MFG_STANDARD;
+     }
+ 
++    if (func == ExtendedFunctions::CHECK) iosp->setMFId(MFG_STANDARD);
++
+     // class $02 is Motorola -- set the MFID properly
+     if ((func >> 8) == 0x02U) {
+         iosp->setMFId(MFG_MOT);
+     }
++
++    // A requested check owns its Nmax transmissions. The generic immediate
++    // redundancy option must not silently double the standard retry budget.
++    if (!writeRF_TSDU_SBF(iosp.get(), true, true, true, func != ExtendedFunctions::CHECK)) return false;
+ 
+     if (m_verbose) {
+         LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, mfId = $%02X, op = $%02X, arg = %u, tgt = %u",
+@@ -1230,7 +1279,130 @@
+         break;
+     }
+ 
+-    writeRF_TSDU_SBF_Imm(iosp.get(), true);
++    return true;
++}
++
++// The RFSS retry count is AABD-B 13.2.1 / Table 17-1 (Nmax=5).
++// Two-second spacing/final wait is project policy, not TRFSS_RSP or TACK.
++namespace {
++constexpr uint32_t RADIO_CHECK_ATTEMPTS = 5U;
++constexpr uint32_t RADIO_CHECK_WAIT_MS = 2000U;
++bool activeRadioCheck(ControlSignaling::RadioCheckState state) {
++    return state == ControlSignaling::RadioCheckState::Queued || state == ControlSignaling::RadioCheckState::UnderCheck;
++}
++}
++
++bool ControlSignaling::requestRadioCheck(uint32_t dstId, uint32_t waitMs)
++{
++    if (!m_p25->physicalSubscriberPermitted(dstId)) return false;
++    std::unique_lock<std::mutex> lock(m_radioCheckMutex);
++    const auto old = m_radioChecks.find(dstId);
++    if (old != m_radioChecks.end() && activeRadioCheck(old->second.state)) return false;
++    if (std::count_if(m_radioChecks.begin(), m_radioChecks.end(), [](const auto& item) {
++        return activeRadioCheck(item.second.state);
++    }) >= 16) return false;
++    // Retain bounded local outcomes only. A new process never replays checks.
++    if (old == m_radioChecks.end() && m_radioChecks.size() >= 128U) {
++        const auto retired = std::find_if(m_radioChecks.begin(), m_radioChecks.end(), [](const auto& item) {
++            return !activeRadioCheck(item.second.state);
++        });
++        if (retired != m_radioChecks.end()) m_radioChecks.erase(retired);
++    }
++    RadioCheck request; request.serial = ++m_radioCheckSerial;
++    m_radioChecks[dstId] = request;
++    if (waitMs == 0U) return true;
++    const auto serial = request.serial;
++    m_radioCheckChanged.wait_for(lock, std::chrono::milliseconds(std::min(waitMs, 750U)), [&] {
++        const auto current = m_radioChecks.find(dstId);
++        return current == m_radioChecks.end() || current->second.serial != serial ||
++            current->second.state != RadioCheckState::Queued;
++    });
++    const auto current = m_radioChecks.find(dstId);
++    if (current == m_radioChecks.end() || current->second.serial != serial) return false;
++    if (current->second.state == RadioCheckState::Queued) current->second.state = RadioCheckState::Cancelled;
++    // A REST success means the clock owner really enqueued at least one
++    // command. Timed-out queued requests cannot execute after the response.
++    return current->second.attempts != 0U;
++}
++
++ControlSignaling::RadioCheckState ControlSignaling::radioCheckState(uint32_t dstId)
++{
++    std::lock_guard<std::mutex> lock(m_radioCheckMutex);
++    const auto found = m_radioChecks.find(dstId);
++    return found == m_radioChecks.end() ? RadioCheckState::None : found->second.state;
++}
++
++void ControlSignaling::cancelRadioChecks()
++{
++    std::lock_guard<std::mutex> lock(m_radioCheckMutex);
++    for (auto& entry : m_radioChecks) {
++        if (activeRadioCheck(entry.second.state)) entry.second.state = RadioCheckState::Cancelled;
++    }
++    m_radioCheckChanged.notify_all();
++}
++
++void ControlSignaling::clockRadioChecks(uint32_t ms)
++{
++    std::lock_guard<std::mutex> lock(m_radioCheckMutex);
++    for (auto& entry : m_radioChecks) {
++        auto& check = entry.second;
++        if (!activeRadioCheck(check.state)) continue;
++        // Withdraw on CC stop, reset, loss of local RF availability or policy
++        // revocation. Resuming a channel cannot resume an earlier command.
++        if (!m_p25->m_enableControl || !m_p25->m_dedicatedControl || !m_p25->m_ccRunning ||
++            m_p25->m_ccHalted || m_p25->identificationActive() ||
++            !m_p25->physicalSubscriberPermitted(entry.first) || m_p25->m_modem == nullptr ||
++            m_p25->m_modem->hasError() || m_p25->m_modem->hasLockout()) {
++            check.state = RadioCheckState::Cancelled;
++            continue;
++        }
++        if (check.state == RadioCheckState::UnderCheck) {
++            if (ms < check.remainingMs) { check.remainingMs -= ms; continue; }
++            if (check.attempts == RADIO_CHECK_ATTEMPTS) {
++                check.state = RadioCheckState::NoResponse;
++                LogInfoEx(LOG_HOST, "P25 Radio Check, no response, arg = %u, tgt = %u, attempts = %u",
++                    check.requestor, entry.first, check.attempts);
++                continue;
++            }
++        }
++        if (!writeRF_TSDU_Ext_Func(check.function, check.requestor, entry.first)) {
++            check.state = RadioCheckState::Cancelled;
++            continue;
++        }
++        ++check.attempts;
++        check.remainingMs = RADIO_CHECK_WAIT_MS;
++        check.state = RadioCheckState::UnderCheck;
++        // A stalled clock emits at most one retry per tick, never a burst of
++        // expired attempts. Each actual enqueue receives its full reply wait.
++    }
++    m_radioCheckChanged.notify_all();
++}
++
++bool ControlSignaling::acceptRadioCheckResponse(uint32_t function, uint32_t argument, uint32_t source, uint8_t mfid)
++{
++    std::lock_guard<std::mutex> lock(m_radioCheckMutex);
++    const auto found = m_radioChecks.find(source);
++    if (found == m_radioChecks.end()) return false;
++    auto& check = found->second;
++    if (check.state != RadioCheckState::UnderCheck || check.attempts == 0U ||
++        mfid != MFG_STANDARD || function != ExtendedFunctions::CHECK_ACK ||
++        check.function != ExtendedFunctions::CHECK || argument != check.requestor) return false;
++    check.state = RadioCheckState::Available;
++    return true;
++}
++
++void ControlSignaling::markValidatedWUID(uint32_t source)
++{
++    if (s_wuidTransaction.owner == this && m_p25->physicalSubscriberPermitted(source) &&
++        m_p25->m_affiliations->isUnitReg(source)) s_wuidTransaction.source = source;
++}
++
++void ControlSignaling::refreshAcknowledgedWUID()
++{
++    const auto transaction = s_wuidTransaction;
++    if (transaction.owner == this && transaction.source != 0U &&
++        m_p25->physicalSubscriberPermitted(transaction.source) && m_p25->m_affiliations->isUnitReg(transaction.source))
++        m_p25->m_affiliations->touchUnitReg(transaction.source);
+ }
+ 
+ /* Helper to write a group affiliation query packet. */
+@@ -1523,15 +1695,15 @@
+ 
+ /* Helper to write a single-block P25 TSDU packet. */
+ 
+-void ControlSignaling::writeRF_TSDU_SBF(lc::TSBK* tsbk, bool noNetwork, bool forceSingle, bool imm)
++bool ControlSignaling::writeRF_TSDU_SBF(lc::TSBK* tsbk, bool noNetwork, bool forceSingle, bool imm, bool allowRedundant)
+ {
+     if (dynamic_cast<lc::AMBT*>(tsbk) != nullptr) {
+         LogError(LOG_P25, "AMBT requires a typed message or its PDU encoder; single-block output refused");
+-        return;
++        return false;
+     }
+ 
+     if (!m_p25->m_enableControl)
+-        return;
++        return false;
+ 
+     assert(tsbk != nullptr);
+ 
+@@ -1572,12 +1744,12 @@
+     if (!forceSingle) {
+         if (m_p25->m_dedicatedControl && m_ctrlTSDUMBF) {
+             writeRF_TSDU_MBF(tsbk);
+-            return;
++            return false;
+         }
+ 
+         if (m_p25->m_ccRunning && m_ctrlTSDUMBF) {
+             writeRF_TSDU_MBF(tsbk);
+-            return;
++            return false;
+         }
+     }
+ 
+@@ -1585,13 +1757,16 @@
+         data[0U] = modem::TAG_DATA;
+         data[1U] = 0x00U;
+ 
+-        m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm);
++        bool queued = m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm);
+         
+-        if (imm && m_redundantImmediate) {
++        if (imm && m_redundantImmediate && allowRedundant) {
+             // queue an immediate frame at least twice
+-            m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm);
+-        }
+-    }
++            queued = m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm) || queued;
++        }
++        if (queued) refreshAcknowledgedWUID();
++        return queued;
++    }
++    return false;
+ }
+ 
+ /* Helper to write a network single-block P25 TSDU packet. */
+@@ -1725,7 +1900,8 @@
+         data[0U] = modem::TAG_DATA;
+         data[1U] = 0x00U;
+ 
+-        m_p25->addFrame(data, P25_TSDU_TRIPLE_FRAME_LENGTH_BYTES + 2U);
++        if (m_p25->addFrame(data, P25_TSDU_TRIPLE_FRAME_LENGTH_BYTES + 2U))
++            refreshAcknowledgedWUID();
+ 
+         ::memset(m_rfMBF, 0x00U, P25_PDU_FRAME_LENGTH_BYTES + 2U);
+         m_mbfCnt = 0U;
+@@ -3030,6 +3206,8 @@
+         }
+     }
+ 
++    if (iosp->getResponse() == ResponseCode::ACCEPT) markValidatedWUID(srcId);
++
+     if (iosp->getResponse() == ResponseCode::ACCEPT && dstId != 0U &&
+         (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateGroupAffiliation(srcId, dstId))) {
+         iosp->setResponse(ResponseCode::DENY);
+@@ -3252,6 +3430,7 @@
+         ret = true;
+     }
+ 
++    if (ret) markValidatedWUID(srcId);
+     writeRF_TSDU_SBF_Imm(osp.get(), noNet);
+     return ret;
+ }
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -19,6 +19,7 @@
+ #include "Defines.h"
+ #include "common/lookups/ChannelLookup.h"
+ #include <mutex>
++#include <condition_variable>
+ #include "common/p25/data/DataHeader.h"
+ #include "common/p25/data/DataBlock.h"
+ #include "common/p25/lc/TSBK.h"
+@@ -35,6 +36,7 @@
+ namespace p25
+ {
+     struct DispatchGrantTestAccess;
++    struct RadioCheckTestAccess;
+     struct AMBTIngressTestAccess;
+     // ---------------------------------------------------------------------------
+     //  Class Prototypes
+@@ -110,7 +112,12 @@
+              * @param arg Function Argument.
+              * @param dstId Destination Radio ID.
+              */
+-            void writeRF_TSDU_Ext_Func(uint32_t func, uint32_t arg, uint32_t dstId);
++            bool writeRF_TSDU_Ext_Func(uint32_t func, uint32_t arg, uint32_t dstId);
++            // REST enqueues work; only the protocol clock emits retries.
++            enum class RadioCheckState { None, Queued, UnderCheck, Available, NoResponse, Cancelled };
++            bool requestRadioCheck(uint32_t dstId, uint32_t waitMs = 0U);
++            RadioCheckState radioCheckState(uint32_t dstId);
++            void cancelRadioChecks();
+             /**
+              * @brief Helper to write a group affiliation query packet.
+              * @param dstId Destination Radio ID.
+@@ -154,6 +161,7 @@
+         protected:
+ #if defined(CATCH2_TEST_COMPILATION)
+             friend struct p25::DispatchGrantTestAccess;
++            friend struct p25::RadioCheckTestAccess;
+             friend struct p25::AMBTIngressTestAccess;
+ #endif
+             friend class packet::Voice;
+@@ -209,6 +217,24 @@
+             bool m_redundantGrant;
+ 
+             bool m_inbound;
++            struct WUIDTransaction { ControlSignaling* owner; uint32_t source; };
++            static thread_local WUIDTransaction s_wuidTransaction;
++            struct RadioCheck {
++                uint64_t serial = 0U;
++                uint32_t requestor = defines::WUID_FNE;
++                uint32_t function = defines::ExtendedFunctions::CHECK;
++                uint32_t remainingMs = 0U;
++                uint32_t attempts = 0U;
++                RadioCheckState state = RadioCheckState::Queued;
++            };
++            std::mutex m_radioCheckMutex;
++            std::condition_variable m_radioCheckChanged;
++            uint64_t m_radioCheckSerial = 0U;
++            std::unordered_map<uint32_t, RadioCheck> m_radioChecks;
++            void clockRadioChecks(uint32_t ms);
++            bool acceptRadioCheckResponse(uint32_t function, uint32_t argument, uint32_t source, uint8_t mfid);
++            void markValidatedWUID(uint32_t source);
++            void refreshAcknowledgedWUID();
+ 
+             bool m_dumpTSBK;
+ 
+@@ -271,7 +297,7 @@
+              * @param tsbk TSBK to write to the modem.
+              * @param noNetwork Flag indicating not to write the TSBK to the network.
+              */
+-            void writeRF_TSDU_SBF_Imm(lc::TSBK *tsbk, bool noNetwork) { writeRF_TSDU_SBF(tsbk, noNetwork, false, true); }
++            bool writeRF_TSDU_SBF_Imm(lc::TSBK *tsbk, bool noNetwork) { return writeRF_TSDU_SBF(tsbk, noNetwork, false, true); }
+             /**
+              * @brief Helper to write a single-block P25 TSDU packet.
+              * @param tsbk TSBK to write to the modem.
+@@ -279,7 +305,7 @@
+              * @param forceSingle Force TSBK to be written as a single block TSDU and not bundled into a multiblock TSDU.
+              * @param imm Flag indicating the TSBK should be written to the immediate queue.
+              */
+-            void writeRF_TSDU_SBF(lc::TSBK* tsbk, bool noNetwork, bool forceSingle = false, bool imm = false);
++            bool writeRF_TSDU_SBF(lc::TSBK* tsbk, bool noNetwork, bool forceSingle = false, bool imm = false, bool allowRedundant = true);
+             /**
+              * @brief Helper to write a network single-block P25 TSDU packet.
+              * @param tsbk TSBK to write to the network.
+--- a/src/host/p25/packet/Data.cpp
++++ b/src/host/p25/packet/Data.cpp
+@@ -20,6 +20,7 @@
+ #include "common/Log.h"
+ #include "common/Utils.h"
+ #include "p25/packet/Data.h"
++#include "p25/packet/ControlSignaling.h"
+ #include "ActivityLog.h"
+ 
+ using namespace p25;
+@@ -1081,7 +1082,8 @@
+         data[0U] = modem::TAG_DATA;
+         data[1U] = 0x00U;
+ 
+-        m_p25->addFrame(data, newByteLength + 2U, false, imm);
++        if (m_p25->addFrame(data, newByteLength + 2U, false, imm))
++            m_p25->m_control->refreshAcknowledgedWUID();
+     }
+ 
+     m_p25->writeRF_TDU(true, imm);
+--- a/src/host/restapi/RESTAPI.cpp
++++ b/src/host/restapi/RESTAPI.cpp
+@@ -1460,7 +1460,10 @@
+         m_p25->control()->writeRF_TSDU_Call_Alrt(WUID_FNE, dstId);
+     }
+     else if (::strtolower(command) == RID_CMD_CHECK) {
+-        m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::CHECK, WUID_FNE, dstId);
++        if (!m_p25->control()->requestRadioCheck(dstId, 750U)) {
++            errorPayload(reply, "radio check unavailable, target invalid, or already pending", HTTPPayload::SERVICE_UNAVAILABLE);
++            return;
++        }
+     }
+     else if (::strtolower(command) == RID_CMD_INHIBIT) {
+         m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::INHIBIT, WUID_FNE, dstId);
+--- /dev/null
++++ b/tests/p25/RadioCheckProcedure_Tests.cpp
+@@ -0,0 +1,301 @@
++// TIA-102.AABD-B 6.6.1 (PDF59/printed54), 13.2.1 (PDF118/printed113),
++// Table17-1 (PDF138/printed133); AABC-E Table2.3.15-1 (PDF34/printed15),
++// Fig6.1.7-1 (PDF105/printed86). Literal payloads are requirements-derived;
++// existing CRC/Trellis helpers supply framing only. No socket/modem opens.
++// SPDX-License-Identifier: GPL-2.0-only
++// Actual P25 control/voice serialization and local policy. No RF or socket opens.
++#include "host/Host.h"
++#include "host/p25/Control.h"
++#include "host/modem/port/ModemNullPort.h"
++#include "common/network/P25SiteRouting.h"
++#include "common/p25/acl/AccessControl.h"
++#include "common/p25/Audio.h"
++#include "common/p25/NID.h"
++#include "common/p25/P25Utils.h"
++#include "common/p25/Sync.h"
++#include "common/edac/CRC.h"
++#include "common/edac/Trellis.h"
++#include "common/Log.h"
++#include "host/p25/packet/ControlSignaling.h"
++#include <iostream>
++#include <future>
++#include <thread>
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <memory>
++#include <sstream>
++#include <vector>
++
++namespace p25 {
++struct RadioCheckTestAccess {
++    static void clock(Control& c, uint32_t ms) { c.control()->clockRadioChecks(ms); }
++    static void withValidatedRFContext(Control& c, uint32_t source, const std::function<void()>& body) {
++        auto* signal=c.control(); const auto old=signal->s_wuidTransaction;
++        signal->s_wuidTransaction={signal,0U}; signal->markValidatedWUID(source);
++        body(); signal->s_wuidTransaction=old;
++    }
++    static void redundantImmediate(Control& c) { c.control()->m_redundantImmediate = true; }
++    static void expireRFTimeout(Control& c) { c.m_rfTimeout.start(); c.m_rfTimeout.clock(121000U); }
++};
++}
++namespace {
++using namespace p25;
++using namespace p25::defines;
++constexpr uint32_t RID = 10001U, OTHER = 10005U, APP = 10002U, TG = 1001U, NAC = 0x293U;
++using Block = std::array<uint8_t, P25_TSBK_LENGTH_BYTES>;
++using CheckState = packet::ControlSignaling::RadioCheckState;
++constexpr uint32_t SECOND_SU = 10007U;
++std::ostringstream& diagnosticLog() { static std::ostringstream output; return output; }
++size_t timeoutLogs() {
++    const auto value = diagnosticLog().str(); size_t count=0U, at=0U;
++    while ((at=value.find("P25 Radio Check, no response,", at))!=std::string::npos) { ++count; ++at; }
++    return count;
++}
++struct Fixture {
++    ::lookups::ChannelLookup channels;
++    ::lookups::RadioIdLookup radios{"", 0U, true};
++    ::lookups::TalkgroupRulesLookup groups{"", 0U, true};
++    ::lookups::IdenTableLookup identities{"", 0U};
++    ::lookups::RSSIInterpolator rssi;
++    modem::Modem modem{new modem::port::ModemNullPort(), true, false, false, false,
++        false, false, 0U, 0U, 0U, 8192U, 8192U, 8192U, true, true, false, false, false, false};
++    network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-subscriber-test", false};
++    network::NetRPC* oldRPC = g_RPC;
++    std::unique_ptr<Control> controller;
++    explicit Fixture(bool cc, bool physicalInventory = true) {
++        g_logDisplayLevel = 0U; g_RPC = &rpc;
++        diagnosticLog().str(""); diagnosticLog().clear();
++        log_internal::SetInternalOutputStream(diagnosticLog());
++        radios.addEntry(SECOND_SU,true,"Second physical SU"); radios.addEntry(RID, true, "Subscriber"); radios.addEntry(OTHER, false, "Disabled"); radios.addEntry(APP, true, "Console"); radios.addEntry(10006U, true, "Not physical");
++        groups.addEntry(TG, 1U, true); groups.addEntry(1002U, 1U, true);
++        controller = std::make_unique<Control>(true, NAC, 1U, 16384U, &modem, nullptr, 120U, 1U, true,
++            &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
++        yaml::Node config; std::string mode = cc ? "true" : "false";
++        const std::string inventory = physicalInventory ? "        dispatchSubscribers:\n            - 10001\n            - 10005\n            - 10007\n" : "        dispatchSubscribers: []\n";
++        REQUIRE(yaml::Parse(config, std::string("protocols:\n    p25:\n        managedSite: true\n") + inventory + "        verifyReg: true\n        verifyAff: false\n        inhibitUnauthorized: false\n        tduPreambleCount: 0\n        control:\n            enable: " + mode + "\n            dedicated: " + mode + "\n            ackRequests: false\n            disableTSDUMBF: true\n            redundantImmediate: false\nsystem:\n    config:\n        controlCh:\n            notifyEnable: false\n"));
++        controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 25U, false);
++        controller->configureIdentification(false); controller->setCCRunning(cc); controller->setZoneConnected(false);
++        controller->affiliations()->unitReg(RID);
++    }
++    ~Fixture() { controller.reset(); g_RPC = oldRPC; log_internal::SetInternalOutputStream(std::cerr); }
++    bool signal(uint8_t opcode, uint64_t value, uint8_t manufacturer = 0U) {
++        Block raw{}; raw[0] = 0x80U | opcode; raw[1] = manufacturer;
++        for (unsigned i = 0U; i < 8U; ++i) raw[2U+i] = uint8_t(value >> ((7U-i)*8U));
++        edac::CRC::addCCITT162(raw.data(), raw.size());
++        std::array<uint8_t, P25_TSDU_FRAME_LENGTH_BYTES+2U> frame{}; frame[0] = modem::TAG_DATA; frame[1] = 1U;
++        Sync::addP25Sync(frame.data()+2U); NID nid(NAC); nid.encode(frame.data()+2U, DUID::TSDU);
++        std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> encoded{}; edac::Trellis trellis;
++        trellis.encode12(raw.data(), encoded.data()); P25Utils::encode(encoded.data(), frame.data()+2U, 114U, 318U);
++        P25Utils::addStatusBits(frame.data()+2U, P25_TSDU_FRAME_LENGTH_BITS, false, false);
++        return controller->processFrame(frame.data(), frame.size());
++    }
++    std::vector<Block> responses() {
++        std::array<uint8_t, 1024> frame{}; std::vector<Block> blocks;
++        while (controller->getFrame(frame.data()) != 0U) {
++            NID nid(NAC); if (!nid.decode(frame.data()+2U) || nid.getDUID()!=DUID::TSDU) continue;
++            std::array<uint8_t, P25_TSBK_FEC_LENGTH_BYTES> coded{}; Block raw{}; edac::Trellis trellis;
++            P25Utils::decode(frame.data()+2U, coded.data(), 114U, 318U); REQUIRE(trellis.decode12(coded.data(), raw.data()));
++            REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size())); blocks.push_back(raw);
++        }
++        return blocks;
++    }
++    void age(uint32_t ms) { controller->affiliations()->clock(ms); }
++};
++}
++
++TEST_CASE("RFSS check records state and emits exactly five standard requests before one terminal outcome", "[p25][radio-check]") {
++    Fixture f(true); auto* signal=f.controller->control();
++    signal->setLastMFId(0x90U);
++    RadioCheckTestAccess::redundantImmediate(*f.controller);
++    REQUIRE(signal->requestRadioCheck(RID));
++    REQUIRE(signal->radioCheckState(RID)==CheckState::Queued);
++    REQUIRE_FALSE(signal->requestRadioCheck(RID));
++    REQUIRE(f.responses().empty()); // REST enqueue cannot transmit.
++    const std::array<uint8_t,10U> expected{{0xA4U,0x00U,0x00U,0x00U,0xFFU,0xFFU,0xFCU,0x00U,0x27U,0x11U}};
++    RadioCheckTestAccess::clock(*f.controller,0U);
++    for (unsigned attempt=0U;attempt<5U;++attempt) {
++        auto blocks=f.responses(); REQUIRE(blocks.size()==1U);
++        for (size_t i=0U;i<expected.size();++i) REQUIRE(blocks[0][i]==expected[i]);
++        REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);
++        REQUIRE(timeoutLogs()==0U);
++        RadioCheckTestAccess::clock(*f.controller,1999U);
++        REQUIRE(f.responses().empty()); REQUIRE(timeoutLogs()==0U);
++        RadioCheckTestAccess::clock(*f.controller,1U);
++    }
++    REQUIRE(signal->radioCheckState(RID)==CheckState::NoResponse);
++    REQUIRE(timeoutLogs()==1U);
++    REQUIRE(diagnosticLog().str().find("P25 Radio Check, no response, arg = 16777212, tgt = 10001, attempts = 5")!=std::string::npos);
++    REQUIRE(f.controller->affiliations()->isUnitReg(RID)); // no optional detach/removal policy
++    for (unsigned i=0;i<20U;++i) RadioCheckTestAccess::clock(*f.controller,10000U);
++    REQUIRE(f.responses().empty()); REQUIRE(timeoutLogs()==1U);
++}
++
++TEST_CASE("only an issued matching standard target response completes a requested check", "[p25][radio-check][wuid-refresh]") {
++    Fixture f(true); auto* signal=f.controller->control(); auto* units=f.controller->affiliations();
++    units->unitReg(SECOND_SU); units->unitReg(WUID_FNE);
++    f.age(1000U);
++    // Full five-byte ExtendedFunction: class00 operand80 argumentFFFFFC;
++    // final address002711 is the responding SU, never the argument.
++    constexpr uint64_t reply=0x0080FFFFFC002711ULL;
++    REQUIRE_FALSE(f.signal(0x24U,reply)); // no pending transaction
++    REQUIRE(signal->requestRadioCheck(RID));
++    REQUIRE_FALSE(f.signal(0x24U,reply)); // queued, not issued
++    RadioCheckTestAccess::clock(*f.controller,0U); f.responses();
++    for (const auto wrong : {0x0080002712002711ULL, // wrong requestor
++                             0x0080FFFFFC002717ULL, // different valid physical SU
++                             0x0080FFFFFC002715ULL, // disabled SU
++                             0x0080FFFFFC004E1FULL}) { // unknown SU
++        CAPTURE(wrong); REQUIRE_FALSE(f.signal(0x24U,wrong));
++        REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);
++        REQUIRE(units->unitRegTimer(RID)==1U);
++    }
++    f.signal(0x24U,0x007FFFFFFC002711ULL); // inbound command is not CHECK_ACK
++    REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);
++    REQUIRE(units->unitRegTimer(RID)==1U);
++    f.signal(0x24U,0x00FFFFFFFC002711ULL); // unrelated INHIBIT_ACK is not a check response
++    REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);
++    REQUIRE(units->unitRegTimer(RID)==1U);
++    f.signal(0x24U,0x00FEFFFFFC002711ULL); // unrelated UNINHIBIT_ACK
++    REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);
++    REQUIRE(units->unitRegTimer(RID)==1U);
++    f.signal(0x24U,reply,0x90U); // wrong vendor profile cannot complete standard check
++    REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);
++    REQUIRE(units->unitRegTimer(RID)==1U);
++    REQUIRE(f.signal(0x24U,reply));
++    REQUIRE(signal->radioCheckState(RID)==CheckState::Available);
++    REQUIRE(units->unitRegTimer(RID)==0U);
++    REQUIRE(units->unitRegTimer(SECOND_SU)==1U);
++    REQUIRE(units->unitRegTimer(WUID_FNE)==1U);
++    f.responses();
++    RadioCheckTestAccess::clock(*f.controller,20000U);
++    REQUIRE(f.responses().empty()); REQUIRE(timeoutLogs()==0U);
++    f.age(1000U);
++    REQUIRE_FALSE(f.signal(0x24U,reply)); // duplicate/unsolicited does not refresh again
++    REQUIRE(units->unitRegTimer(RID)==1U);
++}
++
++TEST_CASE("withdrawal reset revocation and reconstruction cannot replay checks", "[p25][radio-check]") {
++    for (unsigned mode=0U;mode<4U;++mode) {
++        CAPTURE(mode); Fixture f(true); auto* signal=f.controller->control();
++        REQUIRE(signal->requestRadioCheck(RID)); RadioCheckTestAccess::clock(*f.controller,0U); f.responses();
++        if (mode==0U) { f.controller->setCCRunning(false); f.controller->setCCRunning(true); }
++        if (mode==1U) { f.controller->setCCHalted(true); f.controller->setCCHalted(false); }
++        if (mode==2U) f.controller->reset();
++        if (mode==3U) f.radios.addEntry(RID,false,"revoked");
++        RadioCheckTestAccess::clock(*f.controller,20000U);
++        REQUIRE(signal->radioCheckState(RID)==CheckState::Cancelled);
++        REQUIRE(f.responses().empty()); REQUIRE(timeoutLogs()==0U);
++        REQUIRE_FALSE(f.signal(0x24U,0x0080FFFFFC002711ULL));
++    }
++    Fixture fresh(true); REQUIRE(fresh.controller->control()->radioCheckState(RID)==CheckState::None);
++    RadioCheckTestAccess::clock(*fresh.controller,20000U); REQUIRE(fresh.responses().empty());
++}
++
++TEST_CASE("radio check clock stalls do not burst and independent targets remain isolated", "[p25][radio-check]") {
++    Fixture f(true); auto* signal=f.controller->control(); f.controller->affiliations()->unitReg(SECOND_SU);
++    REQUIRE_FALSE(signal->requestRadioCheck(APP)); REQUIRE_FALSE(signal->requestRadioCheck(OTHER));
++    REQUIRE_FALSE(signal->requestRadioCheck(0U)); REQUIRE_FALSE(signal->requestRadioCheck(0xFFFFFCU));
++    REQUIRE(signal->requestRadioCheck(RID)); REQUIRE(signal->requestRadioCheck(SECOND_SU));
++    RadioCheckTestAccess::clock(*f.controller,0U); REQUIRE(f.responses().size()==2U);
++    RadioCheckTestAccess::clock(*f.controller,20000U); REQUIRE(f.responses().size()==2U); // one retry each
++    REQUIRE(timeoutLogs()==0U);
++    REQUIRE(f.signal(0x24U,0x0080FFFFFC002711ULL)); f.responses();
++    RadioCheckTestAccess::clock(*f.controller,2000U); auto blocks=f.responses(); REQUIRE(blocks.size()==1U);
++    REQUIRE(blocks[0][7]==0x00U); REQUIRE(blocks[0][8]==0x27U); REQUIRE(blocks[0][9]==0x17U);
++    REQUIRE(signal->radioCheckState(RID)==CheckState::Available);
++    REQUIRE(signal->radioCheckState(SECOND_SU)==CheckState::UnderCheck);
++}
++
++TEST_CASE("WUID expiry advances deterministically and invalid query cannot postpone it", "[p25][wuid-refresh]") {
++    Fixture f(true); auto* units=f.controller->affiliations(); units->groupAff(RID,TG);
++    f.age(43199000U); REQUIRE(units->isUnitReg(RID)); REQUIRE(units->unitRegTimer(RID)==43199U);
++    // AGIDFFFF is inconsistent with RFSS's FFFE; WGID1001 and SU10001 literal.
++    REQUIRE_FALSE(f.signal(0x29U,0x00FFFF03E9002711ULL));
++    REQUIRE(units->unitRegTimer(RID)==43199U);
++    f.age(1001U); REQUIRE_FALSE(units->isUnitReg(RID)); REQUIRE_FALSE(units->isGroupAff(RID,TG));
++}
++
++TEST_CASE("validated acknowledged query resets twelve-hour WUID expiry without an operator wait", "[p25][wuid-refresh]") {
++    Fixture f(true); auto* units=f.controller->affiliations(); units->groupAff(RID,TG);
++    f.age(43199000U);
++    REQUIRE(f.signal(0x29U,0x00FFFE03E9002711ULL));
++    auto blocks=f.responses(); bool ack=false;
++    for(const auto& block:blocks) if((block[0]&0x3FU)==0x20U && (block[2]&0x3FU)==0x29U) ack=true;
++    REQUIRE(ack); REQUIRE(units->unitRegTimer(RID)==0U);
++    f.age(43199000U); REQUIRE(units->isUnitReg(RID));
++    f.age(1001U); REQUIRE_FALSE(units->isUnitReg(RID)); REQUIRE_FALSE(units->isGroupAff(RID,TG));
++}
++
++TEST_CASE("valid unsupported service denial refreshes WUID while invalid or unacknowledged input cannot", "[p25][wuid-refresh]") {
++    SECTION("a validated service denial is still an acknowledged SU transaction") {
++        Fixture f(true); auto* units=f.controller->affiliations(); f.age(1000U);
++        REQUIRE(f.signal(0x12U,0x0000000000002711ULL)); // SNDCP channel request, unsupported service
++        auto blocks=f.responses(); REQUIRE(blocks.size()==1U);
++        REQUIRE((blocks[0][0]&0x3FU)==0x27U); REQUIRE(blocks[0][3]==0xFFU);
++        REQUIRE(units->unitRegTimer(RID)==0U);
++    }
++    SECTION("refused registration with a different system cannot postpone existing expiry") {
++        Fixture f(true); auto* units=f.controller->affiliations(); f.age(43199000U);
++        REQUIRE(f.signal(0x2CU,0x0000001002002711ULL)); // WACN1, System2, RID10001; RFSS is System1
++        REQUIRE(units->unitRegTimer(RID)==43199U);
++        f.age(1001U); REQUIRE_FALSE(units->isUnitReg(RID));
++    }
++    SECTION("disabled source keeps its original expiry") {
++        Fixture f(true); auto* units=f.controller->affiliations(); f.age(1000U); f.radios.addEntry(RID,false,"disabled");
++        REQUIRE_FALSE(f.signal(0x18U,0x0000000000002711ULL)); REQUIRE(units->unitRegTimer(RID)==1U);
++    }
++    SECTION("wrong function and late ACK cannot refresh the argument or SU") {
++        Fixture f(true); auto* units=f.controller->affiliations(); auto* signal=f.controller->control();
++        units->unitReg(WUID_FNE); REQUIRE(signal->requestRadioCheck(RID));
++        RadioCheckTestAccess::clock(*f.controller,0U); f.responses();
++        for(unsigned i=0;i<5U;++i) { RadioCheckTestAccess::clock(*f.controller,2000U); f.responses(); }
++        f.age(43199000U);
++        REQUIRE_FALSE(f.signal(0x24U,0x0080FFFFFC002711ULL));
++        REQUIRE(units->unitRegTimer(RID)==43199U); REQUIRE(units->unitRegTimer(WUID_FNE)==43199U);
++        f.age(1001U); REQUIRE_FALSE(units->isUnitReg(RID)); REQUIRE_FALSE(units->isUnitReg(WUID_FNE));
++        REQUIRE(timeoutLogs()==1U);
++    }
++}
++
++TEST_CASE("REST-style bounded wait reports actual clock enqueue or cancels before later execution", "[p25][radio-check]") {
++    Fixture f(true); auto* signal=f.controller->control();
++    REQUIRE_FALSE(signal->requestRadioCheck(RID,1U));
++    REQUIRE(signal->radioCheckState(RID)==CheckState::Cancelled);
++    RadioCheckTestAccess::clock(*f.controller,1000U); REQUIRE(f.responses().empty());
++    auto submitted=std::async(std::launch::async,[&] { return signal->requestRadioCheck(RID,750U); });
++    const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(500);
++    while(signal->radioCheckState(RID)!=CheckState::Queued && std::chrono::steady_clock::now()<deadline) std::this_thread::yield();
++    REQUIRE(signal->radioCheckState(RID)==CheckState::Queued);
++    RadioCheckTestAccess::clock(*f.controller,0U);
++    REQUIRE(submitted.get()); REQUIRE(f.responses().size()==1U);
++    REQUIRE(signal->radioCheckState(RID)==CheckState::UnderCheck);
++    REQUIRE(timeoutLogs()==0U);
++}
++
++TEST_CASE("failed RF enqueue neither counts a radio-check attempt nor acknowledges WUID freshness", "[p25][radio-check][wuid-refresh]") {
++    Fixture f(true); auto* signal=f.controller->control();
++    f.age(1000U); RadioCheckTestAccess::expireRFTimeout(*f.controller);
++    REQUIRE(signal->requestRadioCheck(RID)); RadioCheckTestAccess::clock(*f.controller,0U);
++    REQUIRE(signal->radioCheckState(RID)==CheckState::Cancelled);
++    REQUIRE(f.responses().empty()); REQUIRE(timeoutLogs()==0U);
++    f.controller->affiliations()->groupAff(RID,TG);
++    REQUIRE(f.signal(0x29U,0x00FFFE03E9002711ULL));
++    REQUIRE(f.responses().empty());
++    REQUIRE(f.controller->affiliations()->unitRegTimer(RID)==1U);
++}
++
++TEST_CASE("another native writer thread cannot refresh an in-flight RF transaction", "[p25][radio-check][wuid-refresh]") {
++    Fixture f(true); auto* units=f.controller->affiliations(); auto* signal=f.controller->control();
++    units->groupAff(RID,TG); units->unitReg(SECOND_SU); f.age(1000U);
++    REQUIRE(signal->requestRadioCheck(SECOND_SU));
++    RadioCheckTestAccess::withValidatedRFContext(*f.controller,RID,[&] {
++        // Model the RF reader's validated handler paused before its response.
++        // The real clock owner runs independently and commits a CHECK packet.
++        auto clock=std::async(std::launch::async,[&] { RadioCheckTestAccess::clock(*f.controller,0U); });
++        clock.get(); REQUIRE(f.responses().size()==1U);
++        REQUIRE(units->unitRegTimer(RID)==1U); REQUIRE(units->unitRegTimer(SECOND_SU)==1U);
++        // A real same-thread query/ACK still refreshes the actual source.
++        REQUIRE(f.signal(0x29U,0x00FFFE03E9002711ULL));
++        REQUIRE(units->unitRegTimer(RID)==0U); REQUIRE(units->unitRegTimer(SECOND_SU)==1U);
++    });
++}

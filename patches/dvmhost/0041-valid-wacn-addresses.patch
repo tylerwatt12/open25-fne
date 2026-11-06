@@ -1,0 +1,205 @@
+--- a/src/bridge/HostBridge.cpp
++++ b/src/bridge/HostBridge.cpp
+@@ -978,9 +978,6 @@
+ 
+     m_netId = (uint32_t)::strtoul(systemConf["netId"].as<std::string>("BB800").c_str(), NULL, 16);
+     m_netId = p25::P25Utils::netId(m_netId);
+-    if (m_netId == 0xBEE00) {
+-        ::fatal("error 4\n");
+-    }
+ 
+     m_sysId = (uint32_t)::strtoul(systemConf["sysId"].as<std::string>("001").c_str(), NULL, 16);
+     m_sysId = p25::P25Utils::sysId(m_sysId);
+--- a/src/common/p25/SiteData.h
++++ b/src/common/p25/SiteData.h
+@@ -18,8 +18,6 @@
+ #include "common/p25/P25Defines.h"
+ #include "common/p25/P25Utils.h"
+ 
+-#include <random>
+-
+ namespace p25
+ {
+     // ---------------------------------------------------------------------------
+@@ -112,25 +110,6 @@
+             m_netId = netId;
+             m_sysId = sysId;
+ 
+-            uint32_t valueTest = (m_netId >> 8);
+-            const uint32_t constValue = 0x5F700U;
+-            if (valueTest == (constValue >> 7)) {
+-                std::random_device rd;
+-                std::mt19937 mt(rd());
+-
+-                std::uniform_int_distribution<uint32_t> dist(0x01, defines::WACN_STD_DEFAULT);
+-                m_netId = dist(mt);
+-
+-                // netId clamping
+-                m_netId = P25Utils::netId(netId);
+-
+-                dist = std::uniform_int_distribution<uint32_t>(0x01, 0xFFEU);
+-                m_sysId = dist(mt);
+-
+-                // sysId clamping
+-                m_sysId = P25Utils::sysId(sysId);
+-            }
+-
+             m_rfssId = rfssId;
+             m_siteId = siteId;
+ 
+--- a/src/host/Host.Config.cpp
++++ b/src/host/Host.Config.cpp
+@@ -357,9 +357,6 @@
+ 
+         m_p25NetId = (uint32_t)::strtoul(rfssConfig["netId"].as<std::string>("BB800").c_str(), NULL, 16);
+         m_p25NetId = p25::P25Utils::netId(m_p25NetId);
+-        if (m_p25NetId == 0xBEE00) {
+-            ::fatal("error 4\n");
+-        }
+ 
+         m_sysId = (uint32_t)::strtoul(rfssConfig["sysId"].as<std::string>("001").c_str(), NULL, 16);
+         m_sysId = p25::P25Utils::sysId(m_sysId);
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -581,11 +581,6 @@
+     */
+     int8_t lto = (int8_t)systemConf["localTimeOffset"].as<int32_t>(0);
+     m_siteData = SiteData(netId, sysId, rfssId, siteId, 0U, channelId, channelNo, serviceClass, lto);
+-    uint32_t valueTest = (netId >> 8);
+-    const uint32_t constValue = 0x17DC0U;
+-    if (valueTest == (constValue >> 5)) {
+-        ::fatal("error 8\n");
+-    }
+     m_siteData.setCallsign(cwCallsign);
+ 
+     lc::LC::setSiteData(m_siteData);
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -210,11 +210,6 @@
+             }
+         } else {
+             tsbk = std::move(preDecodedTSBK);
+-        }
+-
+-        const uint32_t constValue = 0x17DC0U;
+-        if ((m_p25->m_siteData.netId() >> 8) == (constValue >> 5)) {
+-            ::fatal("error 16\n");
+         }
+ 
+         uint32_t srcId = tsbk->getSrcId();
+@@ -2696,11 +2691,6 @@
+         }
+     }
+ 
+-    const uint32_t __ = 0x67558U;
+-    if ((m_p25->m_siteData.netId() >> 8) == ((dstId >> 24) | (__ ^ 0x38258U) >> 7)) {
+-        return false;
+-    }
+-
+     if (chNo > 0U) {
+         ::lookups::VoiceChData voiceChData = m_p25->m_affiliations->rfCh()->getRFChData(chNo);
+ 
+--- a/src/patch/HostPatch.cpp
++++ b/src/patch/HostPatch.cpp
+@@ -311,9 +311,6 @@
+ 
+     m_netId = (uint32_t)::strtoul(systemConf["netId"].as<std::string>("BB800").c_str(), NULL, 16);
+     m_netId = p25::P25Utils::netId(m_netId);
+-    if (m_netId == 0xBEE00) {
+-        ::fatal("error 4\n");
+-    }
+ 
+     m_sysId = (uint32_t)::strtoul(systemConf["sysId"].as<std::string>("001").c_str(), NULL, 16);
+     m_sysId = p25::P25Utils::sysId(m_sysId);
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -16,6 +16,7 @@
+ #include "common/Log.h"
+ #include "common/network/P25SiteRouting.h"
+ #include "common/p25/lc/tsbk/OSP_RFSS_STS_BCAST.h"
++#include "common/p25/lc/tsbk/OSP_NET_STS_BCAST.h"
+ #include "common/p25/Audio.h"
+ 
+ #include <catch2/catch_test_macros.hpp>
+@@ -194,7 +195,7 @@
+         true, true, false, false, false, false};
+     std::unique_ptr<Control> controller;
+ 
+-    explicit ControllerFixture(bool withCapacity = false, bool sndcp = false, bool strictACL = false, bool messageAck = false, bool authoritative = true, network::Network* network = nullptr) :
++    explicit ControllerFixture(bool withCapacity = false, bool sndcp = false, bool strictACL = false, bool messageAck = false, bool authoritative = true, network::Network* network = nullptr, uint32_t wacn = 1U) :
+         radios("", 0U, strictACL), groups("", 0U, strictACL) {
+         g_logDisplayLevel = 0U;
+         g_RPC = &rpc;
+@@ -241,7 +242,7 @@
+ )";
+         REQUIRE(yaml::Parse(config, configText));
+         controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(),
+-            1U, 1U, 1U, 1U, 2U, 1U, false);
++            wacn, 1U, 1U, 1U, 2U, 1U, false);
+         controller->setCCRunning(true);
+     }
+ 
+@@ -1542,3 +1543,63 @@
+     REQUIRE(voice.voiceFrame(DUID::LDU1,GROUP,false,true,SOURCE+1U));
+     REQUIRE(voice.controller->getRFState()==RS_RF_AUDIO); REQUIRE_FALSE(voice.drainVoice().empty());
+ }
++
++
++// AABD-B normative AnnexA.1/Table18-1 PDF141/p136 assigns00001..FFFFE.
++// Every value in the former arbitrary BEE00..BEEFF exclusion is assignable.
++TEST_CASE("all assignable WACN subrange values retain configured identity", "[p25][wacn-address]") {
++    std::vector<uint32_t> networks{1U,0xBEDFFU,0xBEF00U,0xFFFFEU};
++    for(uint32_t value=0xBEE00U;value<=0xBEEFFU;++value) networks.push_back(value);
++    for(const auto wacn:networks) for(uint32_t system:{1U,0xABCU}) {
++        CAPTURE(wacn,system);
++        SiteData identity(wacn,system,1U,1U,0U,2U,25U,ServiceClass::VOICE,0);
++        REQUIRE(identity.netId()==wacn);
++        REQUIRE(identity.sysId()==system);
++        // AABC-E6.2.11.1/Fig6.2.11-1 PDF173/p154 exact identity fields.
++        TSBK::setSiteData(identity);
++        OSP_NET_STS_BCAST broadcast;
++        std::array<uint8_t,P25_TSBK_LENGTH_BYTES> raw{};
++        broadcast.encode(raw.data(),true,true);
++        REQUIRE(((uint32_t(raw[3])<<12U)|(uint32_t(raw[4])<<4U)|(raw[5]>>4U))==wacn);
++        REQUIRE(((uint32_t(raw[5]&15U)<<8U)|raw[6])==system);
++    }
++}
++
++TEST_CASE("valid WACNs allow actual control registration affiliation and correlated grants", "[p25][wacn-address][capacity-permit]") {
++    std::vector<uint32_t> networks;
++    for(uint32_t value=0xBEE00U;value<=0xBEEFFU;++value) networks.push_back(value);
++    for(uint32_t value:{1U,0xBEDFFU,0xBEF00U,0xFFFFEU}) networks.push_back(value);
++    for(const auto wacn:networks) {
++        CAPTURE(wacn);
++        ControllerFixture fixture(true,false,true,false,true,nullptr,wacn);
++        // Literal home-system registration fields, through real CAI framing.
++        auto registration=ControllerFixture::rawBlock(TSBKO::IOSP_U_REG,
++            (uint64_t(wacn)<<36U)|(uint64_t(1U)<<24U)|SOURCE);
++        REQUIRE(fixture.receiveRaw(registration));
++        REQUIRE(fixture.controller->affiliations()->isUnitReg(SOURCE));
++        auto replies=fixture.drain();
++        REQUIRE(replies.size()==1U);
++        REQUIRE(replies[0]->getLCO()==TSBKO::IOSP_U_REG);
++        REQUIRE(((replies[0]->getDecodedRaw()[2]>>4U)&3U)==ResponseCode::ACCEPT);
++        auto affiliation=ControllerFixture::rawBlock(TSBKO::IOSP_GRP_AFF,
++            (uint64_t(1U)<<40U)|(uint64_t(GROUP)<<24U)|SOURCE);
++        REQUIRE(fixture.receiveRaw(affiliation));
++        REQUIRE(fixture.controller->affiliations()->isGroupAff(SOURCE,GROUP));
++        fixture.drain();
++        fixture.controller->setSupervisor(true);
++        fixture.channels.setRFChData(VOICE_CHANNEL,::lookups::VoiceChData(2U,VOICE_CHANNEL,"127.0.0.1",48993U,"offline-test"));
++        auto request=ControllerFixture::rawBlock(TSBKO::IOSP_GRP_VCH,(uint64_t(GROUP)<<24U)|SOURCE);
++        REQUIRE(fixture.receiveRaw(request));
++        REQUIRE(fixture.rpc.permits==1U);
++        REQUIRE(fixture.controller->affiliations()->isGranted(GROUP));
++        const auto granted=fixture.drain();
++        REQUIRE_FALSE(granted.empty());
++        for(const auto& grant:granted) {
++            REQUIRE(grant->getLCO()==TSBKO::IOSP_GRP_VCH);
++            const auto raw=grant->getDecodedRaw();
++            REQUIRE(raw!=nullptr);
++            REQUIRE((((uint32_t)raw[5]<<8U)|raw[6])==GROUP);
++            REQUIRE((((uint32_t)raw[7]<<16U)|((uint32_t)raw[8]<<8U)|raw[9])==SOURCE);
++        }
++    }
++}

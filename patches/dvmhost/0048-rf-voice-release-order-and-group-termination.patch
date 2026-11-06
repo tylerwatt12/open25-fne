@@ -1,0 +1,194 @@
+--- a/src/host/Host.P25.cpp
++++ b/src/host/Host.P25.cpp
+@@ -103,7 +103,7 @@
+                                         afterReadCallback();
+                                     }
+                                     else {
+-                                        ret = host->m_p25->writeRF_VoiceEnd();
++                                        ret = host->m_p25->writeRF_VoiceEnd(false);
+                                         if (ret) {
+                                             afterReadCallback();
+ 
+@@ -143,7 +143,7 @@
+                                         host->m_modeTimer.start();
+                                     }
+                                     else {
+-                                        ret = host->m_p25->writeRF_VoiceEnd();
++                                        ret = host->m_p25->writeRF_VoiceEnd(false);
+                                         if (ret) {
+                                             host->m_modeTimer.start();
+                                         }
+@@ -318,7 +318,7 @@
+                                 }
+ 
+                                 // write end of voice if necessary
+-                                bool ret = host->m_p25->writeRF_VoiceEnd();
++                                bool ret = host->m_p25->writeRF_VoiceEnd(false);
+                                 if (ret) {
+                                     if (host->m_state == STATE_IDLE) {
+                                         host->m_modeTimer.setTimeout(host->m_netModeHang);
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -187,7 +187,8 @@
+          * @brief Helper to write end of voice call frame data.
+          * @returns bool True, if end of voice call was written, otherwise false.
+          */
+-        bool writeRF_VoiceEnd(bool immediate = true);
++        // Ordinary completion appends behind accepted voice; forced overrides opt in.
++        bool writeRF_VoiceEnd(bool immediate = false);
+ 
+         /** @name Data Clocking */
+         /**
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -2137,7 +2137,8 @@
+     }
+ 
+     lc = std::make_unique<lc::tdulc::LC_CALL_TERM>();
+-    lc->setDstId(dstId);
++    // AABD-B 3.5: the RFSS ends a group call for all SUs, not a TG address.
++    lc->setDstId(grp ? WUID_ALL : dstId);
+     writeRF_TDULC(lc.get(), true);
+ 
+     if (m_p25->m_enableControl) {
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -1141,7 +1141,7 @@
+ 
+             if (m_p25->m_dedicatedControl) {
+                 m_p25->m_tailOnIdle = false;
+-                writeRF_EndOfVoice();
++                writeRF_EndOfVoice(false);
+             }
+             else {
+                 m_p25->m_tailOnIdle = true;
+--- a/src/host/p25/packet/Voice.h
++++ b/src/host/p25/packet/Voice.h
+@@ -169,7 +169,8 @@
+             /**
+              * @brief Helper to write end of voice frame data.
+              */
+-            void writeRF_EndOfVoice(bool immediate = true);
++            // Keep queued voice before its normal terminal tail.
++            void writeRF_EndOfVoice(bool immediate = false);
+ 
+             /**
+              * @brief Helper to write a network P25 TDU packet.
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -89,6 +89,7 @@
+     }
+     using ControlSignaling::writeRF_ControlData;
+     using ControlSignaling::queueRF_TSBK_Ctrl;
++    using ControlSignaling::writeRF_TDULC_ChanRelease;
+ };
+ 
+ // Some broadcast decoders in this upstream revision are stubs. Use the shared
+@@ -1124,7 +1125,7 @@
+     REQUIRE(firstTerm != drain.output.end());
+     REQUIRE(lastAudio <= firstTerm); // Every accepted LDU precedes terminal RF; presence alone is insufficient.
+     REQUIRE_FALSE(drain.terminalDestinations.empty());
+-    for (const auto target : drain.terminalDestinations) REQUIRE(target == GROUP);
++    for (const auto target : drain.terminalDestinations) REQUIRE(target == WUID_ALL);
+     REQUIRE(drain.clock >= drain.lastWrite + 750U); // Software-empty alone was insufficient.
+     voice.controller->clearIdentificationTraffic();
+     voice.controller->reset();
+@@ -1603,3 +1604,98 @@
+         }
+     }
+ }
++
++// Ordinary call completion is distinct from an explicit immediate withdrawal.
++// AABD-B §3.5 and BAAA-B §7.2.3: finish accepted voice before the terminal tail.
++TEST_CASE("Ordinary rejected-frame fallback cannot overtake the final accepted RF LDU", "[p25][rf-release-tail]") {
++    for (bool duplicateTerminator : {true, false}) {
++        ControllerFixture voice(true, false, false, false, false);
++        voice.voiceMode(false); voice.permitVoice("ab12:701");
++        REQUIRE(voice.voiceFrame(DUID::HDU));
++        REQUIRE(voice.voiceFrame(DUID::LDU1));
++        REQUIRE(voice.voiceFrame(DUID::LDU2));
++        voice.drainVoice(); // Earlier units have already crossed the modem boundary.
++        REQUIRE(voice.voiceFrame(DUID::LDU1)); // Keep this last accepted unit queued.
++        REQUIRE(voice.voiceFrame(DUID::TDU));
++        if (duplicateTerminator) {
++            REQUIRE_FALSE(voice.voiceFrame(DUID::TDU)); // Orphan/repeated end.
++        } else {
++            std::array<uint8_t, P25_TDU_FRAME_LENGTH_BYTES + 2U> rejected{};
++            REQUIRE_FALSE(voice.controller->processFrame(rejected.data(), rejected.size()));
++        }
++        // Exact ordinary reader fallback in Host.P25.cpp after processFrame(false).
++        REQUIRE(voice.controller->writeRF_VoiceEnd());
++        std::vector<DUID::E> units;
++        std::array<uint8_t, 1024U> frame{};
++        uint32_t length;
++        while ((length = voice.controller->getFrame(frame.data())) != 0U) {
++            NID nid(0x293U);
++            if (!nid.decode(frame.data() + 2U)) {
++                REQUIRE(std::all_of(frame.begin() + 2U, frame.begin() + length,
++                    [](uint8_t value) { return value == 0U; }));
++                continue; // Existing raw zero tail is not a voice data unit.
++            }
++            units.push_back(nid.getDUID());
++        }
++        REQUIRE(units == std::vector<DUID::E>{DUID::LDU1, DUID::TDU, DUID::TDU, DUID::TDULC});
++    }
++}
++
++TEST_CASE("Explicit immediate voice ending remains an explicit queue override", "[p25][rf-release-tail][dispatch-preemption]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.voiceMode(false); voice.permitVoice("ab12:702");
++    REQUIRE(voice.voiceFrame(DUID::HDU));
++    REQUIRE(voice.voiceFrame(DUID::LDU1)); voice.drainVoice();
++    REQUIRE(voice.voiceFrame(DUID::LDU2));
++    REQUIRE(voice.voiceFrame(DUID::TDU));
++    REQUIRE(voice.controller->writeRF_VoiceEnd(true));
++    std::array<uint8_t, 1024U> frame{}; bool immediate = false;
++    REQUIRE(voice.controller->getFrame(frame.data(), &immediate) > 0U);
++    REQUIRE(immediate);
++    NID nid(0x293U); REQUIRE(nid.decode(frame.data() + 2U));
++    REQUIRE(nid.getDUID() == DUID::TDU);
++}
++
++// AABD-B §3.5/PDF26; AABF-D §7.3.8/PDF24. Compare the literal protected-LC
++// information bytes from the actual outbound writer, not a local encoder oracle.
++TEST_CASE("RFSS outbound group call termination addresses all subscriber units", "[p25][group-call-termination]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.voiceMode(false); voice.permitVoice("ab12:703");
++    OfflineScheduler scheduler(voice.controller.get());
++    scheduler.writeRF_TDULC_ChanRelease(true, SOURCE, GROUP);
++    std::array<uint8_t, 1024U> frame{};
++    REQUIRE(voice.controller->getFrame(frame.data()) == P25_TDULC_FRAME_LENGTH_BYTES + 2U);
++    NID nid(0x293U); REQUIRE(nid.decode(frame.data() + 2U)); REQUIRE(nid.getDUID() == DUID::TDULC);
++    lc::tdulc::LC_CALL_TERM term; REQUIRE(term.decode(frame.data() + 2U));
++    const std::array<uint8_t, 9U> expected{{0x4FU, 0U, 0U, 0U, 0U, 0U, 0xFFU, 0xFFU, 0xFFU}};
++    REQUIRE(std::equal(expected.begin(), expected.end(), term.getDecodedRaw()));
++    REQUIRE(term.getDstId() == WUID_ALL);
++    REQUIRE(voice.controller->getFrame(frame.data()) == 0U);
++    REQUIRE(voice.rpc.releases == std::vector<uint32_t>{GROUP}); // Internal grant remains the real TG.
++}
++
++TEST_CASE("RFSS private call termination retains its selected individual target", "[p25][group-call-termination]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.voiceMode(false);
++    OfflineScheduler scheduler(voice.controller.get());
++    scheduler.writeRF_TDULC_ChanRelease(false, SOURCE, TARGET);
++    std::array<uint8_t, 1024U> frame{};
++    REQUIRE(voice.controller->getFrame(frame.data()) == P25_TDULC_FRAME_LENGTH_BYTES + 2U);
++    lc::tdulc::LC_CALL_TERM term; REQUIRE(term.decode(frame.data() + 2U));
++    const std::array<uint8_t, 9U> expected{{0x4FU, 0U, 0U, 0U, 0U, 0U, 0U, 0x03U, 0xEAU}};
++    REQUIRE(std::equal(expected.begin(), expected.end(), term.getDecodedRaw()));
++    REQUIRE(term.getDstId() == TARGET);
++    REQUIRE(voice.rpc.releases.empty());
++}
++
++TEST_CASE("Outbound group termination address does not alter inbound session matching", "[p25][group-call-termination]") {
++    ControllerFixture voice(true, false, false, false, false);
++    voice.voiceMode(false); voice.permitVoice("ab12:704");
++    REQUIRE(voice.voiceFrame(DUID::HDU)); REQUIRE(voice.voiceFrame(DUID::LDU1)); voice.drainVoice();
++    REQUIRE_FALSE(voice.voiceFrame(DUID::TDULC, WUID_ALL));
++    REQUIRE(voice.controller->getRFState() == RS_RF_AUDIO);
++    REQUIRE(voice.rpc.releases.empty());
++    REQUIRE(voice.voiceFrame(DUID::TDULC, GROUP));
++    REQUIRE(voice.controller->getRFState() == RS_RF_LISTENING);
++    REQUIRE(voice.rpc.releases == std::vector<uint32_t>{GROUP});
++}

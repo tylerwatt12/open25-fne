@@ -1,0 +1,114 @@
+--- a/tests/edac/CRC_6_Test.cpp
++++ b/tests/edac/CRC_6_Test.cpp
+@@ -27,18 +27,21 @@
+ 
+     const uint32_t len = 32U;
+     const uint32_t lenBits = len * 8U;
+-    uint8_t* random = (uint8_t*)malloc(len);
++    // The API appends six CRC bits after lenBits payload bits.
++    const uint32_t storageLen = len + 1U;
++    uint8_t* random = (uint8_t*)calloc(storageLen, 1U);
++    REQUIRE(random != nullptr);
+ 
+-    for (size_t i = 0; i < len - 1U; i++) {
++    for (size_t i = 0; i < len; i++) {
+         random[i] = rand();
+     }
+ 
+     CRC::addCRC6(random, lenBits);
+ 
+-    uint32_t inCrc = (random[len - 1U] << 0);
++    uint32_t inCrc = random[len] >> 2;
+     ::LogInfoEx("T", "CRC::checkCRC6(), crc = $%02X", inCrc);
+ 
+-    Utils::dump(2U, "6_Sanity_Test CRC", random, len);
++    Utils::dump(2U, "6_Sanity_Test CRC", random, storageLen);
+ 
+     bool ret = CRC::checkCRC6(random, lenBits);
+     if (!ret) {
+@@ -47,8 +50,7 @@
+         goto cleanup;
+     }
+ 
+-    random[10U] >>= 8;
+-    random[11U] >>= 8;
++    random[10U] ^= 0x01U; // definite one-bit payload error
+ 
+     ret = CRC::checkCRC6(random, lenBits);
+     if (ret) {
+--- a/tests/edac/CRC_15_Test.cpp
++++ b/tests/edac/CRC_15_Test.cpp
+@@ -27,18 +27,21 @@
+ 
+     const uint32_t len = 32U;
+     const uint32_t lenBits = len * 8U;
+-    uint8_t* random = (uint8_t*)malloc(len);
++    // The API appends 15 CRC bits after lenBits payload bits.
++    const uint32_t storageLen = len + 2U;
++    uint8_t* random = (uint8_t*)calloc(storageLen, 1U);
++    REQUIRE(random != nullptr);
+ 
+-    for (size_t i = 0; i < len - 2U; i++) {
++    for (size_t i = 0; i < len; i++) {
+         random[i] = rand();
+     }
+ 
+     CRC::addCRC15(random, lenBits);
+ 
+-    uint16_t inCrc = (random[len - 2U] << 8) | (random[len - 1U] << 0);
++    uint16_t inCrc = (random[len] << 7) | (random[len + 1U] >> 1);
+     ::LogInfoEx("T", "CRC::checkCRC15(), crc = $%04X", inCrc);
+ 
+-    Utils::dump(2U, "15_Sanity_Test CRC", random, len);
++    Utils::dump(2U, "15_Sanity_Test CRC", random, storageLen);
+ 
+     bool ret = CRC::checkCRC15(random, lenBits);
+     if (!ret) {
+@@ -47,8 +50,7 @@
+         goto cleanup;
+     }
+ 
+-    random[10U] >>= 8;
+-    random[11U] >>= 8;
++    random[10U] ^= 0x01U; // definite one-bit payload error
+ 
+     ret = CRC::checkCRC15(random, lenBits);
+     if (ret) {
+--- a/tests/edac/CRC_16_Test.cpp
++++ b/tests/edac/CRC_16_Test.cpp
+@@ -27,18 +27,21 @@
+ 
+     const uint32_t len = 32U;
+     const uint32_t lenBits = len * 8U;
+-    uint8_t* random = (uint8_t*)malloc(len);
++    // The API appends 16 CRC bits after lenBits payload bits.
++    const uint32_t storageLen = len + 2U;
++    uint8_t* random = (uint8_t*)calloc(storageLen, 1U);
++    REQUIRE(random != nullptr);
+ 
+-    for (size_t i = 0; i < len - 2U; i++) {
++    for (size_t i = 0; i < len; i++) {
+         random[i] = rand();
+     }
+ 
+     CRC::addCRC16(random, lenBits);
+ 
+-    uint16_t inCrc = (random[len - 2U] << 8) | (random[len - 1U] << 0);
++    uint16_t inCrc = (random[len] << 8) | random[len + 1U];
+     ::LogInfoEx("T", "CRC::checkCRC16(), crc = $%04X", inCrc);
+ 
+-    Utils::dump(2U, "16_Sanity_Test CRC", random, len);
++    Utils::dump(2U, "16_Sanity_Test CRC", random, storageLen);
+ 
+     bool ret = CRC::checkCRC16(random, lenBits);
+     if (!ret) {
+@@ -47,8 +50,7 @@
+         goto cleanup;
+     }
+ 
+-    random[10U] >>= 8;
+-    random[11U] >>= 8;
++    random[10U] ^= 0x01U; // definite one-bit payload error
+ 
+     ret = CRC::checkCRC16(random, lenBits);
+     if (ret) {

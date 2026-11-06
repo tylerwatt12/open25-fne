@@ -1,0 +1,122 @@
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -689,10 +689,13 @@
+ 
+                     ::ActivityLog("P25", true, "emergency alarm request from %u", srcId);
+ 
+-                    // Native ACK confirms FNE receipt. The Site's observed event
+-                    // notifies consoles; human acknowledgment remains separate.
++                    // Preserve the received alarm even if its ACK cannot be
++                    // queued. Queue admission does not prove RF delivery or
++                    // human acknowledgment of the Site's observed event.
+                     markValidatedWUID(srcId);
+-                    writeRF_TSDU_ACK_FNE(srcId, TSBKO::ISP_EMERG_ALRM_REQ, false, true);
++                    if (!writeRF_TSDU_ACK_FNE(srcId, TSBKO::ISP_EMERG_ALRM_REQ, false, true)) {
++                        LogWarning(LOG_RF, P25_TSDU_STR ", emergency alarm ACK not queued, srcId = %u, dstId = %u", srcId, dstId);
++                    }
+                 }
+             }
+             break;
+--- a/tests/p25/EmergencyAdmission_Tests.cpp
++++ b/tests/p25/EmergencyAdmission_Tests.cpp
+@@ -37,6 +37,11 @@
+     while ((at=log.find("(Emergency Alarm Request)",at))!=std::string::npos) { ++count; ++at; }
+     return count;
+ }
++size_t ackQueueFailureLogs() {
++    const auto log=nativeLog().str(); size_t count=0U, at=0U;
++    while ((at=log.find("emergency alarm ACK not queued,",at))!=std::string::npos) { ++count; ++at; }
++    return count;
++}
+ std::string hex(const uint8_t* bytes,size_t length) {
+     static const char* digits="0123456789ABCDEF"; std::string value;
+     for(size_t i=0U;i<length;++i) { value+=digits[bytes[i]>>4U]; value+=digits[bytes[i]&15U]; }
+@@ -65,13 +70,13 @@
+     network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-subscriber-test", false};
+     network::NetRPC* oldRPC = g_RPC;
+     std::unique_ptr<Control> controller;
+-    explicit Fixture(bool groupACL = true) : groups("",0U,groupACL) {
++    explicit Fixture(bool groupACL = true, uint32_t queue = 16384U) : groups("",0U,groupACL) {
+         const bool cc=true; const bool physicalInventory=true;
+         g_logDisplayLevel = 0U; g_RPC = &rpc;
+         nativeLog().str(""); nativeLog().clear(); log_internal::SetInternalOutputStream(nativeLog());
+         radios.addEntry(RID, true, "Subscriber"); radios.addEntry(OTHER, false, "Disabled"); radios.addEntry(APP, true, "Console"); radios.addEntry(10006U, true, "Not physical");
+         groups.addEntry(TG, 1U, true); groups.addEntry(1002U, 1U, true);
+-        controller = std::make_unique<Control>(true, NAC, 1U, 16384U, &modem, nullptr, 120U, 1U, true,
++        controller = std::make_unique<Control>(true, NAC, 1U, queue, &modem, nullptr, 120U, 1U, true,
+             &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
+         yaml::Node config; std::string mode = cc ? "true" : "false";
+         const std::string inventory = physicalInventory ? "        dispatchSubscribers:\n            - 10001\n            - 10005\n" : "        dispatchSubscribers: []\n";
+@@ -196,3 +201,72 @@
+         REQUIRE(acceptedLogs()==0U);
+     }
+ }
++
++TEST_CASE("emergency receipt survives a rejected ACK queue and retry can queue the unchanged reply", "[p25][emergency-admission][emergency-ack-queue]") {
++    const uint64_t alarm=0x0102000000000000ULL|(uint64_t(TG)<<24U)|RID;
++    // Exact room for one existing TSDU plus its two-octet queue length.
++    Fixture f(true,P25_TSDU_FRAME_LENGTH_BYTES+4U);
++    auto* units=f.controller->affiliations();
++    f.controller->setDebugVerbose(false,false);
++    nativeLog().str(""); nativeLog().clear();
++    f.age(1000U);
++    REQUIRE(f.signal(0x27U,alarm));
++    REQUIRE(acceptedLogs()==1U);
++    REQUIRE(ackQueueFailureLogs()==0U);
++    REQUIRE(units->unitRegTimer(RID)==0U);
++
++    // Without draining the first reply, this actual receive path must retain
++    // the second observation while reporting only the failed queue admission.
++    f.age(1000U);
++    REQUIRE(f.signal(0x27U,alarm));
++    REQUIRE(acceptedLogs()==2U);
++    REQUIRE(ackQueueFailureLogs()==1U);
++    REQUIRE(nativeLog().str().find("emergency alarm ACK not queued, srcId = 10001, dstId = 1001")!=std::string::npos);
++    REQUIRE(units->unitRegTimer(RID)==1U);
++    REQUIRE(f.controller->getRFState()==RS_RF_LISTENING);
++    REQUIRE(units->grantSize()==0U);
++    REQUIRE_FALSE(units->isGroupAff(RID,TG));
++    auto first=f.responses(); REQUIRE(first.size()==1U);
++
++    // A later SU retry may use the now-free queue. The diagnostic neither
++    // clears the received alarm nor creates a retry, grant or new wire format.
++    REQUIRE(f.signal(0x27U,alarm));
++    REQUIRE(acceptedLogs()==3U);
++    REQUIRE(ackQueueFailureLogs()==1U);
++    REQUIRE(units->unitRegTimer(RID)==0U);
++    auto retried=f.responses(); REQUIRE(retried.size()==1U);
++    REQUIRE(retried[0]==first[0]);
++    if(const char* path=std::getenv("DVM_EMERGENCY_ACK_EXPORT")) {
++        json::object observation;
++        const uint32_t acceptedCount=3U, failureCount=1U;
++        observation["native_log"].set<std::string>(nativeLog().str());
++        observation["accepted_observations"].set<uint32_t>(acceptedCount);
++        observation["ack_queue_failures"].set<uint32_t>(failureCount);
++        observation["first_queued_ack_tsbk_hex"].set<std::string>(hex(first[0].data(),first[0].size()));
++        observation["retry_queued_ack_tsbk_hex"].set<std::string>(hex(retried[0].data(),retried[0].size()));
++        json::value document; document.set<json::object>(observation);
++        std::ofstream output(path,std::ios::trunc); REQUIRE(output.good());
++        output << document.serialize(true) << "\n"; REQUIRE(output.good());
++    }
++}
++
++TEST_CASE("emergency ACK failure is diagnostic with zero capacity and denial remains distinct", "[p25][emergency-admission][emergency-ack-queue]") {
++    const uint64_t alarm=0x0102000000000000ULL|(uint64_t(TG)<<24U)|RID;
++    Fixture f(true,0U); auto* units=f.controller->affiliations();
++    f.controller->setDebugVerbose(false,false);
++    f.age(1000U);
++    REQUIRE(f.signal(0x27U,alarm));
++    REQUIRE(acceptedLogs()==1U);
++    REQUIRE(ackQueueFailureLogs()==1U);
++    REQUIRE(f.responses().empty());
++    REQUIRE(units->unitRegTimer(RID)==1U);
++    REQUIRE(units->grantSize()==0U);
++
++    f.groups.addEntry(TG,1U,false);
++    REQUIRE_FALSE(f.signal(0x27U,alarm));
++    REQUIRE(acceptedLogs()==1U);
++    REQUIRE(ackQueueFailureLogs()==1U);
++    REQUIRE(nativeLog().str().find("emergency alarm denial,")!=std::string::npos);
++    REQUIRE(f.responses().empty());
++    REQUIRE(units->unitRegTimer(RID)==1U);
++}

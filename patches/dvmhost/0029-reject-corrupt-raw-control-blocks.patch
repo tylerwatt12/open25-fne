@@ -1,0 +1,56 @@
+diff --git a/src/common/p25/lc/TSBK.cpp b/src/common/p25/lc/TSBK.cpp
+--- a/src/common/p25/lc/TSBK.cpp
++++ b/src/common/p25/lc/TSBK.cpp
+@@ -210,6 +210,7 @@
+             }
+             else {
+                 LogError(LOG_P25, "TSBK::decode(), failed CRC CCITT-162 check");
++                return false;
+             }
+         }
+     }
+diff --git a/src/common/p25/lc/tsbk/TSBKFactory.cpp b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+--- a/src/common/p25/lc/tsbk/TSBKFactory.cpp
++++ b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+@@ -69,6 +69,7 @@
+             }
+             else {
+                 LogError(LOG_P25, "TSBKFactory::createTSBK(), failed CRC CCITT-162 check");
++                return nullptr;
+             }
+         }
+     }
+diff --git a/tests/p25/RawTSBKIntegrity_Tests.cpp b/tests/p25/RawTSBKIntegrity_Tests.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/p25/RawTSBKIntegrity_Tests.cpp
+@@ -0,0 +1,29 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// AABB-B section 5 TSBK integrity. Raw input must retain the same fail-closed
++// CRC policy as the normal CAI decoder; explicit warning mode is diagnostic.
++#include "common/p25/lc/tsbk/TSBKFactory.h"
++#include "common/edac/CRC.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++
++using namespace p25::lc;
++using namespace p25::lc::tsbk;
++
++TEST_CASE("Raw TSBK CRC failure cannot reach a typed command", "[p25][raw-tsbk-integrity]") {
++    TSBK::setWarnCRC(false);
++    TSBKFactory::setWarnCRC(false);
++    std::array<uint8_t, 12> valid{0xA7U, 0U, 0x80U, 1U, 0U, 3U, 0xE9U, 0U, 0x27U, 0x11U, 0U, 0U};
++    edac::CRC::addCCITT162(valid.data(), valid.size());
++    REQUIRE(TSBKFactory::createTSBK(valid.data(), TSBKFactory::Direction::Inbound, true) != nullptr);
++    for (unsigned byte = 0; byte < valid.size(); ++byte) {
++        for (unsigned bit = 0; bit < 8; ++bit) {
++            auto corrupted = valid;
++            corrupted[byte] ^= uint8_t(1U << bit);
++            CAPTURE(byte, bit);
++            REQUIRE_FALSE(edac::CRC::checkCCITT162(corrupted.data(), corrupted.size()));
++            REQUIRE(TSBKFactory::createTSBK(corrupted.data(), TSBKFactory::Direction::Inbound, true) == nullptr);
++            ISP_EMERG_ALRM_REQ direct;
++            REQUIRE_FALSE(direct.decode(corrupted.data(), true));
++        }
++    }
++}

@@ -1,0 +1,993 @@
+diff --git a/src/common/p25/P25Defines.h b/src/common/p25/P25Defines.h
+--- a/src/common/p25/P25Defines.h
++++ b/src/common/p25/P25Defines.h
+@@ -258,6 +258,7 @@
+             enum : uint8_t {
+                 INVALID = 0x00U,                        //!< Invalid Service Class
+                 COMPOSITE = 0x01U,                      //!< Composite Control Channel
++                BACKUP = 0x04U,                         //!< Backup Control Channel Only (AABC-E 2.3.32)
+                 DATA = 0x10U,                           //!< Data
+                 VOICE = 0x20U,                          //!< Voice
+                 REG = 0x40U,                            //!< Registration
+diff --git a/src/common/p25/lc/tsbk/OSP_SCCB.cpp b/src/common/p25/lc/tsbk/OSP_SCCB.cpp
+--- a/src/common/p25/lc/tsbk/OSP_SCCB.cpp
++++ b/src/common/p25/lc/tsbk/OSP_SCCB.cpp
+@@ -25,7 +25,11 @@
+ 
+ OSP_SCCB::OSP_SCCB() : TSBK(),
+     m_sccbChannelId1(0U),
+-    m_sccbChannelId2(0U)
++    m_sccbChannelNo1(0U),
++    m_sccbServiceClass1(0U),
++    m_sccbChannelId2(0U),
++    m_sccbChannelNo2(0U),
++    m_sccbServiceClass2(0U)
+ {
+     m_lco = TSBKO::OSP_SCCB;
+ }
+@@ -51,20 +55,13 @@
+ 
+     tsbkValue = s_siteData.rfssId();                                                // RF Sub-System ID
+     tsbkValue = (tsbkValue << 8) + s_siteData.siteId();                             // Site ID
+-    tsbkValue = (tsbkValue << 16) + m_sccbChannelId1;                               // SCCB Channel ID 1
+-    if (m_sccbChannelId1 > 0) {
+-        tsbkValue = (tsbkValue << 8) + s_siteData.serviceClass();                   // System Service Class
+-    }
+-    else {
+-        tsbkValue = (tsbkValue << 8) + (ServiceClass::INVALID);                     // System Service Class
+-    }
+-    tsbkValue = (tsbkValue << 16) + m_sccbChannelId2;                               // SCCB Channel ID 2
+-    if (m_sccbChannelId2 > 0) {
+-        tsbkValue = (tsbkValue << 8) + s_siteData.serviceClass();                   // System Service Class
+-    }
+-    else {
+-        tsbkValue = (tsbkValue << 8) + (ServiceClass::INVALID);                     // System Service Class
+-    }
++    // AABC-E 6.2.16 Fig6.2.16-1: each Channel is a four-bit
++    // Identifier followed by a twelve-bit number. Identifier zero is valid;
++    // service class zero, rather than a zero identifier, invalidates an entry.
++    tsbkValue = (tsbkValue << 16) + (uint16_t(m_sccbChannelId1) << 12U) + m_sccbChannelNo1;
++    tsbkValue = (tsbkValue << 8) + m_sccbServiceClass1;
++    tsbkValue = (tsbkValue << 16) + (uint16_t(m_sccbChannelId2) << 12U) + m_sccbChannelNo2;
++    tsbkValue = (tsbkValue << 8) + m_sccbServiceClass2;
+ 
+     std::unique_ptr<uint8_t[]> tsbk = TSBK::fromValue(tsbkValue);
+     TSBK::encode(data, tsbk.get(), rawTSBK, noTrellis);
+@@ -88,5 +85,9 @@
+     TSBK::copy(data);
+ 
+     m_sccbChannelId1 = data.m_sccbChannelId1;
++    m_sccbChannelNo1 = data.m_sccbChannelNo1;
++    m_sccbServiceClass1 = data.m_sccbServiceClass1;
+     m_sccbChannelId2 = data.m_sccbChannelId2;
++    m_sccbChannelNo2 = data.m_sccbChannelNo2;
++    m_sccbServiceClass2 = data.m_sccbServiceClass2;
+ }
+diff --git a/src/common/p25/lc/tsbk/OSP_SCCB.h b/src/common/p25/lc/tsbk/OSP_SCCB.h
+--- a/src/common/p25/lc/tsbk/OSP_SCCB.h
++++ b/src/common/p25/lc/tsbk/OSP_SCCB.h
+@@ -66,10 +66,14 @@
+                  * @brief SCCB channel ID 1.
+                  */
+                 DECLARE_PROPERTY(uint8_t, sccbChannelId1, SCCBChnId1);
++                DECLARE_PROPERTY(uint16_t, sccbChannelNo1, SCCBChnNo1);
++                DECLARE_PROPERTY(uint8_t, sccbServiceClass1, SCCBServiceClass1);
+                 /**
+                  * @brief SCCB channel ID 2.
+                  */
+                 DECLARE_PROPERTY(uint8_t, sccbChannelId2, SCCBChnId2);
++                DECLARE_PROPERTY(uint16_t, sccbChannelNo2, SCCBChnNo2);
++                DECLARE_PROPERTY(uint8_t, sccbServiceClass2, SCCBServiceClass2);
+ 
+                 DECLARE_COPY(OSP_SCCB);
+             };
+diff --git a/src/host/p25/Control.Dispatch.cpp b/src/host/p25/Control.Dispatch.cpp
+--- a/src/host/p25/Control.Dispatch.cpp
++++ b/src/host/p25/Control.Dispatch.cpp
+@@ -98,7 +98,7 @@
+ {
+     return localMediaAvailable() && m_dispatchEnabled && !m_dispatchClosing.load() && m_authoritative && m_supervisor &&
+         m_enableControl && m_dedicatedControl && m_duplex && m_ccRunning && !m_ccHalted &&
+-        !identificationActive() && (!admitNew || !identificationUnavailable()) && m_modem != nullptr && !m_modem->hasError() &&
++        !identificationActive() && (!admitNew || (!identificationUnavailable() && !m_controlQuiesced.load())) && m_modem != nullptr && !m_modem->hasError() &&
+         !m_modem->hasLockout() && m_modem->statusGeneration() != 0U &&
+         m_modem->getState() == modem::DVM_STATE::STATE_P25 && g_RPC != nullptr &&
+         (m_network == nullptr || m_network->getStatus() == network::NET_STAT_RUNNING);
+diff --git a/src/host/p25/Control.RFAdmission.cpp b/src/host/p25/Control.RFAdmission.cpp
+--- a/src/host/p25/Control.RFAdmission.cpp
++++ b/src/host/p25/Control.RFAdmission.cpp
+@@ -18,6 +18,7 @@
+     if (!m_managedSite || !m_zoneConnected.load() || m_rfAllStartTalkgroups.count(destination) == 0U)
+         return false;
+     auto allocations = m_affiliations->lockGrants();
++    if (m_controlQuiesced.load()) return true; // consumed without creating or replaying a new request
+     std::lock_guard<std::mutex> lock(m_rfAdmissionMutex);
+     const auto now = Clock::now();
+     for (const auto& entry : m_rfAdmissions) {
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -270,7 +270,7 @@
+     // RF allocation commit holds this same guard through grant enqueue.
+     // A concurrent withdrawal either wins before commit or drains that grant.
+     auto grants = m_affiliations->lockGrants();
+-    if (!m_identificationEnabled.load() || (requireIdle && !identificationIdle()))
++    if (m_controlQuiesced.load() || !m_identificationEnabled.load() || (requireIdle && !identificationIdle()))
+         return false;
+     m_identificationUnavailable.store(true);
+     return true;
+@@ -279,7 +279,7 @@
+ bool Control::tryBeginIdentification()
+ {
+     std::unique_lock<std::recursive_mutex> lock(m_permitMutex, std::try_to_lock);
+-    if (!lock.owns_lock())
++    if (!lock.owns_lock() || m_controlQuiesced.load())
+         return false;
+     if (m_identificationEnabled.load()) {
+         if (!identificationIdle())
+@@ -402,6 +402,17 @@
+     m_tduPreambleCount = p25Protocol["tduPreambleCount"].as<uint32_t>(8U);
+ 
+     yaml::Node rfssConfig = systemConf["config"];
++    m_control->m_backupControlChannels.clear();
++    m_control->m_backupControlIndex = 0U;
++    yaml::Node backupControl = rfssConfig["backupControlChannels"];
++    if (backupControl.isSequence()) {
++        for (size_t i = 0U; i < backupControl.size(); ++i) {
++            auto entry = backupControl[i];
++            const auto identifier = uint8_t(entry["channelId"].as<uint32_t>());
++            const auto number = uint32_t(::strtoul(entry["channelNo"].as<std::string>().c_str(), nullptr, 16));
++            m_control->m_backupControlChannels.emplace_back(identifier, number, "", 0U, "");
++        }
++    }
+     m_control->m_patchSuperGroup = (uint32_t)::strtoul(rfssConfig["pSuperGroup"].as<std::string>("FFFE").c_str(), NULL, 16);
+     m_control->m_announcementGroup = (uint32_t)::strtoul(rfssConfig["announcementGroup"].as<std::string>("FFFE").c_str(), NULL, 16);
+     m_defaultNetIdleTalkgroup = (uint32_t)rfssConfig["defaultNetIdleTalkgroup"].as<uint32_t>(0U);
+@@ -779,6 +790,7 @@
+     permitLock.lock();
+     expireTrafficPermit();
+     if (identificationActive()) return false;
++    if (m_controlQuiesced.load() && !m_authoritative && m_permittedDstId.load() == 0U && m_rfState == RS_RF_LISTENING) return false;
+     assert(data != nullptr);
+ 
+     if (len == 0U) return false;
+@@ -1118,6 +1130,7 @@
+     if (!m_authoritative) permitLock.lock();
+     expireTrafficPermit();
+     if (!m_authoritative) retryPermitReleases();
++    clockControlQuiesce();
+     uint32_t ms = m_interval.elapsed();
+     m_interval.start();
+     if (m_control != nullptr) { m_control->clockInhibitions(ms); m_control->clockRadioChecks(ms); m_control->clockStatusQueries(); m_control->clockMessageUpdates(); }
+@@ -1570,6 +1583,94 @@
+     return m_rfState != RS_RF_LISTENING || m_netState != RS_NET_IDLE;
+ }
+ 
++// Explicit Site operation only. The allocation/permit owners serialize this
++// admission fence; an HTTP caller never decides that a displayed status is idle.
++ControlQuiesceState Control::setControlQuiesce(bool enabled)
++{
++    std::lock_guard<std::recursive_mutex> permit(m_permitMutex);
++    auto grants = m_affiliations->lockGrants();
++    if (m_controlQuiesced.exchange(enabled) != enabled) {
++        m_quiesceBarrierRequested = m_quiesceBarrierPassed = m_quiesceBarrierFailed = m_quiesceHardwareIdle = false;
++        m_quiesceQuietSamples = 0U;
++    }
++    return controlQuiesceState();
++}
++
++ControlQuiesceState Control::controlQuiesceState()
++{
++    std::lock_guard<std::recursive_mutex> permit(m_permitMutex);
++    auto grants = m_affiliations->lockGrants();
++    ControlQuiesceState result;
++    result.quiesced = m_controlQuiesced.load();
++    result.grants = m_affiliations->grantSize();
++    result.dispatchLeases = uint32_t(m_dispatchLeases.size());
++    result.pendingOperations = m_control->pendingControlOperations();
++    {
++        std::lock_guard<std::mutex> queue(m_dispatchQueueMutex);
++        result.pendingDispatch = uint32_t(m_dispatchQueue.size());
++    }
++    {
++        std::lock_guard<std::mutex> pending(m_rfAdmissionMutex);
++        for (const auto& item : m_rfAdmissions) {
++            const auto& state = item.second.state;
++            if (state == "pending" || state == "approved" || state == "committing") ++result.pendingRF;
++        }
++    }
++    result.permitActive = m_permittedDstId.load() != 0U || !m_permitToken.empty();
++    result.radioBusy = isBusy() || identificationActive() || m_txImmQueue.hasOwnedFrames() || m_txQueue.hasOwnedFrames();
++    // A dedicated control carrier continuously queues status broadcasts. Those
++    // are not traffic calls. Voice workers must also drain actual RF/media tails.
++    if (!m_dedicatedControl) {
++        result.radioBusy = result.radioBusy || m_tailOnIdle || !m_txImmQueue.isEmpty() || !m_txQueue.isEmpty() ||
++            !m_pendingSiteFrames.empty() || (m_modem != nullptr && m_modem->hasTX()) ||
++            (result.quiesced && !m_quiesceHardwareIdle);
++    }
++    result.idle = result.grants == 0U && result.dispatchLeases == 0U &&
++        result.pendingDispatch == 0U && result.pendingRF == 0U && result.pendingOperations == 0U &&
++        !result.permitActive && !result.radioBusy;
++    return result;
++}
++
++// The protocol clock owns modem requests and readiness. A serial version-reply
++// barrier fences the final queued write, followed by two fresh quiet status
++// observations, just as the existing station-identification drain does.
++void Control::clockControlQuiesce()
++{
++    if (m_authoritative || !m_controlQuiesced.load()) return;
++    std::lock_guard<std::recursive_mutex> permit(m_permitMutex);
++    if (m_modem == nullptr || m_modem->hasError() || m_modem->hasLockout() ||
++        isBusy() || identificationActive() || m_permittedDstId.load() != 0U ||
++        !m_permitToken.empty() || m_tailOnIdle || !m_txImmQueue.isEmpty() || !m_txQueue.isEmpty() ||
++        !m_pendingSiteFrames.empty() || m_modem->hasTX()) {
++        m_quiesceBarrierRequested = m_quiesceBarrierPassed = m_quiesceBarrierFailed = m_quiesceHardwareIdle = false;
++        m_quiesceQuietSamples = 0U;
++        return;
++    }
++    if (!m_quiesceBarrierRequested) {
++        m_quiesceBarrierGeneration = m_modem->serialBarrierGeneration();
++        m_quiesceBarrierRequested = true;
++        m_quiesceBarrierFailed = !m_modem->requestSerialBarrier();
++        return;
++    }
++    if (m_quiesceBarrierFailed) return;
++    if (m_modem->serialBarrierGeneration() <= m_quiesceBarrierGeneration) return;
++    if (!m_quiesceBarrierPassed) {
++        m_quiesceBarrierPassed = true;
++        m_quiesceStatusGeneration = m_modem->statusGeneration();
++        return;
++    }
++    const auto generation = m_modem->statusGeneration();
++    if (generation == m_quiesceStatusGeneration) return;
++    m_quiesceStatusGeneration = generation;
++    if (m_modem->getState() != modem::STATE_P25) {
++        m_quiesceQuietSamples = 0U;
++        m_quiesceHardwareIdle = false;
++        return;
++    }
++    if (m_quiesceQuietSamples < 2U) ++m_quiesceQuietSamples;
++    m_quiesceHardwareIdle = m_quiesceQuietSamples == 2U;
++}
++
+ /* Helper to change the debug and verbose state. */
+ 
+ void Control::setDebugVerbose(bool debug, bool verbose)
+@@ -1708,6 +1809,7 @@
+     if (!buffer) buffer = m_network->readP25(ret, length, &received);
+     if (!ret)
+         return;
++    if (m_controlQuiesced.load() && !m_authoritative && m_permittedDstId.load() == 0U && m_netState == RS_NET_IDLE) return;
+     if (!localMediaAvailable()) { m_pendingSiteFrames.clear(); return; }
+     if (length < 24U)
+         return;
+@@ -2442,7 +2544,7 @@
+     reply["permitToken"].set<std::string>(token);
+     reply["dstId"].set<uint32_t>(dstId);
+     reply["srcId"].set<uint32_t>(srcId);
+-    if (dstId != 0U && identificationUnavailable()) {
++    if (dstId != 0U && (identificationUnavailable() || m_controlQuiesced.load())) {
+         // A repeat of an already committed permit remains owned while the
+         // channel drains. New tokens must use another voice resource.
+         if (dstId == m_permittedDstId.load() && srcId == m_permittedSrcId && token == m_permitToken && ((leaseMs != 0U) == (m_permitLeaseExpires != std::chrono::steady_clock::time_point{}))) {
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -58,8 +58,14 @@
+ #include <atomic>
+ #include <set>
+ 
++class RESTAPI;
++
+ namespace p25
+ {
++    struct ControlQuiesceState {
++        bool quiesced = false, idle = false, permitActive = false, radioBusy = false;
++        uint32_t grants = 0U, dispatchLeases = 0U, pendingDispatch = 0U, pendingRF = 0U, pendingOperations = 0U;
++    };
+     // ---------------------------------------------------------------------------
+     //  Class Prototypes
+     // ---------------------------------------------------------------------------
+@@ -303,6 +309,9 @@
+ 
+         void setZoneConnected(bool connected) { m_zoneConnected.store(connected); }
+         bool zoneConnected() const { return m_zoneConnected.load(); }
++        bool controlQuiesced() const { return m_controlQuiesced.load(); }
++        ControlQuiesceState controlQuiesceState();
++        ControlQuiesceState setControlQuiesce(bool enabled);
+         bool externalNetworkAvailable() const { return !m_managedSite || m_zoneConnected.load(); }
+         bool physicalSubscriberPermitted(uint32_t source) const;
+         bool isRadioInhibited(uint32_t source) const;
+@@ -316,6 +325,7 @@
+         bool localMediaAvailable() const { return !m_managedSite || m_network != nullptr; }
+ 
+     private:
++        friend class ::RESTAPI;
+ #if defined(CATCH2_TEST_COMPILATION)
+         friend struct CapacityPermitTestAccess;
+         friend struct DispatchGrantTestAccess;
+@@ -355,6 +365,11 @@
+         void expireTrafficPermit();
+         bool m_dispatchEnabled = false;
+         std::atomic<bool> m_dispatchClosing{false};
++        std::atomic<bool> m_controlQuiesced{false};
++        void clockControlQuiesce();
++        bool m_quiesceBarrierRequested = false, m_quiesceBarrierPassed = false, m_quiesceBarrierFailed = false, m_quiesceHardwareIdle = false;
++        uint64_t m_quiesceBarrierGeneration = 0U, m_quiesceStatusGeneration = 0U;
++        uint8_t m_quiesceQuietSamples = 0U;
+         std::mutex m_dispatchQueueMutex;
+         std::deque<std::shared_ptr<DispatchOperation>> m_dispatchQueue;
+         std::unordered_map<std::string, DispatchResult> m_dispatchHistory;
+diff --git a/src/host/p25/TxFrameQueue.h b/src/host/p25/TxFrameQueue.h
+--- a/src/host/p25/TxFrameQueue.h
++++ b/src/host/p25/TxFrameQueue.h
+@@ -73,6 +73,15 @@
+         return m_frames.empty() ? 0U : uint32_t(m_frames.front().data.size());
+     }
+     bool isEmpty() { return frontLength() == 0U; }
++    bool hasOwnedFrames() const {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        const auto now = std::chrono::steady_clock::now();
++        for (const auto& frame : m_frames) {
++            if (frame.owner && frame.owner->active.load() &&
++                (frame.expiresAt == std::chrono::steady_clock::time_point{} || now < frame.expiresAt)) return true;
++        }
++        return false;
++    }
+     uint32_t freeSpace() const {
+         std::lock_guard<std::mutex> lock(m_mutex);
+         return m_capacity - m_used;
+diff --git a/src/host/p25/packet/ControlSignaling.Inhibit.cpp b/src/host/p25/packet/ControlSignaling.Inhibit.cpp
+--- a/src/host/p25/packet/ControlSignaling.Inhibit.cpp
++++ b/src/host/p25/packet/ControlSignaling.Inhibit.cpp
+@@ -76,6 +76,7 @@
+ InhibitResult ControlSignaling::submitInhibitOperation(const std::shared_ptr<InhibitOperation>& op,uint32_t waitMs)
+ {
+     std::unique_lock<std::mutex> lock(m_inhibitMutex);
++    if(!op->policy && m_p25->m_controlQuiesced.load())return InhibitResult{503U,"Site control transition is pending",{}};
+     if(m_inhibitOperations.size()+m_inhibitCompleting>=MAX_INHIBIT_OPERATIONS)return InhibitResult{503U,"inhibit owner mailbox full",{}};
+     op->deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(std::min(waitMs?waitMs:750U,750U));
+     m_inhibitOperations.push_back(op);
+diff --git a/src/host/p25/packet/ControlSignaling.Message.cpp b/src/host/p25/packet/ControlSignaling.Message.cpp
+--- a/src/host/p25/packet/ControlSignaling.Message.cpp
++++ b/src/host/p25/packet/ControlSignaling.Message.cpp
+@@ -16,6 +16,8 @@
+ }
+ }
+ bool ControlSignaling::requestMessageUpdate(uint32_t target, uint16_t message, uint32_t waitMs) {
++    std::unique_lock<std::recursive_mutex> permit(m_p25->m_permitMutex);
++    if (m_p25->m_controlQuiesced.load()) return false;
+     std::unique_lock<std::mutex> lock(m_messageUpdateMutex);
+     // REST parses the address/code; the protocol owner admits actual operation.
+     if (target == 0U || target >= WUID_FNE) return false;
+@@ -34,6 +36,7 @@
+     request.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs ? std::min(waitMs, 750U) : 750U);
+     request.owner = std::make_shared<TxFrameOwner>(target, true, WUID_FNE, target, request.deadline, std::chrono::seconds(10));
+     m_messageUpdates[target] = request;
++    permit.unlock();
+     if (waitMs == 0U) return true; // test/mailbox admission only
+     const auto serial = request.serial;
+     m_messageUpdateChanged.wait_until(lock, request.deadline, [&] {
+diff --git a/src/host/p25/packet/ControlSignaling.Status.cpp b/src/host/p25/packet/ControlSignaling.Status.cpp
+--- a/src/host/p25/packet/ControlSignaling.Status.cpp
++++ b/src/host/p25/packet/ControlSignaling.Status.cpp
+@@ -19,6 +19,8 @@
+         !m_p25->m_modem->hasError() && !m_p25->m_modem->hasLockout();
+ }
+ bool ControlSignaling::requestStatusQuery(uint32_t target, uint32_t waitMs) {
++    std::unique_lock<std::recursive_mutex> permit(m_p25->m_permitMutex);
++    if (m_p25->m_controlQuiesced.load()) return false;
+     std::unique_lock<std::mutex> lock(m_statusQueryMutex);
+     // REST validates only the address domain. All control/registration/policy
+     // admission runs on the protocol owner before a successful return.
+@@ -38,6 +40,7 @@
+     request.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMs ? std::min(waitMs,750U) : 750U);
+     request.owner = std::make_shared<TxFrameOwner>(target,true,WUID_FNE,target,request.deadline,std::chrono::seconds(10));
+     m_statusQueries[target] = request;
++    permit.unlock();
+     if (waitMs == 0U) return true; // test/mailbox admission, never RF evidence
+     const auto serial = request.serial;
+     m_statusQueryChanged.wait_until(lock,request.deadline,[&]{
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -1302,9 +1302,11 @@
+ 
+ /* Helper to write a call alert packet. */
+ 
+-void ControlSignaling::writeRF_TSDU_Call_Alrt(uint32_t srcId, uint32_t dstId, uint8_t mfId)
+-{
+-    if (m_p25->isRadioInhibited(dstId)) return;
++bool ControlSignaling::writeRF_TSDU_Call_Alrt(uint32_t srcId, uint32_t dstId, uint8_t mfId)
++{
++    std::lock_guard<std::recursive_mutex> permit(m_p25->m_permitMutex);
++    if (m_p25->m_controlQuiesced.load()) return false;
++    if (m_p25->isRadioInhibited(dstId)) return false;
+     std::unique_ptr<IOSP_CALL_ALRT> iosp = std::make_unique<IOSP_CALL_ALRT>();
+     iosp->setSrcId(srcId);
+     iosp->setDstId(dstId);
+@@ -1315,12 +1317,15 @@
+     ::ActivityLog("P25", true, "call alert request from %u to %u", srcId, dstId);
+ 
+     writeRF_TSDU_SBF_Imm(iosp.get(), false);
++    return true;
+ }
+ 
+ /* Helper to write a radio monitor packet. */
+ 
+-void ControlSignaling::writeRF_TSDU_Radio_Mon(uint32_t srcId, uint32_t dstId, uint8_t txMult)
+-{
++bool ControlSignaling::writeRF_TSDU_Radio_Mon(uint32_t srcId, uint32_t dstId, uint8_t txMult)
++{
++    std::lock_guard<std::recursive_mutex> permit(m_p25->m_permitMutex);
++    if (m_p25->m_controlQuiesced.load()) return false;
+     std::unique_ptr<IOSP_RAD_MON> iosp = std::make_unique<IOSP_RAD_MON>();
+     iosp->setSrcId(srcId);
+     iosp->setDstId(dstId);
+@@ -1333,12 +1338,15 @@
+     ::ActivityLog("P25", true, "Radio Unit Monitor request from %u to %u", srcId, dstId);
+ 
+     writeRF_TSDU_SBF_Imm(iosp.get(), false);
++    return true;
+ }
+ 
+ /* Helper to write a extended function packet. */
+ 
+ bool ControlSignaling::writeRF_TSDU_Ext_Func(uint32_t func, uint32_t arg, uint32_t dstId, const TxFrameOwnership& owner)
+ {
++    std::unique_lock<std::recursive_mutex> permit(m_p25->m_permitMutex, std::defer_lock);
++    if (!owner) { permit.lock(); if (m_p25->m_controlQuiesced.load()) return false; }
+     std::unique_ptr<IOSP_EXT_FNCT> iosp = std::make_unique<IOSP_EXT_FNCT>();
+     iosp->setExtendedFunction(func);
+     iosp->setSrcId(arg);
+@@ -1409,7 +1417,8 @@
+ 
+ bool ControlSignaling::requestRadioCheck(uint32_t dstId, uint32_t waitMs)
+ {
+-    if (!m_p25->physicalSubscriberPermitted(dstId)) return false;
++    std::unique_lock<std::recursive_mutex> permit(m_p25->m_permitMutex);
++    if (m_p25->m_controlQuiesced.load() || !m_p25->physicalSubscriberPermitted(dstId)) return false;
+     std::unique_lock<std::mutex> lock(m_radioCheckMutex);
+     const auto old = m_radioChecks.find(dstId);
+     if (old != m_radioChecks.end() && activeRadioCheck(old->second.state)) return false;
+@@ -1427,6 +1436,7 @@
+     request.owner = std::make_shared<TxFrameOwner>(dstId);
+     if (waitMs != 0U) request.firstDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::min(waitMs, 750U));
+     m_radioChecks[dstId] = request;
++    permit.unlock();
+     if (waitMs == 0U) return true;
+     const auto serial = request.serial;
+     m_radioCheckChanged.wait_for(lock, std::chrono::milliseconds(std::min(waitMs, 750U)), [&] {
+@@ -1543,8 +1553,10 @@
+ 
+ /* Helper to write a group affiliation query packet. */
+ 
+-void ControlSignaling::writeRF_TSDU_Grp_Aff_Q(uint32_t dstId)
+-{
++bool ControlSignaling::writeRF_TSDU_Grp_Aff_Q(uint32_t dstId)
++{
++    std::lock_guard<std::recursive_mutex> permit(m_p25->m_permitMutex);
++    if (m_p25->m_controlQuiesced.load()) return false;
+     std::unique_ptr<OSP_GRP_AFF_Q> osp = std::make_unique<OSP_GRP_AFF_Q>();
+     osp->setSrcId(WUID_FNE);
+     osp->setDstId(dstId);
+@@ -1555,12 +1567,14 @@
+     ::ActivityLog("P25", true, "group affiliation query command from %u to %u", WUID_FNE, dstId);
+ 
+     writeRF_TSDU_SBF_Imm(osp.get(), true);
++    return true;
+ }
+ 
+ /* Helper to write a unit registration command packet. */
+ 
+-void ControlSignaling::writeRF_TSDU_U_Reg_Cmd(uint32_t dstId)
+-{
++bool ControlSignaling::writeRF_TSDU_U_Reg_Cmd(uint32_t dstId)
++{
++    if (m_p25->m_controlQuiesced.load()) return false;
+     std::unique_ptr<OSP_U_REG_CMD> osp = std::make_unique<OSP_U_REG_CMD>();
+     osp->setSrcId(WUID_FNE);
+     osp->setDstId(dstId);
+@@ -1571,6 +1585,7 @@
+     ::ActivityLog("P25", true, "unit registration command from %u to %u", WUID_FNE, dstId);
+ 
+     writeRF_TSDU_SBF_Imm(osp.get(), true);
++    return true;
+ }
+ 
+ /* Helper to write a raw TSBK. */
+@@ -2274,6 +2289,10 @@
+         break;
+     case 8:
+         // write SCCB
++        if (!m_backupControlChannels.empty()) {
++            queueRF_TSBK_Ctrl(TSBKO::OSP_SCCB);
++            break;
++        }
+         if (adjSS && m_sccbTable.size() > 0) {
+             queueRF_TSBK_Ctrl(TSBKO::OSP_SCCB_EXP);
+             break;
+@@ -2448,6 +2467,23 @@
+                 return; // don't create anything
+             }
+             break;
++        case TSBKO::OSP_SCCB:
++        {
++            if (m_backupControlChannels.empty()) return;
++            if (m_backupControlIndex >= m_backupControlChannels.size()) m_backupControlIndex = 0U;
++            const auto& first = m_backupControlChannels[m_backupControlIndex];
++            const auto& second = m_backupControlChannels[m_backupControlIndex + 1U < m_backupControlChannels.size() ? m_backupControlIndex + 1U : m_backupControlIndex];
++            std::unique_ptr<OSP_SCCB> osp = std::make_unique<OSP_SCCB>();
++            osp->setSCCBChnId1(first.chId());
++            osp->setSCCBChnNo1(uint16_t(first.chNo()));
++            osp->setSCCBServiceClass1(ServiceClass::BACKUP);
++            osp->setSCCBChnId2(second.chId());
++            osp->setSCCBChnNo2(uint16_t(second.chNo()));
++            osp->setSCCBServiceClass2(ServiceClass::BACKUP);
++            m_backupControlIndex += 2U;
++            tsbk = std::move(osp);
++            break;
++        }
+         case TSBKO::OSP_SCCB_EXP:
+             // write SCCB
+             if (m_sccbTable.size() > 0) {
+@@ -2575,8 +2611,9 @@
+ 
+ bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_t serviceOptions, bool grp, bool net, bool skip, uint32_t chNo, const std::function<bool()>& commit, uint8_t mfId, uint32_t leaseMs)
+ {
++    std::lock_guard<std::recursive_mutex> permit(m_p25->m_permitMutex);
+     if (m_p25->isRadioInhibited(srcId) || (!grp && m_p25->isRadioInhibited(dstId))) return false;
+-    if (m_p25->identificationUnavailable()) return false;
++    if (m_p25->identificationUnavailable() || m_p25->m_controlQuiesced.load()) return false;
+     if (grp && !net && (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateGroupTransmit(srcId, dstId))) {
+         LogWarning(LOG_RF, P25_TSDU_STR ", subscriber transmit denial, srcId = %u, dstId = %u", srcId, dstId);
+         if (!net) writeRF_TSDU_Deny(srcId, dstId, ReasonCode::DENY_TGT_GROUP_NOT_AUTH, TSBKO::IOSP_GRP_VCH, true, true);
+@@ -2715,6 +2752,8 @@
+                 }
+             }
+             else {
++                auto admission = m_p25->m_affiliations->lockGrants();
++                if (m_p25->m_controlQuiesced.load()) return false;
+                 if (m_p25->m_affiliations->grantCh(dstId, srcId, GRANT_TIMER_TIMEOUT, grp, net)) {
+                     chNo = m_p25->m_affiliations->getGrantedCh(dstId);
+                     m_p25->m_siteData.setChCnt(m_p25->m_affiliations->rfCh()->rfChSize() + m_p25->m_affiliations->getGrantedRFChCnt());
+@@ -2772,7 +2811,7 @@
+ 
+             // A lookup reload can revoke access while the VC permit RPC waits.
+             // Recheck at the RF enqueue boundary before announcing the grant.
+-            if (m_p25->isRadioInhibited(srcId) || (!grp && m_p25->isRadioInhibited(dstId)) ||
++            if (m_p25->m_controlQuiesced.load() || m_p25->isRadioInhibited(srcId) || (!grp && m_p25->isRadioInhibited(dstId)) ||
+                 (!net && (!m_p25->physicalSubscriberPermitted(srcId) || !acl::AccessControl::validateGroupTransmit(srcId, dstId)))) {
+                 const uint64_t epoch = m_p25->m_affiliations->grantEpoch(dstId);
+                 if (m_p25->m_affiliations->ownsGrant(dstId, srcId, chNo, epoch))
+@@ -3162,7 +3201,7 @@
+                 response["identificationUnavailable"].is<bool>() && response["identificationUnavailable"].get<bool>());
+         }, channel.address(), channel.port(), true);
+     grantGuard.lock();
+-    if (replied && accepted->load() && !m_p25->identificationUnavailable() && allocations->ownsGrant(dstId, srcId, chNo, epoch))
++    if (replied && accepted->load() && !m_p25->identificationUnavailable() && !m_p25->m_controlQuiesced.load() && allocations->ownsGrant(dstId, srcId, chNo, epoch))
+         return true; // keep the guard until the RF grant has been enqueued
+ 
+     if (identificationUnavailable != nullptr)
+@@ -3695,3 +3734,36 @@
+         writeRF_TSDU_Ext_Func(ExtendedFunctions::INHIBIT, WUID_FNE, srcId);
+     }
+ }
++
++// Retained terminal outcomes and blocked-radio protection are not pending
++// transactions. Read each existing procedure owner under its normal lock.
++uint32_t ControlSignaling::pendingControlOperations()
++{
++    uint32_t pending = 0U;
++    {
++        std::lock_guard<std::mutex> lock(m_radioCheckMutex);
++        for (const auto& item : m_radioChecks)
++            if (item.second.state == RadioCheckState::Queued || item.second.state == RadioCheckState::UnderCheck) ++pending;
++    }
++    {
++        std::lock_guard<std::mutex> lock(m_statusQueryMutex);
++        const auto now = std::chrono::steady_clock::now();
++        for (const auto& item : m_statusQueries) {
++            const auto& query = item.second;
++            if (query.state == StatusQueryState::Queued || query.state == StatusQueryState::Awaiting ||
++                (query.state == StatusQueryState::Reported && query.owner && query.owner->active.load() && now < query.deadline)) ++pending;
++        }
++    }
++    {
++        std::lock_guard<std::mutex> lock(m_messageUpdateMutex);
++        for (const auto& item : m_messageUpdates)
++            if (item.second.state == MessageUpdateState::Queued || item.second.state == MessageUpdateState::Awaiting) ++pending;
++    }
++    {
++        std::lock_guard<std::mutex> lock(m_inhibitMutex);
++        pending += uint32_t(m_inhibitOperations.size() + m_inhibitCompleting);
++        for (const auto& item : m_inhibitions)
++            if (item.second.procedure == "queued" || item.second.procedure == "awaiting" || item.second.wake) ++pending;
++    }
++    return pending;
++}
+diff --git a/src/host/p25/packet/ControlSignaling.h b/src/host/p25/packet/ControlSignaling.h
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -104,14 +104,14 @@
+              * @param srcId Source Radio ID.
+              * @param dstId Destination Radio ID.
+              */
+-            void writeRF_TSDU_Call_Alrt(uint32_t srcId, uint32_t dstId, uint8_t mfId = defines::MFG_STANDARD);
++            bool writeRF_TSDU_Call_Alrt(uint32_t srcId, uint32_t dstId, uint8_t mfId = defines::MFG_STANDARD);
+             /**
+              * @brief Helper to write a radio monitor packet.
+              * @param srcId Source Radio ID.
+              * @param dstId Destination Radio ID.
+              * @param txMult Tx Multiplier.
+              */
+-            void writeRF_TSDU_Radio_Mon(uint32_t srcId, uint32_t dstId, uint8_t txMult);
++            bool writeRF_TSDU_Radio_Mon(uint32_t srcId, uint32_t dstId, uint8_t txMult);
+             /**
+              * @brief Helper to write a extended function packet.
+              * @param func Extended Function Operation.
+@@ -146,12 +146,12 @@
+              * @brief Helper to write a group affiliation query packet.
+              * @param dstId Destination Radio ID.
+              */
+-            void writeRF_TSDU_Grp_Aff_Q(uint32_t dstId);
++            bool writeRF_TSDU_Grp_Aff_Q(uint32_t dstId);
+             /**
+              * @brief Helper to write a unit registration command packet.
+              * @param dstId Destination Radio ID.
+              */
+-            void writeRF_TSDU_U_Reg_Cmd(uint32_t dstId);
++            bool writeRF_TSDU_U_Reg_Cmd(uint32_t dstId);
+             /**
+              * @brief Helper to write a raw TSBK packet.
+              * @param tsbk Raw TSBK buffer to write.
+@@ -217,6 +217,9 @@
+ 
+             std::unordered_map<uint8_t, SiteData> m_sccbTable;
+             std::unordered_map<uint8_t, uint8_t> m_sccbUpdateCnt;
++            // Configured standby traffic channels, in administrator order.
++            std::vector<::lookups::VoiceChData> m_backupControlChannels;
++            size_t m_backupControlIndex = 0U;
+ 
+             std::unordered_map<uint32_t, ulong64_t> m_llaDemandTable;
+ 
+@@ -260,6 +263,7 @@
+             std::condition_variable m_radioCheckChanged;
+             uint64_t m_radioCheckSerial = 0U;
+             std::unordered_map<uint32_t, RadioCheck> m_radioChecks;
++            uint32_t pendingControlOperations();
+             void clockRadioChecks(uint32_t ms);
+             bool acceptRadioCheckResponse(uint32_t function, uint32_t argument, uint32_t source, uint8_t mfid);
+ 
+diff --git a/src/host/restapi/RESTAPI.cpp b/src/host/restapi/RESTAPI.cpp
+--- a/src/host/restapi/RESTAPI.cpp
++++ b/src/host/restapi/RESTAPI.cpp
+@@ -324,6 +324,7 @@
+     m_dispatcher.match(GET_P25_DEBUG, true).get(REST_API_BIND(RESTAPI::restAPI_GetP25Debug, this));
+     m_dispatcher.match(GET_P25_DUMP_TSBK, true).get(REST_API_BIND(RESTAPI::restAPI_GetP25DumpTSBK, this));
+     m_dispatcher.match("/p25/site-state").put(REST_API_BIND(RESTAPI::restAPI_PutP25SiteState, this));
++    m_dispatcher.match("/p25/control-quiesce").get(REST_API_BIND(RESTAPI::restAPI_GetP25ControlQuiesce, this)).put(REST_API_BIND(RESTAPI::restAPI_PutP25ControlQuiesce, this));
+     m_dispatcher.match(PUT_P25_RID).put(REST_API_BIND(RESTAPI::restAPI_PutP25RID, this));
+     m_dispatcher.match(PUT_P25_ALIASES).put(REST_API_BIND(RESTAPI::restAPI_PutP25Aliases, this));
+     m_dispatcher.match(P25_INHIBIT_POLICY).get(REST_API_BIND(RESTAPI::restAPI_GetP25InhibitPolicy, this)).put(REST_API_BIND(RESTAPI::restAPI_PutP25InhibitPolicy, this));
+@@ -1404,6 +1405,43 @@
+ }
+ 
+ namespace {
++void controlQuiesceResponse(HTTPPayload& reply, const p25::ControlQuiesceState& state)
++{
++    json::object response;
++    setResponseDefaultStatus(response);
++    response["quiesced"].set<bool>(state.quiesced);
++    response["idle"].set<bool>(state.idle);
++    response["grants"].set<uint32_t>(state.grants);
++    response["dispatch_leases"].set<uint32_t>(state.dispatchLeases);
++    response["pending_dispatch"].set<uint32_t>(state.pendingDispatch);
++    response["pending_rf"].set<uint32_t>(state.pendingRF);
++    response["pending_operations"].set<uint32_t>(state.pendingOperations);
++    response["permit_active"].set<bool>(state.permitActive);
++    response["radio_busy"].set<bool>(state.radioBusy);
++    reply.payload(response);
++}
++}
++
++void RESTAPI::restAPI_GetP25ControlQuiesce(const HTTPPayload& request, HTTPPayload& reply, const RequestMatch&)
++{
++    if (!validateAuth(request, reply)) return;
++    if (m_p25 == nullptr) { errorPayload(reply, "P25 mode is not enabled", HTTPPayload::SERVICE_UNAVAILABLE); return; }
++    std::lock_guard<std::mutex> writer(Host::m_clockingMutex);
++    controlQuiesceResponse(reply, m_p25->controlQuiesceState());
++}
++
++void RESTAPI::restAPI_PutP25ControlQuiesce(const HTTPPayload& request, HTTPPayload& reply, const RequestMatch&)
++{
++    if (!validateAuth(request, reply)) return;
++    if (m_p25 == nullptr) { errorPayload(reply, "P25 mode is not enabled", HTTPPayload::SERVICE_UNAVAILABLE); return; }
++    json::object req;
++    if (!parseRequestBody(request, reply, req)) return;
++    if (!req["enabled"].is<bool>()) { errorPayload(reply, "enabled must be boolean"); return; }
++    std::lock_guard<std::mutex> writer(Host::m_clockingMutex);
++    controlQuiesceResponse(reply, m_p25->setControlQuiesce(req["enabled"].get<bool>()));
++}
++
++namespace {
+ bool inhibitRadioId(const json::value& value, uint32_t& id)
+ {
+     if (!value.is<double>()) return false;
+@@ -1512,6 +1550,8 @@
+         return;
+     }
+ 
++    if (m_p25->controlQuiesced()) { errorPayload(reply, "Site control transition is pending", HTTPPayload::SERVICE_UNAVAILABLE); return; }
++
+     // validate state is a string within the JSON blob
+     if (!req["command"].is<std::string>()) {
+         errorPayload(reply, "command was not valid");
+@@ -1550,7 +1590,7 @@
+     }
+     else if (::strtolower(command) == RID_CMD_PAGE) {
+         if (m_p25->isRadioInhibited(dstId)) { errorPayload(reply, "target subscriber is inhibited", HTTPPayload::SERVICE_UNAVAILABLE); return; }
+-        m_p25->control()->writeRF_TSDU_Call_Alrt(WUID_FNE, dstId);
++        if (!m_p25->control()->writeRF_TSDU_Call_Alrt(WUID_FNE, dstId)) { errorPayload(reply, "Radio command unavailable or Site control transition pending", HTTPPayload::SERVICE_UNAVAILABLE); return; }
+     }
+     else if (::strtolower(command) == RID_CMD_CHECK) {
+         if (!m_p25->control()->requestRadioCheck(dstId, 750U)) {
+@@ -1571,10 +1611,10 @@
+ 
+         uint32_t tgId = req["tgId"].get<uint32_t>();
+ 
+-        m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::DYN_REGRP_REQ, tgId, dstId);
++        if (!m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::DYN_REGRP_REQ, tgId, dstId)) { errorPayload(reply, "Radio command unavailable or Site control transition pending", HTTPPayload::SERVICE_UNAVAILABLE); return; }
+     }
+     else if (::strtolower(command) == RID_CMD_DYN_REGRP_CANCEL) {
+-        m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::DYN_REGRP_CANCEL, 0U, dstId);
++        if (!m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::DYN_REGRP_CANCEL, 0U, dstId)) { errorPayload(reply, "Radio command unavailable or Site control transition pending", HTTPPayload::SERVICE_UNAVAILABLE); return; }
+     }
+     else if (::strtolower(command) == RID_CMD_DYN_REGRP_LOCK) {
+         m_p25->control()->writeRF_TSDU_Ext_Func(ExtendedFunctions::DYN_REGRP_LOCK, 0U, dstId);
+@@ -1599,10 +1639,11 @@
+         }
+     }
+     else if (::strtolower(command) == RID_CMD_GAQ) {
+-        m_p25->control()->writeRF_TSDU_Grp_Aff_Q(dstId);
++        if (!m_p25->control()->writeRF_TSDU_Grp_Aff_Q(dstId)) { errorPayload(reply, "Radio command unavailable or Site control transition pending", HTTPPayload::SERVICE_UNAVAILABLE); return; }
+     }
+     else if (::strtolower(command) == RID_CMD_UREG) {
+-        m_p25->control()->writeRF_TSDU_U_Reg_Cmd(dstId);
++        std::lock_guard<std::recursive_mutex> permit(m_p25->m_permitMutex);
++        if (!m_p25->control()->writeRF_TSDU_U_Reg_Cmd(dstId)) { errorPayload(reply, "Radio command unavailable or Site control transition pending", HTTPPayload::SERVICE_UNAVAILABLE); return; }
+     }
+     else {
+         errorPayload(reply, "invalid command");
+diff --git a/src/host/restapi/RESTAPI.h b/src/host/restapi/RESTAPI.h
+--- a/src/host/restapi/RESTAPI.h
++++ b/src/host/restapi/RESTAPI.h
+@@ -339,6 +339,8 @@
+      * @param match HTTP request matcher.
+      */
+     void restAPI_PutP25SiteState(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
++    void restAPI_GetP25ControlQuiesce(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
++    void restAPI_PutP25ControlQuiesce(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+     void restAPI_GetP25InhibitPolicy(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+     void restAPI_PutP25InhibitPolicy(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+     void restAPI_PutP25RID(const HTTPPayload& request, HTTPPayload& reply, const restapi::RequestMatch& match);
+diff --git a/tests/p25/DispatchGrant_Tests.cpp b/tests/p25/DispatchGrant_Tests.cpp
+--- a/tests/p25/DispatchGrant_Tests.cpp
++++ b/tests/p25/DispatchGrant_Tests.cpp
+@@ -42,6 +42,9 @@
+     static void ageAdmissions(Control& c) { std::lock_guard<std::mutex> lock(c.m_rfAdmissionMutex); for (auto& entry : c.m_rfAdmissions) entry.second.retainedUntil = std::chrono::steady_clock::now() - std::chrono::milliseconds(1); }
+     static void disable(Control& c) { c.m_dispatchEnabled = false; }
+     static void managed(Control& c) { c.m_managedSite = true; c.setZoneConnected(false); }
++    static void voiceWorker(Control& c) { c.m_authoritative = false; c.m_enableControl = false; c.m_dedicatedControl = false; }
++    static void broadcast(Control& c, uint8_t slot) { c.m_control->writeRF_ControlData(1U, slot, false); }
++    static void quiesceClock(Control& c) { c.clockControlQuiesce(); }
+ };
+ }
+ namespace {
+@@ -54,6 +57,10 @@
+     void ready() { m_modemState = modem::DVM_STATE::STATE_P25; m_statusGeneration.store(1U); m_error = m_lockout = false; }
+     void error() { m_error = true; }
+     void stale() { m_statusGeneration.store(0U); }
++    void transmitting(bool active) { m_tx = active; }
++    void quiesceReady() { m_protoVer = 4U; }
++    void barrierReply() { m_serialBarrierPending.store(false); ++m_serialBarrierGeneration; }
++    void freshStatus() { ++m_statusGeneration; }
+ };
+ class DispatchRPC : public network::NetRPC {
+ public:
+@@ -139,7 +146,7 @@
+     LocalNetwork network;
+     network::NetRPC* old = g_RPC;
+     std::unique_ptr<p25::Control> control;
+-    explicit Fixture(bool authoritative = true) {
++    explicit Fixture(bool authoritative = true, const std::string& extraConfig = "") {
+         g_logDisplayLevel = 0U; g_RPC = &rpc;
+         radios.addEntry(RID, true, "Dispatch"); radios.addEntry(10001U, true, "Subscriber");
+         radios.addEntry(10003U, false, "Denied"); radios.addEntry(10005U, true, "Subscriber 2"); radios.addEntry(10006U, true, "Harris 3");
+@@ -169,7 +176,7 @@
+     config:
+         controlCh:
+             notifyEnable: false
+-)")));
++)" + extraConfig)));
+         control->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 1U, false);
+         control->setSupervisor(true); control->setCCRunning(true);
+         control->affiliations()->unitReg(10001U); control->affiliations()->groupAff(10001U,TG);
+@@ -781,3 +788,161 @@
+     REQUIRE(reply["status"].get<int>() == network::NetRPC::BAD_REQUEST);
+     CHECK(p25::DispatchGrantTestAccess::permitted(*vc.control) == 0U);
+ }
++
++TEST_CASE("control quiesce drains existing dispatch lease without accepting another", "[dispatch-grant][control-promotion]") {
++    Fixture f; f.secondChannel(); f.interest(TG2);
++    const auto initial = f.run(f.request()); REQUIRE(initial.accepted); f.drain();
++    const auto draining = f.control->setControlQuiesce(true);
++    REQUIRE(draining.quiesced); REQUIRE_FALSE(draining.idle);
++    REQUIRE(draining.grants == 1U); REQUIRE(draining.dispatchLeases == 1U);
++    auto renew = f.request(p25::DispatchAction::Renew); renew.epoch = initial.epoch;
++    REQUIRE(f.run(renew).accepted);
++    auto second = f.request(p25::DispatchAction::Grant, LEASE2); second.dstId = TG2;
++    REQUIRE_FALSE(f.run(second).accepted);
++    REQUIRE(f.control->affiliations()->grantSize() == 1U);
++    auto release = f.request(p25::DispatchAction::Release); release.epoch = initial.epoch;
++    REQUIRE(f.run(release).accepted);
++    REQUIRE(f.control->controlQuiesceState().idle);
++    REQUIRE_FALSE(p25::DispatchGrantTestAccess::rfGrant(*f.control, 10001U, TG, false));
++    REQUIRE_FALSE(f.control->setControlQuiesce(false).quiesced);
++    REQUIRE(p25::DispatchGrantTestAccess::rfGrant(*f.control, 10001U, TG, false));
++}
++
++TEST_CASE("quiesce during permit reply fences the final RF grant", "[dispatch-grant][control-promotion]") {
++    Fixture f;
++    f.rpc.beforeReply = [&] { REQUIRE_FALSE(f.control->setControlQuiesce(true).idle); };
++    REQUIRE_FALSE(p25::DispatchGrantTestAccess::rfGrant(*f.control, 10001U, TG, false));
++    REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
++    f.control->clearRFReject();
++    REQUIRE(f.control->controlQuiesceState().idle);
++}
++
++TEST_CASE("quiesce reports queued RF admission and prevents a later commit", "[dispatch-grant][control-promotion]") {
++    Fixture f; p25::DispatchGrantTestAccess::allStart(*f.control, TG);
++    REQUIRE(p25::DispatchGrantTestAccess::queue(*f.control, 10001U, TG));
++    const auto pending = f.control->rfAdmissions().front(); f.drain();
++    const auto draining = f.control->setControlQuiesce(true);
++    REQUIRE_FALSE(draining.idle); REQUIRE(draining.pendingRF == 1U);
++    f.control->decideRFAdmission(pending.id, pending.epoch, true);
++    p25::DispatchGrantTestAccess::run(*f.control);
++    REQUIRE_FALSE(f.control->affiliations()->isGranted(TG));
++    REQUIRE(f.control->controlQuiesceState().idle);
++    REQUIRE(p25::DispatchGrantTestAccess::queue(*f.control, 10001U, TG));
++    REQUIRE(f.control->rfAdmissions().size() == 1U);
++}
++
++TEST_CASE("voice quiesce retains exact permit renewal and waits for actual TX end", "[dispatch-grant][control-promotion]") {
++    Fixture f(false); p25::DispatchGrantTestAccess::voiceWorker(*f.control);
++    const auto request = [](uint32_t destination, const std::string& token) {
++        json::object value;
++        const uint32_t source = destination == 0U ? 0U : RID, lease = destination == 0U ? 0U : 1000U;
++        value["srcId"].set<uint32_t>(source); value["dstId"].set<uint32_t>(destination);
++        value["leaseMs"].set<uint32_t>(lease); value["permitToken"].set<std::string>(token);
++        json::value parsed; REQUIRE(json::parse(parsed, json::value(value).serialize()).empty());
++        return parsed.get<json::object>();
++    };
++    auto initial = request(TG, "a:1"); json::object reply;
++    p25::DispatchGrantTestAccess::permit(*f.control, initial, reply);
++    CAPTURE(json::value(initial).serialize(), json::value(reply).serialize());
++    REQUIRE(reply["status"].get<int>() == network::NetRPC::OK);
++    REQUIRE_FALSE(f.control->setControlQuiesce(true).idle);
++    initial = request(TG, "a:1"); // each real RPC is parsed into a fresh numeric holder
++    reply.clear(); p25::DispatchGrantTestAccess::permit(*f.control, initial, reply);
++    REQUIRE(reply["status"].get<int>() == network::NetRPC::OK);
++    auto other = request(TG2, "a:2"); reply.clear();
++    p25::DispatchGrantTestAccess::permit(*f.control, other, reply);
++    REQUIRE(reply["status"].get<int>() != network::NetRPC::OK);
++    REQUIRE(p25::DispatchGrantTestAccess::permitted(*f.control) == TG);
++    auto clear = request(0U, "a:1"); reply.clear();
++    p25::DispatchGrantTestAccess::permit(*f.control, clear, reply);
++    REQUIRE(reply["status"].get<int>() == network::NetRPC::OK);
++    f.modem.transmitting(true); REQUIRE_FALSE(f.control->controlQuiesceState().idle);
++    f.modem.transmitting(false); f.drain();
++    f.modem.quiesceReady();
++    p25::DispatchGrantTestAccess::quiesceClock(*f.control); // request the ordinary native serial barrier
++    REQUIRE_FALSE(f.control->controlQuiesceState().idle);
++    f.modem.barrierReply(); p25::DispatchGrantTestAccess::quiesceClock(*f.control);
++    f.modem.freshStatus(); p25::DispatchGrantTestAccess::quiesceClock(*f.control);
++    REQUIRE_FALSE(f.control->controlQuiesceState().idle);
++    REQUIRE_FALSE(f.control->controlQuiesceState().idle); // HTTP/status reads never advance hardware proof
++    f.modem.freshStatus(); p25::DispatchGrantTestAccess::quiesceClock(*f.control);
++    REQUIRE(f.control->controlQuiesceState().idle);
++    f.control->setControlQuiesce(false); reply.clear();
++    other = request(TG2, "a:2");
++    p25::DispatchGrantTestAccess::permit(*f.control, other, reply);
++    REQUIRE(reply["status"].get<int>() == network::NetRPC::OK);
++}
++
++// AABC-E6.2.16 Fig6.2.16-1, PDF182/printed163; 2.3.32 PDF40/printed21.
++// AABD-B12.7 PDF117/printed112. Exact editions/paths in plan26.
++// Expected octets below are derived directly from the original PDF diagram,
++// independently of the production SCCB encoder; CRC is checked after trellis.
++TEST_CASE("configured backup channels advertise complete identities with backup service class", "[p25][control-promotion]") {
++    Fixture f(true, R"(
++        backupControlChannels:
++            - channelId: 0
++              channelNo: "000"
++            - channelId: 15
++              channelNo: "FFF"
++            - channelId: 3
++              channelNo: "123"
++)");
++    const auto next = [&] {
++        p25::DispatchGrantTestAccess::broadcast(*f.control, 8U);
++        std::array<uint8_t, p25::defines::P25_TSDU_FRAME_LENGTH_BYTES + 2U> frame{};
++        REQUIRE(f.control->getFrame(frame.data()) == frame.size());
++        std::array<uint8_t, p25::defines::P25_TSBK_FEC_LENGTH_BYTES> coded{};
++        p25::P25Utils::decode(frame.data() + 2U, coded.data(), 114U, 318U);
++        std::array<uint8_t, p25::defines::P25_TSBK_LENGTH_BYTES> raw{};
++        edac::Trellis trellis; REQUIRE(trellis.decode12(coded.data(), raw.data()));
++        REQUIRE(edac::CRC::checkCCITT162(raw.data(), raw.size()));
++        REQUIRE((raw[0] & 0x3FU) == 0x39U); REQUIRE(raw[1] == 0U);
++        REQUIRE(raw[2] == 1U); REQUIRE(raw[3] == 1U);
++        REQUIRE(raw[6] == 4U); REQUIRE(raw[9] == 4U);
++        REQUIRE(f.control->getFrame(frame.data()) == 0U);
++        return raw;
++    };
++    const auto first = next();
++    REQUIRE(first[4] == 0U); REQUIRE(first[5] == 0U);
++    REQUIRE(first[7] == 0xFFU); REQUIRE(first[8] == 0xFFU);
++    const auto last = next();
++    REQUIRE(last[4] == 0x31U); REQUIRE(last[5] == 0x23U);
++    REQUIRE(last[7] == 0x31U); REQUIRE(last[8] == 0x23U); // odd final entry repeats, AABC-E6.2.16
++    REQUIRE(next() == first);
++}
++
++TEST_CASE("quiesced idle cannot start a new station identification", "[p25][control-promotion]") {
++    Fixture f;
++    f.control->configureIdentification(true);
++    REQUIRE(f.control->tryBeginIdentification());
++    REQUIRE_FALSE(f.control->setControlQuiesce(true).idle);
++    f.control->completeIdentification();
++    REQUIRE(f.control->controlQuiesceState().idle);
++    REQUIRE_FALSE(f.control->beginIdentificationDrain());
++    REQUIRE_FALSE(f.control->tryBeginIdentification());
++    REQUIRE(f.control->controlQuiesceState().idle);
++    f.control->setControlQuiesce(false);
++    REQUIRE(f.control->beginIdentificationDrain());
++    REQUIRE(f.control->tryBeginIdentification());
++    f.control->completeIdentification();
++}
++
++TEST_CASE("quiesce fences new commands and waits for the actual pending procedure", "[p25][control-promotion]") {
++    Fixture f;
++    REQUIRE(f.control->control()->requestRadioCheck(10001U, 0U));
++    const auto state = f.control->setControlQuiesce(true);
++    REQUIRE_FALSE(state.idle); REQUIRE(state.pendingOperations == 1U);
++    REQUIRE_FALSE(f.control->control()->requestRadioCheck(10005U, 0U));
++    REQUIRE_FALSE(f.control->control()->requestStatusQuery(10001U, 0U));
++    REQUIRE_FALSE(f.control->control()->requestMessageUpdate(10001U, 0U, 0U));
++    REQUIRE_FALSE(f.control->control()->writeRF_TSDU_Call_Alrt(p25::defines::WUID_FNE, 10001U));
++    REQUIRE_FALSE(f.control->control()->writeRF_TSDU_Grp_Aff_Q(10001U));
++    REQUIRE_FALSE(f.control->control()->writeRF_TSDU_U_Reg_Cmd(10001U));
++    REQUIRE(f.control->control()->requestInhibitCommand(10001U, true, 0U).status == 503U);
++    REQUIRE(f.control->control()->radioCheckState(10001U) == p25::packet::ControlSignaling::RadioCheckState::Queued);
++    f.control->control()->cancelRadioChecks();
++    REQUIRE(f.control->control()->radioCheckState(10001U) == p25::packet::ControlSignaling::RadioCheckState::Cancelled);
++    REQUIRE(f.control->controlQuiesceState().idle);
++    REQUIRE(f.control->control()->updateInhibitPolicy({}, {}, false, 0U).status == 202U);
++    REQUIRE_FALSE(f.control->controlQuiesceState().idle);
++}
+diff --git a/tests/p25/InhibitProcedure_Tests.cpp b/tests/p25/InhibitProcedure_Tests.cpp
+--- a/tests/p25/InhibitProcedure_Tests.cpp
++++ b/tests/p25/InhibitProcedure_Tests.cpp
+@@ -354,7 +354,10 @@
+     for(bool expire:{false,true}){
+         Fixture f;auto permit=Access::permitLock(*f.controller);
+         auto operation=std::async(std::launch::async,[&]{return expire?f.controller->control()->requestInhibitCommand(RID,false,50U):f.controller->control()->updateInhibitPolicy({{RID,true}},{},false,750U);});
+-        auto end=std::chrono::steady_clock::now()+std::chrono::seconds(2);while(Access::queued(*f.controller)==0&&std::chrono::steady_clock::now()<end)std::this_thread::yield();REQUIRE(Access::queued(*f.controller)==1);
++        auto end=std::chrono::steady_clock::now()+std::chrono::seconds(2);while(Access::queued(*f.controller)==0&&std::chrono::steady_clock::now()<end)std::this_thread::yield();
++        const bool queued=Access::queued(*f.controller)==1;
++        if(!queued){permit.unlock();operation.get();} // Join before reporting failure; future destruction must not hold the permit.
++        REQUIRE(queued);
+         auto owner=std::async(std::launch::async,[&]{Access::tick(*f.controller);});
+         end=std::chrono::steady_clock::now()+std::chrono::seconds(2);while(!f.controller->isRadioInhibited(RID)&&std::chrono::steady_clock::now()<end)std::this_thread::yield();REQUIRE(f.controller->isRadioInhibited(RID));
+         const bool wasPending=operation.wait_for(std::chrono::milliseconds(0))==std::future_status::timeout;

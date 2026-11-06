@@ -1,0 +1,309 @@
+--- a/src/common/Log.h
++++ b/src/common/Log.h
+@@ -822,12 +822,18 @@
+     char prefixBuf[256];
+ 
+     if (!g_disableTimeDisplay && !g_useSyslog) {
+-        time_t now;
+-        ::time(&now);
+-        struct tm* tm = ::localtime(&now);
+-
++        // Use one wall-clock sample so a second rollover cannot mix two times.
+         struct timeval nowMillis;
+         ::gettimeofday(&nowMillis, NULL);
++        const time_t now = static_cast<time_t>(nowMillis.tv_sec);
++        struct tm localTime{};
++#if defined(_WIN32)
++        ::localtime_s(&localTime, &now);
++#else
++        ::localtime_r(&now, &localTime);
++#endif
++        const struct tm* tm = &localTime;
++        const unsigned long milliseconds = static_cast<unsigned long>(nowMillis.tv_usec / 1000U);
+ 
+         if (level > 6U)
+             level = 2U; // default this sort of log message to INFO
+@@ -840,22 +846,22 @@
+                     // if we have a function name add that to the log entry
+                     if (sourceLoc.funcname != nullptr) {
+                         prefixLen = ::sprintf(prefixBuf, "%c: %04d-%02d-%02d %02d:%02d:%02d.%03lu (%s)[%s:%u][%s] ", LOG_LEVELS[level], 
+-                            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, nowMillis.tv_usec / 1000U, 
++                            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, milliseconds, 
+                             sourceLoc.module, sourceLoc.filename, sourceLoc.line, sourceLoc.funcname);
+                     }
+                     else {
+                         prefixLen = ::sprintf(prefixBuf, "%c: %04d-%02d-%02d %02d:%02d:%02d.%03lu (%s)[%s:%u] ", LOG_LEVELS[level], 
+-                            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, nowMillis.tv_usec / 1000U, 
++                            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, milliseconds, 
+                             sourceLoc.module, sourceLoc.filename, sourceLoc.line);
+                     }
+                 } else {
+                     prefixLen = ::sprintf(prefixBuf, "%c: %04d-%02d-%02d %02d:%02d:%02d.%03lu (%s) ", LOG_LEVELS[level], 
+-                        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, nowMillis.tv_usec / 1000U, 
++                        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, milliseconds, 
+                         sourceLoc.module);
+                 }
+             } else {
+                 prefixLen = ::sprintf(prefixBuf, "%c: %04d-%02d-%02d %02d:%02d:%02d.%03lu (%s) ", LOG_LEVELS[level], 
+-                    tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, nowMillis.tv_usec / 1000U, 
++                    tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, milliseconds, 
+                     sourceLoc.module);
+             }
+         }
+@@ -867,21 +873,21 @@
+                     // if we have a function name add that to the log entry
+                     if (sourceLoc.funcname != nullptr) {
+                         prefixLen = ::sprintf(prefixBuf, "%c: %04d-%02d-%02d %02d:%02d:%02d.%03lu [%s:%u][%s] ", LOG_LEVELS[level], 
+-                            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, nowMillis.tv_usec / 1000U, 
++                            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, milliseconds, 
+                             sourceLoc.filename, sourceLoc.line, sourceLoc.funcname);
+                     }
+                     else {
+                         prefixLen = ::sprintf(prefixBuf, "%c: %04d-%02d-%02d %02d:%02d:%02d.%03lu [%s:%u] ", LOG_LEVELS[level], 
+-                            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, nowMillis.tv_usec / 1000U, 
++                            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, milliseconds, 
+                             sourceLoc.filename, sourceLoc.line);
+                     }
+                 } else {
+                     prefixLen = ::sprintf(prefixBuf, "%c: %04d-%02d-%02d %02d:%02d:%02d.%03lu ", LOG_LEVELS[level], tm->tm_year + 1900, 
+-                        tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, nowMillis.tv_usec / 1000U);
++                        tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, milliseconds);
+                 }
+             } else {
+                 prefixLen = ::sprintf(prefixBuf, "%c: %04d-%02d-%02d %02d:%02d:%02d.%03lu ", LOG_LEVELS[level], 
+-                    tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, nowMillis.tv_usec / 1000U);
++                    tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, milliseconds);
+             }
+         }
+     }
+--- /dev/null
++++ b/tests/LogTimestamp_Tests.cpp
+@@ -0,0 +1,228 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Compile separately with DVM_LOG_TIMESTAMP_STANDALONE. This exercises the
++// production Log template with timestamps enabled; only clock, calendar and
++// output boundaries are replaced. It does not use the Catch2 timestamp bypass.
++#if defined(DVM_LOG_TIMESTAMP_STANDALONE)
++#include "common/Defines.h"
++#include "common/Clock.h"
++#include "common/backtrace/backward.h"
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <ctime>
++#include <iostream>
++#include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <sys/time.h>
++
++namespace {
++struct Sample {
++    time_t oldSeconds = 0;
++    time_t seconds = 0;
++    long microseconds = 0;
++    unsigned timeCalls = 0;
++    unsigned sampleCalls = 0;
++    unsigned role = 0;
++};
++thread_local Sample sample;
++thread_local std::string output;
++std::mutex conversionMutex;
++std::condition_variable conversionChanged;
++bool firstConverted = false;
++bool secondConverted = false;
++struct tm sharedCalendar;
++
++struct tm calendar(time_t value)
++{
++    struct tm result{};
++    if (::localtime_r(&value, &result) == nullptr)
++        throw std::runtime_error("test calendar conversion failed");
++    return result;
++}
++
++void orderConversion(std::unique_lock<std::mutex>& lock)
++{
++    if (sample.role == 1) {
++        firstConverted = true;
++        conversionChanged.notify_all();
++        conversionChanged.wait(lock, [] { return secondConverted; });
++    } else if (sample.role == 2) {
++        secondConverted = true;
++        conversionChanged.notify_all();
++    }
++}
++}
++
++time_t logTestTime(time_t* destination)
++{
++    ++sample.timeCalls;
++    if (destination != nullptr)
++        *destination = sample.oldSeconds;
++    return sample.oldSeconds;
++}
++
++int logTestGettimeofday(struct timeval* value, void*)
++{
++    ++sample.sampleCalls;
++    value->tv_sec = sample.seconds;
++    value->tv_usec = sample.microseconds;
++    return 0;
++}
++
++struct tm* logTestLocaltime(const time_t* value)
++{
++    std::unique_lock<std::mutex> lock(conversionMutex);
++    if (sample.role == 2)
++        conversionChanged.wait(lock, [] { return firstConverted; });
++    sharedCalendar = calendar(*value);
++    // The second thread overwrites the legacy shared tm before the first
++    // caller can format it. Synchronization makes this deterministic.
++    orderConversion(lock);
++    return &sharedCalendar;
++}
++
++struct tm* logTestLocaltimeR(const time_t* value, struct tm* destination)
++{
++    std::unique_lock<std::mutex> lock(conversionMutex);
++    if (sample.role == 2)
++        conversionChanged.wait(lock, [] { return firstConverted; });
++    *destination = calendar(*value);
++    orderConversion(lock);
++    return destination;
++}
++
++int logTestLocaltimeS(struct tm* destination, const time_t* value)
++{
++    return logTestLocaltimeR(value, destination) == nullptr ? 1 : 0;
++}
++
++#define time logTestTime
++#define gettimeofday logTestGettimeofday
++#define localtime logTestLocaltime
++#define localtime_r logTestLocaltimeR
++#define localtime_s logTestLocaltimeS
++// The optional branch check compiles the actual Windows Log-template branch
++// against the localtime_s boundary above. It is not a Windows SDK build.
++#if defined(DVM_LOG_TIMESTAMP_WINDOWS_BRANCH)
++#define _WIN32
++#endif
++#include "common/Log.h"
++#if defined(DVM_LOG_TIMESTAMP_WINDOWS_BRANCH)
++#undef _WIN32
++#endif
++#undef time
++#undef gettimeofday
++#undef localtime
++#undef localtime_r
++#undef localtime_s
++
++uint32_t g_logDisplayLevel = 2;
++bool g_disableTimeDisplay = false;
++bool g_useSyslog = false;
++bool g_disableNetworkLog = false;
++void log_internal::LogInternal(uint32_t, const std::string& line) { output = line; }
++
++namespace {
++unsigned failures = 0;
++void expect(const std::string& actual, const std::string& expected, const char* name)
++{
++    if (actual != expected) {
++        ++failures;
++        std::cerr << "FAIL " << name << "\n  expected: " << expected << "\n  actual:   " << actual << '\n';
++    }
++}
++
++time_t at(int year, int month, int day, int hour, int minute, int second)
++{
++    struct tm value{};
++    value.tm_year = year - 1900;
++    value.tm_mon = month - 1;
++    value.tm_mday = day;
++    value.tm_hour = hour;
++    value.tm_min = minute;
++    value.tm_sec = second;
++    value.tm_isdst = 0;
++    return ::mktime(&value);
++}
++
++void rollover(time_t seconds, const char* expected, const char* name)
++{
++    sample = Sample{};
++    sample.oldSeconds = seconds - 1;
++    sample.seconds = seconds;
++    sample.microseconds = 2000;
++    LogInfoEx("RF", "word %u", 7U);
++    expect(output, std::string("I: ") + expected + " (RF) word 7", name);
++    expect(std::to_string(sample.sampleCalls), "1", "one wall-clock sample");
++    expect(std::to_string(sample.timeCalls), "0", "no separate seconds sample");
++}
++
++void formats()
++{
++    sample = Sample{};
++    sample.seconds = sample.oldSeconds = at(2026, 10, 31, 6, 32, 12);
++    sample.microseconds = 824000;
++    const std::string stamp = "2026-10-31 06:32:12.824 ";
++    const log_internal::SourceLocation locations[] = {
++        {"RF", "file.cpp", 42, "receive"}, {"RF", "file.cpp", 42, nullptr},
++        {"RF", nullptr, 0, nullptr}, {nullptr, "file.cpp", 42, "receive"},
++        {nullptr, "file.cpp", 42, nullptr}, {nullptr, nullptr, 0, nullptr}};
++    const char* suffixes[] = {"(RF)[file.cpp:42][receive] ", "(RF)[file.cpp:42] ", "(RF) ",
++        "[file.cpp:42][receive] ", "[file.cpp:42] ", ""};
++    for (unsigned i = 0; i < 6; ++i) {
++        Log(1, locations[i], "message");
++        expect(output, "D: " + stamp + suffixes[i] + "message", "debug format");
++    }
++    LogInfo("message");
++    expect(output, "I: " + stamp + "message", "plain info format");
++    LogWarning("RF", "message");
++    expect(output, "W: " + stamp + "(RF) message", "module warning format");
++    g_disableTimeDisplay = true;
++    LogInfoEx("RF", "message");
++    expect(output, "I: (RF) message", "disabled timestamp format");
++    g_disableTimeDisplay = false;
++    g_useSyslog = true;
++    LogInfoEx("RF", "message");
++    expect(output, "I: (RF) message", "syslog format");
++    g_useSyslog = false;
++}
++
++void concurrent()
++{
++    firstConverted = secondConverted = false;
++    std::string first, second;
++    auto emit = [](unsigned role, time_t seconds, long micros, std::string& result) {
++        sample = Sample{};
++        sample.role = role;
++        sample.seconds = sample.oldSeconds = seconds;
++        sample.microseconds = micros;
++        LogInfoEx("RF", "thread %u", role);
++        result = output;
++    };
++    std::thread one(emit, 1U, at(2026, 12, 31, 23, 59, 59), 999000L, std::ref(first));
++    std::thread two(emit, 2U, at(2027, 1, 1, 0, 0, 0), 1000L, std::ref(second));
++    one.join();
++    two.join();
++    expect(first, "I: 2026-12-31 23:59:59.999 (RF) thread 1", "concurrent first calendar");
++    expect(second, "I: 2027-01-01 00:00:00.001 (RF) thread 2", "concurrent second calendar");
++}
++}
++
++int main()
++{
++    ::setenv("TZ", "UTC0", 1);
++    ::tzset();
++    rollover(at(2026, 10, 31, 6, 32, 12), "2026-10-31 06:32:12.002", "second rollover");
++    rollover(at(2026, 10, 31, 6, 33, 0), "2026-10-31 06:33:00.002", "minute rollover");
++    rollover(at(2026, 11, 1, 0, 0, 0), "2026-11-01 00:00:00.002", "day rollover");
++    rollover(at(2027, 1, 1, 0, 0, 0), "2027-01-01 00:00:00.002", "year rollover");
++    rollover(at(2028, 2, 29, 0, 0, 0), "2028-02-29 00:00:00.002", "leap day rollover");
++    formats();
++    concurrent();
++    std::cout << (failures ? "FAILED " : "PASSED ") << failures << " assertions failed\n";
++    return failures ? 1 : 0;
++}
++#endif

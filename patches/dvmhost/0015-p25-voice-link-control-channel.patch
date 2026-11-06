@@ -1,0 +1,201 @@
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -673,26 +673,14 @@
+                 }
+                 else {
+                     std::lock_guard<std::mutex> lock(m_p25->s_activeTGLock);
+-                    if (m_p25->m_activeTG.size() > 0) {
+-                        if (m_grpUpdtCount > m_p25->m_activeTG.size())
+-                            m_grpUpdtCount = 0U;
+-
+-                        if (m_p25->m_activeTG.size() < 2) {
+-                            uint32_t dstId = m_p25->m_activeTG.at(0);
+-                            m_rfLC.setMFId(MFG_STANDARD);
+-                            m_rfLC.setLCO(LCO::GROUP_UPDT);
+-                            m_rfLC.setDstId(dstId);
+-                        }
+-                        else {
+-                            uint32_t dstId = m_p25->m_activeTG.at(m_grpUpdtCount);
+-                            uint32_t dstIdB = m_p25->m_activeTG.at(m_grpUpdtCount + 1U);
+-                            m_rfLC.setMFId(MFG_STANDARD);
+-                            m_rfLC.setLCO(LCO::GROUP_UPDT);
+-                            m_rfLC.setDstId(dstId);
+-                            m_rfLC.setDstIdB(dstIdB);
+-
+-                            m_grpUpdtCount++;
+-                        }
++                    if (!m_p25->m_activeTG.empty() && m_rfLC.getGroup()) {
++                        // The active list has no channel assignments. Only
++                        // advertise this call on this configured voice channel.
++                        m_rfLC.setMFId(MFG_STANDARD);
++                        m_rfLC.setLCO(LCO::GROUP_UPDT);
++                        m_rfLC.setGrpVchNo(m_p25->m_siteData.channelNo());
++                        m_rfLC.setDstIdB(0U);
++                        m_rfLC.setGrpVchNoB(0U);
+                     }
+                 }
+             }
+@@ -2073,26 +2061,14 @@
+         }
+         else {
+             std::lock_guard<std::mutex> lock(m_p25->s_activeTGLock);
+-            if (m_p25->m_activeTG.size() > 0) {
+-                if (m_grpUpdtCount > m_p25->m_activeTG.size())
+-                    m_grpUpdtCount = 0U;
+-
+-                if (m_p25->m_activeTG.size() < 2) {
+-                    uint32_t dstId = m_p25->m_activeTG.at(0);
+-                    m_netLC.setMFId(MFG_STANDARD);
+-                    m_netLC.setLCO(LCO::GROUP_UPDT);
+-                    m_netLC.setDstId(dstId);
+-                }
+-                else {
+-                    uint32_t dstId = m_p25->m_activeTG.at(m_grpUpdtCount);
+-                    uint32_t dstIdB = m_p25->m_activeTG.at(m_grpUpdtCount + 1U);
+-                    m_netLC.setMFId(MFG_STANDARD);
+-                    m_netLC.setLCO(LCO::GROUP_UPDT);
+-                    m_netLC.setDstId(dstId);
+-                    m_netLC.setDstIdB(dstIdB);
+-
+-                    m_grpUpdtCount++;
+-                }
++            if (!m_p25->m_activeTG.empty() && m_netLC.getGroup()) {
++                // The active list has no channel assignments. Only advertise
++                // this call, rather than inventing mappings for other groups.
++                m_netLC.setMFId(MFG_STANDARD);
++                m_netLC.setLCO(LCO::GROUP_UPDT);
++                m_netLC.setGrpVchNo(m_p25->m_siteData.channelNo());
++                m_netLC.setDstIdB(0U);
++                m_netLC.setGrpVchNoB(0U);
+             }
+         }
+     }
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -245,7 +245,7 @@
+         g_RPC = previousRPC;
+     }
+ 
+-    void voiceMode(bool identification = true) {
++    void voiceMode(bool identification = true, uint32_t channelNumber = VOICE_CHANNEL) {
+         yaml::Node config;
+         REQUIRE(yaml::Parse(config, std::string(R"(
+ protocols:
+@@ -263,7 +263,7 @@
+             notifyEnable: true
+ )")));
+         controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(2U, 1U, "127.0.0.1", 48993U, "offline-test"),
+-            1U, 1U, 1U, 1U, 2U, VOICE_CHANNEL, false);
++            1U, 1U, 1U, 1U, 2U, channelNumber, false);
+         controller->setCCRunning(false);
+         controller->configureIdentification(identification);
+     }
+@@ -276,7 +276,7 @@
+         REQUIRE(rpc.dispatchRequest(RPC_PERMIT_P25_TG, request, reply));
+         REQUIRE(reply["status"].get<int>() == network::NetRPC::OK);
+     }
+-    bool voiceFrame(DUID::E duid, uint32_t destination = GROUP, bool nonTerminationLC = false) {
++    bool voiceFrame(DUID::E duid, uint32_t destination = GROUP, bool nonTerminationLC = false, bool groupCall = true) {
+         const uint32_t length = duid == DUID::HDU ? P25_HDU_FRAME_LENGTH_BYTES :
+             (duid == DUID::LDU1 || duid == DUID::LDU2) ? P25_LDU_FRAME_LENGTH_BYTES :
+             duid == DUID::TDULC ? P25_TDULC_FRAME_LENGTH_BYTES : P25_TDU_FRAME_LENGTH_BYTES;
+@@ -284,7 +284,7 @@
+         frame[0U] = modem::TAG_DATA; frame[1U] = 1U;
+         LC control;
+         control.setSrcId(SOURCE); control.setDstId(destination);
+-        control.setGroup(true); control.setLCO(LCO::GROUP); control.setAlgId(ALGO_UNENCRYPT);
++        control.setGroup(groupCall); control.setLCO(groupCall ? LCO::GROUP : LCO::PRIVATE); control.setAlgId(ALGO_UNENCRYPT);
+         if (duid == DUID::LDU1 || duid == DUID::LDU2) {
+             p25::Audio audio; for (uint32_t i=0U; i<9U; ++i) audio.encode(frame.data()+2U, NULL_IMBE, i);
+         }
+@@ -1157,8 +1157,8 @@
+         uint32_t length; auto message=createP25_TDUMessage(length,control,lsd,flags);
+         outgoing.emplace_back(message.get(),message.get()+length); return true;
+     }
+-    std::vector<uint8_t> encoded(DUID::E duid, uint32_t source = SOURCE) {
+-        LC control; control.setLCO(LCO::GROUP); control.setGroup(true); control.setSrcId(source); control.setDstId(GROUP); control.setAlgId(ALGO_UNENCRYPT);
++    std::vector<uint8_t> encoded(DUID::E duid, uint32_t source = SOURCE, bool groupCall = true) {
++        LC control; control.setLCO(groupCall ? LCO::GROUP : LCO::PRIVATE); control.setGroup(groupCall); control.setSrcId(source); control.setDstId(GROUP); control.setAlgId(ALGO_UNENCRYPT);
+         p25::data::LowSpeedData lsd;
+         std::array<uint8_t,P25_LDU_FRAME_LENGTH_BYTES> frame{};
+         // Native IMBE FEC/interleaving, then native DFSI serialization.
+@@ -1204,6 +1204,79 @@
+ )")));
+     return value;
+ }
++}
++
++TEST_CASE("Periodic voice link control advertises only its actual local group channel", "[p25][multisite][voice-lc]") {
++    // Exercise actual network DFSI and actual protected RF input paths. Decode
++    // the queued RF LDU1 with native interleaving/Hamming/Reed-Solomon checks;
++    // inspecting the LC object before encoding would miss the over-air defect.
++    for (const uint32_t channel : {81U, 125U}) {
++        for (const bool fromNetwork : {false, true}) {
++            for (const bool groupCall : {false, true}) {
++                for (const bool activeList : {false, true}) {
++                    DYNAMIC_SECTION("channel " << channel << ", network " << fromNetwork <<
++                        ", group " << groupCall << ", active list " << activeList) {
++                        SiteNetwork net;
++                        ControllerFixture voice(true, false, false, false, false, &net);
++                        voice.voiceMode(false, channel);
++                        voice.permitVoice("abcde:1");
++                        json::object request, reply;
++                        json::array active;
++                        if (activeList) {
++                            // A CC active list is not a TG-to-channel map. Its
++                            // unrelated TG must never be mapped to this carrier.
++                            for (const uint32_t group : {GROUP + 300U, GROUP}) {
++                                json::value value;
++                                value.set<uint32_t>(group);
++                                active.push_back(value);
++                            }
++                        }
++                        request["active"].set<json::array>(active);
++                        request = wireObject(request);
++                        REQUIRE(voice.rpc.dispatchRequest(RPC_ACTIVE_P25_TG, request, reply));
++                        REQUIRE(reply["status"].get<int>() == network::NetRPC::OK);
++                        const auto feed = [&](DUID::E duid) {
++                            if (fromNetwork) {
++                                net.incoming.push_back(net.encoded(duid, SOURCE, groupCall));
++                                MultiSiteTestAccess::process(*voice.controller);
++                            } else {
++                                REQUIRE(voice.voiceFrame(duid, GROUP, false, groupCall));
++                            }
++                        };
++                        if (!fromNetwork) feed(DUID::HDU);
++                        for (uint32_t i = 0U; i < 8U; ++i) {
++                            feed(DUID::LDU1);
++                            feed(DUID::LDU2);
++                        }
++                        uint32_t ldu1Count = 0U, updates = 0U;
++                        std::array<uint8_t, 1024U> frame{};
++                        while (voice.controller->getFrame(frame.data()) != 0U) {
++                            NID nid(0x293U);
++                            REQUIRE(nid.decode(frame.data() + 2U));
++                            if (nid.getDUID() != DUID::LDU1) continue;
++                            ++ldu1Count;
++                            LC decoded;
++                            // GROUP_UPDT's semantic decoder is upstream-stubbed,
++                            // so retain raw standardized bytes after real FEC.
++                            REQUIRE(decoded.decodeLDU1(frame.data() + 2U, true));
++                            if (decoded.getLCO() != LCO::GROUP_UPDT) continue;
++                            ++updates;
++                            REQUIRE(groupCall);
++                            REQUIRE(activeList);
++                            const ulong64_t payload = decoded.getRS();
++                            REQUIRE(((payload >> 48U) & 0xFFFFU) == ((2U << 12U) | channel));
++                            REQUIRE(((payload >> 32U) & 0xFFFFU) == GROUP);
++                            REQUIRE(((payload >> 16U) & 0x0FFFU) == 0U); // Unused B channel number.
++                            REQUIRE((payload & 0xFFFFU) == 0U); // Unused B TG; B channel ID is ignored.
++                        }
++                        REQUIRE(ldu1Count == 8U);
++                        if (groupCall && activeList) REQUIRE(updates >= 2U);
++                        else REQUIRE(updates == 0U); // No group LC substitution for private/idle lists.
++                    }
++                }
++            }
++        }
++    }
+ }
+ 
+ TEST_CASE("P25 system routes only accepted interested sites and retains terminal legs", "[p25][multisite]") {

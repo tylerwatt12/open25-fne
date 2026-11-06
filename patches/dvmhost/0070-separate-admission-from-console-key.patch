@@ -1,0 +1,271 @@
+--- a/src/host/p25/Control.Dispatch.cpp
++++ b/src/host/p25/Control.Dispatch.cpp
+@@ -158,14 +158,15 @@
+ bool Control::rfSecurityPermitted(uint32_t destination, bool secure, uint32_t key, bool media, uint32_t algorithm) const
+ {
+     if (media && (secure != (algorithm != 0x80U) || (!secure && key != 0U) ||
+-        (algorithm != 0x80U && algorithm != 0x81U && algorithm != 0x84U && algorithm != 0xaaU))) return false;
++        (algorithm != 0x80U && algorithm != 0x81U && algorithm != 0x83U && algorithm != 0x84U && algorithm != 0xaaU))) return false;
+     const auto policy = m_rfTalkgroupSecurity.find(destination);
+     if (policy == m_rfTalkgroupSecurity.end()) return true;
+-    const auto& value = policy->second;
+-    if (value.mode != "clear" && value.mode != "secure" && value.mode != "selectable") return false;
+-    if ((value.mode == "clear" && secure) || (value.mode == "secure" && !secure)) return false;
+-    return !secure || !media || (key == value.key && algorithm == value.algorithm &&
+-        (algorithm == 0x81U || algorithm == 0x84U || algorithm == 0xaaU));
++    const auto& mode = policy->second;
++    if (mode != "clear" && mode != "secure" && mode != "selectable") return false;
++    if ((mode == "clear" && secure) || (mode == "secure" && !secure)) return false;
++    // Admission controls clear/secure mode. The console's assigned transmit
++    // key is independent of the actual public ALGID/KID carried by a call.
++    return true;
+ }
+ 
+ // Retire the actual VC permit before reusing a channel. This covers both
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -371,7 +371,7 @@
+         for (size_t i = 0U; i < security.size(); ++i) {
+             const uint32_t group = security[i]["talkgroup"].as<uint32_t>(0U);
+             if (group > 0U && group < 0xFFFFU)
+-                m_rfTalkgroupSecurity[group] = RFSecurity{security[i]["mode"].as<std::string>("clear"), security[i]["keyId"].as<uint32_t>(0U), security[i]["algorithmId"].as<uint32_t>(0U)};
++                m_rfTalkgroupSecurity[group] = security[i]["mode"].as<std::string>("clear");
+         }
+     }
+     auto priorities = p25Protocol["dispatchTalkgroupPriorities"];
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -370,8 +370,7 @@
+         };
+         std::unordered_map<uint32_t, GrantPriority> m_grantPriorities;
+         std::unordered_map<uint32_t, uint32_t> m_dispatchTalkgroupPriorities;
+-        struct RFSecurity { std::string mode; uint32_t key = 0U; uint32_t algorithm = 0U; };
+-        std::unordered_map<uint32_t, RFSecurity> m_rfTalkgroupSecurity;
++        std::unordered_map<uint32_t, std::string> m_rfTalkgroupSecurity;
+ 
+         bool m_authoritative;
+         bool m_managedSite = false;
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -59,6 +59,7 @@
+     m_rfLC = lc;
+     //m_rfLastHDU = lc;
+     m_rfLastHDUValid = false;
++    m_rfSecurityKnown = false;
+     m_rfLastLDU1 = lc;
+     m_rfLastLDU2 = lc;
+     m_rfFirstLDU2 = true;
+@@ -134,9 +135,10 @@
+                 return false;
+             }
+ 
+-            // The grant request supplies only a secure flag. The HDU is the
+-            // first opportunity to enforce the actual algorithm/key pair,
+-            // before this stream can preempt or repeat any voice.
++            // Bind received cipher identity to this burst, independently of
++            // the console transmit key. A new burst may use another key.
++            if (m_p25->m_rfState == RS_RF_AUDIO && m_rfSecurityKnown &&
++                (lc.getAlgId() != m_rfLC.getAlgId() || lc.getKId() != m_rfLC.getKId())) return false;
+             if (!m_p25->rfSecurityPermitted(lc.getDstId(), lc.getAlgId() != ALGO_UNENCRYPT,
+                 lc.getKId(), true, lc.getAlgId())) return false;
+ 
+@@ -215,6 +217,7 @@
+ 
+             m_rfLastHDU = lc;
+             m_rfLastHDUValid = true;
++            m_rfSecurityKnown = true;
+ 
+             if (m_p25->m_rfState == RS_RF_LISTENING) {
+                 if (!m_p25->m_dedicatedControl) {
+@@ -816,6 +819,8 @@
+             std::memcpy(m_rfES,candidate.receivedES(),18);
+             std::memcpy(m_rfESStatus,candidate.receivedESStatus(),6);
+ 
++            if (ret && m_rfSecurityKnown && (candidate.getAlgId() != m_rfLC.getAlgId() ||
++                candidate.getKId() != m_rfLC.getKId())) return false;
+             if (ret && candidate.getGroup() && !m_p25->rfSecurityPermitted(candidate.getDstId(),
+                 candidate.getAlgId() != ALGO_UNENCRYPT, candidate.getKId(), true, candidate.getAlgId())) return false;
+             if (!ret) {
+@@ -851,6 +856,7 @@
+             }
+             else {
+                 m_rfLC = candidate;
++                m_rfSecurityKnown = true;
+                 m_rfLastLDU2 = m_rfLC;
+                 m_rfFirstLDU2 = false;
+             }
+@@ -1264,8 +1270,12 @@
+             lc::LC next(candidate);next.setEncrypted(candidate.getEncrypted());
+             const bool decodedESS=ldu2&&fullRateESS(batch,next);
+             if(decodedESS&&((next.getAlgId()!=ALGO_UNENCRYPT)!=control.getEncrypted()))return false;
++            if(decodedESS&&batch.headerPresent&&(next.getAlgId()!=candidate.getAlgId()||
++                next.getKId()!=candidate.getKId()))return false;
+             if(decodedESS)known=true;
+             const lc::LC& policy=decodedESS?next:candidate;
++            if(m_netSecurityKnown && known && (policy.getAlgId()!=m_netSyncControl.getAlgId() ||
++                policy.getKId()!=m_netSyncControl.getKId()))return false;
+             if(known&&control.getGroup()&&!m_p25->rfSecurityPermitted(dstId,
+                 policy.getAlgId()!=ALGO_UNENCRYPT,policy.getKId(),true,policy.getAlgId()))return false;
+             if(!ldu2) {
+--- a/src/host/p25/packet/Voice.h
++++ b/src/host/p25/packet/Voice.h
+@@ -107,6 +107,7 @@
+             lc::LC m_rfLC;
+             lc::LC m_rfLastHDU;
+             bool m_rfLastHDUValid;
++            bool m_rfSecurityKnown = false;
+             lc::LC m_rfLastLDU1;
+             lc::LC m_rfLastLDU2;
+             bool m_rfFirstLDU2;
+--- a/tests/p25/DispatchGrant_Tests.cpp
++++ b/tests/p25/DispatchGrant_Tests.cpp
+@@ -34,7 +34,7 @@
+         return c.m_control->writeRF_TSDU_Grant(source, group, 4U | (emergency ? 0x80U : 0U), true, false, false, 0U);
+     }
+     static void priority(Control& c, uint32_t group, uint32_t priority) { c.m_dispatchTalkgroupPriorities[group] = priority; }
+-    static void security(Control& c, uint32_t group, const std::string& mode, uint32_t key = 0U, uint32_t algorithm = 0x84U) { c.m_rfTalkgroupSecurity[group] = Control::RFSecurity{mode,key,algorithm}; }
++    static void security(Control& c, uint32_t group, const std::string& mode) { c.m_rfTalkgroupSecurity[group] = mode; }
+     static bool mediaPermitted(Control& c, uint32_t group, bool secure, uint32_t key, uint32_t algorithm) { return c.rfSecurityPermitted(group, secure, key, true, algorithm); }
+     static void allStart(Control& c, uint32_t group) { c.m_managedSite = true; c.setZoneConnected(true); c.m_rfAllStartTalkgroups.insert(group); }
+     static bool queue(Control& c, uint32_t source, uint32_t group) { return c.queueRFAdmission(source, group, 4U); }
+@@ -473,7 +473,7 @@
+ TEST_CASE("native clear secure mode policy rejects mismatches before any channel is allocated", "[dispatch-grant][rf-admission]") {
+     for (const auto mode : {"clear", "secure", "selectable"}) {
+         for (bool secure : {false, true}) {
+-            Fixture f; p25::DispatchGrantTestAccess::security(*f.control, TG, mode, 7U);
++            Fixture f; p25::DispatchGrantTestAccess::security(*f.control, TG, mode);
+             auto request = f.request(); request.secure = secure;
+             const auto result = f.run(request);
+             const bool permitted = std::string(mode) == "selectable" || (secure == (std::string(mode) == "secure"));
+@@ -482,32 +482,27 @@
+             if (!permitted) { REQUIRE_FALSE(result.issued); REQUIRE(f.rpc.permits == 0U); REQUIRE(f.drain() == 0U); }
+         }
+     }
+-    Fixture f; p25::DispatchGrantTestAccess::security(*f.control, TG, "secure", 7U);
++    Fixture f; p25::DispatchGrantTestAccess::security(*f.control, TG, "secure");
+     REQUIRE_FALSE(p25::DispatchGrantTestAccess::rfGrant(*f.control, 10001U, TG, false));
+     REQUIRE_FALSE(f.control->affiliations()->isGranted(TG)); REQUIRE(f.rpc.permits == 0U);
+ }
+ 
+-TEST_CASE("native media security uses the algorithm and key ID together", "[dispatch-grant][rf-admission][crypto]") {
+-    for (uint32_t allowed : {0x81U, 0x84U, 0xaaU}) {
++TEST_CASE("native admission applies clear and secure rules without assigning a key", "[dispatch-grant][rf-admission][crypto]") {
++    for (uint32_t actual : {0x81U, 0x83U, 0x84U, 0xaaU}) {
+         Fixture f;
+-        p25::DispatchGrantTestAccess::security(*f.control, TG, "secure", 7U, allowed);
+-        REQUIRE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 7U, allowed));
++        p25::DispatchGrantTestAccess::security(*f.control, TG, "secure");
++        for (uint32_t key : {0U, 7U, 8U, 65535U})
++            REQUIRE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, key, actual));
+         REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, false, 0U, 0x80U));
+-        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 8U, allowed));
+-        for (uint32_t other : {0x81U, 0x82U, 0x84U, 0x85U, 0x9fU, 0xaaU}) {
+-            if (other == allowed) continue;
+-            REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 7U, other));
+-        }
+-        p25::DispatchGrantTestAccess::security(*f.control, TG, "selectable", 7U, allowed);
++        p25::DispatchGrantTestAccess::security(*f.control, TG, "selectable");
+         REQUIRE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, false, 0U, 0x80U));
+-        REQUIRE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 7U, allowed));
+-        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, false, 7U, allowed));
++        REQUIRE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 9U, actual));
++        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, false, 7U, actual));
+         REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 0U, 0x80U));
+-        p25::DispatchGrantTestAccess::security(*f.control, TG, "secure", 0U, allowed);
+-        REQUIRE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 0U, allowed));
++        for (uint32_t unavailable : {0x82U, 0x85U, 0x9fU})
++            REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 7U, unavailable));
+         p25::DispatchGrantTestAccess::security(*f.control, TG, "clear");
+-        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 7U, allowed));
+-        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, false, 7U, allowed));
++        REQUIRE_FALSE(p25::DispatchGrantTestAccess::mediaPermitted(*f.control, TG, true, 7U, actual));
+     }
+ }
+ 
+--- a/tests/p25/MultiAlgorithmVoice_Tests.cpp
++++ b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+@@ -27,6 +27,11 @@
+ namespace p25 {
+ struct NIDReceiveTestAccess {
+     static bool voice(Control& c,uint8_t* p,uint32_t n) { return c.m_voice->process(p,n); }
++    static bool networkIdle(const Control& c) { return c.m_netState==RS_NET_IDLE; }
++    static bool network(Control& c,uint8_t* p,uint32_t n,lc::LC& control) {
++        data::LowSpeedData lsd;auto duid=defines::DUID::LDU2;auto type=defines::FrameType::HDU_VALID;
++        return c.m_voice->processNetwork(p,n,control,lsd,duid,type,{1U,0U,1000U});
++    }
+     static bool signaling(Control& c,uint8_t* p,uint32_t n) { return c.m_control->process(p,n); }
+     static bool packet(Control& c,uint8_t* p,uint32_t n) { return c.m_data->process(p,n); }
+     static void enableControl(Control& c) { c.m_enableControl = true; }
+@@ -115,8 +120,6 @@
+         rfTalkgroupSecurity:
+             - talkgroup: 1001
+               mode: secure
+-              algorithmId: )") + std::to_string(algorithm) + R"(
+-              keyId: )" + std::to_string(key) + R"(
+         control:
+             enable: false
+             dedicated: false
+@@ -124,7 +127,7 @@
+     config:
+         controlCh:
+             notifyEnable: false
+-)"));
++)")));
+         controller->setOptions(configuration, false, "N0TEST", ::lookups::VoiceChData(), 1U, 1U, 1U, 1U, 2U, 25U, false);
+         controller->setCCRunning(false);
+         controller->configureIdentification(false);
+@@ -212,6 +215,54 @@
+         }
+     }
+ };
++}
++
++TEST_CASE("RF and network forwarding preserve each received cipher identity", "[p25][crypto][voice-path][independent-key]") {
++    for (uint8_t algorithm : {0x81U, 0x83U, 0x84U, 0xaaU}) for (uint16_t key : {0U, 9U}) {
++        CAPTURE(algorithm, key);
++        const MI mi{1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 0U};
++        SECTION("RF") {
++            VoiceFixture f(algorithm, key);
++            REQUIRE(f.rf(DUID::HDU, mi)); f.drain();
++            REQUIRE(f.rf(DUID::LDU1, mi)); f.requireLDU(DUID::LDU1, mi);
++            REQUIRE(f.rf(DUID::LDU2, mi)); f.requireLDU(DUID::LDU2, mi);
++            f.requireForwardedIdentity();
++        }
++        SECTION("network") {
++            VoiceFixture f(algorithm, key);
++            f.net(DUID::LDU1, mi, true); f.net(DUID::LDU2, mi);
++            f.requireLDU(DUID::LDU1, mi);
++            f.net(DUID::LDU1, mi); f.requireLDU(DUID::LDU1, mi);
++            f.net(DUID::LDU2, mi); f.requireLDU(DUID::LDU2, mi);
++        }
++    }
++}
++
++TEST_CASE("initial network Header and ESS must identify the same cipher", "[p25][crypto][voice-path][header-ess-identity]") {
++    for (bool changeAlgorithm : {false, true}) {
++        CAPTURE(changeAlgorithm);
++        VoiceFixture fixture(0x84U, 7U);
++        const MI mi{1U,2U,3U,4U,5U,6U,7U,8U,0U};
++        auto control=fixture.control(0x84U,7U,mi);
++        const uint8_t algorithm=changeAlgorithm?0x81U:0x84U;
++        const uint16_t key=changeAlgorithm?7U:9U;
++        fullrate::Batch batch;batch.headerPresent=true;
++        batch.header=fullrate::generatedHeader(mi.data(),0x84U,7U,control.getMFId(),Group,uint16_t(NAC<<4));
++        for(unsigned i=0;i<9;++i)batch.voice[i]=fullrate::generatedVoice(NULL_IMBE,uint8_t(i+9U),0U,mi.data(),algorithm,key);
++        uint8_t ess[18]{};std::copy(mi.begin(),mi.end(),ess);
++        ess[9]=algorithm;ess[10]=uint8_t(key>>8);ess[11]=uint8_t(key);
++        edac::RS634717 fec;fec.encode24169(ess);
++        for(unsigned i=0;i<6;++i)std::copy_n(ess+i*3,3,batch.voice[i+2].bytes.data()+14);
++        std::array<uint8_t,256U> bytes{};
++        const auto length=fullrate::marshalBatch(batch,true,bytes.data(),bytes.size());
++        REQUIRE(length!=0U);
++        REQUIRE_FALSE(NIDReceiveTestAccess::network(*fixture.controller,bytes.data(),length,control));
++        REQUIRE(fixture.drain().empty());
++        REQUIRE(NIDReceiveTestAccess::networkIdle(*fixture.controller));
++        // Rejection must leave coherent initial setup available.
++        fixture.net(DUID::LDU1,mi,true);fixture.net(DUID::LDU2,mi);
++        fixture.requireLDU(DUID::LDU1,mi);
++    }
+ }
+ 
+ TEST_CASE("rejected RF encryption headers preserve the active voice session", "[p25][crypto][voice-path]") {

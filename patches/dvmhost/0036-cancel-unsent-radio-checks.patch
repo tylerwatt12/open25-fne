@@ -1,0 +1,703 @@
+--- a/src/host/p25/Control.cpp
++++ b/src/host/p25/Control.cpp
+@@ -97,8 +97,8 @@
+     m_controlChData(),
+     m_idenEntry(),
+     m_activeTG(),
+-    m_txImmQueue(queueSize, "P25 Imm Frame"),
+-    m_txQueue(queueSize, "P25 Frame"),
++    m_txImmQueue(queueSize),
++    m_txQueue(queueSize),
+     m_rfState(RS_RF_LISTENING),
+     m_rfLastDstId(0U),
+     m_rfLastSrcId(0U),
+@@ -956,47 +956,42 @@
+ 
+ /* Get the frame data length for the next frame in the data ring buffer. */
+ 
++void Control::discardCancelledChecks()
++{
++    const auto cancelled = [this](const TxFrameOwnership& owner) {
++        if (!physicalSubscriberPermitted(owner->destination)) owner->active.store(false);
++        return !owner->active.load();
++    };
++    m_txImmQueue.discard(cancelled);
++    m_txQueue.discard(cancelled);
++}
++
+ uint32_t Control::peekFrameLength()
+ {
+     std::lock_guard<std::mutex> lock(s_queueLock);
+-
+-    if (m_txQueue.isEmpty() && m_txImmQueue.isEmpty())
+-        return 0U;
+-
+-    uint8_t length[2U];
+-    ::memset(length, 0x00U, 2U);
+-
+-    uint16_t len = 0U;
+-
+-    // tx immediate queue takes priority
+-    if (!m_txImmQueue.isEmpty()) {
+-        m_txImmQueue.peek(length, 2U);
+-        len = (length[0U] << 8) + length[1U];
+-    }
+-    else {
+-        m_txQueue.peek(length, 2U);
+-        len = (length[0U] << 8) + length[1U];
+-    }
+-
+-    return len;
++    discardCancelledChecks();
++    const auto immediate = m_txImmQueue.frontLength();
++    return immediate != 0U ? immediate : m_txQueue.frontLength();
+ }
+ 
+ /* Helper to determine whether or not the internal frame queue is full. */
+ 
+ bool Control::isQueueFull()
+ {
++    std::lock_guard<std::mutex> lock(s_queueLock);
++    discardCancelledChecks();
+     if (m_txQueue.isEmpty() && m_txImmQueue.isEmpty())
+         return false;
+ 
+     // tx immediate queue takes priority
+     if (!m_txImmQueue.isEmpty()) {
+         uint32_t space = m_txImmQueue.freeSpace();
+-        if (space < (P25_LDU_FRAME_LENGTH_BYTES + 1U))
++        if (space < (P25_LDU_FRAME_LENGTH_BYTES + 4U))
+             return true;
+     }
+     else {
+         uint32_t space = m_txQueue.freeSpace();
+-        if (space < (P25_LDU_FRAME_LENGTH_BYTES + 1U))
++        if (space < (P25_LDU_FRAME_LENGTH_BYTES + 4U))
+             return true;
+     }
+ 
+@@ -1008,38 +1003,15 @@
+ uint32_t Control::getFrame(uint8_t* data, bool *imm)
+ {
+     assert(data != nullptr);
+-
+     std::lock_guard<std::mutex> lock(s_queueLock);
+-
+-    if (m_txQueue.isEmpty() && m_txImmQueue.isEmpty())
+-        return 0U;
+-
+-    uint8_t length[2U];
+-    ::memset(length, 0x00U, 2U);
+-
+-    uint16_t len = 0U;
+-
+-    // tx immediate queue takes priority
+-    if (!m_txImmQueue.isEmpty()) {
+-        if (imm != nullptr)
+-            *imm = true;
+-
+-        m_txImmQueue.get(length, 2U);
+-        len = (length[0U] << 8) + length[1U];
+-
+-        m_txImmQueue.get(data, len);
+-    }
+-    else {
+-        if (imm != nullptr)
+-            *imm = false;
+-
+-        m_txQueue.get(length, 2U);
+-        len = (length[0U] << 8) + length[1U];
+-
+-        m_txQueue.get(data, len);
+-    }
+-
+-    return len;
++    discardCancelledChecks();
++    const auto immediate = m_txImmQueue.pop(data);
++    if (immediate != 0U) {
++        if (imm != nullptr) *imm = true;
++        return immediate;
++    }
++    if (imm != nullptr) *imm = false;
++    return m_txQueue.pop(data);
+ }
+ 
+ /* Helper to write end of voice call frame data. */
+@@ -1598,83 +1570,18 @@
+ 
+ /* Add data frame to the data ring buffer. */
+ 
+-bool Control::addFrame(const uint8_t* data, uint32_t length, bool net, bool imm)
+-{
+-    assert(data != nullptr);
+-
++bool Control::addFrame(const uint8_t* data, uint32_t length, bool net, bool imm, const TxFrameOwnership& owner)
++{
++    if (data == nullptr || length <= 2U || length > 0xFFFFU) return false;
+     std::lock_guard<std::mutex> lock(s_queueLock);
++    discardCancelledChecks();
+     if (identificationActive()) return false;
+-
+-    if (!net) {
+-        if (m_rfTimeout.isRunning() && m_rfTimeout.hasExpired())
+-            return false;
+-    } else {
+-        if (m_netTimeout.isRunning() && m_netTimeout.hasExpired())
+-            return false;
+-    }
+-
+-    if (m_debug) {
+-        Utils::symbols("!!! *Tx P25", data + 2U, length - 2U);
+-    }
+-
+-    uint32_t fifoSpace = m_modem->getP25Space();
+-
+-    // LogDebugEx(LOG_P25, "Control::addFrame()", "fifoSpace = %u", fifoSpace);
+-
+-    // is this immediate data?
+-    if (imm) {
+-        // resize immediate queue if necessary (this shouldn't really ever happen)
+-        uint32_t space = m_txImmQueue.freeSpace();
+-        if (space < (length + 2U)) {
+-            if (!net) {
+-                uint32_t queueLen = m_txImmQueue.length();
+-                m_txImmQueue.resize(queueLen + P25_LDU_FRAME_LENGTH_BYTES);
+-                LogError(LOG_P25, "overflow in the P25 queue while writing imm data; queue free is %u, needed %u; resized was %u is %u, fifoSpace = %u", space, length, queueLen, m_txImmQueue.length(), fifoSpace);
+-                return false;
+-            }
+-            else {
+-                LogError(LOG_P25, "overflow in the P25 queue while writing imm network data; queue free is %u, needed %u, fifoSpace = %u", space, length, fifoSpace);
+-                return false;
+-            }
+-        }
+-
+-        uint8_t lenBuffer[2U];
+-        if (length > 255U)
+-            lenBuffer[0U] = (length >> 8U) & 0xFFU;
+-        else
+-            lenBuffer[0U] = 0x00U;
+-        lenBuffer[1U] = length & 0xFFU;
+-        m_txImmQueue.addData(lenBuffer, 2U);
+-
+-        m_txImmQueue.addData(data, length);
+-        return true;
+-    }
+-
+-    // resize queue if necessary (this shouldn't really ever happen)
+-    uint32_t space = m_txQueue.freeSpace();
+-    if (space < (length + 2U)) {
+-        if (!net) {
+-            uint32_t queueLen = m_txQueue.length();
+-            m_txQueue.resize(queueLen + P25_LDU_FRAME_LENGTH_BYTES);
+-            LogError(LOG_P25, "overflow in the P25 queue while writing data; queue free is %u, needed %u; resized was %u is %u, fifoSpace = %u", space, length, queueLen, m_txQueue.length(), fifoSpace);
+-            return false;
+-        }
+-        else {
+-            LogError(LOG_P25, "overflow in the P25 queue while writing network data; queue free is %u, needed %u, fifoSpace = %u", space, length, fifoSpace);
+-            return false;
+-        }
+-    }
+-
+-    uint8_t lenBuffer[2U];
+-    if (length > 255U)
+-        lenBuffer[0U] = (length >> 8U) & 0xFFU;
+-    else
+-        lenBuffer[0U] = 0x00U;
+-    lenBuffer[1U] = length & 0xFFU;
+-    m_txQueue.addData(lenBuffer, 2U);
+-
+-    m_txQueue.addData(data, length);
+-    return true;
++    if ((!net && m_rfTimeout.isRunning() && m_rfTimeout.hasExpired()) ||
++        (net && m_netTimeout.isRunning() && m_netTimeout.hasExpired())) return false;
++    if (m_debug) Utils::symbols("!!! *Tx P25", data + 2U, length > 2U ? length - 2U : 0U);
++    // Bounded records reject the new frame on pressure; unrelated queued
++    // responses are never cleared or resized by a failed CHECK enqueue.
++    return imm ? m_txImmQueue.push(data, length, owner) : m_txQueue.push(data, length, owner);
+ }
+ 
+ /* Process a data frames from the network. */
+@@ -2204,9 +2111,11 @@
+     }
+ 
+     // don't add any frames if the queue is full
+-    uint8_t len = (P25_TSDU_TRIPLE_FRAME_LENGTH_BYTES * 2U) + 2U;
++    // Reserve two triple TSDUs, each with modem tag/reserved and the
++    // private two-octet length-prefix budget.
++    const uint32_t required = 2U * (P25_TSDU_TRIPLE_FRAME_LENGTH_BYTES + 4U);
+     uint32_t space = m_txQueue.freeSpace();
+-    if (space < (len + 1U)) {
++    if (space < required) {
+         return false;
+     }
+ 
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -39,7 +39,7 @@
+ #include "common/network/RTPFNEHeader.h"
+ #include "common/network/Network.h"
+ #include "common/p25/SiteData.h"
+-#include "common/RingBuffer.h"
++#include "p25/TxFrameQueue.h"
+ #include "common/StopWatch.h"
+ #include "common/Timer.h"
+ #include "common/yaml/Yaml.h"
+@@ -414,8 +414,8 @@
+ 
+         std::vector<uint32_t> m_activeTG;
+ 
+-        RingBuffer<uint8_t> m_txImmQueue;
+-        RingBuffer<uint8_t> m_txQueue;
++        TxFrameQueue m_txImmQueue;
++        TxFrameQueue m_txQueue;
+         static std::mutex s_queueLock;
+ 
+         std::atomic<RPT_RF_STATE> m_rfState;
+@@ -515,7 +515,8 @@
+          * @param net Flag indicating whether the data came from the network or not
+          * @param imm Flag indicating whether or not the data is priority and is added to the immediate queue.
+          */
+-        bool addFrame(const uint8_t* data, uint32_t length, bool net = false, bool imm = false);
++        bool addFrame(const uint8_t* data, uint32_t length, bool net = false, bool imm = false, const TxFrameOwnership& owner = {});
++        void discardCancelledChecks();
+ 
+         /**
+          * @brief Process a data frames from the network.
+--- /dev/null
++++ b/src/host/p25/TxFrameQueue.h
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Private P25 transmit records. The payload is the unchanged modem frame;
++// cancellation ownership exists only inside the host process.
++#pragma once
++#include <atomic>
++#include <cstdint>
++#include <cstring>
++#include <deque>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <vector>
++
++namespace p25 {
++struct TxFrameOwner {
++    explicit TxFrameOwner(uint32_t destination) : destination(destination) {}
++    const uint32_t destination;
++    std::atomic<bool> active{true};
++};
++using TxFrameOwnership = std::shared_ptr<TxFrameOwner>;
++
++class TxFrameQueue {
++public:
++    explicit TxFrameQueue(uint32_t capacity) : m_capacity(capacity) {}
++    bool push(const uint8_t* data, uint32_t length, const TxFrameOwnership& owner = {}) {
++        // A frame needs modem tag/reserved octets and a nonempty CAI body.
++        // Account the original two-octet length prefix in the payload budget.
++        if (data == nullptr || length <= 2U || length > 0xFFFFU) return false;
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (length + 2U > m_capacity - m_used || (owner && !owner->active.load())) return false;
++        m_frames.push_back(Frame{std::vector<uint8_t>(data, data + length), owner});
++        m_used += length + 2U;
++        return true;
++    }
++    uint32_t pop(uint8_t* data) {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        discardInactive();
++        if (m_frames.empty()) return 0U;
++        const auto length = uint32_t(m_frames.front().data.size());
++        // The active load in discardInactive is the handoff commit point.
++        // A frame already handed to the modem cannot subsequently be unsent.
++        ::memcpy(data, m_frames.front().data.data(), length);
++        m_frames.pop_front(); m_used -= length + 2U;
++        return length;
++    }
++    uint32_t frontLength() {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        discardInactive();
++        return m_frames.empty() ? 0U : uint32_t(m_frames.front().data.size());
++    }
++    bool isEmpty() { return frontLength() == 0U; }
++    uint32_t freeSpace() const {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        return m_capacity - m_used;
++    }
++    uint32_t capacity() const { return m_capacity; }
++    void clear() {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        m_frames.clear(); m_used = 0U;
++    }
++    void discard(const std::function<bool(const TxFrameOwnership&)>& cancelled) {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        for (auto it = m_frames.begin(); it != m_frames.end();) {
++            if (it->owner && cancelled(it->owner)) {
++                m_used -= uint32_t(it->data.size()) + 2U;
++                it = m_frames.erase(it);
++            } else ++it;
++        }
++    }
++private:
++    struct Frame { std::vector<uint8_t> data; TxFrameOwnership owner; };
++    void discardInactive() {
++        while (!m_frames.empty() && m_frames.front().owner && !m_frames.front().owner->active.load()) {
++            m_used -= uint32_t(m_frames.front().data.size()) + 2U;
++            m_frames.pop_front();
++        }
++    }
++    const uint32_t m_capacity;
++    uint32_t m_used = 0U;
++    mutable std::mutex m_mutex;
++    std::deque<Frame> m_frames;
++};
++}
+--- a/src/host/p25/packet/ControlSignaling.cpp
++++ b/src/host/p25/packet/ControlSignaling.cpp
+@@ -559,7 +559,7 @@
+                     markValidatedWUID(respondingSU);
+                     refreshAcknowledgedWUID();
+                 }
+-                if (m_verbose) {
++                if (m_verbose || function == ExtendedFunctions::CHECK_ACK) {
+                     LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, op = $%02X, arg = %u, tgt = %u",
+                         tsbk->toString(true).c_str(), iosp->getExtendedFunction(), srcId, dstId);
+                 }
+@@ -568,13 +568,13 @@
+                 switch (iosp->getExtendedFunction()) {
+                 // Standard
+                 case ExtendedFunctions::CHECK_ACK:
+-                    ::ActivityLog("P25", true, "radio check response from %u to %u", srcId, dstId);
++                    ::ActivityLog("P25", true, "radio check response from %u to %u", respondingSU, srcId);
+                     break;
+                 case ExtendedFunctions::INHIBIT_ACK:
+-                    ::ActivityLog("P25", true, "radio inhibit response from %u to %u", srcId, dstId);
++                    ::ActivityLog("P25", true, "radio inhibit response from %u to %u", respondingSU, srcId);
+                     break;
+                 case ExtendedFunctions::UNINHIBIT_ACK:
+-                    ::ActivityLog("P25", true, "radio uninhibit response from %u to %u", srcId, dstId);
++                    ::ActivityLog("P25", true, "radio uninhibit response from %u to %u", respondingSU, srcId);
+                     break;
+                 // Dynamic Regroup
+                 case ExtendedFunctions::DYN_REGRP_REQ_ACK:
+@@ -591,7 +591,9 @@
+                     break;
+                 }
+ 
+-                writeRF_TSDU_SBF(iosp, true);
++                // AABD-B 13.2.1 consumes a matched response and ends the
++                // procedure; do not retransmit an ISP ACK as an OSP command.
++                if (function != ExtendedFunctions::CHECK_ACK) writeRF_TSDU_SBF(iosp, true);
+             }
+             break;
+             case TSBKO::ISP_EMERG_ALRM_REQ:
+@@ -1257,7 +1259,7 @@
+ 
+ /* Helper to write a extended function packet. */
+ 
+-bool ControlSignaling::writeRF_TSDU_Ext_Func(uint32_t func, uint32_t arg, uint32_t dstId)
++bool ControlSignaling::writeRF_TSDU_Ext_Func(uint32_t func, uint32_t arg, uint32_t dstId, const TxFrameOwnership& owner)
+ {
+     std::unique_ptr<IOSP_EXT_FNCT> iosp = std::make_unique<IOSP_EXT_FNCT>();
+     iosp->setExtendedFunction(func);
+@@ -1278,7 +1280,7 @@
+ 
+     // A requested check owns its Nmax transmissions. The generic immediate
+     // redundancy option must not silently double the standard retry budget.
+-    if (!writeRF_TSDU_SBF(iosp.get(), true, true, true, func != ExtendedFunctions::CHECK)) return false;
++    if (!writeRF_TSDU_SBF(iosp.get(), true, true, true, func != ExtendedFunctions::CHECK, owner)) return false;
+ 
+     if (m_verbose) {
+         LogInfoEx(LOG_RF, P25_TSDU_STR ", %s, mfId = $%02X, op = $%02X, arg = %u, tgt = %u",
+@@ -1342,6 +1344,8 @@
+         if (retired != m_radioChecks.end()) m_radioChecks.erase(retired);
+     }
+     RadioCheck request; request.serial = ++m_radioCheckSerial;
++    request.owner = std::make_shared<TxFrameOwner>(dstId);
++    if (waitMs != 0U) request.firstDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::min(waitMs, 750U));
+     m_radioChecks[dstId] = request;
+     if (waitMs == 0U) return true;
+     const auto serial = request.serial;
+@@ -1352,10 +1356,13 @@
+     });
+     const auto current = m_radioChecks.find(dstId);
+     if (current == m_radioChecks.end() || current->second.serial != serial) return false;
+-    if (current->second.state == RadioCheckState::Queued) current->second.state = RadioCheckState::Cancelled;
++    if (current->second.state == RadioCheckState::Queued) {
++        current->second.state = RadioCheckState::Cancelled;
++        current->second.owner->active.store(false);
++    }
+     // A REST success means the clock owner really enqueued at least one
+     // command. Timed-out queued requests cannot execute after the response.
+-    return current->second.attempts != 0U;
++    return current->second.attempts != 0U && current->second.state != RadioCheckState::Cancelled;
+ }
+ 
+ ControlSignaling::RadioCheckState ControlSignaling::radioCheckState(uint32_t dstId)
+@@ -1369,7 +1376,10 @@
+ {
+     std::lock_guard<std::mutex> lock(m_radioCheckMutex);
+     for (auto& entry : m_radioChecks) {
+-        if (activeRadioCheck(entry.second.state)) entry.second.state = RadioCheckState::Cancelled;
++        if (activeRadioCheck(entry.second.state)) {
++            entry.second.state = RadioCheckState::Cancelled;
++            entry.second.owner->active.store(false);
++        }
+     }
+     m_radioCheckChanged.notify_all();
+ }
+@@ -1380,6 +1390,12 @@
+     for (auto& entry : m_radioChecks) {
+         auto& check = entry.second;
+         if (!activeRadioCheck(check.state)) continue;
++        if (!check.owner->active.load() || (check.state == RadioCheckState::Queued &&
++            check.firstDeadline != std::chrono::steady_clock::time_point{} && std::chrono::steady_clock::now() >= check.firstDeadline)) {
++            check.state = RadioCheckState::Cancelled;
++            check.owner->active.store(false);
++            continue;
++        }
+         // Withdraw on CC stop, reset, loss of local RF availability or policy
+         // revocation. Resuming a channel cannot resume an earlier command.
+         if (!m_p25->m_enableControl || !m_p25->m_dedicatedControl || !m_p25->m_ccRunning ||
+@@ -1387,19 +1403,22 @@
+             !m_p25->physicalSubscriberPermitted(entry.first) || m_p25->m_modem == nullptr ||
+             m_p25->m_modem->hasError() || m_p25->m_modem->hasLockout()) {
+             check.state = RadioCheckState::Cancelled;
++            check.owner->active.store(false);
+             continue;
+         }
+         if (check.state == RadioCheckState::UnderCheck) {
+             if (ms < check.remainingMs) { check.remainingMs -= ms; continue; }
+             if (check.attempts == RADIO_CHECK_ATTEMPTS) {
+                 check.state = RadioCheckState::NoResponse;
++                check.owner->active.store(false);
+                 LogInfoEx(LOG_HOST, "P25 Radio Check, no response, arg = %u, tgt = %u, attempts = %u",
+                     check.requestor, entry.first, check.attempts);
+                 continue;
+             }
+         }
+-        if (!writeRF_TSDU_Ext_Func(check.function, check.requestor, entry.first)) {
++        if (!writeRF_TSDU_Ext_Func(check.function, check.requestor, entry.first, check.owner)) {
+             check.state = RadioCheckState::Cancelled;
++            check.owner->active.store(false);
+             continue;
+         }
+         ++check.attempts;
+@@ -1417,10 +1436,11 @@
+     const auto found = m_radioChecks.find(source);
+     if (found == m_radioChecks.end()) return false;
+     auto& check = found->second;
+-    if (check.state != RadioCheckState::UnderCheck || check.attempts == 0U ||
++    if (check.state != RadioCheckState::UnderCheck || check.attempts == 0U || !check.owner->active.load() ||
+         (mfid != MFG_STANDARD && mfid != MFG_STANDARD_ALT) || function != ExtendedFunctions::CHECK_ACK ||
+         check.function != ExtendedFunctions::CHECK || argument != check.requestor) return false;
+     check.state = RadioCheckState::Available;
++    check.owner->active.store(false);
+     return true;
+ }
+ 
+@@ -1728,7 +1748,7 @@
+ 
+ /* Helper to write a single-block P25 TSDU packet. */
+ 
+-bool ControlSignaling::writeRF_TSDU_SBF(lc::TSBK* tsbk, bool noNetwork, bool forceSingle, bool imm, bool allowRedundant)
++bool ControlSignaling::writeRF_TSDU_SBF(lc::TSBK* tsbk, bool noNetwork, bool forceSingle, bool imm, bool allowRedundant, const TxFrameOwnership& owner)
+ {
+     if (dynamic_cast<lc::AMBT*>(tsbk) != nullptr) {
+         LogError(LOG_P25, "AMBT requires a typed message or its PDU encoder; single-block output refused");
+@@ -1790,11 +1810,11 @@
+         data[0U] = modem::TAG_DATA;
+         data[1U] = 0x00U;
+ 
+-        bool queued = m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm);
++        bool queued = m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm, owner);
+         
+         if (imm && m_redundantImmediate && allowRedundant) {
+             // queue an immediate frame at least twice
+-            queued = m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm) || queued;
++            queued = m_p25->addFrame(data, P25_TSDU_FRAME_LENGTH_BYTES + 2U, false, imm, owner) || queued;
+         }
+         if (queued) refreshAcknowledgedWUID();
+         return queued;
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -112,7 +112,7 @@
+              * @param arg Function Argument.
+              * @param dstId Destination Radio ID.
+              */
+-            bool writeRF_TSDU_Ext_Func(uint32_t func, uint32_t arg, uint32_t dstId);
++            bool writeRF_TSDU_Ext_Func(uint32_t func, uint32_t arg, uint32_t dstId, const TxFrameOwnership& owner = {});
+             // REST enqueues work; only the protocol clock emits retries.
+             enum class RadioCheckState { None, Queued, UnderCheck, Available, NoResponse, Cancelled };
+             bool requestRadioCheck(uint32_t dstId, uint32_t waitMs = 0U);
+@@ -221,6 +221,8 @@
+             static thread_local WUIDTransaction s_wuidTransaction;
+             struct RadioCheck {
+                 uint64_t serial = 0U;
++                TxFrameOwnership owner;
++                std::chrono::steady_clock::time_point firstDeadline{};
+                 uint32_t requestor = defines::WUID_FNE;
+                 uint32_t function = defines::ExtendedFunctions::CHECK;
+                 uint32_t remainingMs = 0U;
+@@ -305,7 +307,7 @@
+              * @param forceSingle Force TSBK to be written as a single block TSDU and not bundled into a multiblock TSDU.
+              * @param imm Flag indicating the TSBK should be written to the immediate queue.
+              */
+-            bool writeRF_TSDU_SBF(lc::TSBK* tsbk, bool noNetwork, bool forceSingle = false, bool imm = false, bool allowRedundant = true);
++            bool writeRF_TSDU_SBF(lc::TSBK* tsbk, bool noNetwork, bool forceSingle = false, bool imm = false, bool allowRedundant = true, const TxFrameOwnership& owner = {});
+             /**
+              * @brief Helper to write a network single-block P25 TSDU packet.
+              * @param tsbk TSBK to write to the network.
+--- a/tests/p25/RadioCheckProcedure_Tests.cpp
++++ b/tests/p25/RadioCheckProcedure_Tests.cpp
+@@ -29,6 +29,9 @@
+ namespace p25 {
+ struct RadioCheckTestAccess {
+     static void clock(Control& c, uint32_t ms) { c.control()->clockRadioChecks(ms); }
++    static bool enqueue(Control& c, const std::vector<uint8_t>& bytes, bool immediate) {
++        return c.addFrame(bytes.data(),uint32_t(bytes.size()),false,immediate);
++    }
+     static void withValidatedRFContext(Control& c, uint32_t source, const std::function<void()>& body) {
+         auto* signal=c.control(); const auto old=signal->s_wuidTransaction;
+         signal->s_wuidTransaction={signal,0U}; signal->markValidatedWUID(source);
+@@ -62,13 +65,13 @@
+     network::NetRPC rpc{"127.0.0.1", 48991U, 0U, "unopened-subscriber-test", false};
+     network::NetRPC* oldRPC = g_RPC;
+     std::unique_ptr<Control> controller;
+-    explicit Fixture(bool cc, bool physicalInventory = true) {
++    explicit Fixture(bool cc, bool physicalInventory = true, uint32_t queueSize = 16384U) {
+         g_logDisplayLevel = 0U; g_RPC = &rpc;
+         diagnosticLog().str(""); diagnosticLog().clear();
+         log_internal::SetInternalOutputStream(diagnosticLog());
+         radios.addEntry(SECOND_SU,true,"Second physical SU"); radios.addEntry(RID, true, "Subscriber"); radios.addEntry(OTHER, false, "Disabled"); radios.addEntry(APP, true, "Console"); radios.addEntry(10006U, true, "Not physical");
+         groups.addEntry(TG, 1U, true); groups.addEntry(1002U, 1U, true);
+-        controller = std::make_unique<Control>(true, NAC, 1U, 16384U, &modem, nullptr, 120U, 1U, true,
++        controller = std::make_unique<Control>(true, NAC, 1U, queueSize, &modem, nullptr, 120U, 1U, true,
+             &channels, &radios, &groups, &identities, &rssi, false, false, false, false, false);
+         yaml::Node config; std::string mode = cc ? "true" : "false";
+         const std::string inventory = physicalInventory ? "        dispatchSubscribers:\n            - 10001\n            - 10005\n            - 10007\n" : "        dispatchSubscribers: []\n";
+@@ -317,3 +320,127 @@
+         REQUIRE(f.responses().empty()); REQUIRE(timeoutLogs()==0U);
+     }
+ }
++
++namespace {
++// Opaque transport markers prove byte/order preservation. They are deliberately
++// not P25 message/FEC fixtures; CHECK records use the actual encoder/queue.
++std::vector<uint8_t> marker(unsigned sequence,size_t length=13U) {
++    std::vector<uint8_t> data(length,0xA5U); data[0]=modem::TAG_DATA; data[1]=0U;
++    data[2]=0x5AU; data[3]=uint8_t(sequence>>8U); data[4]=uint8_t(sequence); return data;
++}
++std::vector<std::vector<uint8_t>> rawFrames(Control& c) {
++    std::vector<std::vector<uint8_t>> frames; std::array<uint8_t,65536U> bytes{};
++    while (const auto size=c.getFrame(bytes.data())) frames.emplace_back(bytes.begin(),bytes.begin()+size);
++    return frames;
++}
++bool checkFrame(const std::vector<uint8_t>& bytes) {
++    if(bytes.size()!=P25_TSDU_FRAME_LENGTH_BYTES+2U)return false;
++    std::array<uint8_t,P25_TSBK_FEC_LENGTH_BYTES> coded{}; Block raw{}; edac::Trellis trellis;
++    P25Utils::decode(bytes.data()+2U,coded.data(),114U,318U);
++    REQUIRE(trellis.decode12(coded.data(),raw.data()));
++    REQUIRE(edac::CRC::checkCCITT162(raw.data(),raw.size()));
++    return (raw[0]&0x3FU)==0x24U && raw[2]==0U && raw[3]==0U;
++}
++}
++
++TEST_CASE("CHECK cancellation removes unsent records before first getFrame and preserves other queue order", "[p25][radio-check][check-withdrawal]") {
++    for(unsigned mode=0U;mode<5U;++mode) {
++        CAPTURE(mode); Fixture f(true); auto* signal=f.controller->control();
++        REQUIRE(signal->requestRadioCheck(RID)); RadioCheckTestAccess::clock(*f.controller,0U);
++        REQUIRE(f.controller->peekFrameLength()==P25_TSDU_FRAME_LENGTH_BYTES+2U);
++        REQUIRE(RadioCheckTestAccess::enqueue(*f.controller,marker(1),true));
++        REQUIRE(RadioCheckTestAccess::enqueue(*f.controller,marker(2),true));
++        REQUIRE(RadioCheckTestAccess::enqueue(*f.controller,marker(3),false));
++        if(mode==0U) { f.controller->setCCRunning(false); f.controller->setCCRunning(true); }
++        if(mode==1U) { f.controller->setCCHalted(true); f.controller->setCCHalted(false); }
++        if(mode==2U) REQUIRE(f.signal(0x24U,0x0080FFFFFC002711ULL));
++        if(mode==3U) for(unsigned i=0U;i<5U;++i) RadioCheckTestAccess::clock(*f.controller,2000U);
++        if(mode==4U) {
++            f.radios.addEntry(RID,false,"revoked");
++            REQUIRE(f.controller->peekFrameLength()==13U); // revoke before scheduler tick
++            f.radios.addEntry(RID,true,"enabled again");
++        }
++        REQUIRE(f.controller->peekFrameLength()==13U);
++        const auto frames=rawFrames(*f.controller);
++        REQUIRE(frames==std::vector<std::vector<uint8_t>>{marker(1),marker(2),marker(3)});
++        if(mode==2U) {
++            REQUIRE(signal->radioCheckState(RID)==CheckState::Available);
++            REQUIRE(diagnosticLog().str().find("(Extended Function Response)")!=std::string::npos);
++        }
++        RadioCheckTestAccess::clock(*f.controller,20000U);
++        REQUIRE(rawFrames(*f.controller).empty());
++        REQUIRE(timeoutLogs()==(mode==3U?1U:0U));
++    }
++}
++
++TEST_CASE("ACK cancels all queued retries without an RF echo and a new generation cannot revive them", "[p25][radio-check][check-withdrawal]") {
++    Fixture f(true); auto* signal=f.controller->control();
++    REQUIRE(signal->requestRadioCheck(RID));
++    RadioCheckTestAccess::clock(*f.controller,0U); RadioCheckTestAccess::clock(*f.controller,2000U);
++    REQUIRE(f.signal(0x24U,0x0080FFFFFC002711ULL));
++    REQUIRE(rawFrames(*f.controller).empty());
++    REQUIRE(f.controller->affiliations()->unitRegTimer(RID)==0U);
++    REQUIRE(signal->requestRadioCheck(RID)); RadioCheckTestAccess::clock(*f.controller,0U);
++    auto frames=rawFrames(*f.controller); REQUIRE(frames.size()==1U); REQUIRE(checkFrame(frames[0]));
++    RadioCheckTestAccess::clock(*f.controller,2000U); // unsent retry
++    f.controller->reset(); f.controller->setCCRunning(true);
++    REQUIRE(rawFrames(*f.controller).empty()); REQUIRE(timeoutLogs()==0U);
++    REQUIRE(checkFrame(frames[0])); // previously handed-off bytes cannot be unsent
++}
++
++TEST_CASE("full bounded queue preserves unrelated records and failure cancels older unsent CHECK attempts", "[p25][radio-check][check-withdrawal]") {
++    Fixture f(true,true,128U); auto* signal=f.controller->control();
++    REQUIRE(signal->requestRadioCheck(RID)); RadioCheckTestAccess::clock(*f.controller,0U); //49 bytes with prefix
++    REQUIRE(RadioCheckTestAccess::enqueue(*f.controller,marker(1,62U),true)); //64 bytes with prefix
++    REQUIRE_FALSE(RadioCheckTestAccess::enqueue(*f.controller,marker(2,62U),true));
++    RadioCheckTestAccess::clock(*f.controller,2000U); // retry cannot fit in remaining15 bytes
++    REQUIRE(signal->radioCheckState(RID)==CheckState::Cancelled);
++    REQUIRE(rawFrames(*f.controller)==std::vector<std::vector<uint8_t>>{marker(1,62U)});
++    REQUIRE(timeoutLogs()==0U);
++    REQUIRE_FALSE(signal->requestRadioCheck(RID,1U));
++    RadioCheckTestAccess::clock(*f.controller,20000U); REQUIRE(rawFrames(*f.controller).empty());
++}
++
++TEST_CASE("frame records reject empty tag-only and overlong input with precise bounded prefix accounting", "[p25][check-withdrawal]") {
++    TxFrameQueue queue(64U); const auto bytes=marker(1,62U); std::array<uint8_t,65536U> output{};
++    for(uint32_t length:{0U,1U,2U,65536U}) REQUIRE_FALSE(queue.push(bytes.data(),length));
++    REQUIRE(queue.push(bytes.data(),62U)); REQUIRE(queue.freeSpace()==0U);
++    REQUIRE_FALSE(queue.push(bytes.data(),3U)); REQUIRE(queue.pop(output.data())==62U);
++    REQUIRE(std::equal(bytes.begin(),bytes.end(),output.begin())); REQUIRE(queue.freeSpace()==64U);
++    const std::array<uint8_t,3U> tiny{{1U,2U,3U}};
++    for(unsigned i=0U;i<12U;++i) REQUIRE(queue.push(tiny.data(),tiny.size()));
++    REQUIRE(queue.freeSpace()==4U); REQUIRE_FALSE(queue.push(tiny.data(),tiny.size()));
++    for(unsigned i=0U;i<12U;++i) REQUIRE(queue.pop(output.data())==3U);
++    REQUIRE(queue.pop(output.data())==0U);
++}
++
++TEST_CASE("concurrent peek get and CHECK cancellation preserve every unrelated frame in order", "[p25][check-withdrawal]") {
++    Fixture f(true); auto* signal=f.controller->control(); std::atomic<bool> produced{false};
++    std::vector<std::vector<uint8_t>> received;
++    auto producer=std::async(std::launch::async,[&] {
++        bool okay=true;
++        for(unsigned i=1U;i<=250U;++i) {
++            okay=RadioCheckTestAccess::enqueue(*f.controller,marker(i),true)&&okay;
++            if(i%5U==0U && signal->requestRadioCheck(RID)) RadioCheckTestAccess::clock(*f.controller,0U);
++        }
++        produced.store(true); return okay;
++    });
++    auto consumer=std::async(std::launch::async,[&] {
++        std::array<uint8_t,65536U> frame{};
++        while(!produced.load() || f.controller->peekFrameLength()!=0U) {
++            f.controller->peekFrameLength();
++            if(const auto length=f.controller->getFrame(frame.data())) received.emplace_back(frame.begin(),frame.begin()+length);
++            else std::this_thread::yield();
++        }
++    });
++    auto canceller=std::async(std::launch::async,[&] {
++        while(!produced.load()) { signal->cancelRadioChecks(); std::this_thread::yield(); }
++        signal->cancelRadioChecks();
++    });
++    REQUIRE(producer.get()); consumer.get(); canceller.get();
++    std::vector<std::vector<uint8_t>> normal;
++    for(const auto& frame:received) if(frame.size()==13U) normal.push_back(frame);
++    REQUIRE(normal.size()==250U);
++    for(unsigned i=1U;i<=250U;++i) REQUIRE(normal[i-1U]==marker(i));
++    REQUIRE(rawFrames(*f.controller).empty());
++}

@@ -1,0 +1,1077 @@
+diff --git a/src/bridge/HostBridge.Opaque.cpp b/src/bridge/HostBridge.Opaque.cpp
+index 7e56b55..08962a1 100644
+--- a/src/bridge/HostBridge.Opaque.cpp
++++ b/src/bridge/HostBridge.Opaque.cpp
+@@ -4,6 +4,7 @@
+ #include "HostBridge.h"
+ #include "PacketCodecMI.h"
+ #include "common/p25/dfsi/LC.h"
++#include "common/p25/lc/tdulc/TDULCFactory.h"
+ #include "common/p25/dfsi/DFSIDefines.h"
+ #include "common/Utils.h"
+ #include <chrono>
+@@ -21,6 +22,8 @@ uint64_t read64(const uint8_t* p) { return (uint64_t(read32(p))<<32)|read32(p+4)
+ void write16(uint8_t* p,uint16_t n) { p[0]=n>>8;p[1]=n; }
+ void write32(uint8_t* p,uint32_t n) { p[0]=n>>24;p[1]=n>>16;p[2]=n>>8;p[3]=n; }
+ void write64(uint8_t* p,uint64_t n) { write32(p,n>>32);write32(p+4,n); }
++// RTP counters wrap. A difference of half the counter range is ambiguous.
++bool forwardTimestamp(uint32_t next,uint32_t previous) { return uint32_t(next-previous)<0x80000000U; }
+ }
+ 
+ void HostBridge::writeOpaqueP25(uint32_t src,uint32_t dst,const uint8_t* imbe,uint8_t index,bool end)
+@@ -34,81 +37,147 @@ void HostBridge::writeOpaqueP25(uint32_t src,uint32_t dst,const uint8_t* imbe,ui
+     packet[57]=m_opaqueRxMFId;
+     write16(packet+58,end?0:11);
+     if (!end) std::memcpy(packet+packetHeader,imbe,11);
++    if (!end) std::memcpy(m_opaqueRxVoiceHeader,packet,packetHeader);
+     sockaddr_storage address;uint32_t addressLength;
+     if (network::udp::Socket::lookup(m_udpSendAddress,m_udpSendPort,address,addressLength)==0)
+         m_udpAudioSocket->write(packet,end?packetHeader:packetHeader+11,address,addressLength);
+ }
+ 
+-void HostBridge::processOpaqueP25Network(uint8_t* buffer,uint32_t length)
++void HostBridge::processOpaqueP25Network(uint8_t* buffer,uint32_t length,network::P25PacketMetadata received)
+ {
+     using namespace p25;
+     using namespace p25::defines;
+     using namespace p25::dfsi::defines;
+-    if (length<24 || m_txMode!=TX_MODE_P25 || m_trafficFromUDP) return;
+-    // Voice LDUs may carry associated group/channel or RFSS status LC. The
+-    // host forwards that opcode in the DVM header (and the following LDU2),
+-    // while their nine voice words still belong to the same group call.
+-    // Match the established non-opaque P25 path's explicit LC allowlist;
+-    // never treat private calls or arbitrary signaling as group audio.
+-    const uint8_t lco=buffer[4];
+-    if (lco!=LCO::GROUP && lco!=LCO::GROUP_UPDT && lco!=LCO::RFSS_STS_BCAST) return;
++    std::lock_guard<std::mutex> lock(m_opaqueRxMutex);
++    if (length<24 || received.streamId==0U || m_txMode!=TX_MODE_P25 || m_trafficFromUDP) return;
+     if (buffer[14]&network::NET_CTRL_U2U) return;
+-    uint32_t src=GET_UINT24(buffer,5);
+-    uint32_t dst=GET_UINT24(buffer,8);
+-    if (!src || src>0xfffffb || dst!=m_dstId || dst>65534) return;
+-    auto duid=static_cast<DUID::E>(buffer[22]);
++    const uint8_t lco=buffer[4],manufacturer=buffer[15];
++    const uint32_t src=GET_UINT24(buffer,5);
++    const uint32_t dst=GET_UINT24(buffer,8);
++    const auto duid=static_cast<DUID::E>(buffer[22]);
++    if (manufacturer>1) return;
++    const bool active=m_opaqueRxLastFrame!=std::chrono::steady_clock::time_point();
++    const auto forward=[](network::P25PacketMetadata next,network::P25PacketMetadata previous) {
++        const uint16_t delta=uint16_t(next.sequence-previous.sequence);
++        return delta!=0U && delta<0x8000U && forwardTimestamp(next.timestamp,previous.timestamp);
++    };
+     if (duid==DUID::TDU || duid==DUID::TDULC) {
+         if (buffer[14]&network::NET_CTRL_GRANT_DEMAND) return;
+-        if (m_opaqueRxSequence) writeOpaqueP25(src,dst,nullptr,0,true);
+-        m_opaqueRxSequence=0;m_opaqueRxAlgorithm=0;m_rxStreamId=0;m_callInProgress=false;
+-        m_networkWatchdog.stop();m_network->resetP25();return;
++        if (duid==DUID::TDULC) {
++            // CALL_TERM has a target, not a source. Its exact received stream
++            // binds it to an existing group receiver, never to a new call.
++            if(lco!=LCO::CALL_TERM || (dst!=m_dstId && dst!=WUID_ALL) || length<24U+P25_TDULC_FRAME_LENGTH_BYTES) return;
++            auto terminal=lc::tdulc::TDULCFactory::createTDULC(buffer+24U);
++            if(!terminal || terminal->getLCO()!=LCO::CALL_TERM || terminal->getDstId()!=dst || terminal->getMFId()!=manufacturer) return;
++        } else if((lco!=LCO::GROUP && lco!=LCO::GROUP_UPDT && lco!=LCO::RFSS_STS_BCAST) || dst!=m_dstId || src==0U) return;
++        if(!active || received.streamId!=m_rxStreamId) {
++            auto previous=m_opaqueRxRetired.find(received.streamId);
++            if(previous!=m_opaqueRxRetired.end() && (src==previous->second.source || (duid==DUID::TDULC && src==0U)) && forwardTimestamp(received.timestamp,previous->second.received.timestamp) && (received.sequence==RTP_END_OF_CALL_SEQ || forward(received,previous->second.received))) {
++                previous->second.received=received;previous->second.terminal=true;
++            }
++            return;
++        }
++        if((src!=m_opaqueRxSource && !(duid==DUID::TDULC && src==0U)) || !forwardTimestamp(received.timestamp,m_opaqueRxReceived.timestamp)) return;
++        if(received.sequence!=RTP_END_OF_CALL_SEQ && !forward(received,m_opaqueRxReceived)) return;
++        m_opaqueRxReceived=received;endOpaqueP25Receive(true);return;
++    }
++
++    if (lco!=LCO::GROUP && lco!=LCO::GROUP_UPDT && lco!=LCO::RFSS_STS_BCAST) return;
++    if (!src || src>0xfffffb || dst!=m_dstId || dst>65534 || (duid!=DUID::LDU1 && duid!=DUID::LDU2) || length<178) return;
++    if (active && received.streamId==m_rxStreamId) {
++        if(src!=m_opaqueRxSource || manufacturer!=m_opaqueRxMFId || !forward(received,m_opaqueRxReceived)) return;
+     }
+-    if ((duid!=DUID::LDU1 && duid!=DUID::LDU2) || length<178) return;
+-    const uint8_t manufacturer=buffer[15]; // DVM/FNE header, not a DFSI voice byte.
+-    if (manufacturer>1) return; // Proprietary LC requires a separately implemented profile.
+-    uint32_t stream=m_network->getP25StreamId();
+-    if (stream==m_rxStreamId && m_callInProgress && manufacturer!=m_opaqueRxMFId) return;
+-    lc::LC control;control.setLCO(LCO::GROUP);control.setSrcId(src);control.setDstId(dst);
+-    control.setMFId(manufacturer);
+-    data::LowSpeedData lsd;
+-    dfsi::LC dfsiLC(control,lsd);
++    auto old=m_opaqueRxRetired.find(received.streamId);
++    if(old!=m_opaqueRxRetired.end() && (old->second.terminal || old->second.source!=src || !forward(received,old->second.received))) return;
++    lc::LC control;control.setLCO(LCO::GROUP);control.setSrcId(src);control.setDstId(dst);control.setMFId(manufacturer);
++    data::LowSpeedData lsd;dfsi::LC dfsiLC(control,lsd);
+     uint8_t words[9][11]{};
+     const uint8_t first=duid==DUID::LDU1?DFSIFrameType::LDU1_VOICE1:DFSIFrameType::LDU2_VOICE10;
+-    for (unsigned i=0;i<9;i++) {
+-        if (length<dfsiOffsets[i]+dfsiLengths[i] || buffer[dfsiOffsets[i]]!=first+i) return;
++    for(unsigned i=0;i<9;i++) {
++        if(length<dfsiOffsets[i]+dfsiLengths[i] || buffer[dfsiOffsets[i]]!=first+i) return;
+         dfsiLC.setFrameType(static_cast<DFSIFrameType::E>(first+i));
+-        if (duid==DUID::LDU1) dfsiLC.decodeLDU1(buffer+dfsiOffsets[i],words[i]);
++        if(duid==DUID::LDU1)dfsiLC.decodeLDU1(buffer+dfsiOffsets[i],words[i]);
+         else dfsiLC.decodeLDU2(buffer+dfsiOffsets[i],words[i]);
+     }
+-    // LDU1 repeats MFID in its LC; LDU2 carries ESS only and retains the
+-    // accepted stream value supplied above. Never replace it with a default.
+-    if (dfsiLC.control()->getMFId()!=manufacturer) return;
+-    // Malformed/mismatched LC must not replace an accepted stream identity.
+-    if (stream!=m_rxStreamId || !m_callInProgress) {
+-        m_opaqueRxSequence=0;m_opaqueRxAlgorithm=0;m_opaqueRxKey=0;
++    if(dfsiLC.control()->getMFId()!=manufacturer) return;
++    if(!active || received.streamId!=m_rxStreamId) {
++        if(active)endOpaqueP25Receive(true);
++        for(auto& previous:m_opaqueRxRetired)if(previous.first!=received.streamId)previous.second.terminal=true;
++    m_opaqueRxSequence=0;m_opaqueRxControlSequence=0;m_opaqueRxAlgorithm=0;m_opaqueRxKey=0;
+         m_opaqueRxMFId=manufacturer;
+         std::memset(m_opaqueRxMI,0,9);std::memset(m_opaqueRxToken,0,16);
+-        uint64_t now=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+-        write64(m_opaqueRxToken,now);write32(m_opaqueRxToken+8,stream);write32(m_opaqueRxToken+12,src);
+-        m_rxStreamId=stream;m_callInProgress=true;
++        const uint64_t now=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        write64(m_opaqueRxToken,now);write32(m_opaqueRxToken+8,received.streamId);write32(m_opaqueRxToken+12,src);
++        m_rxStreamId=received.streamId;m_opaqueRxSource=src;m_callInProgress=true;
+     }
+-    m_networkWatchdog.start();
+-    // HDU metadata contains the current superframe's MI. Late entry without
+-    // this metadata waits for LDU2's next MI rather than guessing clear audio.
+-    if (duid==DUID::LDU1 && length>=193 && buffer[180]==FrameType::HDU_VALID) {
++    m_opaqueRxReceived=received;
++    m_opaqueRxLastFrame=std::chrono::steady_clock::now();
++    m_opaqueRxNextActivity=m_opaqueRxLastFrame+std::chrono::milliseconds(100);
++    if(duid==DUID::LDU1 && length>=193 && buffer[180]==FrameType::HDU_VALID) {
+         m_opaqueRxAlgorithm=buffer[181];m_opaqueRxKey=GET_UINT16(buffer,182);
+         std::memcpy(m_opaqueRxMI,buffer+184,9);
+     }
+     const bool known=(m_opaqueRxAlgorithm==0x80 && m_opaqueRxKey==0) || (supportedSecure(m_opaqueRxAlgorithm) && packetcodec::validMI(m_opaqueRxMI));
+-    if (known) for (unsigned i=0;i<9;i++) writeOpaqueP25(src,dst,words[i],uint8_t(i+(duid==DUID::LDU2?9:0)),false);
+-    // The LDU2 encryption sync applies to the NEXT superframe, never the nine
+-    // encrypted codewords just exported above.
+-    if (duid==DUID::LDU2) {
+-        m_opaqueRxAlgorithm=dfsiLC.control()->getAlgId();m_opaqueRxKey=dfsiLC.control()->getKId();
+-        dfsiLC.control()->getMI(m_opaqueRxMI);
++    if(known)for(unsigned i=0;i<9;i++)writeOpaqueP25(src,dst,words[i],uint8_t(i+(duid==DUID::LDU2?9:0)),false);
++    if(duid==DUID::LDU2) {
++        m_opaqueRxAlgorithm=dfsiLC.control()->getAlgId();m_opaqueRxKey=dfsiLC.control()->getKId();dfsiLC.control()->getMI(m_opaqueRxMI);
+     }
+ }
+ 
++// Activity describes native receive liveness only. It never carries IMBE,
++// increments the voice sequence, or refreshes the last real LDU deadline.
++void HostBridge::clockOpaqueP25Receive(std::chrono::steady_clock::time_point now)
++{
++    std::lock_guard<std::mutex> lock(m_opaqueRxMutex);
++    if (m_opaqueRxLastFrame==std::chrono::steady_clock::time_point()) return;
++    if (m_trafficFromUDP) {endOpaqueP25Receive(true);return;}
++    const auto deadline=m_opaqueRxLastFrame+std::chrono::milliseconds(1500);
++    if (now>=deadline) { endOpaqueP25Receive(false);return; }
++    if (!m_opaqueRxSequence || now<m_opaqueRxNextActivity) return;
++    uint8_t packet[packetHeader]{};
++    std::memcpy(packet,m_opaqueRxVoiceHeader,packetHeader);
++    packet[4]=17;packet[7]=0;
++    write16(packet+10,0);write16(packet+58,0);
++    const auto remaining=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-now).count();
++    if (remaining<=0) { endOpaqueP25Receive(false);return; }
++    write32(packet+20,uint32_t(remaining));
++    write64(packet+24,++m_opaqueRxControlSequence);
++    std::memset(packet+48,0,9);
++    write64(packet+48,m_opaqueRxSequence);
++    sockaddr_storage address;uint32_t addressLength;
++    if (network::udp::Socket::lookup(m_udpSendAddress,m_udpSendPort,address,addressLength)==0)
++        m_udpAudioSocket->write(packet,packetHeader,address,addressLength);
++    m_opaqueRxNextActivity=now+std::chrono::milliseconds(100);
++}
++
++// Callers hold the receive mutex. Terminal packets keep the last exported
++// voice profile, including when LDU2 has already announced the next key/MI.
++void HostBridge::endOpaqueP25Receive(bool terminal)
++{
++    if (m_opaqueRxSequence) {
++        uint8_t packet[packetHeader]{};
++        std::memcpy(packet,m_opaqueRxVoiceHeader,packetHeader);
++        packet[7]=0;write16(packet+10,1);write16(packet+58,0);
++        write64(packet+24,++m_opaqueRxSequence);
++        sockaddr_storage address;uint32_t addressLength;
++        if (network::udp::Socket::lookup(m_udpSendAddress,m_udpSendPort,address,addressLength)==0)
++            m_udpAudioSocket->write(packet,packetHeader,address,addressLength);
++    }
++    if(m_rxStreamId!=0U) {
++        if(m_opaqueRxRetired.find(m_rxStreamId)==m_opaqueRxRetired.end())m_opaqueRxRetiredOrder.push_back(m_rxStreamId);
++        m_opaqueRxRetired[m_rxStreamId]=OpaqueRetiredOwner{m_opaqueRxReceived,m_opaqueRxSource,terminal};
++        if(m_opaqueRxRetiredOrder.size()>64U){m_opaqueRxRetired.erase(m_opaqueRxRetiredOrder.front());m_opaqueRxRetiredOrder.pop_front();}
++        if(m_network!=nullptr)m_network->retireP25Receive(m_rxStreamId);
++    }
++    m_opaqueRxSequence=0;m_opaqueRxControlSequence=0;m_opaqueRxAlgorithm=0;
++    m_opaqueRxLastFrame={};m_opaqueRxNextActivity={};
++    std::memset(m_opaqueRxVoiceHeader,0,packetHeader);
++    m_rxStreamId=0;
++    if (!m_trafficFromUDP) m_callInProgress=false;
++    m_networkWatchdog.stop();
++
++}
++
+ void HostBridge::processOpaqueP25UDP(const uint8_t* packet,uint32_t length)
+ {
+     using namespace p25;
+@@ -127,7 +196,13 @@ void HostBridge::processOpaqueP25UDP(const uint8_t* packet,uint32_t length)
+     if (fresh) {
+         if (index!=0) return;
+         if (m_trafficFromUDP) callEnd(m_udpSrcId,m_dstId);
+-        m_callInProgress=false;m_networkWatchdog.stop();m_rxStreamId=0;m_opaqueRxSequence=0;
++        {
++            std::lock_guard<std::mutex> lock(m_opaqueRxMutex);
++            if(m_opaqueRxLastFrame!=std::chrono::steady_clock::time_point())endOpaqueP25Receive(true);
++            // Publish the direction change before another receiver can enter.
++            m_trafficFromUDP=true;
++        }
++        m_callInProgress=false;m_networkWatchdog.stop();
+         m_p25N=0;m_opaqueTxSequence=0;m_opaqueTxAlgorithm=algorithm;m_opaqueTxKey=key;
+         m_opaqueTxMFId=manufacturer;
+         std::memcpy(m_opaqueTxToken,packet+32,16);
+diff --git a/src/bridge/HostBridge.P25.cpp b/src/bridge/HostBridge.P25.cpp
+index 2fe0274..c821e8c 100644
+--- a/src/bridge/HostBridge.P25.cpp
++++ b/src/bridge/HostBridge.P25.cpp
+@@ -50,10 +50,10 @@ using namespace network::udp;
+ 
+ /* Helper to process P25 network traffic. */
+ 
+-void HostBridge::processP25Network(uint8_t* buffer, uint32_t length)
++void HostBridge::processP25Network(uint8_t* buffer, uint32_t length, network::P25PacketMetadata received)
+ {
+     assert(buffer != nullptr);
+-    if (m_opaqueP25) { processOpaqueP25Network(buffer, length); return; }
++    if (m_opaqueP25) { processOpaqueP25Network(buffer, length, received); return; }
+     using namespace p25;
+     using namespace p25::defines;
+     using namespace p25::dfsi::defines;
+@@ -154,7 +154,7 @@ void HostBridge::processP25Network(uint8_t* buffer, uint32_t length)
+ 
+         // is this a new call stream?
+         uint16_t callKID = 0U;
+-        if (m_network->getP25StreamId() != m_rxStreamId && ((duid != DUID::TDU) && (duid != DUID::TDULC)) && !m_callInProgress) {
++        if (received.streamId != m_rxStreamId && ((duid != DUID::TDU) && (duid != DUID::TDULC)) && !m_callInProgress) {
+             m_callInProgress = true;
+             m_callAlgoId = ALGO_UNENCRYPT;
+ 
+@@ -397,7 +397,7 @@ void HostBridge::processP25Network(uint8_t* buffer, uint32_t length)
+             break;
+         }
+ 
+-        m_rxStreamId = m_network->getP25StreamId();
++        m_rxStreamId = received.streamId;
+     }
+ }
+ 
+diff --git a/src/bridge/HostBridge.cpp b/src/bridge/HostBridge.cpp
+index 22ab786..617f1ce 100644
+--- a/src/bridge/HostBridge.cpp
++++ b/src/bridge/HostBridge.cpp
+@@ -625,7 +625,10 @@ int HostBridge::run()
+             std::lock_guard<std::mutex> lock(HostBridge::s_networkMutex);
+             m_network->clock(ms);
+ 
+-            if (m_callInProgress) {
++            if (m_opaqueP25)
++                clockOpaqueP25Receive(std::chrono::steady_clock::now());
++
++            if (!m_opaqueP25 && m_callInProgress) {
+                 m_networkWatchdog.clock(ms);
+ 
+                 if (m_networkWatchdog.isRunning() && m_networkWatchdog.hasExpired()) {
+@@ -2323,7 +2326,7 @@ void* HostBridge::threadUDPAudioProcess(void* arg)
+ 
+                 if (bridge->m_debug)
+                     LogDebugEx(LOG_HOST, "HostBridge::threadUDPAudioProcess()", "now = %llu, lastUdpFrameTime = %llu, audioDetect = %u, callInProgress = %u, p25N = %u, dmrN = %u, analogN = %u, frameCnt = %u, pktSeq = %u",
+-                        now, lastFrameTime, bridge->m_audioDetect, bridge->m_callInProgress, bridge->m_p25N, bridge->m_dmrN, bridge->m_analogN, bridge->m_udpFrameCnt, pktSeq);
++                        now, lastFrameTime, bridge->m_audioDetect, bridge->m_callInProgress.load(), bridge->m_p25N, bridge->m_dmrN, bridge->m_analogN, bridge->m_udpFrameCnt, pktSeq);
+ 
+                 // validate frame before popping
+                 if (req->pcm == nullptr || req->pcmLength == 0U) {
+@@ -2582,15 +2585,16 @@ void* HostBridge::threadNetworkProcess(void* arg)
+             // is the bridge in P25 mode?
+             if (bridge->m_txMode == TX_MODE_P25) {
+                 UInt8Array p25Buffer = nullptr;
++                network::P25PacketMetadata received;
+ 
+                 // scope is intentional to limit lock duration
+                 {
+                     std::lock_guard<std::mutex> lock(HostBridge::s_networkMutex);
+-                    p25Buffer = bridge->m_network->readP25(netReadRet, length);
++                    p25Buffer = bridge->m_network->readP25(netReadRet, length, &received);
+                 }
+ 
+                 if (netReadRet && p25Buffer != nullptr) {
+-                    bridge->processP25Network(p25Buffer.get(), length);
++                    bridge->processP25Network(p25Buffer.get(), length, received);
+                 }
+             }
+ 
+diff --git a/src/bridge/HostBridge.h b/src/bridge/HostBridge.h
+index 0f99a6f..5a9ca46 100644
+--- a/src/bridge/HostBridge.h
++++ b/src/bridge/HostBridge.h
+@@ -16,6 +16,9 @@
+ #if !defined(__HOST_BRIDGE_H__)
+ #define __HOST_BRIDGE_H__
+ 
++#include <chrono>
++#include <atomic>
++#include <map>
+ #include "Defines.h"
+ #include "common/concurrent/deque.h"
+ #include "common/dmr/data/EmbeddedData.h"
+@@ -227,6 +230,17 @@ private:
+     uint8_t m_opaqueRxAlgorithm = 0, m_opaqueTxAlgorithm = 0;
+     uint8_t m_opaqueRxMFId = 0, m_opaqueTxMFId = 0;
+     uint16_t m_opaqueRxKey = 0, m_opaqueTxKey = 0;
++    std::mutex m_opaqueRxMutex;
++    std::chrono::steady_clock::time_point m_opaqueRxLastFrame{}, m_opaqueRxNextActivity{};
++    uint64_t m_opaqueRxControlSequence = 0;
++    uint8_t m_opaqueRxVoiceHeader[64]{};
++    network::P25PacketMetadata m_opaqueRxReceived{};
++    uint32_t m_opaqueRxSource=0;
++    struct OpaqueRetiredOwner { network::P25PacketMetadata received;uint32_t source;bool terminal; };
++    std::map<uint32_t,OpaqueRetiredOwner> m_opaqueRxRetired;
++    std::deque<uint32_t> m_opaqueRxRetiredOrder;
++
++
+     uint16_t m_udpSendPort;
+     std::string m_udpSendAddress;
+     uint16_t m_udpReceivePort;
+@@ -288,10 +302,10 @@ private:
+     uint32_t m_ctsCorHoldoffMs; // hold-off time before clearing COR after it deasserts
+ 
+     bool m_audioDetect;
+-    bool m_trafficFromUDP;
++    std::atomic<bool> m_trafficFromUDP;
+     uint32_t m_udpSrcId;
+     uint32_t m_udpDstId;
+-    bool m_callInProgress;
++    std::atomic<bool> m_callInProgress;
+     bool m_ignoreCall;
+     uint8_t m_callAlgoId;
+     uint64_t m_rxStartTime;
+@@ -462,7 +476,10 @@ private:
+      */
+     void processUDPAudio();
+     void processOpaqueP25UDP(const uint8_t* packet, uint32_t length);
+-    void processOpaqueP25Network(uint8_t* packet, uint32_t length);
++    void processOpaqueP25Network(uint8_t* packet, uint32_t length, network::P25PacketMetadata received);
++    void clockOpaqueP25Receive(std::chrono::steady_clock::time_point now);
++    void endOpaqueP25Receive(bool terminal = true);
++
+     void writeOpaqueP25(uint32_t src, uint32_t dst, const uint8_t* imbe, uint8_t index, bool end);
+ 
+     /**
+@@ -611,7 +628,7 @@ private:
+      * @param buffer 
+      * @param length 
+      */
+-    void processP25Network(uint8_t* buffer, uint32_t length);
++    void processP25Network(uint8_t* buffer, uint32_t length, network::P25PacketMetadata received);
+     /**
+      * @brief Helper to decode P25 network traffic audio frames.
+      * @param ldu 
+diff --git a/src/common/network/BaseNetwork.cpp b/src/common/network/BaseNetwork.cpp
+index f1426b5..10ca1be 100644
+--- a/src/common/network/BaseNetwork.cpp
++++ b/src/common/network/BaseNetwork.cpp
+@@ -52,7 +52,6 @@ BaseNetwork::BaseNetwork(uint32_t peerId, bool duplex, bool debug, bool slot1, b
+     m_socket(nullptr),
+     m_frameQueue(nullptr),
+     m_rxDMRData(NET_RING_BUF_SIZE, "DMR Net Buffer"),
+-    m_rxP25Data(NET_RING_BUF_SIZE, "P25 Net Buffer"),
+     m_rxP25P2Data(NET_RING_BUF_SIZE, "P25 Phase 2 Net Buffer"),
+     m_rxNXDNData(NET_RING_BUF_SIZE, "NXDN Net Buffer"),
+     m_rxAnalogData(NET_RING_BUF_SIZE, "Analog Net Buffer"),
+@@ -369,7 +368,7 @@ void BaseNetwork::resetP25()
+         LogDebugEx(LOG_NET, "BaseNetwork::resetP25()", "reset P25 stream ID, streamId = %u", m_p25StreamId);
+ 
+     m_pktSeq = 0U;
+-    m_rxP25Data.clear();
++    { std::lock_guard<std::mutex> lock(m_rxP25Mutex);m_rxP25Packets.clear();m_rxP25Bytes=0; }
+ }
+ 
+ /* Resets the P25 Phase 2 ring buffer for the given slot. */
+@@ -565,36 +564,33 @@ bool BaseNetwork::hasDMRData() const
+ 
+ /* Reads P25 raw frame data from the P25 ring buffer. */
+ 
+-UInt8Array BaseNetwork::readP25(bool& ret, uint32_t& frameLength)
++// Keep packet bytes and received ownership together in one bounded queue.
++// The budget charges payload plus entry metadata before allocating a payload.
++bool BaseNetwork::enqueueP25(const uint8_t* packet,uint32_t length,P25PacketMetadata received)
+ {
+-    if (m_status != NET_STAT_RUNNING && m_status != NET_STAT_MST_RUNNING)
+-        return nullptr;
+-
+-    ret = true;
+-    if (m_rxP25Data.isEmpty()) {
+-        ret = false;
+-        return nullptr;
+-    }
+-
+-    uint8_t length = 0U;
+-    m_rxP25Data.get(&length, 1U);
+-    if (length == 0U) {
+-        ret = false;
+-        return nullptr;
+-    }
+-
+-    if (length == 254U) {
+-        m_rxP25Data.get(&length, 1U); // read the next byte for the actual length
+-        length += 254U; // a packet length of 254 is a special case for P25 frames, so we need to add the 254 to the length
+-    }
+-
+-    UInt8Array buffer;
+-    frameLength = length;
+-    buffer = std::unique_ptr<uint8_t[]>(new uint8_t[length]);
+-    ::memset(buffer.get(), 0x00U, length);
+-    m_rxP25Data.get(buffer.get(), length);
++    if (packet==nullptr || length<24U || length>NET_RING_BUF_SIZE-sizeof(P25ReceivedPacket) || received.streamId==0U) return false;
++    const uint32_t charge=length+sizeof(P25ReceivedPacket);
++    std::lock_guard<std::mutex> lock(m_rxP25Mutex);
++    if (charge>NET_RING_BUF_SIZE-m_rxP25Bytes) {
++        // Preserve overflow recovery: discard the queue and incoming packet.
++        m_rxP25Packets.clear();m_rxP25Bytes=0;return false;
++    }
++    P25ReceivedPacket entry;entry.received=received;
++    entry.bytes.assign(packet,packet+length);
++    m_rxP25Packets.push_back(std::move(entry));m_rxP25Bytes+=charge;return true;
++}
+ 
+-    return buffer;
++UInt8Array BaseNetwork::readP25(bool& ret,uint32_t& frameLength,P25PacketMetadata* received)
++{
++    ret=false;frameLength=0U;if(received!=nullptr)*received={};
++    if (m_status!=NET_STAT_RUNNING && m_status!=NET_STAT_MST_RUNNING) return nullptr;
++    std::lock_guard<std::mutex> lock(m_rxP25Mutex);
++    if(m_rxP25Packets.empty()) return nullptr;
++    auto entry=std::move(m_rxP25Packets.front());m_rxP25Packets.pop_front();
++    m_rxP25Bytes-=entry.bytes.size()+sizeof(P25ReceivedPacket);
++    frameLength=entry.bytes.size();if(received!=nullptr)*received=entry.received;
++    UInt8Array buffer(new uint8_t[frameLength]);
++    std::memcpy(buffer.get(),entry.bytes.data(),frameLength);ret=true;return buffer;
+ }
+ 
+ /* Writes P25 LDU1 frame data to the network. */
+@@ -787,10 +783,8 @@ bool BaseNetwork::writeP25P2(const p25::lc::LC& control, p25::defines::P2_DUID::
+ 
+ bool BaseNetwork::hasP25Data() const
+ {
+-    if (m_rxP25Data.isEmpty())
+-        return false;
+-
+-    return true;
++    std::lock_guard<std::mutex> lock(m_rxP25Mutex);
++    return !m_rxP25Packets.empty();
+ }
+ 
+ /* Helper to test if the P25 Phase 2 ring buffer has data. */
+diff --git a/src/common/network/BaseNetwork.h b/src/common/network/BaseNetwork.h
+index 6c54fd6..9e2bbe6 100644
+--- a/src/common/network/BaseNetwork.h
++++ b/src/common/network/BaseNetwork.h
+@@ -39,6 +39,9 @@
+ #include "common/Utils.h"
+ 
+ #include <string>
++#include <deque>
++#include <mutex>
++#include <vector>
+ #include <cstdint>
+ #include <random>
+ #include <unordered_map>
+@@ -77,6 +80,9 @@
+ 
+ namespace network
+ {
++    // Metadata belongs to the received packet, never to the local TX stream.
++    struct P25PacketMetadata { uint32_t streamId=0; uint16_t sequence=0; uint32_t timestamp=0; };
++
+     // ---------------------------------------------------------------------------
+     //  Constants
+     // ---------------------------------------------------------------------------
+@@ -794,7 +800,7 @@ namespace network
+          * @param[out] frameLength Length in bytes of received frame.
+          * @returns UInt8Array Buffer containing received frame.
+          */
+-        virtual UInt8Array readP25(bool& ret, uint32_t& frameLength);
++        virtual UInt8Array readP25(bool& ret, uint32_t& frameLength, P25PacketMetadata* received = nullptr);
+         /**
+          * @brief Writes P25 LDU1 frame data to the network.
+          * @param[in] control Instance of p25::lc::LC containing link control data.
+@@ -979,7 +985,11 @@ namespace network
+         FrameQueue* m_frameQueue;
+ 
+         RingBuffer<uint8_t> m_rxDMRData;
+-        RingBuffer<uint8_t> m_rxP25Data;
++        struct P25ReceivedPacket { std::vector<uint8_t> bytes; P25PacketMetadata received; };
++        mutable std::mutex m_rxP25Mutex;
++        std::deque<P25ReceivedPacket> m_rxP25Packets;
++        uint32_t m_rxP25Bytes=0;
++        bool enqueueP25(const uint8_t* packet,uint32_t length,P25PacketMetadata received);
+         RingBuffer<uint8_t> m_rxP25P2Data;
+         RingBuffer<uint8_t> m_rxNXDNData;
+         RingBuffer<uint8_t> m_rxAnalogData;
+diff --git a/src/common/network/Network.cpp b/src/common/network/Network.cpp
+index ce4df7a..709235b 100644
+--- a/src/common/network/Network.cpp
++++ b/src/common/network/Network.cpp
+@@ -145,6 +145,12 @@ void Network::resetP25()
+         LogDebugEx(LOG_NET, "Network::resetP25()", "reset P25 rx stream ID");
+ }
+ 
++// Retire only this RX filter. Do not reset TX state or queued replacements.
++void Network::retireP25Receive(uint32_t receivedStreamId)
++{
++    if(receivedStreamId!=0U) m_rxP25StreamId.compare_exchange_strong(receivedStreamId,0U);
++}
++
+ /* Resets the P25 Phase 2 ring buffer for the given slot. */
+ 
+ void Network::resetP25P2(uint32_t slotNo)
+@@ -511,21 +517,8 @@ void Network::clock(uint32_t ms)
+ 
+                             if (m_packetDump)
+                                 Utils::dump(1U, "Network::clock(), Network Rx, P25", buffer.get(), length);
+-                            if (length > 512)
+-                                LogError(LOG_NET, "P25 Stream %u, frame oversized? this shouldn't happen, pktSeq = %u, len = %u", streamId, m_pktSeq, length);
+-
+-                            // P25 frames can be up to 512 bytes, but we need to handle the case where the frame is larger than 255 bytes
+-                            uint8_t len = length;
+-                            if (length > 254) {
+-                                len = 254U;
+-                                m_rxP25Data.addData(&len, 1U);
+-                                len = length - 254U;
+-                                m_rxP25Data.addData(&len, 1U);
+-                            } else {
+-                                m_rxP25Data.addData(&len, 1U);
+-                            }
+-
+-                            m_rxP25Data.addData(buffer.get(), len);
++                            if (!enqueueP25(buffer.get(),uint32_t(length),P25PacketMetadata{streamId,rtpHeader.getSequence(),rtpHeader.getTimestamp()}))
++                                LogWarning(LOG_NET, "P25 stream %u receive queue rejected packet, pktSeq = %u, len = %u", streamId, m_pktSeq, length);
+                         }
+                     }
+                     break;
+diff --git a/src/common/network/Network.h b/src/common/network/Network.h
+index fc5ced0..715bb01 100644
+--- a/src/common/network/Network.h
++++ b/src/common/network/Network.h
+@@ -16,6 +16,7 @@
+ #if !defined(__NETWORK_H__)
+ #define __NETWORK_H__
+ 
++#include <atomic>
+ #include "common/Defines.h"
+ #include "common/network/BaseNetwork.h"
+ #include "common/network/RTPHeader.h"
+@@ -167,6 +168,7 @@ namespace network
+          * @brief Resets the P25 ring buffer.
+          */
+         void resetP25() override;
++        void retireP25Receive(uint32_t receivedStreamId);
+         /**
+          * @brief Resets the P25 Phase 2 ring buffer.
+          */
+@@ -334,7 +336,7 @@ namespace network
+         uint32_t m_pingsReceived;
+ 
+         uint32_t* m_rxDMRStreamId;
+-        uint32_t m_rxP25StreamId;
++        std::atomic<uint32_t> m_rxP25StreamId;
+         uint32_t* m_rxP25P2StreamId;
+         uint32_t m_rxNXDNStreamId;
+         uint32_t m_rxAnalogStreamId;
+diff --git a/tests/BridgeOpaqueContinuity_Tests.cpp b/tests/BridgeOpaqueContinuity_Tests.cpp
+index 9257492..ee27571 100644
+--- a/tests/BridgeOpaqueContinuity_Tests.cpp
++++ b/tests/BridgeOpaqueContinuity_Tests.cpp
+@@ -67,9 +67,12 @@ public:
+ struct Fixture {
+     std::string conf="offline";TestPeer peer;CapturingSocket output;HostBridge bridge{conf};
+     Fixture(){bridge.m_network=&peer;bridge.m_udpAudioSocket=&output;}
++    uint16_t packetSequence=0;uint32_t packetTime=0;
++    void deliver(uint8_t* p,uint32_t n) {packetTime+=1440;bridge.processOpaqueP25Network(p,n,network::P25PacketMetadata{0x12345678,packetSequence++,packetTime});}
++
+     void send(uint8_t lco,DUID::E duid,unsigned marker,bool header=true,uint8_t mfid=0,uint8_t algorithm=0x80,uint16_t key=0) {
+         uint32_t n=0;auto p=peer.packet(n,lco,duid,marker,header,mfid,algorithm,key);
+-        REQUIRE(p[4]==lco);REQUIRE(p[22]==duid);bridge.processOpaqueP25Network(p.get(),n);
++        REQUIRE(p[4]==lco);REQUIRE(p[22]==duid);deliver(p.get(),n);
+     }
+     void assertWords(unsigned offset,unsigned marker,unsigned firstIndex=0,uint8_t algorithm=0x80,uint16_t key=0,uint8_t manufacturer=0) {
+         REQUIRE(output.packets.size()>=offset+9);
+@@ -117,7 +120,7 @@ TEST_CASE("Opaque audio ingress retains identity profile and malformed-frame rej
+     const auto reject=[&](std::function<void(uint8_t*,uint32_t&)> alter) {
+         uint32_t n=0;auto p=f.peer.packet(n,LCO::GROUP_UPDT,DUID::LDU1,2);alter(p.get(),n);
+         auto token=f.output.packets.front();auto size=f.output.packets.size();
+-        f.bridge.processOpaqueP25Network(p.get(),n);REQUIRE(f.output.packets.size()==size);
++        f.deliver(p.get(),n);REQUIRE(f.output.packets.size()==size);
+         REQUIRE(f.bridge.m_rxStreamId==0x12345678);REQUIRE(f.bridge.m_callInProgress);
+         REQUIRE(std::memcmp(f.bridge.m_opaqueRxToken,token.data()+32,16)==0);
+     };
+@@ -149,7 +152,7 @@ TEST_CASE("Update LC retains opaque encryption and late-entry fail-closed behavi
+     }
+     SECTION("invalid encrypted MI is not reinterpreted as clear") {
+         Fixture f;uint32_t n=0;auto p=f.peer.packet(n,LCO::GROUP_UPDT,DUID::LDU1,1,true,0,0x84,7);
+-        std::memset(p.get()+184,0,9);f.bridge.processOpaqueP25Network(p.get(),n);REQUIRE(f.output.packets.empty());
++        std::memset(p.get()+184,0,9);f.deliver(p.get(),n);REQUIRE(f.output.packets.empty());
+     }
+ }
+ 
+diff --git a/tests/BridgeOpaqueLiveness_Tests.cpp b/tests/BridgeOpaqueLiveness_Tests.cpp
+new file mode 100644
+index 0000000..d64e11b
+--- /dev/null
++++ b/tests/BridgeOpaqueLiveness_Tests.cpp
+@@ -0,0 +1,340 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Offline actual-method checks; the included fixture replaces device/thread
++// construction and captures UDP output. No modem, network peer or RF is used.
++#if defined(DVM_BRIDGE_OPAQUE_LIVENESS_STANDALONE)
++#define DVM_BRIDGE_OPAQUE_CONTINUITY_STANDALONE
++#include "BridgeOpaqueContinuity_Tests.cpp"
++
++namespace {
++class ChangingPeer : public TestPeer {
++public:
++    void stream(uint32_t value) { m_p25StreamId=value; }
++};
++struct LiveFixture {
++    std::string conf="offline-liveness";
++    ChangingPeer peer;
++    CapturingSocket output;
++    HostBridge bridge{conf};
++    LiveFixture() { bridge.m_network=&peer;bridge.m_udpAudioSocket=&output; }
++    uint32_t receivedStream=0x12345678,packetTime=0;uint16_t packetSequence=0;
++    network::P25PacketMetadata metadata(){packetTime+=1440;return {receivedStream,packetSequence++,packetTime};}
++    void stream(uint32_t value){receivedStream=value;packetSequence=0;}
++    void send(DUID::E duid,unsigned marker,uint8_t algorithm=0x80,uint16_t key=0) {
++        uint32_t n=0;auto p=peer.packet(n,LCO::GROUP,duid,marker,true,0,algorithm,key);
++        bridge.processOpaqueP25Network(p.get(),n,metadata());
++    }
++};
++}
++
++TEST_CASE("A replacement native stream terminates its previous opaque owner", "[opaque-receive-transition]") {
++    LiveFixture f;f.send(DUID::LDU1,1);
++    REQUIRE(f.output.packets.size()==9);
++    auto old=f.output.packets.front();
++    f.stream(0x87654321);
++    f.send(DUID::LDU1,2);
++    REQUIRE(f.output.packets.size()==19);
++    const auto& end=f.output.packets[9];
++    REQUIRE(end.size()==64);REQUIRE(read16(end.data()+10)==1);
++    REQUIRE(read64(end.data()+24)==10);
++    REQUIRE(std::memcmp(end.data()+32,old.data()+32,16)==0);
++    const auto& voice=f.output.packets[10];
++    REQUIRE(voice.size()==75);REQUIRE(read64(voice.data()+24)==1);
++    REQUIRE(std::memcmp(voice.data()+32,old.data()+32,16)!=0);
++}
++
++TEST_CASE("A terminator from a different source cannot retire the opaque receiver", "[opaque-receive-transition]") {
++    LiveFixture f;f.send(DUID::LDU1,1);
++    uint32_t n=0;auto p=f.peer.packet(n,LCO::GROUP,DUID::TDU,2);
++    p[5]=0;p[6]=0x27;p[7]=0x12; // A different valid source:10002.
++    f.bridge.processOpaqueP25Network(p.get(),n,f.metadata());
++    REQUIRE(f.output.packets.size()==9);
++    REQUIRE(f.bridge.m_callInProgress);
++    f.send(DUID::TDU,3);
++    REQUIRE(f.output.packets.size()==10);
++    REQUIRE(read16(f.output.packets.back().data()+10)==1);
++}
++
++TEST_CASE("Receive RTP counters wrap without accepting old or ambiguous packets", "[opaque-receive-transition]") {
++    LiveFixture f;
++    uint32_t n=0;auto packet=f.peer.packet(n,LCO::GROUP,DUID::LDU1,1);
++    f.bridge.processOpaqueP25Network(packet.get(),n,{101U,65534U,0xfffffff0U});
++    REQUIRE(f.output.packets.size()==9);
++    f.bridge.processOpaqueP25Network(packet.get(),n,{101U,0U,0x00000590U});
++    REQUIRE(f.output.packets.size()==18);
++    auto last=f.bridge.m_opaqueRxLastFrame;
++    for(auto stale:{network::P25PacketMetadata{101U,65534U,0xfffffff0U},
++                    network::P25PacketMetadata{101U,0x8000U,0x00000b30U},
++                    network::P25PacketMetadata{101U,1U,0x80000590U}}) {
++        f.bridge.processOpaqueP25Network(packet.get(),n,stale);
++        REQUIRE(f.output.packets.size()==18);
++        REQUIRE(f.bridge.m_opaqueRxLastFrame==last);
++    }
++    f.bridge.processOpaqueP25Network(packet.get(),n,{101U,1U,0x00000b30U});
++    REQUIRE(f.output.packets.size()==27);
++}
++
++#if !defined(DVM_OPAQUE_LIVENESS_NEGATIVE_ONLY)
++#include "OpaqueWireFixture.h"
++#include <fstream>
++#include <cstdlib>
++#include "common/p25/lc/tdulc/LC_CALL_TERM.h"
++namespace {
++class OpaqueWirePeer : public network::PeerNetwork {
++public:
++    OpaqueWireSocket* wire;
++    OpaqueWirePeer(uint32_t peer=12345U,bool promiscuous=false):PeerNetwork("127.0.0.1",49991U,0U,peer,"offline-private-wire",true,false,false,true,false,false,false,false,false,false,false,false) {
++        delete m_frameQueue;delete m_socket;
++        wire=new OpaqueWireSocket();m_socket=wire;
++        m_frameQueue=new network::FrameQueue(wire,peer,false);
++        network::udp::Socket::lookup("127.0.0.1",49991U,m_addr,m_addrLen);
++        wire->source=m_addr;wire->sourceLength=m_addrLen;
++        m_status=network::NET_STAT_RUNNING;m_enabled=true;m_promiscuousPeer=promiscuous;
++    }
++    void ingest(const std::vector<uint8_t>& packet){wire->incoming.push_back(packet);clock(0U);}
++    std::vector<uint8_t> frame(const uint8_t* body,uint32_t length,uint32_t stream,uint16_t sequence) {
++        OpaqueWireSocket output;network::FrameQueue sender(&output,m_peerId,false);
++        REQUIRE(sender.write(body,length,stream,m_peerId,m_peerId,{network::NET_FUNC::PROTOCOL,network::NET_SUBFUNC::PROTOCOL_SUBFUNC_P25},sequence,m_addr,m_addrLen));
++        return output.outgoing.back();
++    }
++    // A mutation of a captured terminal must retain that sender's RTP clock.
++    // A new FrameQueue cannot infer the clock after the original End erased it.
++    std::vector<uint8_t> frameAtTimestamp(const uint8_t* body,uint32_t length,uint32_t stream,uint16_t sequence,uint32_t timestamp) {
++        auto packet=frame(body,length,stream,sequence);
++        network::frame::RTPHeader header;
++        REQUIRE(header.decode(packet.data()));
++        header.setTimestamp(timestamp);header.encode(packet.data());
++        network::frame::RTPHeader check;REQUIRE(check.decode(packet.data()));
++        REQUIRE(check.getTimestamp()==timestamp);
++        return packet;
++    }
++};
++struct WireReceiveFixture {
++    std::string conf="offline-wire-owner";TestPeer builder;OpaqueWirePeer peer;
++    CapturingSocket output;HostBridge bridge{conf};
++    std::vector<uint8_t> terminalBody,terminalDatagram;
++    network::P25PacketMetadata terminalMetadata;
++    bool sawTerminal=false;
++    WireReceiveFixture(uint32_t id=12345U,bool promiscuous=false):peer(id,promiscuous){bridge.m_network=&peer;bridge.m_udpAudioSocket=&output;}
++    std::vector<uint8_t> voice(uint32_t stream,uint16_t sequence,unsigned marker=1) {
++        uint32_t n=0;auto packet=builder.packet(n,LCO::GROUP,DUID::LDU1,marker);
++        return peer.frame(packet.get(),n,stream,sequence);
++    }
++    std::vector<uint8_t> terminal(uint32_t stream) {
++        uint32_t n=0;auto packet=builder.packet(n,LCO::GROUP,DUID::TDU,1);
++        return peer.frame(packet.get(),n,stream,RTP_END_OF_CALL_SEQ);
++    }
++    bool drainOne() {
++        bool available=false;uint32_t length=0;network::P25PacketMetadata metadata;
++        auto packet=peer.readP25(available,length,&metadata);
++        if(!available)return false;
++        REQUIRE(packet!=nullptr);REQUIRE(metadata.streamId!=0U);
++        if(length>=24U && packet[22]==DUID::TDULC){terminalBody.assign(packet.get(),packet.get()+length);terminalMetadata=metadata;sawTerminal=true;}
++        bridge.processOpaqueP25Network(packet.get(),length,metadata);return true;
++    }
++    void receive(const std::vector<uint8_t>& packet){sawTerminal=false;peer.ingest(packet);while(drainOne()){}if(sawTerminal)terminalDatagram=packet;}
++};
++}
++
++TEST_CASE("Real FNE ingress preserves each packet owner across queued replacement and late End", "[opaque-receive-ingress]") {
++    WireReceiveFixture f;
++    // Queue all packets before reading. Ending A must not clear queued B or
++    // use a global current/TX stream value for any of the queued packets.
++    f.peer.ingest(f.voice(101,0));f.peer.ingest(f.terminal(101));f.peer.ingest(f.voice(202,0,2));
++    REQUIRE(f.drainOne());auto tokenA=f.output.packets.front();
++    REQUIRE(f.drainOne());REQUIRE(f.output.packets.size()==10);
++    REQUIRE(f.drainOne());REQUIRE(f.output.packets.size()==19);
++    auto tokenB=f.output.packets.back();REQUIRE(std::memcmp(tokenA.data()+32,tokenB.data()+32,16)!=0);
++    f.receive(f.terminal(101));REQUIRE(f.output.packets.size()==19);REQUIRE(f.bridge.m_rxStreamId==202);
++    f.receive(f.terminal(202));REQUIRE(f.output.packets.size()==20);
++}
++
++TEST_CASE("Watchdog recovery allows forward real voice only before a replacement owner", "[opaque-receive-ingress]") {
++    for(bool replace:{false,true}) {
++        WireReceiveFixture f(12345U,true);f.receive(f.voice(101,0));
++        auto old=f.output.packets.front();auto last=f.bridge.m_opaqueRxLastFrame;
++        f.bridge.clockOpaqueP25Receive(last+std::chrono::milliseconds(1500));
++        REQUIRE(f.output.packets.size()==10);REQUIRE(read16(f.output.packets.back().data()+10)==1);
++        if(replace) {
++            f.receive(f.voice(202,0,2));REQUIRE(f.output.packets.size()==19);
++            auto current=f.output.packets.back();
++            f.receive(f.voice(101,5,3));f.receive(f.terminal(101));
++            REQUIRE(f.output.packets.size()==19);REQUIRE(f.bridge.m_rxStreamId==202);
++            REQUIRE(std::memcmp(current.data()+32,f.output.packets.back().data()+32,16)==0);
++        } else {
++            f.receive(f.voice(101,1,2));REQUIRE(f.output.packets.size()==19);
++            REQUIRE(read64(f.output.packets[10].data()+24)==1);
++            REQUIRE(std::memcmp(old.data()+32,f.output.packets[10].data()+32,16)!=0);
++        }
++    }
++}
++
++TEST_CASE("One typed P25 queue retains complete large packets and rejects bounded overflow", "[opaque-receive-ingress]") {
++    OpaqueWireNetwork network(12345U,true);
++    for(uint32_t length:{193U,255U,512U,544U}) {
++        std::vector<uint8_t> body(length);for(uint32_t i=0;i<length;i++)body[i]=uint8_t(i*17U+3U);
++        auto wire=network.frame(body.data(),length,1000U+length,0);
++        network.ingest(wire);bool available=false;uint32_t size=0;network::P25PacketMetadata received;
++        auto packet=network.readP25(available,size,&received);
++        REQUIRE(available);REQUIRE(size==length);REQUIRE(received.streamId==1000U+length);
++        REQUIRE(std::equal(body.begin(),body.end(),packet.get()));
++    }
++    std::vector<uint8_t> oversized(4099,7);
++    network.ingest(network.frame(oversized.data(),oversized.size(),5000,0));
++    REQUIRE_FALSE(network.hasP25Data());REQUIRE(network.chargedBytes()==0);
++    std::vector<uint8_t> body(193,8);
++    bool overflow=false;
++    for(unsigned i=0;i<100;i++) {
++        network.ingest(network.frame(body.data(),body.size(),6000,uint16_t(i)));
++        REQUIRE(network.chargedBytes()<=4098U);
++        if(!network.hasP25Data()){overflow=true;break;}
++    }
++    REQUIRE(overflow);REQUIRE(network.chargedBytes()==0);
++}
++
++#if defined(DVM_OPAQUE_PRODUCER_CHAIN)
++TEST_CASE("Actual RF control writer source-zero group CALL TERM ends its exact opaque owner", "[opaque-receive-producer]") {
++    auto datagrams=opaqueActualProducerDatagrams();REQUIRE_FALSE(datagrams.empty());
++    if(const char* path=std::getenv("P25_OPAQUE_PRODUCER_CAPTURE")) {
++        std::ofstream capture(path,std::ios::binary);REQUIRE(capture.good());
++        uint8_t word[4];write32(word,datagrams.size());capture.write(reinterpret_cast<const char*>(word),4);
++        for(const auto& packet:datagrams){write32(word,packet.size());capture.write(reinterpret_cast<const char*>(word),4);capture.write(reinterpret_cast<const char*>(packet.data()),packet.size());}
++        REQUIRE(capture.good());
++    }
++
++    WireReceiveFixture f(100101001U);f.bridge.m_dstId=101;
++    for(const auto& packet:datagrams)f.receive(packet);
++    REQUIRE(f.output.packets.size()==10);
++    const auto& end=f.output.packets.back();REQUIRE(end[4]==16);REQUIRE(read16(end.data()+10)==1);
++    REQUIRE(read32(end.data()+12)==1001);REQUIRE(read32(end.data()+16)==101);
++    REQUIRE(read64(end.data()+24)==10);
++    REQUIRE(std::memcmp(end.data()+32,f.output.packets.front().data()+32,16)==0);
++    REQUIRE_FALSE(f.bridge.m_callInProgress);
++}
++
++TEST_CASE("Actual group terminal rejects wrong owner target private orphan and malformed forms", "[opaque-receive-producer]") {
++    auto datagrams=opaqueActualProducerDatagrams();WireReceiveFixture completed(100101001U);completed.bridge.m_dstId=101;
++    for(const auto& packet:datagrams)completed.receive(packet);
++    REQUIRE_FALSE(completed.terminalBody.empty());REQUIRE_FALSE(completed.terminalDatagram.empty());
++    for(unsigned variant=0;variant<7;variant++) {
++        WireReceiveFixture f(100101001U);f.bridge.m_dstId=101;
++        for(const auto& packet:datagrams)if(packet!=completed.terminalDatagram)f.receive(packet);
++        REQUIRE(f.output.packets.size()==9);auto body=completed.terminalBody;uint32_t stream=completed.terminalMetadata.streamId;
++        if(variant==0)stream^=0x10000000U;
++        if(variant==1){lc::tdulc::LC_CALL_TERM term;REQUIRE(term.decode(body.data()+24));term.setDstId(102);term.encode(body.data()+24);SET_UINT24(102U,body.data(),8U);}
++        if(variant==2)body[14]|=network::NET_CTRL_U2U;
++        if(variant==3)body[4]=LCO::PRIVATE;
++        if(variant==4)std::fill(body.begin()+24,body.end(),0);
++        if(variant==5)body[15]=2;
++        if(variant==6){SET_UINT24(1002U,body.data(),5U);}
++        f.receive(f.peer.frameAtTimestamp(body.data(),body.size(),stream,RTP_END_OF_CALL_SEQ,completed.terminalMetadata.timestamp));
++        if(f.sawTerminal)REQUIRE(f.terminalMetadata.timestamp==completed.terminalMetadata.timestamp);
++        REQUIRE(f.output.packets.size()==9);REQUIRE(f.bridge.m_callInProgress);
++    }
++    WireReceiveFixture orphan(100101001U);orphan.bridge.m_dstId=101;orphan.receive(completed.terminalDatagram);
++    REQUIRE(orphan.output.packets.empty());REQUIRE_FALSE(orphan.bridge.m_callInProgress);
++    WireReceiveFixture broadcast(100101001U);broadcast.bridge.m_dstId=101;
++    for(const auto& packet:datagrams)if(packet!=completed.terminalDatagram)broadcast.receive(packet);
++    auto body=completed.terminalBody;lc::tdulc::LC_CALL_TERM term;REQUIRE(term.decode(body.data()+24));term.setDstId(WUID_ALL);term.encode(body.data()+24);SET_UINT24(WUID_ALL,body.data(),8U);
++    broadcast.receive(broadcast.peer.frameAtTimestamp(body.data(),body.size(),completed.terminalMetadata.streamId,RTP_END_OF_CALL_SEQ,completed.terminalMetadata.timestamp));
++    REQUIRE(broadcast.sawTerminal);REQUIRE(broadcast.terminalMetadata.timestamp==completed.terminalMetadata.timestamp);
++    REQUIRE(broadcast.output.packets.size()==10);REQUIRE(read32(broadcast.output.packets.back().data()+16)==101);
++}
++
++TEST_CASE("Real ingress rejects a wrong terminal clock and accepts forward wrap", "[opaque-receive-ingress]") {
++    for(uint32_t first:{0x100U,0x90000000U,0xffffff00U}) {
++        WireReceiveFixture f;uint32_t length=0;
++        auto voice=f.builder.packet(length,LCO::GROUP,DUID::LDU1,1);
++        f.receive(f.peer.frameAtTimestamp(voice.get(),length,701U,0U,first));
++        REQUIRE(f.output.packets.size()==9);REQUIRE(f.bridge.m_opaqueRxReceived.timestamp==first);
++        auto end=f.builder.packet(length,LCO::GROUP,DUID::TDU,1);
++        const auto last=f.bridge.m_opaqueRxLastFrame;
++        for(uint32_t wrong:{uint32_t(first-1U),uint32_t(first+0x80000000U)}) {
++            f.receive(f.peer.frameAtTimestamp(end.get(),length,701U,RTP_END_OF_CALL_SEQ,wrong));
++            REQUIRE(f.output.packets.size()==9);REQUIRE(f.bridge.m_callInProgress);
++            REQUIRE(f.bridge.m_opaqueRxReceived.timestamp==first);REQUIRE(f.bridge.m_opaqueRxLastFrame==last);
++        }
++        f.receive(f.peer.frameAtTimestamp(end.get(),length,701U,RTP_END_OF_CALL_SEQ,uint32_t(first+0x200U)));
++        REQUIRE(f.output.packets.size()==10);REQUIRE_FALSE(f.bridge.m_callInProgress);
++    }
++}
++
++TEST_CASE("A delayed real producer terminal cannot end its same-source replacement", "[opaque-receive-producer]") {
++    auto a=opaqueActualProducerDatagrams(),b=opaqueActualProducerDatagrams();
++    WireReceiveFixture inspectedA(100101001U),inspectedB(100101001U);inspectedA.bridge.m_dstId=101;inspectedB.bridge.m_dstId=101;
++    for(const auto& packet:a)inspectedA.receive(packet);for(const auto& packet:b)inspectedB.receive(packet);
++    REQUIRE(inspectedA.terminalMetadata.streamId!=inspectedB.terminalMetadata.streamId);
++    WireReceiveFixture current(100101001U);current.bridge.m_dstId=101;
++    for(const auto& packet:a)if(packet!=inspectedA.terminalDatagram)current.receive(packet);
++    auto last=current.bridge.m_opaqueRxLastFrame;current.bridge.clockOpaqueP25Receive(last+std::chrono::milliseconds(1500));
++    REQUIRE(current.output.packets.size()==10);
++    for(const auto& packet:b)if(packet!=inspectedB.terminalDatagram)current.receive(packet);
++    REQUIRE(current.output.packets.size()==19);
++    current.receive(inspectedA.terminalDatagram);REQUIRE(current.output.packets.size()==19);REQUIRE(current.bridge.m_callInProgress);
++    current.receive(inspectedB.terminalDatagram);REQUIRE(current.output.packets.size()==20);REQUIRE_FALSE(current.bridge.m_callInProgress);
++}
++#endif
++
++TEST_CASE("Receive activity is bounded metadata and never consumes a voice sequence", "[opaque-receive-liveness]") {
++    LiveFixture f;f.send(DUID::LDU1,1);
++    const auto first=f.output.packets.front();
++    auto at=f.bridge.m_opaqueRxLastFrame;
++    f.bridge.clockOpaqueP25Receive(at+std::chrono::milliseconds(99));
++    REQUIRE(f.output.packets.size()==9);
++    for(unsigned i=1;i<=2;i++) {
++        f.bridge.clockOpaqueP25Receive(at+std::chrono::milliseconds(100*i));
++        const auto& p=f.output.packets.back();
++        REQUIRE(p.size()==64);REQUIRE(p[4]==17);REQUIRE(p[7]==0);
++        REQUIRE(read16(p.data()+10)==0);REQUIRE(read16(p.data()+58)==0);
++        REQUIRE(read32(p.data()+20)==1500-100*i);
++        REQUIRE(read64(p.data()+24)==i);REQUIRE(read64(p.data()+48)==9);
++        REQUIRE(std::memcmp(p.data()+32,first.data()+32,16)==0);
++    }
++    f.send(DUID::LDU2,2);
++    REQUIRE(f.output.packets.size()==20);
++    for(unsigned i=0;i<9;i++) {
++        const auto& p=f.output.packets[11+i];
++        REQUIRE(p.size()==75);REQUIRE(read64(p.data()+24)==10+i);
++        auto expected=TestPeer::expected(2,i);
++        REQUIRE(std::equal(expected.begin(),expected.end(),p.begin()+64));
++    }
++    auto last=f.bridge.m_opaqueRxLastFrame;
++    f.bridge.clockOpaqueP25Receive(last+std::chrono::milliseconds(1400));
++    REQUIRE(read32(f.output.packets.back().data()+20)==100);
++    f.bridge.clockOpaqueP25Receive(last+std::chrono::milliseconds(1500));
++    const auto& end=f.output.packets.back();
++    REQUIRE(end.size()==64);REQUIRE(end[4]==16);REQUIRE(read16(end.data()+10)==1);
++    REQUIRE(read64(end.data()+24)==19);
++    REQUIRE_FALSE(f.bridge.m_callInProgress);
++    const auto size=f.output.packets.size();
++    f.bridge.clockOpaqueP25Receive(last+std::chrono::milliseconds(5000));
++    REQUIRE(f.output.packets.size()==size);
++}
++
++TEST_CASE("Activity and watchdog End retain the last exported secure profile", "[opaque-receive-liveness]") {
++    LiveFixture f;f.send(DUID::LDU1,1,0x84,7);
++    f.send(DUID::LDU2,2,0x81,8); // ESS describes the next superframe.
++    REQUIRE(f.output.packets.size()==18);
++    REQUIRE(f.bridge.m_opaqueRxAlgorithm==0x81);
++    auto last=f.bridge.m_opaqueRxLastFrame;
++    f.bridge.clockOpaqueP25Receive(last+std::chrono::milliseconds(100));
++    const auto& activity=f.output.packets.back();
++    REQUIRE(activity[4]==17);REQUIRE(activity[6]==0x84);REQUIRE(read16(activity.data()+8)==7);
++    REQUIRE(read64(activity.data()+48)==18);
++    f.bridge.clockOpaqueP25Receive(last+std::chrono::milliseconds(1500));
++    const auto& end=f.output.packets.back();
++    REQUIRE(end[6]==0x84);REQUIRE(read16(end.data()+8)==7);
++    REQUIRE(read16(end.data()+10)==1);REQUIRE(read64(end.data()+24)==19);
++}
++
++TEST_CASE("Unknown late-entry media cannot create receive activity", "[opaque-receive-liveness]") {
++    LiveFixture f;uint32_t n=0;auto p=f.peer.packet(n,LCO::GROUP,DUID::LDU1,1,false);
++    f.bridge.processOpaqueP25Network(p.get(),n,f.metadata());
++    REQUIRE(f.output.packets.empty());
++    auto last=f.bridge.m_opaqueRxLastFrame;
++    f.bridge.clockOpaqueP25Receive(last+std::chrono::milliseconds(100));
++    REQUIRE(f.output.packets.empty());
++    f.bridge.clockOpaqueP25Receive(last+std::chrono::milliseconds(1500));
++    REQUIRE(f.output.packets.empty());REQUIRE_FALSE(f.bridge.m_callInProgress);
++}
++#endif
++#endif
+diff --git a/tests/OpaqueWireFixture.h b/tests/OpaqueWireFixture.h
+new file mode 100644
+index 0000000..a42d932
+--- /dev/null
++++ b/tests/OpaqueWireFixture.h
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Offline socket boundary. Framing, CRC parsing, peer filtering and P25
++// packet queue methods remain production code; no socket is opened.
++#pragma once
++#include "common/network/Network.h"
++#include "common/network/FrameQueue.h"
++#include <algorithm>
++#include <cstring>
++#include <deque>
++#include <stdexcept>
++#include <vector>
++
++class OpaqueWireSocket : public network::udp::Socket {
++public:
++    std::deque<std::vector<uint8_t>> incoming;
++    std::vector<std::vector<uint8_t>> outgoing;
++    sockaddr_storage source{};
++    uint32_t sourceLength=0;
++    OpaqueWireSocket():Socket(0U){}
++    ssize_t read(uint8_t* out,uint32_t size,sockaddr_storage& address,uint32_t& length) noexcept override {
++        if(incoming.empty())return 0;
++        auto packet=std::move(incoming.front());incoming.pop_front();
++        if(packet.size()>size)return -1;
++        address=source;length=sourceLength;std::memcpy(out,packet.data(),packet.size());return packet.size();
++    }
++    bool write(const uint8_t* packet,uint32_t length,const sockaddr_storage&,uint32_t,ssize_t* written=nullptr) noexcept override {
++        outgoing.emplace_back(packet,packet+length);if(written!=nullptr)*written=length;return true;
++    }
++};
++
++class OpaqueWireNetwork : public network::Network {
++public:
++    OpaqueWireSocket* wire;
++    OpaqueWireNetwork(uint32_t peer=12345U,bool promiscuous=false):Network("127.0.0.1",49991U,0U,peer,"offline-private-wire",true,false,false,true,false,false,false,false,false,false,false,false) {
++        delete m_frameQueue;delete m_socket;
++        wire=new OpaqueWireSocket();m_socket=wire;
++        m_frameQueue=new network::FrameQueue(wire,peer,false);
++        network::udp::Socket::lookup("127.0.0.1",49991U,m_addr,m_addrLen);
++        wire->source=m_addr;wire->sourceLength=m_addrLen;
++        m_status=network::NET_STAT_RUNNING;m_enabled=true;m_promiscuousPeer=promiscuous;
++    }
++    void ingest(const std::vector<uint8_t>& packet){wire->incoming.push_back(packet);clock(0U);}
++    std::vector<uint8_t> frame(const uint8_t* body,uint32_t length,uint32_t stream,uint16_t sequence) {
++        OpaqueWireSocket output;
++        network::FrameQueue sender(&output,m_peerId,false);
++        if(!sender.write(body,length,stream,m_peerId,m_peerId,{network::NET_FUNC::PROTOCOL,network::NET_SUBFUNC::PROTOCOL_SUBFUNC_P25},sequence,m_addr,m_addrLen))throw std::runtime_error("offline framing failed");
++        return output.outgoing.back();
++    }
++    uint32_t receivedFilter()const{return m_rxP25StreamId.load();}
++    uint32_t chargedBytes()const{std::lock_guard<std::mutex> lock(m_rxP25Mutex);return m_rxP25Bytes;}
++    using network::BaseNetwork::createP25_LDU1Message;
++    using network::BaseNetwork::createP25_TDUMessage;
++};
++
++// Defined beside ControllerFixture so this invokes the actual RF control
++// writer and inherited network serializers, not a copied packet layout.
++std::vector<std::vector<uint8_t>> opaqueActualProducerDatagrams();
+diff --git a/tests/p25/CapacityPermit_Tests.cpp b/tests/p25/CapacityPermit_Tests.cpp
+--- a/tests/p25/CapacityPermit_Tests.cpp
++++ b/tests/p25/CapacityPermit_Tests.cpp
+@@ -1148,7 +1148,8 @@
+     SiteNetwork() : Network("127.0.0.1", 49991U, 0U, 100101001U, "offline", true, false,
+         false, true, false, false, false, false, false, false, false, false) { m_status = network::NET_STAT_RUNNING; }
+     void running(bool active) { m_status = active ? network::NET_STAT_RUNNING : network::NET_STAT_WAITING_CONNECT; }
+-    UInt8Array readP25(bool& ret, uint32_t& length) override {
++    UInt8Array readP25(bool& ret, uint32_t& length, network::P25PacketMetadata* received=nullptr) override {
++        if(received!=nullptr)*received={};
+         ret = !incoming.empty(); length = 0U; if (!ret) return nullptr;
+         auto bytes = std::move(incoming.front()); incoming.pop_front(); length = bytes.size();
+         UInt8Array result(new uint8_t[length]); std::copy(bytes.begin(), bytes.end(), result.get()); return result;
+@@ -1832,3 +1833,16 @@
+     REQUIRE(voice.rpc.releases.empty());
+     REQUIRE(voice.controller->getRFState() == RS_RF_LISTENING);
+ }
++
++
++#include "../OpaqueWireFixture.h"
++std::vector<std::vector<uint8_t>> opaqueActualProducerDatagrams()
++{
++    OpaqueWireNetwork network(100101001U);
++    ControllerFixture voice(true,false,false,false,false,&network);
++    voice.voiceMode(false);receivedTerminationPermit(voice,GROUP,"ab12:7801");
++    REQUIRE(voice.voiceFrame(DUID::HDU));
++    REQUIRE(voice.voiceFrame(DUID::LDU1));voice.drainVoice();
++    REQUIRE(voice.voiceFrame(DUID::TDULC,GROUP));
++    return network.wire->outgoing;
++}
+diff --git a/tests/p25/MultiAlgorithmVoice_Tests.cpp b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+index 66e6694..ab29207 100644
+--- a/tests/p25/MultiAlgorithmVoice_Tests.cpp
++++ b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+@@ -50,7 +50,8 @@ public:
+     std::vector<std::vector<uint8_t>> outgoing;
+     VoiceNetwork() : Network("127.0.0.1", 49991U, 0U, 100101001U, "unopened-voice-test", true, false,
+         false, true, false, false, false, false, false, false, false, false) { m_status = network::NET_STAT_RUNNING; }
+-    UInt8Array readP25(bool& available, uint32_t& length) override {
++    UInt8Array readP25(bool& available, uint32_t& length, network::P25PacketMetadata* received=nullptr) override {
++        if(received!=nullptr)*received={};
+         available = !incoming.empty(); length = 0U;
+         if (!available) return nullptr;
+         auto bytes = std::move(incoming.front()); incoming.pop_front(); length = bytes.size();

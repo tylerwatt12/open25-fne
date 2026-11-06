@@ -1,0 +1,16 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0816499..dd6a6dd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -258,6 +258,11 @@ if (ENABLE_TESTS)
+     )
+     
+     FetchContent_MakeAvailable(Catch2)
++    # Catch2 3.0.1 assumes fixed-width integers arrive through other headers.
++    # GCC 14 removed those transitive includes; limit the shim to test code.
++    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 14)
++        target_compile_options(Catch2 PRIVATE -include cstdint)
++    endif ()
+     find_package(Threads REQUIRED)
+     
+     # add ASIO

@@ -1,0 +1,275 @@
+diff --git a/src/bridge/HostBridge.Opaque.cpp b/src/bridge/HostBridge.Opaque.cpp
+--- a/src/bridge/HostBridge.Opaque.cpp
++++ b/src/bridge/HostBridge.Opaque.cpp
+@@ -11,7 +11,7 @@
+ 
+ namespace {
+ const unsigned packetHeader = 64;
+-bool supportedSecure(uint8_t algorithm) { return algorithm==0x81 || algorithm==0x84 || algorithm==0xaa; }
++bool supportedSecure(uint8_t algorithm) { return algorithm==0x81 || algorithm==0x83 || algorithm==0x84 || algorithm==0xaa; }
+ const unsigned voiceOffsets[9] = {10,26,55,80,105,130,155,180,204};
+ const unsigned dfsiOffsets[9] = {24,46,60,77,94,111,128,145,162};
+ const unsigned dfsiLengths[9] = {22,14,17,17,17,17,17,17,16};
+diff --git a/src/bridge/PacketCodec.cpp b/src/bridge/PacketCodec.cpp
+--- a/src/bridge/PacketCodec.cpp
++++ b/src/bridge/PacketCodec.cpp
+@@ -4,6 +4,7 @@
+ #include "PacketCodec.h"
+ #include "PacketCodecMI.h"
+ #include "common/p25/Crypto.h"
++#include "common/p25/TDEAKey.h"
+ #include "common/p25/P25Defines.h"
+ #include "vocoder/MBEEncoder.h"
+ #include "vocoder/MBEDecoder.h"
+@@ -27,9 +28,9 @@
+ 
+ namespace {
+ constexpr size_t Header = 64;
+-constexpr uint8_t Clear = 0x80, DES = 0x81, AES256 = 0x84, ADP = 0xaa;
++constexpr uint8_t Clear = 0x80, DES = 0x81, TDEA = 0x83, AES256 = 0x84, ADP = 0xaa;
+ size_t keyBytes(uint8_t algorithm) {
+-    switch (algorithm) { case DES: return 8; case AES256: return 32; case ADP: return 5; default: return 0; }
++    switch (algorithm) { case DES: return 8; case TDEA: return 24; case AES256: return 32; case ADP: return 5; default: return 0; }
+ }
+ uint16_t u16(const uint8_t* p) { return (uint16_t(p[0]) << 8) | p[1]; }
+ uint32_t u32(const uint8_t* p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
+@@ -107,6 +108,7 @@
+                 if (a < 0 || b < 0) return false;
+                 key[i] = uint8_t(a * 16 + b);
+             }
++            if (identity.first == TDEA && !p25::crypto::validTDEAKey(key.data(), key.size())) return false;
+             values[identity] = key;
+             if (values.size() > 256) return false;
+         }
+@@ -132,7 +134,7 @@
+     auto duid = index < 9 ? p25::defines::DUID::LDU1 : p25::defines::DUID::LDU2;
+     auto transform = [&](uint8_t* word) {
+         switch (algorithm) {
+-        case DES: crypto.cryptDES_IMBE(word, duid); break;
++        case DES: case TDEA: crypto.cryptDES_IMBE(word, duid); break;
+         case AES256: crypto.cryptAES_IMBE(word, duid); break;
+         case ADP: crypto.cryptARC4_IMBE(word, duid); break;
+         }
+diff --git a/src/common/p25/Crypto.cpp b/src/common/p25/Crypto.cpp
+--- a/src/common/p25/Crypto.cpp
++++ b/src/common/p25/Crypto.cpp
+@@ -11,6 +11,7 @@
+ #include "p25/kmm/KeysetItem.h"
+ #include "p25/P25Defines.h"
+ #include "p25/Crypto.h"
++#include "p25/TDEAKey.h"
+ #include "AESCrypto.h"
+ #include "DESCrypto.h"
+ #include "RC4Crypto.h"
+@@ -138,6 +139,7 @@
+     uint8_t keyLength = 0U;
+     switch (m_tekAlgoId) {
+     case ALGO_DES: keyLength = 8U; break;
++    case ALGO_TDEA: keyLength = 24U; break;
+     case ALGO_AES_256: keyLength = 32U; break;
+     case ALGO_ARC4: keyLength = 5U; break;
+     default: return;
+@@ -147,9 +149,19 @@
+     if (m_tekLength != keyLength)
+         return;
+ 
++    // AAAD-B B.1-B.4: ALGID83 requires keying option1 and a non-null
++    // effective 64-bit MI; the reserved ninth octet is not cipher state.
++    if (m_tekAlgoId == ALGO_TDEA) {
++        if (!validTDEAKey(m_tek.get(), m_tekLength)) return;
++        uint8_t effectiveMI = 0;
++        for (size_t i = 0; i < 8; ++i) effectiveMI |= m_mi[i];
++        if (effectiveMI == 0) return;
++    }
++
+     // generate keystream
+     switch (m_tekAlgoId) {
+     case ALGO_DES:
++    case ALGO_TDEA:
+         {
+             m_keystream = new uint8_t[224U];
+             ::memset(m_keystream, 0x00U, 224U);
+@@ -165,6 +177,14 @@
+ 
+             for (uint32_t i = 0U; i < (224U / 8U); i++) {
+                 uint8_t* output = des.encryptBlock(input, desKey);
++                if (m_tekAlgoId == ALGO_TDEA) {
++                    // AAAD-B B.1: E(K3, D(K2, E(K1, input))). Feedback
++                    // is the final EDE output, never an intermediate block.
++                    uint8_t* middle = des.decryptBlock(output, m_tek.get() + 8U);
++                    delete[] output;
++                    output = des.encryptBlock(middle, m_tek.get() + 16U);
++                    delete[] middle;
++                }
+                 ::memcpy(m_keystream + (i * 8U), output, 8U);
+                 ::memcpy(input, output, 8U);
+                 delete[] output;
+@@ -538,7 +558,7 @@
+ 
+ void P25Crypto::cryptDES_IMBE(uint8_t* imbe, DUID::E duid)
+ {
+-    if (m_keystream == nullptr || m_tekAlgoId != ALGO_DES)
++    if (m_keystream == nullptr || (m_tekAlgoId != ALGO_DES && m_tekAlgoId != ALGO_TDEA))
+         return;
+ 
+     uint32_t offset = 8U;
+diff --git a/src/common/p25/P25Defines.h b/src/common/p25/P25Defines.h
+--- a/src/common/p25/P25Defines.h
++++ b/src/common/p25/P25Defines.h
+@@ -203,6 +203,8 @@
+         const uint8_t   ALGO_UNENCRYPT = 0x80U;
+         /** @brief DES-OFB */
+         const uint8_t   ALGO_DES = 0x81U;
++        /** @brief Three-key TDEA-OFB (AAAD-B Annex B) */
++        const uint8_t   ALGO_TDEA = 0x83U;
+         /** @brief AES-256 */
+         const uint8_t   ALGO_AES_256 = 0x84U;
+         /** @brief ARC4 */
+diff --git a/src/common/p25/TDEAKey.h b/src/common/p25/TDEAKey.h
+new file mode 100644
+--- /dev/null
++++ b/src/common/p25/TDEAKey.h
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#ifndef P25_TDEA_KEY_H
++#define P25_TDEA_KEY_H
++#include <cstddef>
++#include <cstdint>
++namespace p25 { namespace crypto {
++// AAAD-B-2015 B.1, PDF45/printed35: ALGID83 is keying option1.
++// DES parity occupies each octet's low bit and does not change the key.
++inline bool validTDEAKey(const uint8_t* key, size_t size) {
++    if (key == nullptr || size != 24U) return false;
++    for (size_t first = 0; first < 3; ++first) {
++        for (size_t second = first + 1; second < 3; ++second) {
++            uint8_t difference = 0;
++            for (size_t i = 0; i < 8; ++i)
++                difference |= (key[first*8+i] ^ key[second*8+i]) & 0xFEU;
++            if (difference == 0) return false;
++        }
++    }
++    return true;
++}
++} }
++#endif
+diff --git a/tests/BridgeOpaqueContinuity_Tests.cpp b/tests/BridgeOpaqueContinuity_Tests.cpp
+--- a/tests/BridgeOpaqueContinuity_Tests.cpp
++++ b/tests/BridgeOpaqueContinuity_Tests.cpp
+@@ -142,6 +142,14 @@
+         REQUIRE(f.output.packets.size()==18);f.assertWords(0,1,0,0x84,7);f.assertWords(9,2,0,0x84,7);
+         for(const auto&p:f.output.packets){const uint8_t mi[9]={1,2,3,4,5,6,7,8,9};REQUIRE(std::memcmp(p.data()+48,mi,9)==0);}
+     }
++    SECTION("three-key TDEA is relayed without traffic keys") {
++        Fixture f;f.send(LCO::GROUP,DUID::LDU1,1,true,0,0x83,0);
++        f.send(LCO::GROUP_UPDT,DUID::LDU1,2,false,0,0x83,0);
++        f.send(LCO::GROUP,DUID::LDU2,3,false,0,0x83,0);
++        REQUIRE(f.output.packets.size()==27);
++        f.assertWords(0,1,0,0x83,0);f.assertWords(9,2,0,0x83,0);f.assertWords(18,3,9,0x83,0);
++        for(const auto&p:f.output.packets){const uint8_t mi[9]={1,2,3,4,5,6,7,8,9};REQUIRE(std::memcmp(p.data()+48,mi,9)==0);}
++    }
+     SECTION("late entry must learn ESS before exporting") {
+         Fixture f;f.send(LCO::GROUP_UPDT,DUID::LDU1,1,false);REQUIRE(f.output.packets.empty());
+         f.send(LCO::GROUP_UPDT,DUID::LDU2,2);REQUIRE(f.output.packets.empty());
+diff --git a/tests/crypto/P25_StreamLifetime_Test.cpp b/tests/crypto/P25_StreamLifetime_Test.cpp
+--- a/tests/crypto/P25_StreamLifetime_Test.cpp
++++ b/tests/crypto/P25_StreamLifetime_Test.cpp
+@@ -81,7 +81,7 @@
+             }
+         }
+     }
+-    for (uint8_t algorithm : {0x80,0x00,0x83,0x85,0xFF}) {
++    for (uint8_t algorithm : {0x80,0x00,0x85,0xFF}) {
+         setup(crypto, 0x84, valid);
+         crypto.setTEKAlgoId(algorithm);
+         REQUIRE_FALSE(crypto.hasValidKeystream());
+diff --git a/tests/crypto/P25_TDEA_Test.cpp b/tests/crypto/P25_TDEA_Test.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/crypto/P25_TDEA_Test.cpp
+@@ -0,0 +1,86 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// AAAD-B-2015 B.1/B.4, PDF45-47/printed35-37, p25_6b7b5e252ef69091;
++// documents/tia-library/8.3_TIA-102.AAAD-B_Final Published Document_2015_12_02.pdf.
++// Plaintext A.4 PDF42/printed32; independent expected ciphertext from B.4.
++#include "common/p25/Crypto.h"
++#include "common/p25/TDEAKey.h"
++#include <catch2/catch_test_macros.hpp>
++#include <array>
++#include <cstring>
++#include <vector>
++namespace {
++std::vector<uint8_t> hex(const char* s) {
++    std::vector<uint8_t> out;
++    auto n=[](char c){return c<='9'?c-'0':c-'A'+10;};
++    for(size_t i=0;s[i];i+=2)out.push_back(uint8_t(n(s[i])*16+n(s[i+1])));
++    return out;
++}
++using Crypto=p25::crypto::P25Crypto;
++const auto key=hex("0123456789ABCDEF23456789ABCDEF01456789ABCDEF0123");
++const auto mi=hex("1234567890ABCDEF00");
++void setup(Crypto& c,const std::vector<uint8_t>& k=key) {
++    c.setTEKAlgoId(0x83);c.setKey(k.data(),uint8_t(k.size()));c.setMI(mi.data());c.generateKeystream();
++}
++}
++TEST_CASE("Three-key TDEA matches every published FDMA voice word", "[p25][tdea]") {
++    struct Row {const char* plain;const char* cipher;};
++    const Row rows[]={
++        {"0CEE42226F6101AB31EF14","D56308F6C6C8AE9C6C4E2F"},
++        {"0CEF400078A701A8FDA9AD","E25F76F0920AD6D3AEA4A9"},
++        {"10EF4020E8A501AC5516EC","B5842FF8EBF607BA10A717"},
++        {"18F68212A84601BCF72A1F","93EFEA79C7F6367DDD7502"},
++        {"80DD87B18C800002097BBA","0F6D8C48A17C4F27CC275A"},
++        {"34F0AC16F04C00B3BE61E5","59EBB8D27708A499D58ADF"},
++        {"34E97460B7030022F0693A","686B09EA39CDF949510755"},
++        {"30DE25C408610067AE870B","C2C4FFCCB829F0AEB82F44"},
++        {"3CD286DE30A40008D7A2B4","C6A879D099E3477D747404"},
++        {"04E343E6F61F02E0C18BAB","A65BC5BA8319C32CC00C3E"},
++        {"0CEB08E9945B02522A9AD0","D0305F5CE2C0CB5A73139C"},
++        {"A0FC5D90952F88832A3CD3","C022B79FBEE32493B6617C"},
++        {"8CD91CA671ED000109FC56","638C60A00DF816366D4428"},
++        {"98DA2BA287C40000CEC96D","92086AE1456E7FDBD71352"},
++        {"30DC36C0DC9D0049B1915A","340D51ACEA2419925F6783"},
++        {"0CCFC141129F0552E6E775","A34297F1C7B8E23B3E3180"},
++        {"0CEB4839E526002B4DDDDC","D05E9F4A1A4A82D7601DBF"},
++        {"0CEE02E689DD00B3AAF185","4A4EC01628291A92E532EA"},
++    };
++    Crypto c;setup(c);REQUIRE(c.hasValidKeystream());
++    for(unsigned i=0;i<18;i++) {
++        auto word=hex(rows[i].plain);
++        c.cryptDES_IMBE(word.data(),i<9?p25::defines::DUID::LDU1:p25::defines::DUID::LDU2);
++        REQUIRE(word==hex(rows[i].cipher));
++    }
++    setup(c);
++    for(unsigned i=0;i<18;i++) {
++        auto word=hex(rows[i].cipher);
++        c.cryptDES_IMBE(word.data(),i<9?p25::defines::DUID::LDU1:p25::defines::DUID::LDU2);
++        REQUIRE(word==hex(rows[i].plain));
++    }
++}
++TEST_CASE("TDEA rejects malformed and nonindependent key bundles", "[p25][tdea]") {
++    Crypto c;
++    for(unsigned size=0;size<=255;size++) {
++        setup(c);REQUIRE(c.hasValidKeystream());
++        std::vector<uint8_t> k(size,0x5A);
++        if(size==24) k=key;
++        c.setKey(k.data(),uint8_t(k.size()));REQUIRE_FALSE(c.hasValidKeystream());
++        c.generateKeystream();REQUIRE(c.hasValidKeystream()==(size==24));
++    }
++    for(unsigned first=0;first<3;first++)for(unsigned second=first+1;second<3;second++) {
++        for(bool parityOnly:{false,true}) {
++            auto k=key;
++            for(unsigned i=0;i<8;i++) k[second*8+i]=k[first*8+i]^(parityOnly?1:0);
++            REQUIRE_FALSE(p25::crypto::validTDEAKey(k.data(),k.size()));
++            setup(c,k);REQUIRE_FALSE(c.hasValidKeystream());
++        }
++    }
++    for(unsigned trailing:{0,1,255}) {
++        setup(c);uint8_t nullMI[9]{};nullMI[8]=trailing;c.setMI(nullMI);
++        c.generateKeystream();REQUIRE_FALSE(c.hasValidKeystream());
++    }
++    auto parity=key;for(auto& octet:parity)octet^=1;
++    setup(c,parity);REQUIRE(c.hasValidKeystream());
++    auto word=hex("0CEE42226F6101AB31EF14");c.cryptDES_IMBE(word.data(),p25::defines::DUID::LDU1);
++    REQUIRE(word==hex("D56308F6C6C8AE9C6C4E2F"));
++    c.setKey(nullptr,24);c.generateKeystream();REQUIRE_FALSE(c.hasValidKeystream());
++}
