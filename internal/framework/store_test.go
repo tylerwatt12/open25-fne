@@ -432,6 +432,22 @@ func TestFrameworkConfigurationPreservesEnteredValuesForEveryOwner(t *testing.T)
 	}
 }
 
+func TestSystemSavePreservesWACNRestrictedForOperation(t *testing.T) {
+	s := storeOpen(t, RoleSystem)
+	for _, wacn := range []int{0xBEE00, 0xBEE80, 0xBEEFF} {
+		config := storeFixtureSystem()
+		config.WACN = wacn
+		raw := storeDoc(t, config)
+		if err := s.SaveConfig(raw); err != nil {
+			t.Fatal("operating restriction blocked administrator Save", err)
+		}
+		saved, err := s.Config()
+		if err != nil || !bytes.Equal(raw, saved) {
+			t.Fatalf("operating restriction altered saved WACN %05X: %s %v", wacn, saved, err)
+		}
+	}
+}
+
 func TestFrameworkCachePreservesIncompleteSettings(t *testing.T) {
 	s := storeOpen(t, RoleSite)
 	raw := json.RawMessage(`{"sites":[],"unknown_setting":"retain"}`)

@@ -93,15 +93,18 @@ func TestInhibitSnapshotRequiresCompleteCurrentPhysicalEvidence(t *testing.T) {
 	}
 }
 
-func TestAssignedWACNRangeIncludesEveryBEEPrefix(t *testing.T) {
+func TestOperatingWACNRestriction(t *testing.T) {
 	p := fixtureProfile()
-	for wacn := 0xBEDFF; wacn <= 0xBEF00; wacn++ {
+	for wacn := 0xBEE00; wacn <= 0xBEEFF; wacn++ {
 		p.System.WACN = wacn
-		if err := Validate(p); err != nil {
-			t.Fatalf("assigned WACN %05X rejected: %v", wacn, err)
+		if err := Validate(p); err == nil || !strings.Contains(err.Error(), "BEE00-BEEFF") || !strings.Contains(err.Error(), "subscriber roaming") {
+			t.Fatalf("restricted WACN %05X did not explain the operating policy: %v", wacn, err)
+		}
+		if p.System.WACN != wacn {
+			t.Fatal("operating refusal changed configured identity")
 		}
 	}
-	for _, wacn := range []int{1, 0xFFFFE} {
+	for _, wacn := range []int{1, 0xBEDFF, 0xBEF00, 0xFFFFE} {
 		p.System.WACN = wacn
 		if err := Validate(p); err != nil {
 			t.Fatalf("assigned boundary %05X rejected: %v", wacn, err)

@@ -78,6 +78,11 @@ func Validate(p Profile) error {
 	if p.System.WACN < 1 || p.System.WACN > 0xFFFFE || p.System.SystemID < 1 || p.System.SystemID > 0xFFE || strings.TrimSpace(p.System.Callsign) == "" || strings.ContainsAny(p.System.Callsign, "\r\n\x00") {
 		return errors.New("valid home WACN, System ID and callsign are required")
 	}
+	// Match the native startup policy for direct DVM callers. This checks an
+	// operating profile only; administrator Save preserves the entered identity.
+	if p.System.WACN >= 0xBEE00 && p.System.WACN <= 0xBEEFF {
+		return fmt.Errorf("WACN %05X is blocked for operation: BEE00-BEEFF is restricted to reduce unintended subscriber roaming risk", p.System.WACN)
+	}
 	if p.Site.Identification.Mode != "ham" && p.Site.Identification.Mode != "bsi" {
 		return errors.New("choose Ham CWID or Commercial BSI")
 	}

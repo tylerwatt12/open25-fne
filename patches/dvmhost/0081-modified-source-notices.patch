@@ -1,0 +1,2968 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -8,6 +8,9 @@
+ # *  Copyright (C) 2022 Natalie Moore
+ # *
+ # */
++# Modified by Open25 FNE contributors; updated 2026-11-16.
++# Upstream DVMProject copyright and license notices remain in force.
++# Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+ cmake_minimum_required(VERSION 3.16.0)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS on) 
+ 
+diff --git a/configs/config.example.yml b/configs/config.example.yml
+--- a/configs/config.example.yml
++++ b/configs/config.example.yml
+@@ -3,6 +3,9 @@
+ #
+ 
+ # Flag indicating whether the host will run as a background or foreground task.
++# Modified by Open25 FNE contributors; updated 2026-11-16.
++# Upstream DVMProject copyright and license notices remain in force.
++# Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+ daemon: true
+ 
+ #
+diff --git a/configs/fne-config.example.yml b/configs/fne-config.example.yml
+--- a/configs/fne-config.example.yml
++++ b/configs/fne-config.example.yml
+@@ -3,6 +3,9 @@
+ #
+ 
+ # Flag indicating whether the host will run as a background or foreground task.
++# Modified by Open25 FNE contributors; updated 2026-11-16.
++# Upstream DVMProject copyright and license notices remain in force.
++# Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+ daemon: true
+ 
+ #
+diff --git a/src/bridge/ActivityLog.cpp b/src/bridge/ActivityLog.cpp
+--- a/src/bridge/ActivityLog.cpp
++++ b/src/bridge/ActivityLog.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2024-2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "ActivityLog.h"
+ #include "common/network/BaseNetwork.h"
+diff --git a/src/bridge/ActivityLog.h b/src/bridge/ActivityLog.h
+--- a/src/bridge/ActivityLog.h
++++ b/src/bridge/ActivityLog.h
+@@ -12,6 +12,10 @@
+  * @ingroup bridge
+  * @file ActivityLog.cpp
+  * @ingroup bridge
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__ACTIVITY_LOG_H__)
+ #define __ACTIVITY_LOG_H__
+diff --git a/src/bridge/BridgeMain.cpp b/src/bridge/BridgeMain.cpp
+--- a/src/bridge/BridgeMain.cpp
++++ b/src/bridge/BridgeMain.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2024,2026 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/Log.h"
+diff --git a/src/bridge/HostBridge.Opaque.cpp b/src/bridge/HostBridge.Opaque.cpp
+--- a/src/bridge/HostBridge.Opaque.cpp
++++ b/src/bridge/HostBridge.Opaque.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Keyless P25 media transport. Neither vocoding nor traffic-key processing runs
+ // in this Site-facing path; encrypted IMBE and its public metadata stay opaque.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "HostBridge.h"
+ #include "common/p25/lc/tdulc/TDULCFactory.h"
+ #include "common/p25/dfsi/DFSIDefines.h"
+diff --git a/src/bridge/HostBridge.P25.cpp b/src/bridge/HostBridge.P25.cpp
+--- a/src/bridge/HostBridge.P25.cpp
++++ b/src/bridge/HostBridge.P25.cpp
+@@ -8,6 +8,10 @@
+  *  Copyright (C) 2025 Caleb, K4PHP
+  *  Copyright (C) 2025 Lorenzo L Romero, K2LLR
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/analog/AnalogDefines.h"
+diff --git a/src/bridge/HostBridge.h b/src/bridge/HostBridge.h
+--- a/src/bridge/HostBridge.h
++++ b/src/bridge/HostBridge.h
+@@ -12,6 +12,10 @@
+  * @ingroup bridge
+  * @file HostBridge.cpp
+  * @ingroup bridge
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__HOST_BRIDGE_H__)
+ #define __HOST_BRIDGE_H__
+diff --git a/src/bridge/PacketCodec.cpp b/src/bridge/PacketCodec.cpp
+--- a/src/bridge/PacketCodec.cpp
++++ b/src/bridge/PacketCodec.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Local, length-framed codec interface. Traffic keys are read only from a
+ // private runtime file; the wire format contains identifiers, never key bytes.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "PacketCodec.h"
+ #include "PacketCodecMI.h"
+ #include "common/p25/FullRate.h"
+diff --git a/src/bridge/PacketCodec.h b/src/bridge/PacketCodec.h
+--- a/src/bridge/PacketCodec.h
++++ b/src/bridge/PacketCodec.h
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // TrunkSystem local packet codec. Uses the DVM vocoder and P25 crypto routines.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef TRUNKSYSTEM_PACKET_CODEC_H
+ #define TRUNKSYSTEM_PACKET_CODEC_H
+ int packetCodecMain(const char* keyFile);
+diff --git a/src/bridge/PacketCodecMI.h b/src/bridge/PacketCodecMI.h
+--- a/src/bridge/PacketCodecMI.h
++++ b/src/bridge/PacketCodecMI.h
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #pragma once
+ #include <array>
+ #include <cstddef>
+diff --git a/src/bridge/UDPInactivity.h b/src/bridge/UDPInactivity.h
+--- a/src/bridge/UDPInactivity.h
++++ b/src/bridge/UDPInactivity.h
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // UDP activity is a receipt timestamp, not a timer clocked by another thread.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef __UDP_INACTIVITY_H__
+ #define __UDP_INACTIVITY_H__
+ 
+diff --git a/src/bridge/network/PeerNetwork.cpp b/src/bridge/network/PeerNetwork.cpp
+--- a/src/bridge/network/PeerNetwork.cpp
++++ b/src/bridge/network/PeerNetwork.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "bridge/Defines.h"
+ #include "common/dmr/data/EMB.h"
+diff --git a/src/bridge/network/PeerNetwork.h b/src/bridge/network/PeerNetwork.h
+--- a/src/bridge/network/PeerNetwork.h
++++ b/src/bridge/network/PeerNetwork.h
+@@ -16,6 +16,10 @@
+  * @ingroup bridge_network
+  * @file PeerNetwork.cpp
+  * @ingroup bridge_network
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__PEER_NETWORK_H__)
+ #define __PEER_NETWORK_H__
+diff --git a/src/common/Log.cpp b/src/common/Log.cpp
+--- a/src/common/Log.cpp
++++ b/src/common/Log.cpp
+@@ -7,6 +7,10 @@
+  *  Copyright (C) 2015,2016 Jonathan Naylor, G4KLX
+  *  Copyright (C) 2018-2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Log.h"
+ #include "network/BaseNetwork.h"
+diff --git a/src/common/Log.h b/src/common/Log.h
+--- a/src/common/Log.h
++++ b/src/common/Log.h
+@@ -17,6 +17,10 @@
+  * @ingroup logging
+  * @file Log.cpp
+  * @ingroup logging
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__LOG_H__)
+ #define __LOG_H__
+diff --git a/src/common/Thread.cpp b/src/common/Thread.cpp
+--- a/src/common/Thread.cpp
++++ b/src/common/Thread.cpp
+@@ -8,6 +8,10 @@
+  *  Copyright (C) 2023,2024 Bryan Biedenkapp, N2PLL
+  *
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "Thread.h"
+ #include "Log.h"
+ 
+diff --git a/src/common/Thread.h b/src/common/Thread.h
+--- a/src/common/Thread.h
++++ b/src/common/Thread.h
+@@ -17,6 +17,10 @@
+  * @ingroup threading
+  * @file Thread.cpp
+  * @ingroup threading
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__THREAD_H__)
+ #define __THREAD_H__
+diff --git a/src/common/ThreadPool.cpp b/src/common/ThreadPool.cpp
+--- a/src/common/ThreadPool.cpp
++++ b/src/common/ThreadPool.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "ThreadPool.h"
+ #include "Log.h"
+diff --git a/src/common/ThreadPool.h b/src/common/ThreadPool.h
+--- a/src/common/ThreadPool.h
++++ b/src/common/ThreadPool.h
+@@ -12,6 +12,10 @@
+  * @ingroup threading
+  * @file ThreadPool.cpp
+  * @ingroup threading
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__THREAD_POOL_H__)
+ #define __THREAD_POOL_H__
+diff --git a/src/common/edac/AMBEFEC.cpp b/src/common/edac/AMBEFEC.cpp
+--- a/src/common/edac/AMBEFEC.cpp
++++ b/src/common/edac/AMBEFEC.cpp
+@@ -9,6 +9,10 @@
+  *  Copyright (C) 2018-2022 Bryan Biedenkapp, N2PLL
+  *
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "Defines.h"
+ #include "edac/AMBEFEC.h"
+ #include "edac/Golay24128.h"
+diff --git a/src/common/edac/AMBEFEC.h b/src/common/edac/AMBEFEC.h
+--- a/src/common/edac/AMBEFEC.h
++++ b/src/common/edac/AMBEFEC.h
+@@ -13,6 +13,10 @@
+  * @ingroup edac
+  * @file AMBEFEC.cpp
+  * @ingroup edac
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__AMBE_FEC_H__)
+ #define __AMBE_FEC_H__
+diff --git a/src/common/edac/Hamming.cpp b/src/common/edac/Hamming.cpp
+--- a/src/common/edac/Hamming.cpp
++++ b/src/common/edac/Hamming.cpp
+@@ -7,6 +7,10 @@
+  *  Copyright (C) 2015,2016 Jonathan Naylor, G4KLX
+  *  Copyright (C) 2026 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "edac/Hamming.h"
+ 
+diff --git a/src/common/edac/Hamming.h b/src/common/edac/Hamming.h
+--- a/src/common/edac/Hamming.h
++++ b/src/common/edac/Hamming.h
+@@ -13,6 +13,10 @@
+  * @ingroup edac
+  * @file Hamming.cpp
+  * @ingroup edac
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__HAMMING_H__)
+ #define __HAMMING_H__
+diff --git a/src/common/lookups/AffiliationLookup.cpp b/src/common/lookups/AffiliationLookup.cpp
+--- a/src/common/lookups/AffiliationLookup.cpp
++++ b/src/common/lookups/AffiliationLookup.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "lookups/AffiliationLookup.h"
+ #include "Log.h"
+diff --git a/src/common/lookups/AffiliationLookup.h b/src/common/lookups/AffiliationLookup.h
+--- a/src/common/lookups/AffiliationLookup.h
++++ b/src/common/lookups/AffiliationLookup.h
+@@ -17,6 +17,10 @@
+  * @file AffiliationLookup.cpp
+  * @ingroup lookups_aff
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__AFFILIATION_LOOKUP_H__)
+ #define __AFFILIATION_LOOKUP_H__
+ 
+diff --git a/src/common/lookups/RadioIdLookup.cpp b/src/common/lookups/RadioIdLookup.cpp
+--- a/src/common/lookups/RadioIdLookup.cpp
++++ b/src/common/lookups/RadioIdLookup.cpp
+@@ -8,6 +8,10 @@
+  *  Copyright (C) 2017-2022,2025 Bryan Biedenkapp, N2PLL
+  *  Copyright (c) 2024 Patrick McDonnell, W3AXL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "lookups/RadioIdLookup.h"
+ #include "p25/P25Defines.h"
+diff --git a/src/common/lookups/RadioIdLookup.h b/src/common/lookups/RadioIdLookup.h
+--- a/src/common/lookups/RadioIdLookup.h
++++ b/src/common/lookups/RadioIdLookup.h
+@@ -19,6 +19,10 @@
+  * @file RadioIdLookup.cpp
+  * @ingroup lookups_rid
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__RADIO_ID_LOOKUP_H__)
+ #define __RADIO_ID_LOOKUP_H__
+ 
+diff --git a/src/common/lookups/TalkgroupRulesLookup.h b/src/common/lookups/TalkgroupRulesLookup.h
+--- a/src/common/lookups/TalkgroupRulesLookup.h
++++ b/src/common/lookups/TalkgroupRulesLookup.h
+@@ -18,6 +18,10 @@
+  * @file TalkgroupRulesLookup.cpp
+  * @ingroup lookups_tgid
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__TALKGROUP_RULES_LOOKUP_H__)
+ #define __TALKGROUP_RULES_LOOKUP_H__
+ 
+diff --git a/src/common/network/BaseNetwork.cpp b/src/common/network/BaseNetwork.cpp
+--- a/src/common/network/BaseNetwork.cpp
++++ b/src/common/network/BaseNetwork.cpp
+@@ -8,6 +8,10 @@
+  *  Copyright (C) 2020-2026 Bryan Biedenkapp, N2PLL
+  *  Copyright (C) 2024 Caleb, KO4UYJ
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/analog/AnalogDefines.h"
+diff --git a/src/common/network/BaseNetwork.h b/src/common/network/BaseNetwork.h
+--- a/src/common/network/BaseNetwork.h
++++ b/src/common/network/BaseNetwork.h
+@@ -20,6 +20,10 @@
+  * @ingroup network_core
+  * @file BaseNetwork.cpp
+  * @ingroup network_core
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__BASE_NETWORK_H__)
+ #define __BASE_NETWORK_H__
+diff --git a/src/common/network/NetRPC.cpp b/src/common/network/NetRPC.cpp
+--- a/src/common/network/NetRPC.cpp
++++ b/src/common/network/NetRPC.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/edac/CRC.h"
+diff --git a/src/common/network/NetRPC.h b/src/common/network/NetRPC.h
+--- a/src/common/network/NetRPC.h
++++ b/src/common/network/NetRPC.h
+@@ -13,6 +13,10 @@
+  * @file NetRPC.cpp
+  * @ingroup network_core
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__NET_RPC_H__)
+ #define __NET_RPC_H__
+ 
+diff --git a/src/common/network/Network.cpp b/src/common/network/Network.cpp
+--- a/src/common/network/Network.cpp
++++ b/src/common/network/Network.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2017-2026 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/edac/SHA256.h"
+diff --git a/src/common/network/Network.h b/src/common/network/Network.h
+--- a/src/common/network/Network.h
++++ b/src/common/network/Network.h
+@@ -12,6 +12,10 @@
+  * @ingroup network_core
+  * @file Network.cpp
+  * @ingroup network_core
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__NETWORK_H__)
+ #define __NETWORK_H__
+diff --git a/src/common/network/P25SiteRouting.h b/src/common/network/P25SiteRouting.h
+--- a/src/common/network/P25SiteRouting.h
++++ b/src/common/network/P25SiteRouting.h
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Current TrunkSystem P25 system/site routing policy. No transport or RF scheduler. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef __P25_SITE_ROUTING_H__
+ #define __P25_SITE_ROUTING_H__
+ #include "common/yaml/Yaml.h"
+diff --git a/src/common/p25/Audio.cpp b/src/common/p25/Audio.cpp
+--- a/src/common/p25/Audio.cpp
++++ b/src/common/p25/Audio.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2016 Jonathan Naylor, G4KLX
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/Audio.h"
+diff --git a/src/common/p25/Audio.h b/src/common/p25/Audio.h
+--- a/src/common/p25/Audio.h
++++ b/src/common/p25/Audio.h
+@@ -12,6 +12,10 @@
+  * @ingroup p25
+  * @file Audio.cpp
+  * @ingroup p25
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_AUDIO_H__)
+ #define __P25_AUDIO_H__
+diff --git a/src/common/p25/Crypto.cpp b/src/common/p25/Crypto.cpp
+--- a/src/common/p25/Crypto.cpp
++++ b/src/common/p25/Crypto.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/kmm/KeysetItem.h"
+diff --git a/src/common/p25/Crypto.h b/src/common/p25/Crypto.h
+--- a/src/common/p25/Crypto.h
++++ b/src/common/p25/Crypto.h
+@@ -17,6 +17,10 @@
+  * @file Crypto.cpp
+  * @ingroup p25
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__P25_CRYPTO_H__)
+ #define __P25_CRYPTO_H__
+ 
+diff --git a/src/common/p25/FrameBounds.h b/src/common/p25/FrameBounds.h
+--- a/src/common/p25/FrameBounds.h
++++ b/src/common/p25/FrameBounds.h
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Fixed CAI modem spans: BAAA-B7.2/Figs29-34; AABB-B5/Fig5-1.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef P25_FRAME_BOUNDS_H
+ #define P25_FRAME_BOUNDS_H
+ #include "common/p25/P25Defines.h"
+diff --git a/src/common/p25/FullRate.h b/src/common/p25/FullRate.h
+--- a/src/common/p25/FullRate.h
++++ b/src/common/p25/FullRate.h
+@@ -2,6 +2,10 @@
+ // Current private native carrier for TIA-102.BACA-B/B-2 FullRate blocks.
+ // Exact citations and private policies: fullrate-source-policy.json in the
+ // candidate evidence. No FEC, vocoding or traffic keys belong in this codec.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef P25_FULL_RATE_H
+ #define P25_FULL_RATE_H
+ #include <array>
+diff --git a/src/common/p25/FullRateGenerate.h b/src/common/p25/FullRateGenerate.h
+--- a/src/common/p25/FullRateGenerate.h
++++ b/src/common/p25/FullRateGenerate.h
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef P25_FULL_RATE_GENERATE_H
+ #define P25_FULL_RATE_GENERATE_H
+ #include "common/p25/FullRate.h"
+diff --git a/src/common/p25/FullRateSync.h b/src/common/p25/FullRateSync.h
+--- a/src/common/p25/FullRateSync.h
++++ b/src/common/p25/FullRateSync.h
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef P25_FULL_RATE_SYNC_H
+ #define P25_FULL_RATE_SYNC_H
+ #include "common/p25/FullRate.h"
+diff --git a/src/common/p25/NID.cpp b/src/common/p25/NID.cpp
+--- a/src/common/p25/NID.cpp
++++ b/src/common/p25/NID.cpp
+@@ -7,6 +7,10 @@
+  *  Copyright (C) 2016 Jonathan Naylor, G4KLX
+  *  Copyright (C) 2017,2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/Utils.h"
+diff --git a/src/common/p25/NID.h b/src/common/p25/NID.h
+--- a/src/common/p25/NID.h
++++ b/src/common/p25/NID.h
+@@ -13,6 +13,10 @@
+  * @ingroup p25
+  * @file NID.cpp
+  * @ingroup p25
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_NID_H__)
+ #define  __P25_NID_H__
+diff --git a/src/common/p25/NIDCodec.h b/src/common/p25/NIDCodec.h
+--- a/src/common/p25/NIDCodec.h
++++ b/src/common/p25/NIDCodec.h
+@@ -3,6 +3,10 @@
+  * Tables 6, 17-19; PDF pages 34, 57-59. Transmission order is MSB first.
+  * See docs/standards-audit/firmware-nid-plan.md for exact source provenance.
+  * Shared verbatim by the modem and host; no heap, recursion or hardware access.
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #ifndef P25_NID_CODEC_H
+ #define P25_NID_CODEC_H
+diff --git a/src/common/p25/P25Defines.h b/src/common/p25/P25Defines.h
+--- a/src/common/p25/P25Defines.h
++++ b/src/common/p25/P25Defines.h
+@@ -15,6 +15,10 @@
+  * 
+  * @file P25Defines.h
+  * @ingroup p25
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_DEFINES_H__)
+ #define  __P25_DEFINES_H__
+diff --git a/src/common/p25/PDUHeaderCodec.h b/src/common/p25/PDUHeaderCodec.h
+--- a/src/common/p25/PDUHeaderCodec.h
++++ b/src/common/p25/PDUHeaderCodec.h
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Phase1 primary packet header FEC and fixed-window frame bounds.
+ // BAAA-B6/Tables11-14,8.2/Table20;7.2/7.2.4/Fig35. See pdu-completion-plan.md.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef P25_PDU_HEADER_CODEC_H
+ #define P25_PDU_HEADER_CODEC_H
+ #include <stdint.h>
+diff --git a/src/common/p25/TDEAKey.h b/src/common/p25/TDEAKey.h
+--- a/src/common/p25/TDEAKey.h
++++ b/src/common/p25/TDEAKey.h
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef P25_TDEA_KEY_H
+ #define P25_TDEA_KEY_H
+ #include <cstddef>
+diff --git a/src/common/p25/acl/AccessControl.cpp b/src/common/p25/acl/AccessControl.cpp
+--- a/src/common/p25/acl/AccessControl.cpp
++++ b/src/common/p25/acl/AccessControl.cpp
+@@ -8,6 +8,10 @@
+  *  Copyright (C) 2016,2017 Jonathan Naylor, G4KLX
+  *  Copyright (C) 2017,2019,2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/acl/AccessControl.h"
+diff --git a/src/common/p25/acl/AccessControl.h b/src/common/p25/acl/AccessControl.h
+--- a/src/common/p25/acl/AccessControl.h
++++ b/src/common/p25/acl/AccessControl.h
+@@ -14,6 +14,10 @@
+  * @ingroup p25
+  * @file AccessControl.cpp
+  * @ingroup p25
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_ACL__ACCESS_CONTROL_H__)
+ #define __P25_ACL__ACCESS_CONTROL_H__
+diff --git a/src/common/p25/data/Assembler.cpp b/src/common/p25/data/Assembler.cpp
+--- a/src/common/p25/data/Assembler.cpp
++++ b/src/common/p25/data/Assembler.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025-2026 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/P25Defines.h"
+diff --git a/src/common/p25/data/DataHeader.cpp b/src/common/p25/data/DataHeader.cpp
+--- a/src/common/p25/data/DataHeader.cpp
++++ b/src/common/p25/data/DataHeader.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2018,2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/P25Defines.h"
+diff --git a/src/common/p25/data/DataHeader.h b/src/common/p25/data/DataHeader.h
+--- a/src/common/p25/data/DataHeader.h
++++ b/src/common/p25/data/DataHeader.h
+@@ -17,6 +17,10 @@
+  * @file DataHeader.cpp
+  * @ingroup p25_pdu
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__P25_DATA__DATA_HEADER_H__)
+ #define  __P25_DATA__DATA_HEADER_H__
+ 
+diff --git a/src/common/p25/data/LowSpeedData.cpp b/src/common/p25/data/LowSpeedData.cpp
+--- a/src/common/p25/data/LowSpeedData.cpp
++++ b/src/common/p25/data/LowSpeedData.cpp
+@@ -7,6 +7,10 @@
+  *  Copyright (C) 2016 Jonathan Naylor, G4KLX
+  *  Copyright (C) 2022 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/data/LowSpeedData.h"
+diff --git a/src/common/p25/data/LowSpeedData.h b/src/common/p25/data/LowSpeedData.h
+--- a/src/common/p25/data/LowSpeedData.h
++++ b/src/common/p25/data/LowSpeedData.h
+@@ -13,6 +13,10 @@
+  * @ingroup p25
+  * @file LowSpeedData.cpp
+  * @ingroup p25
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_DATA__LOW_SPEED_DATA_H__)
+ #define __P25_DATA__LOW_SPEED_DATA_H__
+diff --git a/src/common/p25/kmm/KMMFrame.cpp b/src/common/p25/kmm/KMMFrame.cpp
+--- a/src/common/p25/kmm/KMMFrame.cpp
++++ b/src/common/p25/kmm/KMMFrame.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/P25Defines.h"
+diff --git a/src/common/p25/kmm/KMMFrame.h b/src/common/p25/kmm/KMMFrame.h
+--- a/src/common/p25/kmm/KMMFrame.h
++++ b/src/common/p25/kmm/KMMFrame.h
+@@ -16,6 +16,10 @@
+  * @ingroup p25_kmm
+  * @file KMMFrame.cpp
+  * @ingroup p25_kmm
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_KMM__KMM_FRAME_H__)
+ #define  __P25_KMM__KMM_FRAME_H__
+diff --git a/src/common/p25/kmm/KMMRekeyCommand.cpp b/src/common/p25/kmm/KMMRekeyCommand.cpp
+--- a/src/common/p25/kmm/KMMRekeyCommand.cpp
++++ b/src/common/p25/kmm/KMMRekeyCommand.cpp
+@@ -7,6 +7,10 @@
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "Defines.h"
+ #include "p25/P25Defines.h"
+ #include "p25/kmm/KMMRekeyCommand.h"
+diff --git a/src/common/p25/lc/AMBT.cpp b/src/common/p25/lc/AMBT.cpp
+--- a/src/common/p25/lc/AMBT.cpp
++++ b/src/common/p25/lc/AMBT.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/P25Defines.h"
+diff --git a/src/common/p25/lc/LC.cpp b/src/common/p25/lc/LC.cpp
+--- a/src/common/p25/lc/LC.cpp
++++ b/src/common/p25/lc/LC.cpp
+@@ -8,6 +8,10 @@
+ *   Copyright (C) 2017-2026 Bryan Biedenkapp, N2PLL
+ *
+ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "Defines.h"
+ #include "p25/P25Defines.h"
+ #include "p25/lc/LC.h"
+diff --git a/src/common/p25/lc/LC.h b/src/common/p25/lc/LC.h
+--- a/src/common/p25/lc/LC.h
++++ b/src/common/p25/lc/LC.h
+@@ -18,6 +18,10 @@
+  * @file LC.cpp
+  * @ingroup p25_lc
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__P25_LC__LC_H__)
+ #define  __P25_LC__LC_H__
+ 
+diff --git a/src/common/p25/lc/TSBK.cpp b/src/common/p25/lc/TSBK.cpp
+--- a/src/common/p25/lc/TSBK.cpp
++++ b/src/common/p25/lc/TSBK.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2017-2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/P25Defines.h"
+diff --git a/src/common/p25/lc/tsbk/IOSP_ACK_RSP.cpp b/src/common/p25/lc/tsbk/IOSP_ACK_RSP.cpp
+--- a/src/common/p25/lc/tsbk/IOSP_ACK_RSP.cpp
++++ b/src/common/p25/lc/tsbk/IOSP_ACK_RSP.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/IOSP_ACK_RSP.h"
+diff --git a/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.cpp b/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.cpp
+--- a/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.cpp
++++ b/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/IOSP_MSG_UPDT.h"
+diff --git a/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.h b/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.h
+--- a/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.h
++++ b/src/common/p25/lc/tsbk/IOSP_MSG_UPDT.h
+@@ -12,6 +12,10 @@
+  * @ingroup p25_tsbk
+  * @file IOSP_MSG_UPDT.cpp
+  * @ingroup p25_tsbk
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_LC_TSBK__IOSP_MSG_UPDT_H__)
+ #define  __P25_LC_TSBK__IOSP_MSG_UPDT_H__
+diff --git a/src/common/p25/lc/tsbk/IOSP_STS_UPDT.cpp b/src/common/p25/lc/tsbk/IOSP_STS_UPDT.cpp
+--- a/src/common/p25/lc/tsbk/IOSP_STS_UPDT.cpp
++++ b/src/common/p25/lc/tsbk/IOSP_STS_UPDT.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/IOSP_STS_UPDT.h"
+diff --git a/src/common/p25/lc/tsbk/IOSP_STS_UPDT.h b/src/common/p25/lc/tsbk/IOSP_STS_UPDT.h
+--- a/src/common/p25/lc/tsbk/IOSP_STS_UPDT.h
++++ b/src/common/p25/lc/tsbk/IOSP_STS_UPDT.h
+@@ -12,6 +12,10 @@
+  * @ingroup p25_tsbk
+  * @file IOSP_STS_UPDT.cpp
+  * @ingroup p25_tsbk
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_LC_TSBK__IOSP_STS_UPDT_H__)
+ #define  __P25_LC_TSBK__IOSP_STS_UPDT_H__
+diff --git a/src/common/p25/lc/tsbk/ISP_CAN_SRV_REQ.cpp b/src/common/p25/lc/tsbk/ISP_CAN_SRV_REQ.cpp
+--- a/src/common/p25/lc/tsbk/ISP_CAN_SRV_REQ.cpp
++++ b/src/common/p25/lc/tsbk/ISP_CAN_SRV_REQ.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/ISP_CAN_SRV_REQ.h"
+diff --git a/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.cpp b/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.cpp
+--- a/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.cpp
++++ b/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024,2026 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h"
+diff --git a/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h b/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h
+--- a/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h
++++ b/src/common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h
+@@ -12,6 +12,10 @@
+  * @ingroup p25_tsbk
+  * @file ISP_EMERG_ALRM_REQ.cpp
+  * @ingroup p25_tsbk
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_LC_TSBK__ISP_EMERG_ALRM_REQ_H__)
+ #define  __P25_LC_TSBK__ISP_EMERG_ALRM_REQ_H__
+diff --git a/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.cpp b/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.cpp
+--- a/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.cpp
++++ b/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/OSP_ADJ_STS_BCAST.h"
+diff --git a/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h b/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h
+--- a/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h
++++ b/src/common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h
+@@ -12,6 +12,10 @@
+  * @ingroup p25_tsbk
+  * @file OSP_ADJ_STS_BCAST.cpp
+  * @ingroup p25_tsbk
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_LC_TSBK__OSP_ADJ_STS_BCAST_H__)
+ #define  __P25_LC_TSBK__OSP_ADJ_STS_BCAST_H__
+diff --git a/src/common/p25/lc/tsbk/OSP_MOT_CC_BSI.cpp b/src/common/p25/lc/tsbk/OSP_MOT_CC_BSI.cpp
+--- a/src/common/p25/lc/tsbk/OSP_MOT_CC_BSI.cpp
++++ b/src/common/p25/lc/tsbk/OSP_MOT_CC_BSI.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/OSP_MOT_CC_BSI.h"
+diff --git a/src/common/p25/lc/tsbk/OSP_SCCB.cpp b/src/common/p25/lc/tsbk/OSP_SCCB.cpp
+--- a/src/common/p25/lc/tsbk/OSP_SCCB.cpp
++++ b/src/common/p25/lc/tsbk/OSP_SCCB.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/OSP_SCCB.h"
+diff --git a/src/common/p25/lc/tsbk/OSP_SCCB.h b/src/common/p25/lc/tsbk/OSP_SCCB.h
+--- a/src/common/p25/lc/tsbk/OSP_SCCB.h
++++ b/src/common/p25/lc/tsbk/OSP_SCCB.h
+@@ -12,6 +12,10 @@
+  * @ingroup p25_tsbk
+  * @file OSP_SCCB.cpp
+  * @ingroup p25_tsbk
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_LC_TSBK__OSP_SCCB_H__)
+ #define  __P25_LC_TSBK__OSP_SCCB_H__
+diff --git a/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.cpp b/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.cpp
+--- a/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.cpp
++++ b/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/OSP_SYS_SRV_BCAST.h"
+diff --git a/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h b/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h
+--- a/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h
++++ b/src/common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h
+@@ -12,6 +12,10 @@
+  * @ingroup p25_tsbk
+  * @file OSP_SYS_SRV_BCAST.cpp
+  * @ingroup p25_tsbk
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_LC_TSBK__OSP_SYS_SRV_BCAST_H__)
+ #define  __P25_LC_TSBK__OSP_SYS_SRV_BCAST_H__
+diff --git a/src/common/p25/lc/tsbk/OSP_TSBK_RAW.cpp b/src/common/p25/lc/tsbk/OSP_TSBK_RAW.cpp
+--- a/src/common/p25/lc/tsbk/OSP_TSBK_RAW.cpp
++++ b/src/common/p25/lc/tsbk/OSP_TSBK_RAW.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2023,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/OSP_TSBK_RAW.h"
+diff --git a/src/common/p25/lc/tsbk/StatusQuery.h b/src/common/p25/lc/tsbk/StatusQuery.h
+--- a/src/common/p25/lc/tsbk/StatusQuery.h
++++ b/src/common/p25/lc/tsbk/StatusQuery.h
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // TIA-102.AABC-E6.1.14.1/Fig6.1.14-1, PDF116/printed97;
+ // 6.2.17.1/Fig6.2.17-1, PDF183/printed164. See status-query-backend.md.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #pragma once
+ #include "common/p25/lc/tsbk/IOSP_STS_UPDT.h"
+ namespace p25 { namespace lc { namespace tsbk {
+diff --git a/src/common/p25/lc/tsbk/TSBKFactory.cpp b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+--- a/src/common/p25/lc/tsbk/TSBKFactory.cpp
++++ b/src/common/p25/lc/tsbk/TSBKFactory.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/TSBKFactory.h"
+diff --git a/src/common/p25/lc/tsbk/TSBKFactory.h b/src/common/p25/lc/tsbk/TSBKFactory.h
+--- a/src/common/p25/lc/tsbk/TSBKFactory.h
++++ b/src/common/p25/lc/tsbk/TSBKFactory.h
+@@ -20,6 +20,10 @@
+  * @ingroup p25_tsbk
+  * @file TSBKFactory.cpp
+  * @ingroup p25_tsbk
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_LC__TSBK_FACTORY_H__)
+ #define  __P25_LC__TSBK_FACTORY_H__
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.cpp b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.cpp
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.cpp
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.h"
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.h b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.h
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.h
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_EXT_FNCT.h
+@@ -12,6 +12,10 @@
+  * @ingroup p25_ambt
+  * @file MBT_IOSP_EXT_FNCT.cpp
+  * @ingroup p25_ambt
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_LC_TSBK__MBT_IOSP_EXT_FNCT_H__)
+ #define  __P25_LC_TSBK__MBT_IOSP_EXT_FNCT_H__
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.cpp b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.cpp
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.cpp
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/mbt/MBT_IOSP_GRP_AFF.h"
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.cpp b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.cpp
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.cpp
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.h"
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.h b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.h
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.h
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_MSG_UPDT.h
+@@ -12,6 +12,10 @@
+  * @ingroup p25_ambt
+  * @file MBT_IOSP_MSG_UPDT.cpp
+  * @ingroup p25_ambt
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_LC_TSBK__MBT_IOSP_MSG_UPDT_H__)
+ #define  __P25_LC_TSBK__MBT_IOSP_MSG_UPDT_H__
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.cpp b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.cpp
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.cpp
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2022,2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.h"
+diff --git a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.h b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.h
+--- a/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.h
++++ b/src/common/p25/lc/tsbk/mbt/MBT_IOSP_STS_UPDT.h
+@@ -12,6 +12,10 @@
+  * @ingroup p25_ambt
+  * @file MBT_IOSP_STS_UPDT.cpp
+  * @ingroup p25_ambt
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_LC_TSBK__MBT_IOSP_STS_UPDT_H__)
+ #define  __P25_LC_TSBK__MBT_IOSP_STS_UPDT_H__
+diff --git a/src/common/restapi/http/HTTPPayload.cpp b/src/common/restapi/http/HTTPPayload.cpp
+--- a/src/common/restapi/http/HTTPPayload.cpp
++++ b/src/common/restapi/http/HTTPPayload.cpp
+@@ -7,6 +7,10 @@
+  *  Copyright (c) 2003-2013 Christopher M. Kohlhoff
+  *  Copyright (C) 2023 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "restapi/http/HTTPPayload.h"
+diff --git a/src/common/restapi/http/HTTPPayload.h b/src/common/restapi/http/HTTPPayload.h
+--- a/src/common/restapi/http/HTTPPayload.h
++++ b/src/common/restapi/http/HTTPPayload.h
+@@ -13,6 +13,10 @@
+  * @ingroup http
+  * @file HTTPPayload.cpp
+  * @ingroup http
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__REST_HTTP__HTTP_PAYLOAD_H__)
+ #define __REST_HTTP__HTTP_PAYLOAD_H__
+diff --git a/src/common/restapi/http/HTTPServer.h b/src/common/restapi/http/HTTPServer.h
+--- a/src/common/restapi/http/HTTPServer.h
++++ b/src/common/restapi/http/HTTPServer.h
+@@ -11,6 +11,10 @@
+ /**
+  * @file HTTPServer.h
+  * @ingroup http
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__REST_HTTP__HTTP_SERVER_H__)
+ #define __REST_HTTP__HTTP_SERVER_H__
+diff --git a/src/common/restapi/http/RequestAssembler.h b/src/common/restapi/http/RequestAssembler.h
+--- a/src/common/restapi/http/RequestAssembler.h
++++ b/src/common/restapi/http/RequestAssembler.h
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: BSL-1.0
+ // Bounded request framing shared by the existing TCP and TLS REST transports.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__REST_HTTP__REQUEST_ASSEMBLER_H__)
+ #define __REST_HTTP__REQUEST_ASSEMBLER_H__
+ 
+diff --git a/src/common/restapi/http/SecureHTTPServer.h b/src/common/restapi/http/SecureHTTPServer.h
+--- a/src/common/restapi/http/SecureHTTPServer.h
++++ b/src/common/restapi/http/SecureHTTPServer.h
+@@ -11,6 +11,10 @@
+ /**
+  * @file HTTPServer.h
+  * @ingroup http
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__REST_HTTP__SECURE_HTTP_SERVER_H__)
+ #define __REST_HTTP__SECURE_HTTP_SERVER_H__
+diff --git a/src/common/restapi/http/SecureServerConnection.h b/src/common/restapi/http/SecureServerConnection.h
+--- a/src/common/restapi/http/SecureServerConnection.h
++++ b/src/common/restapi/http/SecureServerConnection.h
+@@ -11,6 +11,10 @@
+ /**
+  * @file SecureServerConnection.h
+  * @ingroup http
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__REST_HTTP__SECURE_SERVER_CONNECTION_H__)
+ #define __REST_HTTP__SECURE_SERVER_CONNECTION_H__
+diff --git a/src/common/restapi/http/ServerConnection.h b/src/common/restapi/http/ServerConnection.h
+--- a/src/common/restapi/http/ServerConnection.h
++++ b/src/common/restapi/http/ServerConnection.h
+@@ -11,6 +11,10 @@
+ /**
+  * @file ServerConnection.h
+  * @ingroup http
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__REST_HTTP__SERVER_CONNECTION_H__)
+ #define __REST_HTTP__SERVER_CONNECTION_H__
+diff --git a/src/common/restapi/http/ServerConnectionManager.h b/src/common/restapi/http/ServerConnectionManager.h
+--- a/src/common/restapi/http/ServerConnectionManager.h
++++ b/src/common/restapi/http/ServerConnectionManager.h
+@@ -11,6 +11,10 @@
+ /**
+  * @file ServerConnection.h
+  * @ingroup http
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__REST_HTTP__SERVER_CONNECTION_MANAGER_H__)
+ #define __REST_HTTP__SERVER_CONNECTION_MANAGER_H__
+diff --git a/src/fne/ActivityLog.cpp b/src/fne/ActivityLog.cpp
+--- a/src/fne/ActivityLog.cpp
++++ b/src/fne/ActivityLog.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2024-2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "ActivityLog.h"
+ #include "common/Log.h" // for CurrentLogFileLevel() and LogGetNetwork()
+diff --git a/src/fne/ActivityLog.h b/src/fne/ActivityLog.h
+--- a/src/fne/ActivityLog.h
++++ b/src/fne/ActivityLog.h
+@@ -12,6 +12,10 @@
+  * @ingroup fne
+  * @file ActivityLog.cpp
+  * @ingroup fne
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__ACTIVITY_LOG_H__)
+ #define __ACTIVITY_LOG_H__
+diff --git a/src/fne/HostFNE.cpp b/src/fne/HostFNE.cpp
+--- a/src/fne/HostFNE.cpp
++++ b/src/fne/HostFNE.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2023-2026 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/network/udp/Socket.h"
+diff --git a/src/fne/HostFNE.h b/src/fne/HostFNE.h
+--- a/src/fne/HostFNE.h
++++ b/src/fne/HostFNE.h
+@@ -12,6 +12,10 @@
+  * @ingroup fne
+  * @file HostFNE.cpp
+  * @ingroup fne
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__HOST_FNE_H__)
+ #define __HOST_FNE_H__
+diff --git a/src/fne/network/P25OTARService.cpp b/src/fne/network/P25OTARService.cpp
+--- a/src/fne/network/P25OTARService.cpp
++++ b/src/fne/network/P25OTARService.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "fne/Defines.h"
+ #include "common/p25/kmm/KMMFactory.h"
+diff --git a/src/fne/network/TrafficNetwork.cpp b/src/fne/network/TrafficNetwork.cpp
+--- a/src/fne/network/TrafficNetwork.cpp
++++ b/src/fne/network/TrafficNetwork.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2023-2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "fne/Defines.h"
+ #include "common/edac/SHA256.h"
+diff --git a/src/fne/network/TrafficNetwork.h b/src/fne/network/TrafficNetwork.h
+--- a/src/fne/network/TrafficNetwork.h
++++ b/src/fne/network/TrafficNetwork.h
+@@ -21,6 +21,10 @@
+  * @file TrafficNetwork.cpp
+  * @ingroup fne_network
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__TRAFFIC_NETWORK_H__)
+ #define __TRAFFIC_NETWORK_H__
+ 
+diff --git a/src/fne/network/callhandler/TagP25Data.cpp b/src/fne/network/callhandler/TagP25Data.cpp
+--- a/src/fne/network/callhandler/TagP25Data.cpp
++++ b/src/fne/network/callhandler/TagP25Data.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2023-2026 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "fne/Defines.h"
+ #include "common/p25/lc/tsbk/TSBKFactory.h"
+diff --git a/src/fne/network/callhandler/TagP25Data.h b/src/fne/network/callhandler/TagP25Data.h
+--- a/src/fne/network/callhandler/TagP25Data.h
++++ b/src/fne/network/callhandler/TagP25Data.h
+@@ -13,6 +13,10 @@
+  * @file TagP25Data.cpp
+  * @ingroup fne_callhandler
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__CALLHANDLER__TAG_P25_DATA_H__)
+ #define __CALLHANDLER__TAG_P25_DATA_H__
+ 
+diff --git a/src/fne/network/callhandler/packetdata/P25PacketData.cpp b/src/fne/network/callhandler/packetdata/P25PacketData.cpp
+--- a/src/fne/network/callhandler/packetdata/P25PacketData.cpp
++++ b/src/fne/network/callhandler/packetdata/P25PacketData.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2024-2026 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "fne/Defines.h"
+ #include "common/p25/kmm/KMMFactory.h"
+diff --git a/src/host/ActivityLog.cpp b/src/host/ActivityLog.cpp
+--- a/src/host/ActivityLog.cpp
++++ b/src/host/ActivityLog.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2024-2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "ActivityLog.h"
+ #include "common/network/BaseNetwork.h"
+diff --git a/src/host/ActivityLog.h b/src/host/ActivityLog.h
+--- a/src/host/ActivityLog.h
++++ b/src/host/ActivityLog.h
+@@ -12,6 +12,10 @@
+  * @ingroup host
+  * @file ActivityLog.cpp
+  * @ingroup host
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__ACTIVITY_LOG_H__)
+ #define __ACTIVITY_LOG_H__
+diff --git a/src/host/C4FMTest.cpp b/src/host/C4FMTest.cpp
+--- a/src/host/C4FMTest.cpp
++++ b/src/host/C4FMTest.cpp
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "C4FMTest.h"
+ #include "HostMain.h"
+ #include "common/Log.h"
+diff --git a/src/host/C4FMTest.h b/src/host/C4FMTest.h
+--- a/src/host/C4FMTest.h
++++ b/src/host/C4FMTest.h
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef __HOST_C4FM_TEST_H__
+ #define __HOST_C4FM_TEST_H__
+ 
+diff --git a/src/host/CWIDDrain.h b/src/host/CWIDDrain.h
+--- a/src/host/CWIDDrain.h
++++ b/src/host/CWIDDrain.h
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Bounded completion of already queued normal traffic before identification. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef DVM_HOST_CWID_DRAIN_H
+ #define DVM_HOST_CWID_DRAIN_H
+ 
+diff --git a/src/host/CWIDPolicy.h b/src/host/CWIDPolicy.h
+--- a/src/host/CWIDPolicy.h
++++ b/src/host/CWIDPolicy.h
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Pure identification scheduling and a bounded modem transaction. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef DVM_HOST_CWID_POLICY_H
+ #define DVM_HOST_CWID_POLICY_H
+ 
+diff --git a/src/host/Host.P25.cpp b/src/host/Host.P25.cpp
+--- a/src/host/Host.P25.cpp
++++ b/src/host/Host.P25.cpp
+@@ -8,6 +8,10 @@
+ *  Copyright (C) 2026 Timothy Sawyer, WD6AWP
+ *
+ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "Defines.h"
+ #include "Host.h"
+ #include "HostMain.h"
+diff --git a/src/host/Host.cpp b/src/host/Host.cpp
+--- a/src/host/Host.cpp
++++ b/src/host/Host.cpp
+@@ -8,6 +8,10 @@
+  *  Copyright (C) 2017-2023 Bryan Biedenkapp, N2PLL
+  *  Copyright (C) 2021 Nat Moore
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/lookups/RSSIInterpolator.h"
+diff --git a/src/host/Host.h b/src/host/Host.h
+--- a/src/host/Host.h
++++ b/src/host/Host.h
+@@ -21,6 +21,10 @@
+  * @ingroup host
+  * @file Host.NXDN.cpp
+  * @ingroup host
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__HOST_H__)
+ #define __HOST_H__
+diff --git a/src/host/HostMain.cpp b/src/host/HostMain.cpp
+--- a/src/host/HostMain.cpp
++++ b/src/host/HostMain.cpp
+@@ -7,6 +7,10 @@
+  *  Copyright (C) 2015,2016,2017 Jonathan Naylor, G4KLX
+  *  Copyright (C) 2020-2023 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/Log.h"
+diff --git a/src/host/modem/Modem.cpp b/src/host/modem/Modem.cpp
+--- a/src/host/modem/Modem.cpp
++++ b/src/host/modem/Modem.cpp
+@@ -9,6 +9,10 @@
+  *  Copyright (C) 2021 Nat Moore
+  *  Copyright (C) 2026 Timothy Sawyer, WD6AWP
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/dmr/DMRDefines.h"
+diff --git a/src/host/modem/Modem.h b/src/host/modem/Modem.h
+--- a/src/host/modem/Modem.h
++++ b/src/host/modem/Modem.h
+@@ -23,6 +23,10 @@
+  * @file Modem.cpp
+  * @ingroup modem
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__MODEM_H__)
+ #define __MODEM_H__
+ 
+diff --git a/src/host/modem/port/ModemNullPort.cpp b/src/host/modem/port/ModemNullPort.cpp
+--- a/src/host/modem/port/ModemNullPort.cpp
++++ b/src/host/modem/port/ModemNullPort.cpp
+@@ -8,6 +8,10 @@
+  *  Copyright (C) 2021,2024 Bryan Biedenkapp, N2PLL
+  *
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "modem/port/ModemNullPort.h"
+ #include "modem/Modem.h"
+ 
+diff --git a/src/host/modem/port/ModemNullPort.h b/src/host/modem/port/ModemNullPort.h
+--- a/src/host/modem/port/ModemNullPort.h
++++ b/src/host/modem/port/ModemNullPort.h
+@@ -13,6 +13,10 @@
+  * @ingroup port
+  * @file ModemNullPort.cpp
+  * @ingroup port
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__MODEM_NULL_PORT_H__)
+ #define __MODEM_NULL_PORT_H__
+diff --git a/src/host/modem/port/UARTPort.cpp b/src/host/modem/port/UARTPort.cpp
+--- a/src/host/modem/port/UARTPort.cpp
++++ b/src/host/modem/port/UARTPort.cpp
+@@ -8,6 +8,10 @@
+  *  Copyright (C) 1999-2001 Thomas Sailor, HB9JNX
+  *  Copyright (C) 2020-2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/Log.h"
+diff --git a/src/host/modem/port/UARTPort.h b/src/host/modem/port/UARTPort.h
+--- a/src/host/modem/port/UARTPort.h
++++ b/src/host/modem/port/UARTPort.h
+@@ -14,6 +14,10 @@
+  * @ingroup port
+  * @file UARTPort.cpp
+  * @ingroup port
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__UART_PORT_H__)
+ #define __UART_PORT_H__
+diff --git a/src/host/p25/Control.Dispatch.cpp b/src/host/p25/Control.Dispatch.cpp
+--- a/src/host/p25/Control.Dispatch.cpp
++++ b/src/host/p25/Control.Dispatch.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Dispatch REST never writes protocol state. The normal clock owner executes
+  * bounded operations using the stock allocator and correlated VC permit. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "p25/Control.h"
+ #include "Host.h"
+ #include "common/p25/acl/AccessControl.h"
+diff --git a/src/host/p25/Control.Inhibit.cpp b/src/host/p25/Control.Inhibit.cpp
+--- a/src/host/p25/Control.Inhibit.cpp
++++ b/src/host/p25/Control.Inhibit.cpp
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "p25/Control.h"
+ #include "p25/packet/ControlSignaling.h"
+ #include "p25/packet/Voice.h"
+diff --git a/src/host/p25/Control.RFAdmission.cpp b/src/host/p25/Control.RFAdmission.cpp
+--- a/src/host/p25/Control.RFAdmission.cpp
++++ b/src/host/p25/Control.RFAdmission.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* AllStart RF requests wait for Site/Zone approval before an RF grant is
+  * emitted. REST only records decisions; the protocol clock owns allocation. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "p25/Control.h"
+ #include "common/p25/acl/AccessControl.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/src/host/p25/Control.h b/src/host/p25/Control.h
+--- a/src/host/p25/Control.h
++++ b/src/host/p25/Control.h
+@@ -21,6 +21,10 @@
+  * @ingroup host_p25
+  * @file Control.cpp
+  * @ingroup host_p25
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_CONTROL_H__)
+ #define __P25_CONTROL_H__
+diff --git a/src/host/p25/Dispatch.h b/src/host/p25/Dispatch.h
+--- a/src/host/p25/Dispatch.h
++++ b/src/host/p25/Dispatch.h
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Private authenticated dispatch allocation contract; no media or modem I/O. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef __P25_DISPATCH_H__
+ #define __P25_DISPATCH_H__
+ #include <atomic>
+diff --git a/src/host/p25/InhibitPolicy.h b/src/host/p25/InhibitPolicy.h
+--- a/src/host/p25/InhibitPolicy.h
++++ b/src/host/p25/InhibitPolicy.h
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Current Zone intent and local RFSS observations are distinct; no wire fields.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #pragma once
+ #include <cstdint>
+ #include <string>
+diff --git a/src/host/p25/TxFrameQueue.h b/src/host/p25/TxFrameQueue.h
+--- a/src/host/p25/TxFrameQueue.h
++++ b/src/host/p25/TxFrameQueue.h
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Private P25 transmit records. The payload is the unchanged modem frame;
+ // cancellation ownership exists only inside the host process.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #pragma once
+ #include <atomic>
+ #include <chrono>
+diff --git a/src/host/p25/packet/AMBTIngress.h b/src/host/p25/packet/AMBTIngress.h
+--- a/src/host/p25/packet/AMBTIngress.h
++++ b/src/host/p25/packet/AMBTIngress.h
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // AABC-E6.1 ISP extended formats; implicit home identity is required before
+ // conversion to concrete local handlers. This never invokes a wire encoder.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #ifndef P25_AMBT_INGRESS_H
+ #define P25_AMBT_INGRESS_H
+ #include "common/p25/lc/tsbk/TSBKFactory.h"
+diff --git a/src/host/p25/packet/ControlSignaling.Inhibit.cpp b/src/host/p25/packet/ControlSignaling.Inhibit.cpp
+--- a/src/host/p25/packet/ControlSignaling.Inhibit.cpp
++++ b/src/host/p25/packet/ControlSignaling.Inhibit.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // AABD-B13.3/13.4: operational RFSS inhibition is distinct from provisioning.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "p25/packet/ControlSignaling.h"
+ #include "common/p25/acl/AccessControl.h"
+ #include "common/p25/lc/tsbk/IOSP_ACK_RSP.h"
+diff --git a/src/host/p25/packet/ControlSignaling.Message.cpp b/src/host/p25/packet/ControlSignaling.Message.cpp
+--- a/src/host/p25/packet/ControlSignaling.Message.cpp
++++ b/src/host/p25/packet/ControlSignaling.Message.cpp
+@@ -3,6 +3,10 @@
+ // (PDF91-93/printed86-88); AABC-E 6.2.10.1 Fig6.2.10-1 (PDF170/printed151),
+ // 6.1.1.1 Fig6.1.1-1 (PDF94/printed75), 2.3.25 (PDF38/printed19).
+ // One send, 750ms enqueue and 10s response fence are project policy.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "p25/packet/ControlSignaling.h"
+ #include "common/p25/lc/tsbk/IOSP_MSG_UPDT.h"
+ #include "p25/lookups/P25AffiliationLookup.h"
+diff --git a/src/host/p25/packet/ControlSignaling.Status.cpp b/src/host/p25/packet/ControlSignaling.Status.cpp
+--- a/src/host/p25/packet/ControlSignaling.Status.cpp
++++ b/src/host/p25/packet/ControlSignaling.Status.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // AABD-B4.1.3/10.4.2/10.4.4-5; AABC-E6.1.14/6.2.17-18. See status-query-backend.md.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "p25/packet/ControlSignaling.h"
+ #include "common/p25/lc/tsbk/StatusQuery.h"
+ #include "p25/lookups/P25AffiliationLookup.h"
+diff --git a/src/host/p25/packet/ControlSignaling.h b/src/host/p25/packet/ControlSignaling.h
+--- a/src/host/p25/packet/ControlSignaling.h
++++ b/src/host/p25/packet/ControlSignaling.h
+@@ -12,6 +12,10 @@
+  * @ingroup host_p25
+  * @file ControlSignaling.cpp
+  * @ingroup host_p25
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__P25_PACKET_CONTROL_SIGNALING_H__)
+ #define __P25_PACKET_CONTROL_SIGNALING_H__
+diff --git a/src/host/p25/packet/Data.cpp b/src/host/p25/packet/Data.cpp
+--- a/src/host/p25/packet/Data.cpp
++++ b/src/host/p25/packet/Data.cpp
+@@ -7,6 +7,10 @@
+  *  Copyright (C) 2016,2017,2018 Jonathan Naylor, G4KLX
+  *  Copyright (C) 2017-2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/src/host/p25/packet/Data.h b/src/host/p25/packet/Data.h
+--- a/src/host/p25/packet/Data.h
++++ b/src/host/p25/packet/Data.h
+@@ -14,6 +14,10 @@
+  * @file Data.cpp
+  * @ingroup host_p25
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__P25_PACKET_DATA_H__)
+ #define __P25_PACKET_DATA_H__
+ 
+diff --git a/src/host/p25/packet/FullRateCAI.h b/src/host/p25/packet/FullRateCAI.h
+--- a/src/host/p25/packet/FullRateCAI.h
++++ b/src/host/p25/packet/FullRateCAI.h
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Native FullRate carrier -> CAI payload. Receiver-quality reports remain in the
+ // carrier; CAI has no corresponding Et/Er/E1/E4/SF/status fields to transmit.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #pragma once
+ #include "common/p25/FullRate.h"
+ #include "common/p25/Audio.h"
+diff --git a/src/host/p25/packet/Voice.cpp b/src/host/p25/packet/Voice.cpp
+--- a/src/host/p25/packet/Voice.cpp
++++ b/src/host/p25/packet/Voice.cpp
+@@ -7,6 +7,10 @@
+  *  Copyright (C) 2016,2017,2018 Jonathan Naylor, G4KLX
+  *  Copyright (C) 2017-2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/src/host/p25/packet/Voice.h b/src/host/p25/packet/Voice.h
+--- a/src/host/p25/packet/Voice.h
++++ b/src/host/p25/packet/Voice.h
+@@ -14,6 +14,10 @@
+  * @file Voice.cpp
+  * @ingroup host_p25
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__P25_PACKET_VOICE_H__)
+ #define __P25_PACKET_VOICE_H__
+ 
+diff --git a/src/host/restapi/RESTAPI.cpp b/src/host/restapi/RESTAPI.cpp
+--- a/src/host/restapi/RESTAPI.cpp
++++ b/src/host/restapi/RESTAPI.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2023-2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/edac/SHA256.h"
+diff --git a/src/host/restapi/RESTAPI.h b/src/host/restapi/RESTAPI.h
+--- a/src/host/restapi/RESTAPI.h
++++ b/src/host/restapi/RESTAPI.h
+@@ -13,6 +13,10 @@
+  * @file RESTAPI.cpp
+  * @ingroup host_rest
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if !defined(__REST_API_H__)
+ #define __REST_API_H__
+ 
+diff --git a/src/host/restapi/RESTDefines.h b/src/host/restapi/RESTDefines.h
+--- a/src/host/restapi/RESTDefines.h
++++ b/src/host/restapi/RESTDefines.h
+@@ -14,6 +14,10 @@
+  * 
+  * @file RESTDefines.h
+  * @ingroup host_rest
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__REST_DEFINES_H__)
+ #define __REST_DEFINES_H__
+diff --git a/src/host/setup/HostSetup.cpp b/src/host/setup/HostSetup.cpp
+--- a/src/host/setup/HostSetup.cpp
++++ b/src/host/setup/HostSetup.cpp
+@@ -8,6 +8,10 @@
+  *  Copyright (C) 2017,2018 Andy Uribe, CA6JAU
+  *  Copyright (C) 2021-2024 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "common/dmr/DMRDefines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/src/patch/ActivityLog.cpp b/src/patch/ActivityLog.cpp
+--- a/src/patch/ActivityLog.cpp
++++ b/src/patch/ActivityLog.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "ActivityLog.h"
+ #include "common/network/BaseNetwork.h"
+diff --git a/src/patch/ActivityLog.h b/src/patch/ActivityLog.h
+--- a/src/patch/ActivityLog.h
++++ b/src/patch/ActivityLog.h
+@@ -12,6 +12,10 @@
+  * @ingroup patch
+  * @file ActivityLog.cpp
+  * @ingroup patch
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__ACTIVITY_LOG_H__)
+ #define __ACTIVITY_LOG_H__
+diff --git a/src/patch/HostPatch.h b/src/patch/HostPatch.h
+--- a/src/patch/HostPatch.h
++++ b/src/patch/HostPatch.h
+@@ -12,6 +12,10 @@
+  * @ingroup patch
+  * @file HostPatch.cpp
+  * @ingroup patch
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #ifndef __HOST_PATCH_H__
+ #define __HOST_PATCH_H__
+diff --git a/src/patch/network/PeerNetwork.cpp b/src/patch/network/PeerNetwork.cpp
+--- a/src/patch/network/PeerNetwork.cpp
++++ b/src/patch/network/PeerNetwork.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "patch/Defines.h"
+ #include "common/dmr/data/EMB.h"
+diff --git a/src/patch/network/PeerNetwork.h b/src/patch/network/PeerNetwork.h
+--- a/src/patch/network/PeerNetwork.h
++++ b/src/patch/network/PeerNetwork.h
+@@ -16,6 +16,10 @@
+  * @ingroup patch_network
+  * @file PeerNetwork.cpp
+  * @ingroup patch_network
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #if !defined(__PEER_NETWORK_H__)
+ #define __PEER_NETWORK_H__
+diff --git a/src/sysview/SysViewMain.cpp b/src/sysview/SysViewMain.cpp
+--- a/src/sysview/SysViewMain.cpp
++++ b/src/sysview/SysViewMain.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2024-2026 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "Defines.h"
+ #include "common/Clock.h"
+diff --git a/tests/BridgeOpaqueContinuity_Tests.cpp b/tests/BridgeOpaqueContinuity_Tests.cpp
+--- a/tests/BridgeOpaqueContinuity_Tests.cpp
++++ b/tests/BridgeOpaqueContinuity_Tests.cpp
+@@ -4,6 +4,10 @@
+ // Compile this standalone file; it includes the unmodified production .cpp.
+ // Generated source fixtures carry explicit zero receiver-error reports; they
+ // are synthetic protocol inputs and make no claim about RF observations.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if defined(DVM_BRIDGE_OPAQUE_CONTINUITY_STANDALONE)
+ #include <algorithm>
+ #include <array>
+diff --git a/tests/BridgeOpaqueLiveness_Tests.cpp b/tests/BridgeOpaqueLiveness_Tests.cpp
+--- a/tests/BridgeOpaqueLiveness_Tests.cpp
++++ b/tests/BridgeOpaqueLiveness_Tests.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Offline actual-method checks; the included fixture replaces device/thread
+ // construction and captures UDP output. No modem, network peer or RF is used.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if defined(DVM_BRIDGE_OPAQUE_LIVENESS_STANDALONE)
+ #define DVM_BRIDGE_OPAQUE_CONTINUITY_STANDALONE
+ #include "BridgeOpaqueContinuity_Tests.cpp"
+diff --git a/tests/BridgeUDPInactivity_Tests.cpp b/tests/BridgeUDPInactivity_Tests.cpp
+--- a/tests/BridgeUDPInactivity_Tests.cpp
++++ b/tests/BridgeUDPInactivity_Tests.cpp
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "bridge/UDPInactivity.h"
+ #include <catch2/catch_test_macros.hpp>
+ #include <chrono>
+diff --git a/tests/C4FMTest_Tests.cpp b/tests/C4FMTest_Tests.cpp
+--- a/tests/C4FMTest_Tests.cpp
++++ b/tests/C4FMTest_Tests.cpp
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/C4FMTest.h"
+ #include "host/modem/Modem.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/CWIDDrain_Tests.cpp b/tests/CWIDDrain_Tests.cpp
+--- a/tests/CWIDDrain_Tests.cpp
++++ b/tests/CWIDDrain_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Pure queue/status fixtures. No Host, modem, network, RF, or wall clock. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/CWIDDrain.h"
+ #include <catch2/catch_test_macros.hpp>
+ #include <functional>
+diff --git a/tests/CWIDModem_Tests.cpp b/tests/CWIDModem_Tests.cpp
+--- a/tests/CWIDModem_Tests.cpp
++++ b/tests/CWIDModem_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Exercise the actual protocol writer with no opened modem port. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/modem/Modem.h"
+ #include "host/modem/port/ModemNullPort.h"
+ #include <catch2/catch_test_macros.hpp>
+diff --git a/tests/CWIDPolicy_Tests.cpp b/tests/CWIDPolicy_Tests.cpp
+--- a/tests/CWIDPolicy_Tests.cpp
++++ b/tests/CWIDPolicy_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Offline clock/status and quiescence fixtures. No modem, network or RF. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/CWIDPolicy.h"
+ #include <catch2/catch_test_macros.hpp>
+ #include <functional>
+diff --git a/tests/CWIDUART_Tests.cpp b/tests/CWIDUART_Tests.cpp
+--- a/tests/CWIDUART_Tests.cpp
++++ b/tests/CWIDUART_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Actual POSIX PTYs and UART/parser methods; no physical modem or network. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/modem/Modem.h"
+ #include "host/modem/port/UARTPort.h"
+ #include <catch2/catch_test_macros.hpp>
+diff --git a/tests/HTTPRequestAssembly_Tests.cpp b/tests/HTTPRequestAssembly_Tests.cpp
+--- a/tests/HTTPRequestAssembly_Tests.cpp
++++ b/tests/HTTPRequestAssembly_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Literal wire inputs: independent framing expectations, no production encoder.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/restapi/http/RequestAssembler.h"
+ #include "common/restapi/http/ServerConnectionManager.h"
+ #include "common/restapi/http/ServerConnection.h"
+diff --git a/tests/KeylessResponseIngress_Tests.cpp b/tests/KeylessResponseIngress_Tests.cpp
+--- a/tests/KeylessResponseIngress_Tests.cpp
++++ b/tests/KeylessResponseIngress_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Real peer FrameQueue/Network::clock ingress over an in-memory UDP socket.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/network/Network.h"
+ #include "common/p25/kmm/KMMModifyKey.h"
+ #include <catch2/catch_test_macros.hpp>
+diff --git a/tests/LogTimestamp_Tests.cpp b/tests/LogTimestamp_Tests.cpp
+--- a/tests/LogTimestamp_Tests.cpp
++++ b/tests/LogTimestamp_Tests.cpp
+@@ -2,6 +2,10 @@
+ // Compile separately with DVM_LOG_TIMESTAMP_STANDALONE. This exercises the
+ // production Log template with timestamps enabled; only clock, calendar and
+ // output boundaries are replaced. It does not use the Catch2 timestamp bypass.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #if defined(DVM_LOG_TIMESTAMP_STANDALONE)
+ #include "common/Defines.h"
+ #include "common/Clock.h"
+diff --git a/tests/NetworkInitialConnection_Tests.cpp b/tests/NetworkInitialConnection_Tests.cpp
+--- a/tests/NetworkInitialConnection_Tests.cpp
++++ b/tests/NetworkInitialConnection_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // The open path resolves a loopback address only. No socket or RF is opened.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/network/Network.h"
+ #include <catch2/catch_test_macros.hpp>
+ namespace {
+diff --git a/tests/OpaqueWireFixture.h b/tests/OpaqueWireFixture.h
+--- a/tests/OpaqueWireFixture.h
++++ b/tests/OpaqueWireFixture.h
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Offline socket boundary. Framing, CRC parsing, peer filtering and P25
+ // packet queue methods remain production code; no socket is opened.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #pragma once
+ #include "common/network/Network.h"
+ #include "common/network/FrameQueue.h"
+diff --git a/tests/ThreadPoolLifetime_Tests.cpp b/tests/ThreadPoolLifetime_Tests.cpp
+--- a/tests/ThreadPoolLifetime_Tests.cpp
++++ b/tests/ThreadPoolLifetime_Tests.cpp
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/ThreadPool.h"
+ #include <catch2/catch_test_macros.hpp>
+ #include <atomic>
+diff --git a/tests/ThreadStartup_Tests.cpp b/tests/ThreadStartup_Tests.cpp
+--- a/tests/ThreadStartup_Tests.cpp
++++ b/tests/ThreadStartup_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Exercise real Thread startup without starting a host, transport or device.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/Thread.h"
+ #include <catch2/catch_test_macros.hpp>
+ 
+diff --git a/tests/crypto/P25_KEK_Crypto_Test.cpp b/tests/crypto/P25_KEK_Crypto_Test.cpp
+--- a/tests/crypto/P25_KEK_Crypto_Test.cpp
++++ b/tests/crypto/P25_KEK_Crypto_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/p25/Crypto.h"
+diff --git a/tests/crypto/P25_MAC_CMAC_Test.cpp b/tests/crypto/P25_MAC_CMAC_Test.cpp
+--- a/tests/crypto/P25_MAC_CMAC_Test.cpp
++++ b/tests/crypto/P25_MAC_CMAC_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "common/p25/Crypto.h"
+ #include <catch2/catch_test_macros.hpp>
+diff --git a/tests/crypto/P25_StreamLifetime_Test.cpp b/tests/crypto/P25_StreamLifetime_Test.cpp
+--- a/tests/crypto/P25_StreamLifetime_Test.cpp
++++ b/tests/crypto/P25_StreamLifetime_Test.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Public vector material only. No operational key material belongs in tests.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/p25/Crypto.h"
+ #include <catch2/catch_test_macros.hpp>
+ #include <array>
+diff --git a/tests/crypto/P25_TDEA_Test.cpp b/tests/crypto/P25_TDEA_Test.cpp
+--- a/tests/crypto/P25_TDEA_Test.cpp
++++ b/tests/crypto/P25_TDEA_Test.cpp
+@@ -2,6 +2,10 @@
+ // AAAD-B-2015 B.1/B.4, PDF45-47/printed35-37, p25_6b7b5e252ef69091;
+ // documents/tia-library/8.3_TIA-102.AAAD-B_Final Published Document_2015_12_02.pdf.
+ // Plaintext A.4 PDF42/printed32; independent expected ciphertext from B.4.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/p25/Crypto.h"
+ #include "common/p25/TDEAKey.h"
+ #include <catch2/catch_test_macros.hpp>
+diff --git a/tests/edac/CRC_12_Test.cpp b/tests/edac/CRC_12_Test.cpp
+--- a/tests/edac/CRC_12_Test.cpp
++++ b/tests/edac/CRC_12_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2023 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/edac/CRC.h"
+diff --git a/tests/edac/CRC_15_Test.cpp b/tests/edac/CRC_15_Test.cpp
+--- a/tests/edac/CRC_15_Test.cpp
++++ b/tests/edac/CRC_15_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2023 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/edac/CRC.h"
+diff --git a/tests/edac/CRC_16_Test.cpp b/tests/edac/CRC_16_Test.cpp
+--- a/tests/edac/CRC_16_Test.cpp
++++ b/tests/edac/CRC_16_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2023 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/edac/CRC.h"
+diff --git a/tests/edac/CRC_6_Test.cpp b/tests/edac/CRC_6_Test.cpp
+--- a/tests/edac/CRC_6_Test.cpp
++++ b/tests/edac/CRC_6_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2023 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/edac/CRC.h"
+diff --git a/tests/fne/KeylessIngress_Tests.cpp b/tests/fne/KeylessIngress_Tests.cpp
+--- a/tests/fne/KeylessIngress_Tests.cpp
++++ b/tests/fne/KeylessIngress_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Real FNE packet dispatcher with an authenticated peer; no socket is opened.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "fne/HostFNE.h"
+ #include "fne/FNEMain.h"
+ #include "fne/network/TrafficNetwork.h"
+diff --git a/tests/fne/SubscriberAccessIngress_Tests.cpp b/tests/fne/SubscriberAccessIngress_Tests.cpp
+--- a/tests/fne/SubscriberAccessIngress_Tests.cpp
++++ b/tests/fne/SubscriberAccessIngress_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Actual FNE ingress handlers; all transports remain unopened.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "fne/HostFNE.h"
+ #include "fne/FNEMain.h"
+ #include "fne/network/TrafficNetwork.h"
+diff --git a/tests/p25/AMBTIngress_Tests.cpp b/tests/p25/AMBTIngress_Tests.cpp
+--- a/tests/p25/AMBTIngress_Tests.cpp
++++ b/tests/p25/AMBTIngress_Tests.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Exact local AMBT ISP layouts enter actual Data/Control handlers. Framing helpers
+ // supply only CRC/Trellis/NID; message bytes and output expectations are literal.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/p25/packet/ControlSignaling.h"
+diff --git a/tests/p25/AMBTLayouts_Tests.cpp b/tests/p25/AMBTLayouts_Tests.cpp
+--- a/tests/p25/AMBTLayouts_Tests.cpp
++++ b/tests/p25/AMBTLayouts_Tests.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Literal wire layouts from AABC-E figures6.1.1-2/4-2/5-2/7-2/9-2/11-2/15-2.
+ // Header/body CRCs were generated independently by polynomial long division.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/p25/lc/tsbk/TSBKFactory.h"
+ #include "host/p25/packet/AMBTIngress.h"
+ #include "common/edac/CRC.h"
+diff --git a/tests/p25/ControlProfileBoundary_Tests.cpp b/tests/p25/ControlProfileBoundary_Tests.cpp
+--- a/tests/p25/ControlProfileBoundary_Tests.cpp
++++ b/tests/p25/ControlProfileBoundary_Tests.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // BAAC-D 2.3/PDF14 printed4; AABB-B5.1/PDF20-21 printed12-13.
+ // Literal header fields choose the profile; CRC supplies framing integrity.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/p25/lc/tsbk/TSBKFactory.h"
+ #include "common/p25/lc/tsbk/ISP_EMERG_ALRM_REQ.h"
+ #include "common/p25/lc/tsbk/IOSP_GRP_VCH.h"
+diff --git a/tests/p25/DigitalStationId_Tests.cpp b/tests/p25/DigitalStationId_Tests.cpp
+--- a/tests/p25/DigitalStationId_Tests.cpp
++++ b/tests/p25/DigitalStationId_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Offline native station-ID wire tests. No hardware or network is opened. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/HostMain.h"
+ #include "host/p25/Control.h"
+diff --git a/tests/p25/DispatchGrant_Tests.cpp b/tests/p25/DispatchGrant_Tests.cpp
+--- a/tests/p25/DispatchGrant_Tests.cpp
++++ b/tests/p25/DispatchGrant_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Actual allocator and RPC contract tests. No sockets, modem or RF is opened. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/EmergencyAdmission_Tests.cpp b/tests/p25/EmergencyAdmission_Tests.cpp
+--- a/tests/p25/EmergencyAdmission_Tests.cpp
++++ b/tests/p25/EmergencyAdmission_Tests.cpp
+@@ -4,6 +4,10 @@
+ // AnnexB PDF232/p213; Table2.3.16-1 PDF34/p15. AABD-B11.2.1-.3
+ // PDF104-106/p99-101 supplies validity/preprogrammed-group behavior.
+ // Existing CRC/Trellis supply framing only. No physical or socket opens.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/EmergencyCancellation_Tests.cpp b/tests/p25/EmergencyCancellation_Tests.cpp
+--- a/tests/p25/EmergencyCancellation_Tests.cpp
++++ b/tests/p25/EmergencyCancellation_Tests.cpp
+@@ -9,6 +9,10 @@
+ // visually verified. The cancelled service remains 0x27 (alarm) or 0x00 (voice)
+ // in the incoming request, not in the cancellation acknowledgment.
+ // Framing helpers supply CRC/Trellis/NID only, not expected service bytes.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/EmergencyDirection_Tests.cpp b/tests/p25/EmergencyDirection_Tests.cpp
+--- a/tests/p25/EmergencyDirection_Tests.cpp
++++ b/tests/p25/EmergencyDirection_Tests.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Field fixtures follow AABC-E 6.1.6/6.2.5, with E-3's SI-1 amendment.
+ // The same 0x27 opcode has different meanings on inbound/outbound CAI.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/p25/lc/tsbk/TSBKFactory.h"
+ #include "common/edac/CRC.h"
+ #include <catch2/catch_test_macros.hpp>
+diff --git a/tests/p25/InhibitProcedure_Tests.cpp b/tests/p25/InhibitProcedure_Tests.cpp
+--- a/tests/p25/InhibitProcedure_Tests.cpp
++++ b/tests/p25/InhibitProcedure_Tests.cpp
+@@ -2,6 +2,10 @@
+ // AABD-B13.3/13.4 PDF120-123/p115-118, A.5.2.2/Table18-5 PDF145/p140;
+ // AABC-E2.3.15/Table2.3.15-1 PDF34/p15;6.1.7.1 PDF105/p86;
+ // ACK6.2.1.1 PDF150-151/p131-132. Body/response bytes are literal.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/KMM_Rekey_CMAC_Test.cpp b/tests/p25/KMM_Rekey_CMAC_Test.cpp
+--- a/tests/p25/KMM_Rekey_CMAC_Test.cpp
++++ b/tests/p25/KMM_Rekey_CMAC_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/tests/p25/LocationRegistrationArea_Tests.cpp b/tests/p25/LocationRegistrationArea_Tests.cpp
+--- a/tests/p25/LocationRegistrationArea_Tests.cpp
++++ b/tests/p25/LocationRegistrationArea_Tests.cpp
+@@ -5,6 +5,10 @@
+ // Document p25_89a3b878eee70a14; exact PDF path/verification in
+ // docs/implementation-plans/lra.md in the corresponding application source.
+ // No modem port, socket, real-time timer or RF operation is used.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/MessageUpdate_Tests.cpp b/tests/p25/MessageUpdate_Tests.cpp
+--- a/tests/p25/MessageUpdate_Tests.cpp
++++ b/tests/p25/MessageUpdate_Tests.cpp
+@@ -4,6 +4,10 @@
+ // Literal expected octets are derived directly from those diagrams. CRC constants
+ // are independently computed by Python binascii.crc_hqx(body,0)^0xFFFF.
+ // The 750ms/one-send/10s fence and 16/128 capacities are project policy.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/ModemNullProtocol4_Tests.cpp b/tests/p25/ModemNullProtocol4_Tests.cpp
+--- a/tests/p25/ModemNullProtocol4_Tests.cpp
++++ b/tests/p25/ModemNullProtocol4_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Current paired protocol4 is a product serial contract, not a CAI packet.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/modem/port/ModemNullPort.h"
+ #include "host/modem/Modem.h"
+ #include "common/Log.h"
+diff --git a/tests/p25/ModemPacketTransport_Tests.cpp b/tests/p25/ModemPacketTransport_Tests.cpp
+--- a/tests/p25/ModemPacketTransport_Tests.cpp
++++ b/tests/p25/ModemPacketTransport_Tests.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Protocol4 lengths and FIFO credits are pinned implementation contracts;
+ // packet RF lengths derive from BAAA-B7.2/7.2.4, documented in the plan.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "PacketTransportFixture.h"
+ #include "common/Log.h"
+ #include <catch2/catch_test_macros.hpp>
+diff --git a/tests/p25/MultiAlgorithmVoice_Tests.cpp b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+--- a/tests/p25/MultiAlgorithmVoice_Tests.cpp
++++ b/tests/p25/MultiAlgorithmVoice_Tests.cpp
+@@ -2,6 +2,10 @@
+ /* Actual RF/FullRate voice-path regression tests. All modem/network ports remain
+  * unopened. Cipher correctness is qualified separately by packet-codec vectors;
+  * these valid FEC frames exercise admission, accepted ESS state and repetition. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/NeighborIdentity_Tests.cpp b/tests/p25/NeighborIdentity_Tests.cpp
+--- a/tests/p25/NeighborIdentity_Tests.cpp
++++ b/tests/p25/NeighborIdentity_Tests.cpp
+@@ -3,6 +3,10 @@
+ // Figure 6.2.2-1, PDF154/printed135, p25_89a3b878eee70a14.
+ // Body fields are independently specified below. CRC96BA was calculated with
+ // Python binascii.crc_hqx(body, 0) ^ 0xFFFF, outside the native implementation.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/p25/lc/tsbk/OSP_ADJ_STS_BCAST.h"
+ #include "common/p25/SiteData.h"
+ #include <catch2/catch_test_macros.hpp>
+diff --git a/tests/p25/PDUCompletion_Tests.cpp b/tests/p25/PDUCompletion_Tests.cpp
+--- a/tests/p25/PDUCompletion_Tests.cpp
++++ b/tests/p25/PDUCompletion_Tests.cpp
+@@ -2,6 +2,10 @@
+ // Literal full on-air vectors: BAAB-B B.8/B.9 PDF142-145, printed130-133.
+ // The independent original-PDF transcription and oracle are in
+ // tools/pi/firmware/pdu-baab-vectors.json and pdu_oracle.py.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/p25/data/DataHeader.h"
+ #include "common/p25/PDUHeaderCodec.h"
+ #include "host/p25/packet/Data.h"
+diff --git a/tests/p25/PDU_Confirmed_AuxES_Test.cpp b/tests/p25/PDU_Confirmed_AuxES_Test.cpp
+--- a/tests/p25/PDU_Confirmed_AuxES_Test.cpp
++++ b/tests/p25/PDU_Confirmed_AuxES_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/tests/p25/PDU_Confirmed_ExtAddr_Test.cpp b/tests/p25/PDU_Confirmed_ExtAddr_Test.cpp
+--- a/tests/p25/PDU_Confirmed_ExtAddr_Test.cpp
++++ b/tests/p25/PDU_Confirmed_ExtAddr_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/tests/p25/PDU_Confirmed_Large_Test.cpp b/tests/p25/PDU_Confirmed_Large_Test.cpp
+--- a/tests/p25/PDU_Confirmed_Large_Test.cpp
++++ b/tests/p25/PDU_Confirmed_Large_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/tests/p25/PDU_Confirmed_Small_Test.cpp b/tests/p25/PDU_Confirmed_Small_Test.cpp
+--- a/tests/p25/PDU_Confirmed_Small_Test.cpp
++++ b/tests/p25/PDU_Confirmed_Small_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp b/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp
+--- a/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp
++++ b/tests/p25/PDU_Unconfirmed_AuxES_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/tests/p25/PDU_Unconfirmed_ExtAddr_Test.cpp b/tests/p25/PDU_Unconfirmed_ExtAddr_Test.cpp
+--- a/tests/p25/PDU_Unconfirmed_ExtAddr_Test.cpp
++++ b/tests/p25/PDU_Unconfirmed_ExtAddr_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/tests/p25/PDU_Unconfirmed_Test.cpp b/tests/p25/PDU_Unconfirmed_Test.cpp
+--- a/tests/p25/PDU_Unconfirmed_Test.cpp
++++ b/tests/p25/PDU_Unconfirmed_Test.cpp
+@@ -6,6 +6,10 @@
+  *
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
++ */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
+  */
+ #include "host/Defines.h"
+ #include "common/p25/P25Defines.h"
+diff --git a/tests/p25/PacketCodec_MI_Test.cpp b/tests/p25/PacketCodec_MI_Test.cpp
+--- a/tests/p25/PacketCodec_MI_Test.cpp
++++ b/tests/p25/PacketCodec_MI_Test.cpp
+@@ -1,4 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "bridge/PacketCodecMI.h"
+ #include <catch2/catch_test_macros.hpp>
+ 
+diff --git a/tests/p25/PacketLengthBoundary_Tests.cpp b/tests/p25/PacketLengthBoundary_Tests.cpp
+--- a/tests/p25/PacketLengthBoundary_Tests.cpp
++++ b/tests/p25/PacketLengthBoundary_Tests.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // BAAA-B5.2/5.3: fixed16/12-byte block payloads, finalCRC4, secondary headers.
+ // Expected boundary counts/pads below are explicit requirements-derived values.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/p25/data/Assembler.h"
+ #include "common/p25/data/DataHeader.h"
+ #include "common/p25/data/DataBlock.h"
+diff --git a/tests/p25/PacketTransportFixture.h b/tests/p25/PacketTransportFixture.h
+--- a/tests/p25/PacketTransportFixture.h
++++ b/tests/p25/PacketTransportFixture.h
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Memory-only serial endpoint: actual Modem parser/writer methods run unchanged.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #pragma once
+ #include "host/modem/Modem.h"
+ #include <algorithm>
+diff --git a/tests/p25/RadioCheckProcedure_Tests.cpp b/tests/p25/RadioCheckProcedure_Tests.cpp
+--- a/tests/p25/RadioCheckProcedure_Tests.cpp
++++ b/tests/p25/RadioCheckProcedure_Tests.cpp
+@@ -4,6 +4,10 @@
+ // existing CRC/Trellis helpers supply framing only. No socket/modem opens.
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Actual P25 control/voice serialization and local policy. No RF or socket opens.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/RawTSBKIntegrity_Tests.cpp b/tests/p25/RawTSBKIntegrity_Tests.cpp
+--- a/tests/p25/RawTSBKIntegrity_Tests.cpp
++++ b/tests/p25/RawTSBKIntegrity_Tests.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // AABB-B section 5 TSBK integrity. Raw input must retain the same fail-closed
+ // CRC policy as the normal CAI decoder; explicit warning mode is diagnostic.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/p25/lc/tsbk/TSBKFactory.h"
+ #include "common/edac/CRC.h"
+ #include <catch2/catch_test_macros.hpp>
+diff --git a/tests/p25/RawTSBKReplay_Tests.cpp b/tests/p25/RawTSBKReplay_Tests.cpp
+--- a/tests/p25/RawTSBKReplay_Tests.cpp
++++ b/tests/p25/RawTSBKReplay_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Clear Phase 1 raw-response replay regression; no modem or socket is opened. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/p25/lc/tsbk/OSP_TSBK_RAW.h"
+ #include "common/p25/lc/tsbk/OSP_DENY_RSP.h"
+ #include "common/edac/CRC.h"
+diff --git a/tests/p25/ScopedManufacturerID_Tests.cpp b/tests/p25/ScopedManufacturerID_Tests.cpp
+--- a/tests/p25/ScopedManufacturerID_Tests.cpp
++++ b/tests/p25/ScopedManufacturerID_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Protocol serialization only. No network socket or modem is opened.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/network/Network.h"
+ #include "common/p25/P25Defines.h"
+ #include "common/p25/lc/LC.h"
+diff --git a/tests/p25/StatusQuery_Tests.cpp b/tests/p25/StatusQuery_Tests.cpp
+--- a/tests/p25/StatusQuery_Tests.cpp
++++ b/tests/p25/StatusQuery_Tests.cpp
+@@ -4,6 +4,10 @@
+ // existing CRC/Trellis helpers supply framing only. No socket/modem opens.
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Actual P25 control/voice serialization and local policy. No RF or socket opens.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/SubscriberAccess_Tests.cpp b/tests/p25/SubscriberAccess_Tests.cpp
+--- a/tests/p25/SubscriberAccess_Tests.cpp
++++ b/tests/p25/SubscriberAccess_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Actual P25 control/voice serialization and local policy. No RF or socket opens.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/TSBK_Tests.cpp b/tests/p25/TSBK_Tests.cpp
+--- a/tests/p25/TSBK_Tests.cpp
++++ b/tests/p25/TSBK_Tests.cpp
+@@ -7,6 +7,10 @@
+  *  Copyright (C) 2025 Bryan Biedenkapp, N2PLL
+  *
+  */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Defines.h"
+ #include "common/p25/lc/tsbk/OSP_SCCB.h"
+ #include "common/p25/lc/tsbk/OSP_TSBK_RAW.h"
+diff --git a/tests/p25/UserAliasTable_Tests.cpp b/tests/p25/UserAliasTable_Tests.cpp
+--- a/tests/p25/UserAliasTable_Tests.cpp
++++ b/tests/p25/UserAliasTable_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Managed names are display metadata; updates cannot change radio admission.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/lookups/RadioIdLookup.h"
+ #include "common/restapi/http/RequestAssembler.h"
+ #include "host/restapi/RESTAPI.h"
+diff --git a/tests/p25/UserAlias_Tests.cpp b/tests/p25/UserAlias_Tests.cpp
+--- a/tests/p25/UserAlias_Tests.cpp
++++ b/tests/p25/UserAlias_Tests.cpp
+@@ -3,6 +3,10 @@
+ // AABF-D-2 7.3.35/36 and Table3 (PDF10-12, pp2-4), July2023 addenda.
+ // Raw LC vectors transcribe the published ASCII example independently.
+ // All modem and network ports remain memory-only or unopened.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/p25/packet/Voice.h"
+diff --git a/tests/p25/WUIDValidity_Tests.cpp b/tests/p25/WUIDValidity_Tests.cpp
+--- a/tests/p25/WUIDValidity_Tests.cpp
++++ b/tests/p25/WUIDValidity_Tests.cpp
+@@ -3,6 +3,10 @@
+ // octet2 is 4hours + field * 30minutes; 0xFF is infinity.
+ // TIA-102.AABD-B 6.6.1-.3, PDF59-60 / printed54-55 ties the
+ // broadcast to RFSS provisioning. Policy is exact representation, not rounding.
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "common/lookups/AffiliationLookup.h"
+ #include "common/p25/lc/tsbk/OSP_SYS_SRV_BCAST.h"
+ #include "common/edac/CRC.h"
+diff --git a/tests/p25/ZeroCapacity_Fixtures.cpp b/tests/p25/ZeroCapacity_Fixtures.cpp
+--- a/tests/p25/ZeroCapacity_Fixtures.cpp
++++ b/tests/p25/ZeroCapacity_Fixtures.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Test-only M1 fixtures: synthetic encoded requests, actual controller output.
+  * No modem port or network socket is opened. No live grants are exported. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"
+diff --git a/tests/p25/ZeroCapacity_Tests.cpp b/tests/p25/ZeroCapacity_Tests.cpp
+--- a/tests/p25/ZeroCapacity_Tests.cpp
++++ b/tests/p25/ZeroCapacity_Tests.cpp
+@@ -1,5 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Offline controller tests. No modem port or network socket is opened. */
++/* Modified by Open25 FNE contributors; updated 2026-11-16.
++ * Upstream DVMProject copyright and license notices remain in force.
++ * Downstream changes: https://github.com/tylerwatt12/open25-fne/tree/main/patches/dvmhost
++ */
+ #include "host/Host.h"
+ #include "host/p25/Control.h"
+ #include "host/modem/port/ModemNullPort.h"

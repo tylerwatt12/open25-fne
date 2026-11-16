@@ -49,7 +49,10 @@ if [ -e "$framework_output/native" ] || [ -e "$framework_output/speech" ]; then
 fi
 cp -R "$framework_native" "$framework_output/native"
 cp -R "$framework_speech" "$framework_output/speech"
-cp README.md "$framework_output/"
+cp README.md LICENSE THIRD_PARTY.md "$framework_output/"
 cp docs/installation.md "$framework_output/docs/"
 cp internal/frameworkui/LICENSE.lucide "$framework_output/LICENSE.lucide"
+mkdir -p "$framework_output/licenses"
+cp third_party/sipgo-LICENSE third_party/sipgo-dependency-LICENSES "$framework_output/licenses/"
+python3 tools/framework/collect-go-notices.py --output "$framework_output/licenses/Go-dependencies.txt"
 printf '%s\n' "Open25 FNE package: $framework_output"

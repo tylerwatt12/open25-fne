@@ -34,7 +34,17 @@ Use HTTPS for web access across a network and keep the internal HTTP, SIP and
 RTP connections on the private service network. Set the Site's native runtime
 paths and provision its modem and channel assignments before starting RF.
 
-The package target assembles an ARM64 executable and the systemd units using
+Open25 blocks operation with a home WACN in `BEE00`–`BEEFF` to reduce the risk
+of unintended subscriber roaming. Start Site reports the configured WACN and
+the reason before modem access or native process launch. Direct native host,
+bridge and patch startup enforce the same policy. Saved programming is retained
+exactly; the software never substitutes a different network identity. This is
+an operating precaution, not a claim that the values are reserved by P25 or
+that other identities guarantee safe RF operation. Coordinate system identities
+and frequencies before operating. See the [native integration policy](../patches/dvmhost/README.md).
+
+The package target requires Python 3.9 or newer to collect dependency notices.
+It assembles an ARM64 executable and the systemd units using
 separately prepared and checksummed native and speech payloads. See
 [`tools/framework/package.sh`](../tools/framework/package.sh) for its inputs.
 

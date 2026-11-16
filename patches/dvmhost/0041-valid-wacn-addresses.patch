@@ -1,18 +1,72 @@
+diff --git a/src/bridge/HostBridge.cpp b/src/bridge/HostBridge.cpp
+index 0f6f718..dca67a4 100644
 --- a/src/bridge/HostBridge.cpp
 +++ b/src/bridge/HostBridge.cpp
-@@ -978,9 +978,6 @@
+@@ -9,6 +9,8 @@
+  *  Copyright (C) 2025 Lorenzo L Romero, K2LLR
+  *
+  */
++/* Modified by Open25 contributors on 2026-11-16: explicit WACN startup policy
++ * and identity-preserving replacement of upstream special cases. */
+ #include "Defines.h"
+ #include "common/analog/AnalogDefines.h"
+ #include "common/analog/AnalogAudio.h"
+@@ -978,8 +980,9 @@ bool HostBridge::readParams()
  
      m_netId = (uint32_t)::strtoul(systemConf["netId"].as<std::string>("BB800").c_str(), NULL, 16);
      m_netId = p25::P25Utils::netId(m_netId);
 -    if (m_netId == 0xBEE00) {
 -        ::fatal("error 4\n");
--    }
++    if (p25::P25Utils::isWACNBlocked(m_netId)) {
++        LogError(LOG_HOST, "WACN %05X is blocked for operation: BEE00-BEEFF is restricted to reduce unintended subscriber roaming risk", m_netId);
++        return false;
+     }
  
      m_sysId = (uint32_t)::strtoul(systemConf["sysId"].as<std::string>("001").c_str(), NULL, 16);
-     m_sysId = p25::P25Utils::sysId(m_sysId);
+diff --git a/src/common/p25/P25Utils.h b/src/common/p25/P25Utils.h
+index 66b4cb2..6108453 100644
+--- a/src/common/p25/P25Utils.h
++++ b/src/common/p25/P25Utils.h
+@@ -8,6 +8,8 @@
+  *  Copyright (C) 2021-2025 Bryan Biedenkapp, N2PLL
+  *
+  */
++/* Modified by Open25 contributors on 2026-11-16: explicit WACN startup policy
++ * and identity-preserving replacement of upstream special cases. */
+ /**
+  * @file P25Utils.h
+  * @ingroup p25
+@@ -83,6 +85,16 @@ namespace p25
+             return id;
+         }
+ 
++        /**
++         * @brief Open25 operating policy, separate from WACN address encoding.
++         * @param id Configured WACN.
++         * @returns bool Whether operation is blocked to reduce unintended roaming.
++         */
++        static bool isWACNBlocked(uint32_t id)
++        {
++            return id >= 0xBEE00U && id <= 0xBEEFFU;
++        }
++
+         /**
+          * @brief Helper to test and clamp a P25 system ID.
+          * @param id System ID
+diff --git a/src/common/p25/SiteData.h b/src/common/p25/SiteData.h
+index f8162dc..d8d3250 100644
 --- a/src/common/p25/SiteData.h
 +++ b/src/common/p25/SiteData.h
-@@ -18,8 +18,6 @@
+@@ -7,6 +7,8 @@
+  *  Copyright (C) 2018,2024 Bryan Biedenkapp, N2PLL
+  *
+  */
++/* Modified by Open25 contributors on 2026-11-16: explicit WACN startup policy
++ * and identity-preserving replacement of upstream special cases. */
+ /**
+  * @file SiteData.h
+  * @ingroup p25
+@@ -18,8 +20,6 @@
  #include "common/p25/P25Defines.h"
  #include "common/p25/P25Utils.h"
  
@@ -21,7 +75,7 @@
  namespace p25
  {
      // ---------------------------------------------------------------------------
-@@ -112,25 +110,6 @@
+@@ -112,25 +112,6 @@ namespace p25
              m_netId = netId;
              m_sysId = sysId;
  
@@ -47,9 +101,35 @@
              m_rfssId = rfssId;
              m_siteId = siteId;
  
+diff --git a/src/host/Host.Config.cpp b/src/host/Host.Config.cpp
+index 0329e3d..b25d781 100644
 --- a/src/host/Host.Config.cpp
 +++ b/src/host/Host.Config.cpp
-@@ -357,9 +357,6 @@
+@@ -8,6 +8,8 @@
+ *  Copyright (C) 2026 Timothy Sawyer, WD6AWP
+ *
+ */
++/* Modified by Open25 contributors on 2026-11-16: explicit WACN startup policy
++ * and identity-preserving replacement of upstream special cases. */
+ #include "Defines.h"
+ #include "common/network/udp/Socket.h"
+ #include "modem/port/ModemNullPort.h"
+@@ -56,6 +58,14 @@ bool Host::readParams()
+     m_p25Enabled = protocolConf["p25"]["enable"].as<bool>(false);
+     m_nxdnEnabled = protocolConf["nxdn"]["enable"].as<bool>(false);
+ 
++    // Refuse the operating identity before modem setup; never rewrite saved values.
++    const uint32_t configuredWACN = (uint32_t)::strtoul(
++        m_conf["system"]["config"]["netId"].as<std::string>("BB800").c_str(), nullptr, 16);
++    if (m_p25Enabled && p25::P25Utils::isWACNBlocked(configuredWACN)) {
++        LogError(LOG_HOST, "WACN %05X is blocked for operation: BEE00-BEEFF is restricted to reduce unintended subscriber roaming risk", configuredWACN);
++        return false;
++    }
++
+     yaml::Node systemConf = m_conf["system"];
+     m_duplex = systemConf["duplex"].as<bool>(true);
+     bool simplexSameFreq = systemConf["simplexSameFrequency"].as<bool>(false);
+@@ -357,9 +367,6 @@ bool Host::readParams()
  
          m_p25NetId = (uint32_t)::strtoul(rfssConfig["netId"].as<std::string>("BB800").c_str(), NULL, 16);
          m_p25NetId = p25::P25Utils::netId(m_p25NetId);
@@ -59,9 +139,20 @@
  
          m_sysId = (uint32_t)::strtoul(rfssConfig["sysId"].as<std::string>("001").c_str(), NULL, 16);
          m_sysId = p25::P25Utils::sysId(m_sysId);
+diff --git a/src/host/p25/Control.cpp b/src/host/p25/Control.cpp
+index 5b07c09..4ca7b6d 100644
 --- a/src/host/p25/Control.cpp
 +++ b/src/host/p25/Control.cpp
-@@ -581,11 +581,6 @@
+@@ -8,6 +8,8 @@
+  *  Copyright (C) 2017-2025 Bryan Biedenkapp, N2PLL
+  *
+  */
++/* Modified by Open25 contributors on 2026-11-16: explicit WACN startup policy
++ * and identity-preserving replacement of upstream special cases. */
+ #include "Defines.h"
+ #include "common/p25/P25Defines.h"
+ #include "common/p25/FrameBounds.h"
+@@ -584,11 +586,6 @@ void Control::setOptions(yaml::Node& conf, bool supervisor, const std::string cw
      */
      int8_t lto = (int8_t)systemConf["localTimeOffset"].as<int32_t>(0);
      m_siteData = SiteData(netId, sysId, rfssId, siteId, 0U, channelId, channelNo, serviceClass, lto);
@@ -73,21 +164,32 @@
      m_siteData.setCallsign(cwCallsign);
  
      lc::LC::setSiteData(m_siteData);
+diff --git a/src/host/p25/packet/ControlSignaling.cpp b/src/host/p25/packet/ControlSignaling.cpp
+index bf51e35..a7ba7e5 100644
 --- a/src/host/p25/packet/ControlSignaling.cpp
 +++ b/src/host/p25/packet/ControlSignaling.cpp
-@@ -210,11 +210,6 @@
-             }
-         } else {
+@@ -8,6 +8,8 @@
+  *  Copyright (C) 2022 Jason-UWU
+  *
+  */
++/* Modified by Open25 contributors on 2026-11-16: explicit WACN startup policy
++ * and identity-preserving replacement of upstream special cases. */
+ #include "Defines.h"
+ #include "common/p25/P25Defines.h"
+ #include "common/p25/acl/AccessControl.h"
+@@ -212,11 +214,6 @@ bool ControlSignaling::process(uint8_t* data, uint32_t len, std::unique_ptr<lc::
              tsbk = std::move(preDecodedTSBK);
--        }
--
+         }
+ 
 -        const uint32_t constValue = 0x17DC0U;
 -        if ((m_p25->m_siteData.netId() >> 8) == (constValue >> 5)) {
 -            ::fatal("error 16\n");
-         }
- 
+-        }
+-
          uint32_t srcId = tsbk->getSrcId();
-@@ -2696,11 +2691,6 @@
+         uint32_t dstId = tsbk->getDstId();
+         m_lastMFID = tsbk->getMFId();
+@@ -2737,11 +2734,6 @@ bool ControlSignaling::writeRF_TSDU_Grant(uint32_t srcId, uint32_t dstId, uint8_
          }
      }
  
@@ -99,21 +201,44 @@
      if (chNo > 0U) {
          ::lookups::VoiceChData voiceChData = m_p25->m_affiliations->rfCh()->getRFChData(chNo);
  
+diff --git a/src/patch/HostPatch.cpp b/src/patch/HostPatch.cpp
+index bf68c6b..8f76265 100644
 --- a/src/patch/HostPatch.cpp
 +++ b/src/patch/HostPatch.cpp
-@@ -311,9 +311,6 @@
+@@ -7,6 +7,8 @@
+  *  Copyright (C) 2025-2026 Bryan Biedenkapp, N2PLL
+  *
+  */
++/* Modified by Open25 contributors on 2026-11-16: explicit WACN startup policy
++ * and identity-preserving replacement of upstream special cases. */
+ #include "Defines.h"
+ #include "common/dmr/DMRDefines.h"
+ #include "common/dmr/data/EMB.h"
+@@ -311,8 +313,9 @@ bool HostPatch::readParams()
  
      m_netId = (uint32_t)::strtoul(systemConf["netId"].as<std::string>("BB800").c_str(), NULL, 16);
      m_netId = p25::P25Utils::netId(m_netId);
 -    if (m_netId == 0xBEE00) {
 -        ::fatal("error 4\n");
--    }
++    if (p25::P25Utils::isWACNBlocked(m_netId)) {
++        LogError(LOG_HOST, "WACN %05X is blocked for operation: BEE00-BEEFF is restricted to reduce unintended subscriber roaming risk", m_netId);
++        return false;
+     }
  
      m_sysId = (uint32_t)::strtoul(systemConf["sysId"].as<std::string>("001").c_str(), NULL, 16);
-     m_sysId = p25::P25Utils::sysId(m_sysId);
+diff --git a/tests/p25/CapacityPermit_Tests.cpp b/tests/p25/CapacityPermit_Tests.cpp
+index ca8da6c..3d340cf 100644
 --- a/tests/p25/CapacityPermit_Tests.cpp
 +++ b/tests/p25/CapacityPermit_Tests.cpp
-@@ -16,6 +16,7 @@
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* Offline controller tests. No modem port or network socket is opened. */
++/* Modified by Open25 contributors on 2026-11-16: explicit WACN startup policy
++ * and identity-preserving replacement of upstream special cases. */
+ #include "host/Host.h"
+ #include "host/CWIDDrain.h"
+ #include "host/p25/Control.h"
+@@ -16,6 +18,7 @@
  #include "common/Log.h"
  #include "common/network/P25SiteRouting.h"
  #include "common/p25/lc/tsbk/OSP_RFSS_STS_BCAST.h"
@@ -121,7 +246,7 @@
  #include "common/p25/Audio.h"
  
  #include <catch2/catch_test_macros.hpp>
-@@ -194,7 +195,7 @@
+@@ -194,7 +197,7 @@ struct ControllerFixture {
          true, true, false, false, false, false};
      std::unique_ptr<Control> controller;
  
@@ -130,7 +255,7 @@
          radios("", 0U, strictACL), groups("", 0U, strictACL) {
          g_logDisplayLevel = 0U;
          g_RPC = &rpc;
-@@ -241,7 +242,7 @@
+@@ -241,7 +244,7 @@ system:
  )";
          REQUIRE(yaml::Parse(config, configText));
          controller->setOptions(config, false, "N0TEST", ::lookups::VoiceChData(),
@@ -139,14 +264,14 @@
          controller->setCCRunning(true);
      }
  
-@@ -1542,3 +1543,63 @@
+@@ -1542,3 +1545,64 @@ TEST_CASE("voice permit binds RF source as well as talkgroup after source preemp
      REQUIRE(voice.voiceFrame(DUID::LDU1,GROUP,false,true,SOURCE+1U));
      REQUIRE(voice.controller->getRFState()==RS_RF_AUDIO); REQUIRE_FALSE(voice.drainVoice().empty());
  }
 +
 +
 +// AABD-B normative AnnexA.1/Table18-1 PDF141/p136 assigns00001..FFFFE.
-+// Every value in the former arbitrary BEE00..BEEFF exclusion is assignable.
++// Encoding validity does not establish eligibility under the startup operating policy.
 +TEST_CASE("all assignable WACN subrange values retain configured identity", "[p25][wacn-address]") {
 +    std::vector<uint32_t> networks{1U,0xBEDFFU,0xBEF00U,0xFFFFEU};
 +    for(uint32_t value=0xBEE00U;value<=0xBEEFFU;++value) networks.push_back(value);
@@ -165,7 +290,8 @@
 +    }
 +}
 +
-+TEST_CASE("valid WACNs allow actual control registration affiliation and correlated grants", "[p25][wacn-address][capacity-permit]") {
++// These internal protocol tests open no RF resource and do not enter Host startup.
++TEST_CASE("offline WACN protocol encoding supports registration affiliation and correlated grants", "[p25][wacn-address][capacity-permit]") {
 +    std::vector<uint32_t> networks;
 +    for(uint32_t value=0xBEE00U;value<=0xBEEFFU;++value) networks.push_back(value);
 +    for(uint32_t value:{1U,0xBEDFFU,0xBEF00U,0xFFFFEU}) networks.push_back(value);
@@ -201,5 +327,28 @@
 +            REQUIRE((((uint32_t)raw[5]<<8U)|raw[6])==GROUP);
 +            REQUIRE((((uint32_t)raw[7]<<16U)|((uint32_t)raw[8]<<8U)|raw[9])==SOURCE);
 +        }
++    }
++}
+diff --git a/tests/p25/WACNOperatingPolicy_Tests.cpp b/tests/p25/WACNOperatingPolicy_Tests.cpp
+new file mode 100644
+index 0000000..a9e6b6a
+--- /dev/null
++++ b/tests/p25/WACNOperatingPolicy_Tests.cpp
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Open25 operating-policy tests; no RF resource or network socket is opened. */
++/* Modified by Open25 contributors on 2026-11-16: explicit WACN startup policy
++ * and identity-preserving replacement of upstream special cases. */
++#include "common/p25/P25Utils.h"
++#include <catch2/catch_test_macros.hpp>
++
++TEST_CASE("Open25 WACN operating policy blocks the complete BEE range", "[p25][wacn-operating-policy]") {
++    for (uint32_t wacn = 0xBEE00U; wacn <= 0xBEEFFU; ++wacn) {
++        CAPTURE(wacn);
++        REQUIRE(p25::P25Utils::isWACNBlocked(wacn));
++    }
++    for (const uint32_t wacn : {1U, 0xBB800U, 0xBEDFFU, 0xBEF00U, 0xFFFFEU}) {
++        CAPTURE(wacn);
++        REQUIRE_FALSE(p25::P25Utils::isWACNBlocked(wacn));
 +    }
 +}
