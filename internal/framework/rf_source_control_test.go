@@ -91,6 +91,13 @@ func TestRFSourceAuthorityServiceShutdownRetainsLockUntilWriterExits(t *testing.
 	system, zone := storeFixtureSystem(), storeFixtureZone()
 	node := startIntegrationService(t, t.TempDir(), RoleZone, "zone-1", zone, ServiceCredentials{Peers: map[string]PeerCredential{}}, system, zone)
 	s := node.service
+	// Settle unrelated history startup before measuring the blocked RF writer.
+	ready, cancelReady := context.WithTimeout(context.Background(), 2*time.Second)
+	if err := s.activity.Flush(ready); err != nil {
+		cancelReady()
+		t.Fatal(err)
+	}
+	cancelReady()
 	authority := s.rfAuthority
 	entered := make(chan struct{})
 	release := make(chan struct{})
