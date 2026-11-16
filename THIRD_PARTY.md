@@ -13,9 +13,12 @@ use modified versions of these components. The modifications are maintained
 for Open25 and are not official DVMProject releases. Thank you to the upstream
 authors and contributors for their engineering, testing, and maintenance.
 
-The [integration instructions](patches/dvmhost/README.md) identify the pinned
-upstream revision and the applied patches. Native files retain their applicable
-upstream licenses; the DVM-derived patches do not replace those licenses.
+The [integration instructions](patches/dvmhost/README.md) select an exact reviewed
+commit from the [Open25-maintained native fork](https://github.com/tylerwatt12/dvmhost).
+That fork retains upstream history and owns subsequent public native changes.
+The patch files here are an immutable historical import snapshot, not a second
+implementation to edit. Native files retain their applicable upstream licenses;
+neither the fork nor the historical patches replace those licenses.
 The root DVM [license text](patches/dvmhost/LICENSE) is GPLv2, and core files
 such as [Host.cpp](https://github.com/DVMProject/dvmhost/blob/435ff45b367887ffa94c89cb1a2779628e0f7bfb/src/host/Host.cpp)
 declare **GPL-2.0-only**. Embedded components have additional declarations:
@@ -46,6 +49,9 @@ combined native binary, establish applicable additional permission or another
 compatible implementation/build arrangement. This repository does not claim
 that permission has been obtained or that the combined binary's licensing is
 resolved. No upstream license declaration has been changed.
+
+The clarification request is tracked in
+[DVMProject/dvmhost issue 137](https://github.com/DVMProject/dvmhost/issues/137).
 
 The [native collector](tools/framework/collect-native.sh) includes:
 

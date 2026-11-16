@@ -21,6 +21,11 @@ Each service owns its configuration and SQLite databases. The executable
 includes the web interfaces. Site RF and native vocoding require a compatible
 [DVM runtime](patches/dvmhost/README.md). The Dispatch and PTT pages are development and testing interfaces.
 
+Open25's public native modifications are maintained in the separate
+[DVMHost fork](https://github.com/tylerwatt12/dvmhost), retaining DVMProject's
+upstream history. The [native integration instructions](patches/dvmhost/README.md)
+select the exact reviewed commit used by this source release.
+
 ## Build and test
 
 Use Go 1.26.3 or newer. The JavaScript tests also use Node.js and Playwright with
