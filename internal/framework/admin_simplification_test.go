@@ -139,6 +139,8 @@ func TestAdminSimplificationBrowser(t *testing.T) {
 		pair.service.assets = frameworkui.Assets()
 	}
 	for _, pair := range []*integrationService{c.site, c.otherSite} {
+		pair.service.operationCancel()
+		pair.service.operationWG.Wait()
 		profile, err := pair.service.profileRadio()
 		if err != nil {
 			t.Fatal(err)

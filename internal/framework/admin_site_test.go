@@ -131,6 +131,8 @@ func TestSiteMockupBrowserFixture(t *testing.T) {
 	now := time.Now().UTC()
 	runtimes := []*operationRadio{}
 	for _, pair := range []*integrationService{c.site, c.otherSite} {
+		pair.service.operationCancel()
+		pair.service.operationWG.Wait()
 		var saved SiteConfig
 		if err := pair.service.owned(&saved); err != nil {
 			t.Fatal(err)

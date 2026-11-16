@@ -139,6 +139,9 @@ func TestSSOAcrossSitesPersistentAndDisconnected(t *testing.T) {
 		t.Fatalf("restart lost persistent session: %s", w.Body)
 	}
 	// Block the actual upstream service connection, not browser cookie sharing.
+	c.site.service.operationCancel()
+	c.site.service.operationWG.Wait()
+	c.site.service.mediaClient.Close()
 	c.site.service.client = &http.Client{Transport: integrationRoundTripFunc(func(*http.Request) (*http.Response, error) { return nil, io.ErrClosedPipe })}
 	disconnected := *client
 	disconnected.Jar, _ = cookiejar.New(nil)

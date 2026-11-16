@@ -13,6 +13,11 @@ import (
 func TestAdministratorRevocationDeliveryHasSeparateDurableWriteBudget(t *testing.T) {
 	c := integrationNewCluster(t)
 	s := c.site.service
+	// This test drives requests directly; join background discovery before
+	// replacing the client whose independent request budgets it observes.
+	s.operationCancel()
+	s.operationWG.Wait()
+	s.mediaClient.Close()
 	budgets := map[string]time.Duration{}
 	s.client = &http.Client{Timeout: 5 * time.Second, Transport: integrationRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		deadline, ok := r.Context().Deadline()

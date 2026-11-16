@@ -161,6 +161,10 @@ func TestHistoryTransferBudgetDoesNotWidenControlTimeout(t *testing.T) {
 	c := integrationNewCluster(t)
 	integrationSyncAll(t, c)
 	s := c.site.service
+	// Direct archive/control requests own this fixture's HTTP client.
+	s.operationCancel()
+	s.operationWG.Wait()
+	s.mediaClient.Close()
 	s.client.Timeout = 20 * time.Millisecond
 	delegate := c.zone.server.Config.Handler
 	zone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

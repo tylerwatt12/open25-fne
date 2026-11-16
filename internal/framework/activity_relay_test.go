@@ -159,6 +159,10 @@ func TestConnectionOutboxRecordsTransitionsWithoutRetrySpam(t *testing.T) {
 	c := integrationNewCluster(t)
 	integrationSyncAll(t, c)
 	site := c.site.service
+	// Explicit SyncOnce calls own the transport and transition sequence here.
+	site.operationCancel()
+	site.operationWG.Wait()
+	site.mediaClient.Close()
 	original := site.client.Transport
 	site.client.Transport = integrationRoundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("first unavailable attempt") })
 	if site.SyncOnce(context.Background()) == nil {

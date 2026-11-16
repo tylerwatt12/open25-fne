@@ -306,6 +306,10 @@ func TestConfigurationSyncRetriesLostReportAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	incident := c.site.service.operatorLocalSnapshot().Emergencies[0]
+	// The test drives polling explicitly while injecting lost report replies.
+	c.site.service.operationCancel()
+	c.site.service.operationWG.Wait()
+	c.site.service.mediaClient.Close()
 	base := c.site.service.client.Transport
 	defer func() { c.site.service.client.Transport = base }()
 	reports, observedCached := 0, false

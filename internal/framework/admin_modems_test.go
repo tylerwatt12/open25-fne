@@ -143,6 +143,8 @@ func TestModemStatusBrowser(t *testing.T) {
 		t.Skip("set TRUNKSYSTEM_MODEM_BROWSER_TEST=1 for disposable telemetry browser qualification")
 	}
 	c := integrationNewCluster(t)
+	c.site.service.operationCancel()
+	c.site.service.operationWG.Wait()
 	c.site.service.radio = &operationRadio{status: modemObservationFixture(time.Now().UTC()), applications: make(chan policyApplication, 16)}
 	integrationSyncAll(t, c)
 	repo, err := filepath.Abs("../..")
