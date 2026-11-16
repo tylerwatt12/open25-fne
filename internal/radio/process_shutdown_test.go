@@ -152,13 +152,19 @@ func TestChildShutdownPreservesFinalOutput(t *testing.T) {
 	if err = process.stop(ctx); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case line := <-lines:
-		if line != "I: native shutdown complete" {
-			t.Fatal("unexpected final output", line)
+	// A POSIX shell may report its terminated sleep before running the trap.
+	// The native shutdown message must still be delivered as the final line.
+	var output []string
+	for {
+		select {
+		case line := <-lines:
+			output = append(output, line)
+		default:
+			if len(output) == 0 || output[len(output)-1] != "I: native shutdown complete" {
+				t.Fatal("final native output was discarded or reordered", output)
+			}
+			return
 		}
-	default:
-		t.Fatal("final native output was discarded")
 	}
 }
 
