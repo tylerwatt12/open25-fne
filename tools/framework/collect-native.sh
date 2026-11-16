@@ -16,6 +16,12 @@ if [ -e "$native_output/SHA256SUMS" ]; then
     printf '%s\n' 'Output already contains a native payload; choose an empty folder.' >&2
     exit 1
 fi
+for native_notice in OPEN25-LICENSING.md LICENSE-CLARIFICATION.json LICENSES/GPL-3.0-or-later.txt; do
+    if [ ! -f "$native_source/$native_notice" ]; then
+        printf '%s\n' "Native source lacks $native_notice; select the reviewed licensing-clarification source." >&2
+        exit 1
+    fi
+done
 mkdir -p "$native_output/bin" "$native_output/lib" "$native_output/licenses" "$native_output/source"
 for native_program in dvmhost dvmfne dvmbridge; do
     test -x "$native_build/$native_program"
@@ -50,6 +56,9 @@ for native_library in libssl.so.3 libcrypto.so.3 libstdc++.so.6 libgcc_s.so.1 li
 done
 cp "$native_source/LICENSE" "$native_output/licenses/DVM-GPL-2.0.txt"
 if [ -f "$native_source/COPYING" ]; then cp "$native_source/COPYING" "$native_output/licenses/DVM-COPYING.txt"; fi
+cp "$native_source/LICENSES/GPL-3.0-or-later.txt" "$native_output/licenses/DVM-GPL-3.0-or-later.txt"
+cp "$native_source/OPEN25-LICENSING.md" "$native_output/licenses/Open25-native-components.md"
+cp "$native_source/LICENSE-CLARIFICATION.json" "$native_output/licenses/LICENSE-CLARIFICATION.json"
 native_ssl_notice=${FRAMEWORK_NATIVE_SSL_NOTICE:-/usr/share/doc/libssl3t64/copyright}
 cp -L "$native_ssl_notice" "$native_output/licenses/OpenSSL.txt"
 cp -L /usr/share/doc/libstdc++6/copyright "$native_output/licenses/GCC-runtime.txt"
@@ -64,6 +73,41 @@ cp "$native_asio/LICENSE_1_0.txt" "$native_output/licenses/Asio-Boost-1.0.txt"
 cp "$native_asio/COPYING" "$native_output/licenses/Asio-COPYING.txt"
 tar --exclude=.git --exclude=build --exclude=.cache --exclude='._*' -C "$native_source" -czf "$native_output/source/dvmhost.tar.gz" .
 tar --exclude=.git --exclude='._*' -C "$native_asio" -czf "$native_output/source/asio.tar.gz" include LICENSE_1_0.txt COPYING
+python3 - "$native_source" "$native_build" "$native_output" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+source, build, output = (Path(value).resolve() for value in sys.argv[1:])
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+provenance = {
+    "source_archive": {"path": "source/dvmhost.tar.gz", "sha256": digest(output / "source/dvmhost.tar.gz")},
+    "source_git": None,
+    "supplied_source_directory": str(source),
+    "supplied_build_directory": str(build),
+    "build_metadata_sha256": {name: digest(build / name) for name in ("CMakeCache.txt", "compile_commands.json") if (build / name).is_file()},
+    "binary_sha256": {name: digest(output / "bin" / name) for name in ("dvmhost", "dvmfne", "dvmbridge")},
+    "license_files_sha256": {name: digest(output / "licenses" / name) for name in ("DVM-GPL-2.0.txt", "DVM-GPL-3.0-or-later.txt", "Open25-native-components.md", "LICENSE-CLARIFICATION.json")},
+    "source_binary_relationship": "Builder-supplied corresponding source. Archive and metadata hashes record inputs; they do not independently prove source/binary equivalence. Retain the matching build qualification.",
+}
+if shutil.which("git"):
+    def git(*args):
+        return subprocess.run(["git", "-C", str(source), *args], env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"}, capture_output=True, text=True)
+    top = git("rev-parse", "--show-toplevel")
+    if top.returncode == 0 and Path(top.stdout.strip()).resolve() == source:
+        commit = git("rev-parse", "HEAD")
+        tree = git("rev-parse", "HEAD^{tree}")
+        state = git("status", "--porcelain", "--untracked-files=all")
+        if commit.returncode == tree.returncode == state.returncode == 0:
+            provenance["source_git"] = {"commit": commit.stdout.strip(), "tree": tree.stdout.strip(), "worktree_status": state.stdout}
+(output / "source-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
+PY
 cat > "$native_output/README.txt" <<'EOF'
 DVM native runtime for Open25 FNE
 
@@ -79,6 +123,12 @@ that supported OS. Hardware firmware is separate from these host executables.
 Corresponding DVM source is in source/dvmhost.tar.gz; its Asio headers are in
 source/asio.tar.gz. License notices are in licenses/. SHA256SUMS covers every
 shipped file except the checksum file itself.
+
+Per-component terms are in licenses/Open25-native-components.md, copied from
+the native source owner, with its LICENSE-CLARIFICATION.json provenance and
+both applicable GPLv2/GPLv3 texts. Original third-party notices remain in source.
+source-provenance.json records the supplied source archive, available Git/build
+metadata and collected binaries; retain the corresponding build qualification.
 EOF
 (
     cd "$native_output"

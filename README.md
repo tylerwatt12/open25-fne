@@ -42,8 +42,9 @@ go test -mod=readonly ./...
 
 See [LICENSE](LICENSE) for the license of original Open25 files and its scope.
 Native DVM components and DVM-derived patches retain their applicable upstream
-licenses and notices, including GPL-2.0-only and embedded GPL-3.0-or-later
-declarations. Other dependencies keep their own licenses.
-[THIRD_PARTY.md](THIRD_PARTY.md) describes the components, packaged notices and
-source, and the unresolved license compatibility issue in the combined native
-vocoder/backend. The MIT license does not resolve that issue.
+licenses and notices. DVMHost and DVMFNE remain GPL-2.0-only; the combined
+vocoder library and DVMBridge use GPL-3.0-or-later under the
+[upstream licensing clarification](https://github.com/DVMProject/dvmhost/issues/137#issuecomment-6926724008).
+Other dependencies keep their own licenses. [THIRD_PARTY.md](THIRD_PARTY.md)
+describes the per-component terms, corrected source declarations and complete
+corresponding source and notices required with native distributions.

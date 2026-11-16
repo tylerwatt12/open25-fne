@@ -10,6 +10,15 @@ if [ ! -f "$framework_native/SHA256SUMS" ]; then
     printf '%s\n' 'A verified Linux arm64 native payload is required. Run tools/framework/collect-native.sh on the build Pi and set FRAMEWORK_NATIVE_DIR.' >&2
     exit 1
 fi
+for framework_native_file in \
+    licenses/Open25-native-components.md licenses/LICENSE-CLARIFICATION.json \
+    licenses/DVM-GPL-2.0.txt licenses/DVM-GPL-3.0-or-later.txt \
+    source-provenance.json source/dvmhost.tar.gz source/asio.tar.gz; do
+    if [ ! -s "$framework_native/$framework_native_file" ]; then
+        printf '%s\n' "Native payload lacks $framework_native_file; recollect the reviewed native source, notices and provenance before packaging." >&2
+        exit 1
+    fi
+done
 if [ ! -f "$framework_speech/SHA256SUMS" ] || [ ! -x "$framework_speech/espeak-ng" ]; then
     printf '%s\n' 'A verified Linux arm64 speech payload is required. Run tools/framework/build-speech.sh on the build Pi and set FRAMEWORK_SPEECH_DIR.' >&2
     exit 1

@@ -19,53 +19,64 @@ That fork retains upstream history and owns subsequent public native changes.
 The patch files here are an immutable historical import snapshot, not a second
 implementation to edit. Native files retain their applicable upstream licenses;
 neither the fork nor the historical patches replace those licenses.
-The root DVM [license text](patches/dvmhost/LICENSE) is GPLv2, and core files
-such as [Host.cpp](https://github.com/DVMProject/dvmhost/blob/435ff45b367887ffa94c89cb1a2779628e0f7bfb/src/host/Host.cpp)
-declare **GPL-2.0-only**. Embedded components have additional declarations:
+The native tree's `OPEN25-LICENSING.md` owns its component-license inventory.
+The collector copies that document unchanged into each payload, together with
+`LICENSE-CLARIFICATION.json`, which records the upstream header corrections and
+Open25-owned changes. This summary must be refreshed when the selected native
+source's licensing inventory changes.
 
-- Pavel Yazev's [IMBE encoder/decoder](https://github.com/DVMProject/dvmhost/blob/435ff45b367887ffa94c89cb1a2779628e0f7bfb/src/vocoder/imbe/imbe_vocoder.h)
-  declares **GPL-3.0-or-later**.
-- [MBEEncoder.cpp](https://github.com/DVMProject/dvmhost/blob/435ff45b367887ffa94c89cb1a2779628e0f7bfb/src/vocoder/MBEEncoder.cpp)
-  carries both a GPL-2.0-only SPDX declaration and a retained GPL-3.0-or-later
-  declaration for OP25-derived AMBE encoder material.
+### Upstream licensing clarification — November 16, 2026
 
-Preserve every applicable upstream copyright and license notice and identify
-changes and their dates in modified native source files.
+[DVMProject's maintainer clarified the intended grants](https://github.com/DVMProject/dvmhost/issues/137#issuecomment-6926724008)
+and corrected the declarations on its `r05a06_dev` branch in
+[commit b819cda22f7d22c87f344492a626d8d562b9ea01](https://github.com/DVMProject/dvmhost/commit/b819cda22f7d22c87f344492a626d8d562b9ea01).
+The third-party vocoder grants and original notices remain unchanged.
 
-### Unresolved native license compatibility
+| Component | Applicable licensing |
+| --- | --- |
+| DVMHost, DVMFNE, Patch and the other non-vocoder DVMProject executables | GPL-2.0-only in their applicable source files; Host and FNE do not link the vocoder library |
+| DVMProject-owned common library, bridge and vocoder-wrapper code | GPL-2.0-or-later; the later-version grant permits their use under GPLv3 in the combined bridge |
+| Pavel Yazev's IMBE and OP25-derived encoder material, including MBEEncoder.cpp | GPL-3.0-or-later |
+| mbelib-derived sources | Retained ISC notices |
+| Combined vocoder library and DVMBridge executable | GPL-3.0-or-later |
 
-The pinned build includes the IMBE sources in its static vocoder library and
-links that library into DVMBridge alongside GPL-2.0-only components. The reviewed
-upstream `LICENSE`, `COPYING`, README, source and documentation do not provide
-a linking exception or additional permission resolving the GPL version mismatch.
-The [GNU compatibility guidance](https://www.gnu.org/licenses/gpl-faq.html#v2v3Compatibility)
-states that GPL-2.0-only and GPLv3 code cannot be combined under their ordinary
-terms; GPL-2.0-or-later would be a different grant.
+The corrected later-version grants address the earlier conflicting declarations;
+the combined bridge does not rely on a separate linking exception. Preserve
+every applicable source-file notice and dated downstream modification notice.
+Open25's MIT license applies only to its original files and does not replace
+these native terms.
 
-**Distribution of the combined native vocoder/backend remains an unresolved
-licensing issue.** Copying both license texts, preserving source, or licensing
-Open25's original files under MIT does not resolve it. Before distributing that
-combined native binary, establish applicable additional permission or another
-compatible implementation/build arrangement. This repository does not claim
-that permission has been obtained or that the combined binary's licensing is
-resolved. No upstream license declaration has been changed.
-
-The clarification request is tracked in
-[DVMProject/dvmhost issue 137](https://github.com/DVMProject/dvmhost/issues/137).
+Native distributions must include the complete corresponding source used to
+produce their binaries and the applicable build/install materials and notices.
+The maintainer also reiterated that source availability requirement in
+[the follow-up comment](https://github.com/DVMProject/dvmhost/issues/137#issuecomment-6926811752).
+The license-adjusted native revision `a2ca11b6` passes a seven-target Linux ARM64
+Release build and the selected offline native regressions in a Debian 13 ARM64 VM without
+source overlays. Collection verifies its complete source archive, authoritative
+licensing documents, provenance and relocated runtime-library closure. This
+revision has not been deployed or executed on the physical Pi; no RF or
+subscriber-roaming qualification follows from these software checks.
 
 The [native collector](tools/framework/collect-native.sh) includes:
 
-- `native/licenses/DVM-GPL-2.0.txt` and the upstream `COPYING` file when present;
+- `native/licenses/DVM-GPL-2.0.txt`, the upstream `COPYING` file when present,
+  and `native/licenses/DVM-GPL-3.0-or-later.txt`;
+- `native/licenses/Open25-native-components.md` and
+  `native/licenses/LICENSE-CLARIFICATION.json`, copied from the selected native
+  source's authoritative inventory and clarification record;
 - `native/source/dvmhost.tar.gz`, copied from the supplied patched source tree;
 - `native/source/asio.tar.gz` and its Boost license/COPYING notices;
 - notices for bundled OpenSSL, GCC runtime, zlib, and zstd libraries, together
   with the corresponding license texts collected from the build host.
 
-For a distributed native binary, retain the corresponding modified source and
-the scripts needed to build and install it under the applicable GPL terms.
 The collector receives source and build directories from the release builder;
-the builder must use the source that produced those binaries. A checksum alone
-does not establish that relationship.
+the builder must supply the source that produced those binaries. It writes
+`native/source-provenance.json` with the source archive hash, Git commit/tree
+and worktree state when available, collected binary hashes, and available
+CMake metadata hashes. Source exports without Git metadata remain supported.
+This evidence records the supplied inputs; it does not independently prove
+source/binary equivalence. Preserve the matching build qualification with a
+release and provide the source to its recipients under the applicable terms.
 
 ## Go executable dependencies
 

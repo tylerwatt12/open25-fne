@@ -11,7 +11,7 @@ directly; no additional patches from this directory are applied:
 
 ```sh
 git clone https://github.com/tylerwatt12/dvmhost.git
-git -C dvmhost checkout --detach b884d4b058408b68a97fe78a983400ccfc580d9d
+git -C dvmhost checkout --detach a2ca11b6d81821cc29819b1760cdef9b17f6b63d
 ```
 
 Follow `OPEN25.md` in the checked-out native tree for build and test instructions.
@@ -19,6 +19,8 @@ Build `dvmhost`, `dvmfne` and `dvmbridge` together from this selected tree. The
 [collection script](../../tools/framework/collect-native.sh) prepares the
 Linux ARM64 payload used by the Open25 FNE package target. Supply the same
 source that produced its binaries, including all applicable license notices.
+Collection uses Python 3 for structured source/build provenance and preserves
+source exports that do not contain Git metadata.
 
 Make future native changes and their tests in the fork. Update the exact source
 pin here only after review and appropriate qualification. The Go startup
@@ -75,11 +77,25 @@ software-only error. The fixtures configure no modem, audio device or network
 connection, and verify that their saved configuration bytes remain unchanged.
 This is offline startup qualification, not an RF or roaming test.
 
-Native binary licensing clarification remains pending in
-[DVMProject/dvmhost issue 137](https://github.com/DVMProject/dvmhost/issues/137).
-See [THIRD_PARTY.md](../../THIRD_PARTY.md) for the inherited version mismatch.
-The source migration does not resolve it or establish a complete unmodified
-Linux native build or RF qualification.
+The upstream maintainer clarified the component licensing in
+[issue 137](https://github.com/DVMProject/dvmhost/issues/137#issuecomment-6926724008)
+and corrected its `r05a06_dev` source declarations in
+[b819cda22f7d22c87f344492a626d8d562b9ea01](https://github.com/DVMProject/dvmhost/commit/b819cda22f7d22c87f344492a626d8d562b9ea01).
+The native tree's `OPEN25-LICENSING.md` and `LICENSE-CLARIFICATION.json` record
+the component terms and the exact corrections incorporated downstream; they
+remain with the corresponding source and are copied into collected payloads.
+The combined vocoder library and DVMBridge use GPL-3.0-or-later. Host and FNE
+retain their GPL-2.0-only terms and do not link that vocoder library. See
+[THIRD_PARTY.md](../../THIRD_PARTY.md) for the component summary.
+
+The selected license-adjusted native revision passes a fresh seven-target
+Linux ARM64 Release build in a Debian 13 ARM64 VM without source overlays.
+Its offline P25, EDAC/crypto, FNE and WACN suites pass, including all 783 real
+Host/Bridge/Patch startup fixtures. The collected payload passes exact source,
+licensing-document, provenance and relocated six-library dependency checks.
+This qualifies the selected software build and collection on that VM. It does
+not qualify physical Pi execution, RF, subscriber roaming or deployment; those
+operations were not performed for this revision.
 
 The imported patch 0081 added dated downstream modification notices to the
 remaining native files changed by this patch series. Upstream copyright and license notices are

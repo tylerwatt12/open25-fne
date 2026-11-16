@@ -25,6 +25,7 @@ Scope
 This license applies to original Open25 FNE files. It does not relicense
 DVMProject code, the DVM-derived patches under patches/dvmhost/, or other
 third-party software, icons, notices, and license texts. Native components
-retain their applicable per-file licenses, including GPL-2.0-only and embedded
-GPL-3.0-or-later declarations. The applicable third-party licenses, notices,
-and unresolved native compatibility issue are described in THIRD_PARTY.md.
+retain their applicable per-file licenses, including GPL-2.0-only,
+GPL-2.0-or-later, GPL-3.0-or-later and ISC notices. The applicable component
+licenses, upstream clarification and source requirements are described in
+THIRD_PARTY.md.
