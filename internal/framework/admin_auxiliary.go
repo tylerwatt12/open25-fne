@@ -60,7 +60,7 @@ func (s *Service) webInstallation(w http.ResponseWriter, r *http.Request, sessio
 	defer webFooter(w)
 	c := s.Config()
 	fmt.Fprint(w, `<div class=ts-reference><span class=ts-badge>Host managed</span> <span class=ts-badge>Read only</span></div><section class=ts-panel>`)
-	webProperties(w, map[string]any{"product": "Open25 FNE", "executable": "open25-fne", "instance": c.InstanceID, "role": c.Role, "listener": c.Listen, "state": c.StateDir, "web": c.PublicURL, "internal": c.InternalURL}, []webColumn{{"product", "Product"}, {"executable", "Executable"}, {"instance", "Instance"}, {"role", "Service role"}, {"listener", "Listener"}, {"state", "State directory"}, {"web", "Web administration address"}, {"internal", "Internal service address"}})
+	s.webProperties(w, map[string]any{"product": "Open25 FNE", "executable": "open25-fne", "instance": c.InstanceID, "role": c.Role, "listener": c.Listen, "state": c.StateDir, "web": c.PublicURL, "internal": c.InternalURL}, []webColumn{{"product", "Product"}, {"executable", "Executable"}, {"instance", "Instance"}, {"role", "Service role"}, {"listener", "Listener"}, {"state", "State directory"}, {"web", "Web administration address"}, {"internal", "Internal service address"}})
 	fmt.Fprint(w, `</section>`)
 }
 
@@ -124,26 +124,25 @@ func (s *Service) webProgrammingReference(w http.ResponseWriter, kind string) {
 		return
 	}
 	zone := s.webKnownZone()
-	system := s.view().System
+	owner := "Zone"
+	if zone != nil && zone.Name != "" {
+		owner = zone.Name
+	}
 	switch kind {
 	case "channels":
-		fmt.Fprint(w, `<section class=ts-reference><div class=ts-itemline><strong>Band Plan reference</strong><span class=ts-badge>Zone · Read only</span></div>`)
+		fmt.Fprintf(w, `<section class=ts-reference><div class=ts-itemline><strong>Band Plan reference</strong><span class=ts-badge>%s</span></div>`, esc(owner))
 		if zone != nil {
-			webTable(w, []webColumn{{"identifier", "Channel Identifier"}, {"base_frequency_hz", "Base (MHz)"}, {"channel_spacing_hz", "Spacing (kHz)"}, {"uplink_offset_hz", "Offset (MHz)"}}, zone.ChannelIdentifiers)
+			s.webTable(w, []webColumn{{"identifier", "Channel Identifier"}, {"base_frequency_hz", "Base (MHz)"}, {"channel_spacing_hz", "Spacing (kHz)"}, {"uplink_offset_hz", "Offset (MHz)"}}, zone.ChannelIdentifiers)
 		} else {
 			fmt.Fprint(w, `<p>Programming unavailable</p>`)
 		}
 		fmt.Fprint(w, `<a class=ts-link href=/reference-zone>Zone Band Plan</a></section>`)
-	case "identification":
-		fmt.Fprint(w, `<section class=ts-reference><div class=ts-itemline><strong>Shared identification</strong><span class=ts-badge>System · Read only</span></div>`)
-		webProperties(w, map[string]any{"callsign": system.Callsign, "profile": system.BSIProfile}, []webColumn{{"callsign", "Callsign"}, {"profile", "BSI signaling profile"}})
-		fmt.Fprint(w, `<a class=ts-link href=/reference-system>System identity</a></section>`)
 	case "site-identity":
-		fmt.Fprint(w, `<section class=ts-reference><div class=ts-itemline><strong>P25 Site identity</strong><span class=ts-badge>Zone · Read only</span></div>`)
+		fmt.Fprintf(w, `<section class=ts-reference><div class=ts-itemline><strong>P25 Site identity</strong><span class=ts-badge>%s</span></div>`, esc(owner))
 		if zone != nil {
 			for _, site := range zone.Sites {
 				if site.ID == s.Config().InstanceID {
-					webProperties(w, site, []webColumn{{"site_id", "P25 Site ID"}, {"nac", "NAC"}, {"lra", "Location Registration Area"}})
+					s.webProperties(w, site, []webColumn{{"site_id", "P25 Site ID"}, {"lra", "Location Registration Area"}})
 				}
 			}
 		}

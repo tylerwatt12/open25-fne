@@ -19,6 +19,8 @@ type webField struct {
 	Related                                bool
 	ChoiceKind                             string
 	Computed                               string
+	RelationLabels                         map[string]string
+	Multiple                               bool
 	BulkApply, ApplyChecked                bool
 }
 type webSection struct {
@@ -56,9 +58,9 @@ func webPlainHeader(w http.ResponseWriter, title string, role Role, session Sess
 					fmt.Fprintf(w, "<a href=/%s>%s</a> | ", p.Path, esc(p.Title))
 				}
 			}
-			fmt.Fprint(w, "<a href=/networking>Networking</a> | <a href=/history>History</a> | <a href=/reports>Site Reports</a> | <a href=/topology>Topology</a> | <a href=/account>Administrator</a> | ")
+			fmt.Fprint(w, "<a href=/networking>Networking</a> | <a href=/reports>Site Reports</a> | <a href=/topology>Topology</a> | <a href=/account>Administrator</a> | ")
 			if role == RoleSystem {
-				fmt.Fprint(w, "<a href=/users>Users</a> | <a href=/profiles>Programmed Profiles</a> | <a href=/automations>Automation Clients</a> | <a href=/keys>Encryption Keys</a> | <a href=/recipients>Authorized Application Servers</a> | ")
+				fmt.Fprint(w, "<a href=/history>History</a> | <a href=/users>Users</a> | <a href=/profiles>Programmed Profiles</a> | <a href=/automations>Automation Clients</a> | <a href=/keys>Encryption Keys</a> | <a href=/recipients>Authorized Application Servers</a> | ")
 			}
 			if role == RoleZone || role == RoleSite {
 				fmt.Fprint(w, "<a href=/live-status>Live Status</a> | <a href=/radio-commands>Radio Commands</a> | ")
@@ -202,7 +204,7 @@ func webUnit(key string) (string, int) {
 		return "Hz", 0
 	case "last_frame_age_ms", "maximum_processing_ms":
 		return "ms", 0
-	case "poll_seconds", "quiet_seconds", "location_stale_seconds", "age_seconds":
+	case "poll_seconds", "location_stale_seconds", "age_seconds":
 		return "s", 0
 	case "retention_days":
 		return "days", 0
@@ -216,8 +218,6 @@ func webUnit(key string) (string, int) {
 		return "m", 0
 	case "baud":
 		return "baud", 0
-	case "wpm":
-		return "WPM", 0
 	}
 	return "", 0
 }
@@ -227,15 +227,32 @@ func webUnitText(key string, value any) string {
 	_, places := webUnit(key)
 	if places != 0 && text != "" {
 		if scaled, err := webScaleDecimal(text, -places); err == nil {
+			if unit, _ := webUnit(key); unit == "MHz" && !strings.ContainsAny(scaled, "eE") {
+				whole, fraction, _ := strings.Cut(scaled, ".")
+				if len(fraction) < 6 {
+					fraction += strings.Repeat("0", 6-len(fraction))
+				}
+				scaled = whole + "." + fraction
+				if key == "uplink_offset_hz" && !strings.HasPrefix(scaled, "-") {
+					scaled = "+" + scaled
+				}
+			}
 			return scaled
 		}
 	}
-	return text
+	if key == "talkgroups" || key == "transmit_talkgroups" || key == "affiliation_radio_ids" || key == "transmit_radio_ids" {
+		items := strings.FieldsFunc(text, func(r rune) bool { return r == ',' || r == ' ' || r == '\n' || r == '\r' })
+		for i := range items {
+			items[i] = webDecimalText(key, items[i])
+		}
+		return strings.Join(items, ", ")
+	}
+	return webDecimalText(key, text)
 }
 
 func webReadFields(r *http.Request, fields []webField, record map[string]any) error {
 	for _, f := range fields {
-		if f.Kind == "derived-frequency" {
+		if f.Kind == "derived-frequency" || f.Kind == "internal" {
 			continue
 		}
 		text := r.FormValue(f.Name)
@@ -273,6 +290,10 @@ func webReadFields(r *http.Request, fields []webField, record map[string]any) er
 						return fmt.Errorf("could not read %s as a number", f.Label)
 					}
 				}
+				text, e := webScaleDecimal(text, 0)
+				if e != nil {
+					return fmt.Errorf("could not read %s as a number", f.Label)
+				}
 				value = json.Number(text)
 			}
 		case "numbers":
@@ -281,7 +302,8 @@ func webReadFields(r *http.Request, fields []webField, record map[string]any) er
 				if _, e := strconv.ParseInt(v, 10, 64); e != nil {
 					return fmt.Errorf("could not read %s as numbers", f.Label)
 				}
-				list = append(list, json.Number(v))
+				canonical, _ := webScaleDecimal(v, 0)
+				list = append(list, json.Number(canonical))
 			}
 			value = list
 		case "strings":
@@ -361,15 +383,31 @@ func webJSONResult(w io.Writer, result *webResult) {
 		fmt.Fprint(w, "<p>Saved.</p>")
 	}
 }
-func (s *Service) webLoginForm(w http.ResponseWriter) {
+func (s *Service) webLoginForm(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("logged_out") == "1" {
+		if r.URL.Query().Get("pending") == "1" {
+			fmt.Fprint(w, `<p role=status>Signed out locally. Shared sign-out delivery is pending reconnection.</p>`)
+		} else {
+			fmt.Fprint(w, `<p role=status>Signed out of this shared session. Disconnected portals will revoke it when they reconnect.</p>`)
+		}
+	}
 	fmt.Fprint(w, "<form method=post action=/login><p><label>Username <input name=username autocomplete=username></label></p><p><label>Password <input type=password name=password autocomplete=current-password></label></p>")
+	fmt.Fprintf(w, `<input type=hidden name=continue value="%s">`, esc(ssoContinue(r.FormValue("continue"))))
+	if s.Config().Role != RoleSystem {
+		fmt.Fprint(w, `<p><a href="/sso/start">Sign in through System Administration</a></p><p>Local sign-in works while disconnected.</p>`)
+	} else if continuation, err := url.Parse(ssoContinue(r.FormValue("continue"))); err == nil && continuation.Path == "/sso/authorize" {
+		callback := continuation.Query().Get("redirect_uri")
+		if s.ssoCallbackAllowed(callback) {
+			fmt.Fprintf(w, `<p><a href="%s">Sign in locally at the destination instead</a></p>`, esc(strings.TrimSuffix(callback, "/sso/callback")+"/login?local=1"))
+		}
+	}
 	if s.Config().Role == RoleApplication {
 		fmt.Fprint(w, "<p><label>Console position ID <input name=position_id></label> <small>Leave empty for a PTT account or its default position.</small></p>")
 	}
 	fmt.Fprint(w, "<div class=actions><button class=primary type=submit>Sign in</button></div></form>")
 }
 func (s *Service) earlyWeb(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/style.css" || r.URL.Path == "/forms.js" || r.URL.Path == "/testing.js" || r.URL.Path == "/messaging.js" || r.URL.Path == "/admin.css" || r.URL.Path == "/admin.js" || r.URL.Path == "/admin-chooser.js" || r.URL.Path == "/modem-status.js" {
+	if r.URL.Path == "/style.css" || r.URL.Path == "/forms.js" || r.URL.Path == "/testing.js" || r.URL.Path == "/messaging.js" || r.URL.Path == "/admin.css" || r.URL.Path == "/admin.js" || r.URL.Path == "/admin-chooser.js" || r.URL.Path == "/modem-status.js" || r.URL.Path == "/hardware-activity.js" || r.URL.Path == "/timestamps.js" {
 		if r.Method != "GET" && r.Method != "HEAD" {
 			w.WriteHeader(405)
 			return
@@ -398,30 +436,43 @@ func (s *Service) earlyWeb(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if s.ssoWeb(w, r) {
+		return
+	}
 	session, authenticated := s.session(r)
 	if r.URL.Path == "/login" {
+		s.ssoLoginPolicy(w, r)
 		if r.Method == "POST" {
 			result := s.webAPI(r, Session{}, "/api/login", "POST", map[string]string{"username": r.FormValue("username"), "password": r.FormValue("password"), "position_id": r.FormValue("position_id")})
 			if result.code < 300 {
 				for _, cookie := range result.header.Values("Set-Cookie") {
 					w.Header().Add("Set-Cookie", cookie)
 				}
-				http.Redirect(w, r, "/", http.StatusSeeOther)
+				destination := ssoContinue(r.FormValue("continue"))
+				if destination == "" {
+					destination = "/"
+				}
+				http.Redirect(w, r, destination, http.StatusSeeOther)
 				return
 			}
 			s.webHeader(w, r, "Sign in", Session{}, false)
 			webJSONResult(w, result)
-			s.webLoginForm(w)
+			s.webLoginForm(w, r)
 			webFooter(w)
 			return
 		}
 		s.webHeader(w, r, "Sign in", Session{}, false)
-		s.webLoginForm(w)
+		s.webLoginForm(w, r)
 		webFooter(w)
 		return
 	}
 	if !authenticated {
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		destination := "/login"
+		role := s.Config().Role
+		if role != RoleSystem && !(role == RoleApplication && (r.URL.Path == "/dispatch-test" || r.URL.Path == "/ptt-test")) {
+			destination = "/sso/start?return=" + url.QueryEscape(r.URL.RequestURI())
+		}
+		http.Redirect(w, r, destination, http.StatusSeeOther)
 		return
 	}
 	if r.Method == "POST" && subtle.ConstantTimeCompare([]byte(r.FormValue("csrf")), []byte(session.CSRF)) != 1 {
@@ -429,14 +480,17 @@ func (s *Service) earlyWeb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/logout" && r.Method == "POST" {
-		s.mu.Lock()
-		delete(s.sessions, session.Key)
-		s.mu.Unlock()
-		if s.hub != nil {
-			s.hub.InvalidateSession(session.Key)
+		delivered, err := s.signOutSession(session)
+		if err != nil {
+			http.Error(w, "Could not record shared sign-out.", 500)
+			return
 		}
 		http.SetCookie(w, &http.Cookie{Name: s.cookieName(), Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode})
-		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		destination := "/login?logged_out=1"
+		if !delivered {
+			destination += "&pending=1"
+		}
+		http.Redirect(w, r, destination, http.StatusSeeOther)
 		return
 	}
 	path := strings.Trim(r.URL.Path, "/")
@@ -446,7 +500,7 @@ func (s *Service) earlyWeb(w http.ResponseWriter, r *http.Request) {
 			title, kind = "Open25 PTT", "ptt"
 		}
 		webPlainHeader(w, title, s.Config().Role, session, false)
-		fmt.Fprintf(w, "<section id=messages aria-label=Messages></section><section id=audio-test data-kind=%s></section><script src=/messaging.js defer></script><script src=/testing.js defer></script>", kind)
+		fmt.Fprintf(w, "<section id=messages aria-label=Messages></section><section id=audio-test data-kind=%s></section><script src=/timestamps.js defer></script><script src=/messaging.js defer></script><script src=/testing.js defer></script>", kind)
 		webPlainFooter(w)
 		return
 	}
@@ -489,6 +543,11 @@ func (s *Service) webConfigSection(w http.ResponseWriter, r *http.Request, sessi
 	if r.Method == http.MethodGet && section.Path == "control-policy" {
 		if _, exists := config["control_policy"]; !exists {
 			config["control_policy"] = webNewControlPolicy()
+		}
+	}
+	if r.Method == http.MethodGet && section.Path == "neighbor-announcements" {
+		if _, exists := config["neighbor_mode"]; !exists {
+			config["neighbor_mode"] = "all"
 		}
 	}
 	row := -1
@@ -555,24 +614,57 @@ func (s *Service) webConfigSection(w http.ResponseWriter, r *http.Request, sessi
 			}
 		} else if clone >= 0 {
 			record, _ = list[clone].(map[string]any)
+			if adminInternalRecord(section.Path) {
+				record["id"] = webNewRecord(section.Path)["id"]
+			}
 		} else if editing {
 			record = webNewRecord(section.Path)
+			if section.Path == "channels" {
+				record["name"] = fmt.Sprintf("RF channel %d", len(list)+1)
+			}
+			if section.Path == "modems" {
+				record["name"] = fmt.Sprintf("USB modem %d", len(list)+1)
+			}
 		}
 	}
 	if section.Path == "identification" {
 		record, _ = config["identification"].(map[string]any)
+		if r.Method == http.MethodPost {
+			record = map[string]any{}
+		}
 	}
 	if record == nil {
 		record = map[string]any{}
 	}
 	if r.Method == http.MethodPost {
+		if selected && adminInternalRecord(section.Path) {
+			record["id"] = resource
+		}
 		if r.FormValue("action") == "delete" && section.Collection != "" {
 			if row >= 0 {
 				config[section.Collection] = append(list[:row], list[row+1:]...)
 			}
 		} else {
-			err = webReadFields(r, section.Fields, record)
+			saveFields := append([]webField(nil), section.Fields...)
+			for i := range saveFields {
+				if adminManagedID(section.Path, saveFields[i].Name) {
+					saveFields[i].Kind = "internal"
+				}
+			}
+			err = webReadFields(r, saveFields, record)
+			if err == nil && adminInternalRecord(section.Path) && !selected && webText(record["id"]) == "" {
+				record["id"] = webNewRecord(section.Path)["id"]
+			}
 			if err == nil && section.Collection != "" {
+				if !selected && adminInternalRecord(section.Path) {
+					for i, item := range list {
+						existing, _ := item.(map[string]any)
+						if webText(existing["id"]) == webText(record["id"]) {
+							row = i
+							break
+						}
+					}
+				}
 				if row >= 0 {
 					list[row] = record
 				} else {
@@ -601,6 +693,12 @@ func (s *Service) webConfigSection(w http.ResponseWriter, r *http.Request, sessi
 	title := section.Title
 	if editing && section.Collection != "" {
 		title = webRecordTitle(section.Path, record)
+		if section.Path == "channels" {
+			title = "Edit RF channel"
+			if !selected {
+				title = "New RF channel"
+			}
+		}
 		if clone >= 0 {
 			title = "Copy of " + title
 		}
@@ -619,9 +717,14 @@ func (s *Service) webConfigSection(w http.ResponseWriter, r *http.Request, sessi
 	}
 
 	if editing {
-		s.webProgrammingReference(w, section.Path)
+		if section.Path == "identification" || section.Path == "site-identity" || section.Path == "control-policy" || section.Path == "neighbor-announcements" {
+			s.webRFConfigurationNotice(w)
+		}
+		if section.Path != "channels" {
+			s.webProgrammingReference(w, section.Path)
+		}
 		fmt.Fprint(w, `<div class=ts-editor>`)
-		fmt.Fprintf(w, `<form method=post data-config-form action="%s"`, esc(r.URL.RequestURI()))
+		fmt.Fprintf(w, `<form method=post data-config-form data-admin-page="%s" action="%s"`, esc(section.Path), esc(r.URL.RequestURI()))
 		if err != nil && r.Method == http.MethodPost {
 			fmt.Fprint(w, ` data-admin-unsaved`)
 		}
@@ -644,14 +747,64 @@ func (s *Service) webConfigSection(w http.ResponseWriter, r *http.Request, sessi
 			submitted = r.PostForm
 		}
 		s.adminEditorFields(w, section.Path, section.Fields, record, submitted)
+		if section.Path == "channels" {
+			s.webProgrammingReference(w, section.Path)
+		}
 		webSaveBar(w, "/"+section.Path, section.Collection != "" && row >= 0)
 		fmt.Fprint(w, `</form></div>`)
 		return
 	}
+	if section.Path == "channels" || section.Path == "modems" {
+		s.webRFConfigurationNotice(w)
+	}
 	if section.Path == "modems" {
 		fmt.Fprint(w, `<p class=ts-reference><a href=/hardware>Discovered radio hardware</a></p>`)
 	}
-	webRecordPage(w, r, section.Path, list, webListFields(section.Path), session.CSRF)
+	if section.Path == "channels" {
+		zone := s.webKnownZone()
+		for _, item := range list {
+			channel, _ := item.(map[string]any)
+			identifier, idErr := strconv.Atoi(webText(channel["identifier"]))
+			number, numberErr := strconv.Atoi(webText(channel["channel_no"]))
+			tx, rx, known := bandPlanFrequencies(zone, identifier, number)
+			channel["tx_frequency_hz"], channel["rx_frequency_hz"] = "Unavailable", "Unavailable"
+			if known && idErr == nil && numberErr == nil {
+				channel["tx_frequency_hz"], channel["rx_frequency_hz"] = tx, rx
+			}
+		}
+	}
+	if section.Path == "modems" {
+		var site SiteConfig
+		_ = s.owned(&site)
+		inventory := s.hardwareInventory()
+		for _, item := range list {
+			modem, _ := item.(map[string]any)
+			names := []string{}
+			for _, ch := range site.Channels {
+				if ch.ModemID == webText(modem["id"]) {
+					names = append(names, ch.Name)
+				}
+			}
+			modem["channel_names"] = strings.Join(names, ", ")
+			if len(names) == 0 {
+				modem["channel_names"] = "Unassigned"
+			}
+			modem["hardware_identity"] = "Not observed"
+			for _, device := range inventory.Devices {
+				if device.Device == webText(modem["device"]) {
+					if device.UID != "" {
+						modem["hardware_identity"] = device.UID
+					}
+					break
+				}
+			}
+		}
+	}
+	presented, _ := s.adminNamedPresentation(list).([]any)
+	webRecordPage(w, r, section.Path, presented, webListFields(section.Path), session.CSRF)
+	if section.Path == "channels" {
+		s.webProgrammingReference(w, section.Path)
+	}
 
 }
 
@@ -663,9 +816,9 @@ func webListFields(path string) []webField {
 		"status-labels": {"id", "label"}, "message-labels": {"id", "label"},
 		"positions":   {"name", "radio_id", "talkgroups", "enabled"},
 		"identifiers": {"identifier", "base_frequency_hz", "channel_spacing_hz", "uplink_offset_hz"},
-		"sites":       {"name", "site_id", "nac", "lra"},
-		"modems":      {"name", "device", "baud"},
-		"channels":    {"name", "role", "identifier", "channel_no", "modem_id", "enabled"},
+		"sites":       {"name", "site_id", "lra"},
+		"modems":      {"name", "channel_names", "hardware_identity"},
+		"channels":    {"name", "modem_id", "tx_frequency_hz", "rx_frequency_hz", "enabled"},
 		"users":       {"username", "role", "radio_id", "enabled"},
 		"profiles":    {"profile.name", "profile.preferred_position_id", "profile.selected_talkgroup"},
 		"automations": {"name", "radio_id", "enabled"},
@@ -681,13 +834,30 @@ func webListFields(path string) []webField {
 	if path == "profiles" {
 		fields = []webField{{Name: "profile.preferred_position_id", Label: "Preferred console position"}, {Name: "profile.name", Label: "Profile name"}, {Name: "profile.selected_talkgroup", Label: "Selected group", Kind: "number"}}
 	}
+	if path == "modems" {
+		fields = append(fields, webField{Name: "channel_names", Label: "Assigned channel"}, webField{Name: "hardware_identity", Label: "USB serial identity"})
+	}
 	out := make([]webField, 0, len(columns[path]))
 	for _, name := range columns[path] {
 		for _, field := range fields {
 			if field.Name == name {
-				labels := map[string]string{"rid": "Radio / Unit ID", "tgid": "Talkgroup ID", "alias": "Name", "enabled": "Access", "affiliation_access": "Affiliation", "transmit_access": "Radio transmit", "site_access": "Sites", "start_policy": "Call start", "priority": "Priority", "admission_mode": "Allowed calls", "transmit_mode": "Transmit strapping", "device": "Device", "baud": "Rate (baud)", "role": "Role", "modem_id": "Modem", "radio_id": "Radio ID", "talkgroups": "Talkgroups", "key_id": "Key ID", "algorithm_id": "Algorithm", "recipient": "Application Server", "public_key": "Public key"}
+				labels := map[string]string{"rid": "Radio / Unit ID", "tgid": "Talkgroup ID", "alias": "Name", "enabled": "Access", "affiliation_access": "Affiliation", "transmit_access": "Radio transmit", "site_access": "Sites", "start_policy": "Call start", "priority": "Priority", "admission_mode": "Allowed calls", "transmit_mode": "Transmit strapping", "device": "Device", "baud": "Rate (baud)", "role": "Role", "modem_id": "Modem", "tx_frequency_hz": "Site TX (MHz)", "rx_frequency_hz": "Site RX (MHz)", "radio_id": "Radio ID", "talkgroups": "Talkgroups", "key_id": "Key ID", "algorithm_id": "Algorithm", "recipient": "Application Server", "public_key": "Public key"}
 				if label, ok := labels[name]; ok {
 					field.Label = label
+				}
+				if path == "channels" {
+					if name == "name" {
+						field.Label = "Channel"
+					}
+					if name == "modem_id" {
+						field.Label = "Assigned modem"
+					}
+					if name == "enabled" {
+						field.Label = "Enabled"
+					}
+				}
+				if path == "modems" && name == "name" {
+					field.Label = "Modem"
 				}
 				out = append(out, field)
 				break
@@ -707,7 +877,7 @@ func webDisplay(field webField, value any) string {
 	if field.Kind == "select" || field.Kind == "select-number" {
 		for _, choice := range strings.Split(field.Choices, "|") {
 			pair := strings.SplitN(choice, "=", 2)
-			if pair[0] == text && len(pair) == 2 {
+			if pair[0] == webText(value) && len(pair) == 2 {
 				if width := webHexWidth(field); width > 0 {
 					if notation := webHexText(text, width); notation != "" {
 						return text + " / " + notation + " · " + pair[1]

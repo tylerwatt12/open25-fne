@@ -20,29 +20,22 @@ func TestSettingsSaveDoesNotBlockLiveVoice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer conn.Close()
 	saved := make(chan error, 1)
 	go func() { saved <- s.SaveSettings(settings) }()
-	defer func() {
-		_ = conn.Close()
-		select {
-		case err := <-saved:
-			if err != nil {
-				t.Error(err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Error("settings save did not finish after storage was released")
-		}
-	}()
-	// The file commit precedes the event write waiting on the reserved DB
-	// connection. Configuration readers and media must stay independent of it.
+	// Connection settings belong to their private file. A diagnostic message
+	// must not introduce an unrelated SQL dependency into this explicit Save.
 	mediaWait(t, time.Second, func() bool {
 		cfg, err := ReadFileConfig(c.zone.configPath)
 		return err == nil && cfg.PollSeconds == settings.PollSeconds
 	}, "settings file commit")
 	select {
-	case <-saved:
-		t.Fatal("settings save did not wait for the reserved storage connection")
-	default:
+	case err := <-saved:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("an unrelated reserved SQL writer blocked the settings Save")
 	}
 	config := make(chan FileConfig, 1)
 	go func() { config <- s.Config() }()

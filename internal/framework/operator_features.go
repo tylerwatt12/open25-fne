@@ -841,9 +841,10 @@ func (s *Service) mergeSiteOperatorSnapshot(siteID string, value OperatorSnapsho
 	return s.writeOperatorCacheLocked("operator-local", mergeOperatorSnapshots(local, filtered))
 }
 func (s *Service) acceptOperatorSnapshot(value OperatorSnapshot) error {
-	// Current affiliations are computed by their controller for an explicit
-	// scoped read. They never become a durable, replicated operator snapshot.
+	// Current affiliations and call delivery come from their owning runtime
+	// for an explicit read. They never become durable operator state.
 	value.Units = nil
+	value.CallDelivery = nil
 	role := s.Config().Role
 	if role != RoleSite && role != RoleApplication {
 		return nil

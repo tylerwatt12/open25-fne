@@ -10,13 +10,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"open25.local/open25-fne/internal/p25crypto"
 	"slices"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
-	"open25.local/open25-fne/internal/p25crypto"
 
 	"open25.local/open25-fne/internal/dispatch"
 	"open25.local/open25-fne/internal/radio"
@@ -32,7 +32,7 @@ type Options struct {
 	Codec         Codec
 	HasRFInterest func(int) bool
 	AllowTX       func(int, int) bool
-	Event         func(Event)
+	Event         func(Event) // Observation callback must never block routing.
 }
 
 type Event struct {
@@ -44,6 +44,9 @@ type Event struct {
 	TalkgroupID  int       `json:"talkgroup_id"`
 	Outcome      string    `json:"outcome"`
 	Message      string    `json:"message"`
+	// These optional observations cover native grant acquisition, not RF airtime.
+	RequestStartedAt time.Time `json:"request_started_at,omitzero"`
+	DurationMS       float64   `json:"duration_ms,omitempty"`
 }
 type Status struct {
 	ActiveCalls int    `json:"active_calls"`
@@ -165,7 +168,7 @@ func (r *Router) preemptFloors(ctx context.Context, request dispatch.CallRequest
 		if err := r.End(ctx, dispatch.Grant{ID: id, Talkgroups: slices.Clone(old.groups), Secure: old.request.Secure, AlgorithmID: old.request.AlgorithmID, KeyID: old.request.KeyID}); err != nil {
 			return err
 		}
-		r.emit(old, 0, "call.preempted", "ended", "Interrupted by an emergency call.")
+		r.emit(old, 0, "call.preempted", "ended", "Interrupted by an emergency call.", time.Time{})
 	}
 	return nil
 }
@@ -298,12 +301,13 @@ func (r *Router) Begin(ctx context.Context, request dispatch.CallRequest) (dispa
 		c.mu.Lock()
 		c.leases = append(c.leases, lease)
 		c.mu.Unlock()
+		started := time.Now()
 		if e = r.acquire(ctx, lease); e != nil {
 			err = e
-			r.emit(c, tg, "rf.grant", "failed", e.Error())
+			r.emit(c, tg, "rf.grant", "failed", e.Error(), started)
 			return grant, err
 		}
-		r.emit(c, tg, "rf.grant", "granted", "")
+		r.emit(c, tg, "rf.grant", "granted", "", started)
 	}
 	if err = ctx.Err(); err != nil {
 		return grant, err
@@ -477,7 +481,7 @@ func (r *Router) Renew(ctx context.Context, grant dispatch.Grant) error {
 				outcome = "unconfirmed"
 				message = cleanup.Error()
 			}
-			r.emit(c, l.Group, "rf.interest_ended", outcome, message)
+			r.emit(c, l.Group, "rf.interest_ended", outcome, message, time.Time{})
 			continue
 		}
 		raw, err := l.Control.Put(ctx, "/p25/dispatch/renew", l.identity())
@@ -496,7 +500,7 @@ func (r *Router) Renew(ctx context.Context, grant dispatch.Grant) error {
 				}
 			}
 			failure := renewalFailure(reply, state, err)
-			r.emit(c, l.Group, "rf.renew", "failed", failure.Error())
+			r.emit(c, l.Group, "rf.renew", "failed", failure.Error(), time.Time{})
 			return failure
 		}
 	}
@@ -608,7 +612,7 @@ func (r *Router) End(ctx context.Context, grant dispatch.Grant) error {
 		message = cleanup.Error()
 	}
 	for _, l := range leases {
-		r.emit(c, l.Group, "rf.release", outcome, message)
+		r.emit(c, l.Group, "rf.release", outcome, message, time.Time{})
 	}
 	return cleanup
 }
@@ -717,9 +721,14 @@ func (r *Router) Close(ctx context.Context) error {
 	r.mu.Unlock()
 	return result
 }
-func (r *Router) emit(c *call, tg int, kind, outcome, message string) {
+func (r *Router) emit(c *call, tg int, kind, outcome, message string, started time.Time) {
 	if r.options.Event != nil {
-		r.options.Event(Event{At: time.Now().UTC(), Kind: kind, CallID: c.request.LogicalCallID, AllocationID: c.request.ID, RadioID: c.request.RadioID, TalkgroupID: tg, Outcome: outcome, Message: message})
+		e := Event{At: time.Now().UTC(), Kind: kind, CallID: c.request.LogicalCallID, AllocationID: c.request.ID, RadioID: c.request.RadioID, TalkgroupID: tg, Outcome: outcome, Message: message}
+		if !started.IsZero() {
+			e.RequestStartedAt = started.UTC()
+			e.DurationMS = float64(time.Since(started)) / float64(time.Millisecond)
+		}
+		r.options.Event(e)
 	}
 }
 

@@ -16,7 +16,7 @@ func TestNativeProfileSeparatesStandardVoiceMFIDFromBSIProfile(t *testing.T) {
 	for _, mfid := range []int{0, 1} {
 		profile := fixtureProfile()
 		profile.System.VoiceMFID = mfid
-		profile.System.BSIProfile = "motorola"
+		profile.Site.Identification.BSIProfile = "motorola"
 		files, err := RenderChannel(profile, profile.Site.Channels[0], network, 41000, 41001, "null")
 		if err != nil {
 			t.Fatal(err)
@@ -33,7 +33,7 @@ func TestNativeProfileSeparatesStandardVoiceMFIDFromBSIProfile(t *testing.T) {
 		}
 	}
 	profile := fixtureProfile()
-	profile.System.BSIProfile = "harris"
+	profile.Site.Identification.BSIProfile = "harris"
 	if err := Validate(profile); err == nil {
 		t.Fatal("unsupported BSI profile accepted")
 	}

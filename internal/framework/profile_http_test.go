@@ -66,7 +66,7 @@ func profileNode(t *testing.T, role Role, id string, system SystemConfig, zone Z
 		t.Fatal(err)
 	}
 	client := newHTTPClient()
-	s := &Service{Store: store, config: cfg, configPath: filepath.Join(dir, "service.json"), client: client, sessions: map[string]Session{}, attempts: map[string]loginAttempt{}}
+	s := &Service{Store: store, config: cfg, configPath: filepath.Join(dir, "service.json"), client: client, attempts: map[string]loginAttempt{}}
 	n := &profileTestNode{service: s}
 	n.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/internal/profile" && r.URL.Path != "/internal/desktop-workspace" {

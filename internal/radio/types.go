@@ -20,9 +20,7 @@ type System struct {
 	Name       string      `json:"name"`
 	WACN       int         `json:"wacn"`
 	SystemID   int         `json:"system_id"`
-	Callsign   string      `json:"callsign"`
 	VoiceMFID  int         `json:"voice_mfid"`
-	BSIProfile string      `json:"bsi_profile"`
 	Radios     []Radio     `json:"radios"`
 	Talkgroups []Talkgroup `json:"talkgroups"`
 }
@@ -48,6 +46,7 @@ type Talkgroup struct {
 	Enabled             bool     `json:"enabled"`
 	SiteAccess          string   `json:"site_access"`
 	SiteIDs             []string `json:"site_ids"`
+	RequestedSiteIDs    []string `json:"requested_site_ids"`
 }
 type Zone struct {
 	ID                 string         `json:"id"`
@@ -69,22 +68,25 @@ type SiteIdentity struct {
 	Name     string `json:"name"`
 	SiteID   int    `json:"site_id"`
 	LRA      int    `json:"lra"`
-	NAC      int    `json:"nac"`
 	Endpoint string `json:"endpoint"`
 }
 type Site struct {
+	NAC               int            `json:"nac"`
 	BroadcastBandPlan bool           `json:"broadcast_band_plan"`
 	ID                string         `json:"id"`
 	Modems            []Modem        `json:"modems"`
 	Channels          []Channel      `json:"channels"`
 	Identification    Identification `json:"identification"`
 	ControlPolicy     ControlPolicy  `json:"control_policy"`
+	NeighborMode      string         `json:"neighbor_mode,omitempty"`
+	NeighborSiteIDs   []string       `json:"neighbor_site_ids,omitempty"`
 }
 
 type ControlPolicy struct {
-	Mode            string  `json:"mode"`
-	RotationEnabled bool    `json:"rotation_enabled"`
-	RotationHours   float64 `json:"rotation_hours"`
+	ChannelID     string   `json:"channel_id"`
+	CandidateIDs  []string `json:"candidate_ids"`
+	Mode          string   `json:"mode"`
+	RotationHours float64  `json:"rotation_hours"`
 }
 type Modem struct {
 	ID          string      `json:"id"`
@@ -105,34 +107,31 @@ type Calibration struct {
 	PTTInvert  bool    `json:"ptt_invert"`
 }
 type Channel struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	Role            string `json:"role"`
-	Identifier      int    `json:"identifier"`
-	ChannelNo       int    `json:"channel_no"`
-	TXHz            int64  `json:"tx_frequency_hz"`
-	RXHz            int64  `json:"rx_frequency_hz"`
-	PowerPercent    int    `json:"power_percent"`
-	ModemID         string `json:"modem_id"`
-	Enabled         bool   `json:"enabled"`
-	ControlEligible bool   `json:"control_eligible"`
-	ControlPriority int    `json:"control_priority"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Role         string `json:"role"`
+	Identifier   int    `json:"identifier"`
+	ChannelNo    int    `json:"channel_no"`
+	TXHz         int64  `json:"tx_frequency_hz"`
+	RXHz         int64  `json:"rx_frequency_hz"`
+	PowerPercent int    `json:"power_percent"`
+	ModemID      string `json:"modem_id"`
+	Enabled      bool   `json:"enabled"`
 }
 type Identification struct {
-	Enabled      bool   `json:"enabled"`
-	Mode         string `json:"mode"`
-	WPM          int    `json:"wpm"`
-	QuietSeconds int    `json:"quiet_seconds"`
+	BSIProfile string `json:"bsi_profile"`
+	Callsign   string `json:"callsign"`
+	Enabled    bool   `json:"enabled"`
 }
 type Network struct {
-	Address        string         `json:"address"`
-	Port           int            `json:"port"`
-	Secret         string         `json:"secret"`
-	PeerBase       int            `json:"peer_base"`
-	ControlPeerID  int            `json:"control_peer_id"`
-	VoicePeerIDs   map[string]int `json:"voice_peer_ids"`
-	ConsolePeerIDs map[int]int    `json:"console_peer_ids"`
-	RPCSecret      string         `json:"-"`
+	Address          string         `json:"address"`
+	Port             int            `json:"port"`
+	Secret           string         `json:"secret"`
+	PeerBase         int            `json:"peer_base"`
+	ChannelPeerIDs   map[string]int `json:"channel_peer_ids"`
+	ConsolePeerIDs   map[int]int    `json:"console_peer_ids"`
+	RPCSecret        string         `json:"-"`
+	ControlAuthority string         `json:"-"`
 }
 
 type Options struct {
@@ -186,35 +185,57 @@ type Registration struct {
 	At  time.Time `json:"at"`
 }
 type ChannelStatus struct {
-	Telemetry           ModemTelemetry `json:"telemetry"`
-	OperatingModemID    string         `json:"operating_modem_id"`
-	OperatingModemName  string         `json:"operating_modem_name"`
-	ID                  string         `json:"id"`
-	Name                string         `json:"name"`
-	Role                string         `json:"role"`
-	State               string         `json:"state"`
-	PID                 int            `json:"pid"`
-	TXHz                int64          `json:"tx_frequency_hz"`
-	RXHz                int64          `json:"rx_frequency_hz"`
-	PowerPercent        int            `json:"power_percent"`
-	Ready               bool           `json:"ready"`
-	Busy                bool           `json:"busy"`
-	TGID                int            `json:"talkgroup,omitempty"`
-	RID                 int            `json:"radio_id,omitempty"`
-	Identifying         bool           `json:"identifying"`
-	IdentificationState string         `json:"identification_state,omitempty"`
-	Error               string         `json:"error,omitempty"`
-	RPCPort             int            `json:"rpc_port,omitempty"`
-	RESTPort            int            `json:"rest_port,omitempty"`
-	StartedAt           time.Time      `json:"started_at,omitempty"`
-	ModemID             string         `json:"modem_id"`
-	Device              string         `json:"device"`
-	ConfiguredRole      string         `json:"configured_role"`
-	ControlEligible     bool           `json:"control_eligible"`
-	RecoveryWanted      bool           `json:"recovery_wanted"`
-	RecoveryAt          time.Time      `json:"recovery_at,omitempty"`
+	Telemetry          ModemTelemetry `json:"telemetry"`
+	OperatingModemID   string         `json:"operating_modem_id"`
+	OperatingModemName string         `json:"operating_modem_name"`
+	ID                 string         `json:"id"`
+	Name               string         `json:"name"`
+	Role               string         `json:"role"`
+	State              string         `json:"state"`
+	PID                int            `json:"pid"`
+	TXHz               int64          `json:"tx_frequency_hz"`
+	RXHz               int64          `json:"rx_frequency_hz"`
+	PowerPercent       int            `json:"power_percent"`
+	Ready              bool           `json:"ready"`
+	Busy               bool           `json:"busy"`
+	TGID               int            `json:"talkgroup,omitempty"`
+	RID                int            `json:"radio_id,omitempty"`
+	Error              string         `json:"error,omitempty"`
+	RPCPort            int            `json:"rpc_port,omitempty"`
+	RESTPort           int            `json:"rest_port,omitempty"`
+	StartedAt          time.Time      `json:"started_at,omitempty"`
+	ModemID            string         `json:"modem_id"`
+	Device             string         `json:"device"`
+	RecoveryWanted     bool           `json:"recovery_wanted"`
+	RecoveryAt         time.Time      `json:"recovery_at,omitempty"`
 }
+
+// AdjacentSite is the control-channel identity read from the running native host.
+type AdjacentSite struct {
+	WACN         int   `json:"wacn"`
+	TXHz         int64 `json:"tx_frequency_hz"`
+	RXHz         int64 `json:"rx_frequency_hz"`
+	SystemID     int   `json:"system_id"`
+	RFSSID       int   `json:"rfss_id"`
+	SiteID       int   `json:"site_id"`
+	LRA          int   `json:"lra"`
+	Identifier   int   `json:"identifier"`
+	ChannelNo    int   `json:"channel_no"`
+	ServiceClass int   `json:"service_class"`
+	Networked    bool  `json:"networked"`
+}
+
+type NeighborSite struct {
+	ID         string        `json:"id"`
+	Name       string        `json:"name"`
+	Control    *AdjacentSite `json:"control,omitempty"`
+	ValidUntil time.Time     `json:"valid_until,omitzero"`
+}
+
 type Status struct {
+	AdjacentSite           *AdjacentSite   `json:"adjacent_site,omitempty"`
+	NAC                    int             `json:"nac"`
+	AppliedRFConfiguration string          `json:"applied_rf_configuration,omitempty"`
 	Available              bool            `json:"available"`
 	MaintenanceSupported   bool            `json:"maintenance_supported"`
 	State                  string          `json:"state"`

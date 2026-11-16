@@ -81,9 +81,9 @@ func (c *Controller) stopChannel(ctx context.Context, id string) error {
 		c.mu.Unlock()
 		return nil
 	}
-	if row.Busy || row.Identifying {
+	if row.Busy {
 		c.mu.Unlock()
-		return errors.New("wait for the voice transmission or identification to finish")
+		return errors.New("wait for the voice transmission to finish")
 	}
 	c.mu.Unlock()
 	client, err := c.ControlClient()
@@ -125,9 +125,9 @@ func (c *Controller) stopChannel(ctx context.Context, id string) error {
 			c.status.Channels[i].Ready = false
 		}
 	}
-	identification := c.profile.Site.Identification.Enabled && c.profile.Site.Identification.Mode == "ham" && c.status.Mode == "hardware"
+
 	c.mu.Unlock()
-	if err = process.stop(ctx, identification); err != nil {
+	if err = process.stop(ctx); err != nil {
 		c.mu.Lock()
 		for i := range c.status.Channels {
 			if c.status.Channels[i].ID == id && c.children[id] == process {
@@ -222,7 +222,7 @@ func (c *Controller) startChannel(ctx context.Context, id string, attempt *chann
 			if ctx.Err() != nil {
 				cancel() // cancelled startup needs immediate forced retirement
 			}
-			cleanupErr = process.stop(stop, false)
+			cleanupErr = process.stop(stop)
 			cancel()
 		} else if leaseCloser != nil {
 			cleanupErr = leaseCloser.Close()
@@ -260,7 +260,7 @@ func (c *Controller) startChannel(ctx context.Context, id string, attempt *chann
 		c.mu.Unlock()
 	}()
 	if previous != nil {
-		if err = previous.stop(ctx, false); err != nil {
+		if err = previous.stop(ctx); err != nil {
 			process, previousCleanupErr = previous, err
 			return err // keep the previous owner and lease in children
 		}
@@ -285,7 +285,7 @@ func (c *Controller) startChannel(ctx context.Context, id string, attempt *chann
 		if leaseCloser, err = c.acquireModem(ctx, modem.Device); err != nil {
 			return err
 		}
-		if err = c.verifyModem(ctx, leaseCloser, modem.Device, p.Site.Identification.Enabled && p.Site.Identification.Mode == "ham"); err != nil {
+		if err = c.verifyModem(ctx, leaseCloser, modem.Device); err != nil {
 			return err
 		}
 	}

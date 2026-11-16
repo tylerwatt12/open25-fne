@@ -25,13 +25,25 @@
     jitterBufferMinimumDelay: ["Cumulative minimum jitter-buffer delay (ms)", .001],
     roundTripTime: ["Round-trip time (ms)", .001], totalRoundTripTime: ["Cumulative round-trip time (ms)", .001]
   };
+  const paddedID = (value, width) => String(value ?? "").padStart(width, "0");
+  function displayMeasurement(key, value, unit) {
+    const scaled = value / unit[1];
+    if (!['tx_frequency_hz', 'rx_frequency_hz', 'base_frequency_hz', 'uplink_offset_hz'].includes(key)) return scaled;
+    const text = String(scaled);
+    if (/[eE]/.test(text)) return text;
+    const [whole, fraction = ''] = text.split('.');
+    const sign = key === 'uplink_offset_hz' && scaled >= 0 ? '+' : '';
+    return sign + whole + '.' + fraction.padEnd(6, '0');
+  }
   function readable(value, rtc = false) {
     const format = item => {
       if (Array.isArray(item)) return item.map(format);
       if (!item || typeof item !== "object") return item;
       return Object.fromEntries(Object.entries(item).map(([key, value]) => {
         const unit = measurementUnits[key] || (rtc ? rtcUnits[key] : undefined);
-        return [unit ? unit[0] : key, unit && typeof value === "number" ? value / unit[1] : format(value)];
+        if (typeof value === "number" && ["rid", "radio_id", "source_radio_id", "target_radio_id"].includes(key)) return [key, paddedID(value, 8)];
+        if (typeof value === "number" && ["tgid", "talkgroup_id", "talkgroup", "selected_talkgroup"].includes(key)) return [key, paddedID(value, 5)];
+        return [unit ? unit[0] : key, unit && typeof value === "number" ? displayMeasurement(key, value, unit) : format(value)];
       }));
     };
     return JSON.stringify(format(value), null, 2);
@@ -54,7 +66,6 @@
     ["DTMF", "Send keypad tones during an accepted transmission.", "Implemented"],
     ["WAV announcements", "Transmit an audio file to the chosen groups.", "Implemented"],
     ["Spoken announcements", "Have the server speak entered words.", "Implemented"],
-    ["Call history", "Read past calls and their delivery outcomes.", "Implemented"],
     ["Affiliated radios", "Read radios currently associated with the selected talkgroup.", "Implemented"],
     ["Private calls", "Speak directly to one radio.", "Not implemented"],
     ["Web conversations", "Exchange written messages with people and private groups in both apps.", "Implemented"],
@@ -136,7 +147,7 @@
       ${ptt ? '' : `<form id="test-patch"><label>Patch name <input name="name"></label> <label>Member groups, separated by commas <input name="talkgroups"></label> <label>Algorithm number <input name="algorithm_id" type="number" value="0"></label> <label>Key number <input name="key_id" type="number" value="0"></label> <button>Start patch</button></form>
       <p><label>Load existing patch <select id="test-patch-select"><option value="">Read controller results to load patches</option></select></label></p>
       <p>Read controller results, then choose a patch to load its current fields.</p><p><label>Existing patch ID <input id="test-patch-id"></label> <label>Previous members <input id="test-patch-previous"></label> <label>New members <input id="test-patch-members"></label> <button id="test-patch-edit" type="button">Change idle patch members</button> <button id="test-patch-end" type="button">End patch</button></p>`}
-      <p><button id="test-read-results" type="button">Read controller results</button> <button id="test-command-results" type="button">Read radio command results</button> <button id="test-units" type="button">Read affiliated radios</button> <button id="test-history" type="button">Read call history</button> <button id="test-stats" type="button">Read audio statistics</button></p><pre id="test-controller-results"></pre>
+      <p><button id="test-read-results" type="button">Read controller results</button> <button id="test-command-results" type="button">Read radio command results</button> <button id="test-units" type="button">Read affiliated radios</button> <button id="test-stats" type="button">Read audio statistics</button></p><pre id="test-controller-results"></pre>
     </fieldset>
     <fieldset><legend>Feature list</legend><p>Implementation describes existing software. Radio and audio qualification of these new testing pages is pending.</p>
       <table border="1" cellpadding="4"><thead><tr><th>Feature</th><th>What it does</th><th>Implementation</th><th>Verification</th></tr></thead><tbody>${features.map(row => '<tr>' + [...row, row[0] === 'Web conversations' ? 'Browser and authenticated API checks' : row[0] === 'Saved preferences' ? 'Browser save/reload and profile API checks' : row[0] === 'Audio device selection' ? 'Browser checks; physical-device test pending' : row[2].startsWith('Not implemented') || row[2] === 'Deferred' || row[2] === 'Outside current scope' ? 'Pending implementation' : 'New-page radio test pending'].map(value => '<td>' + escape(value) + '</td>').join('') + '</tr>').join('')}</tbody></table>
@@ -480,8 +491,8 @@
       else messaging = window.TrunkMessaging.mount(messages, {request, userID: next.user?.id});
     }
     groups = state.system?.talkgroups || []; zones = state.profile?.zones || [];
-    node("test-identity").textContent = `${state.username || ""} · Radio ID ${state.user?.radio_id || "not assigned"}${state.is_administrator ? " · Administrator account" : ""}`;
-    if (!node("test-group").value) node("test-group").value = String(state.profile?.selected_talkgroup || groups[0]?.tgid || "");
+    node("test-identity").textContent = `${state.username || ""} · Radio ID ${state.user?.radio_id ? paddedID(state.user.radio_id, 8) : "not assigned"}${state.is_administrator ? " · Administrator account" : ""}`;
+    if (!node("test-group").value) node("test-group").value = paddedID(state.profile?.selected_talkgroup || groups[0]?.tgid || "", 5);
     node("test-groups").innerHTML = groups.map(group => `<option value="${escape(group.tgid)}">${escape(group.alias)}</option>`).join("");
     if (ptt) node("test-zone").innerHTML = zones.map((zone, index) => `<option value="${index}">${escape(zone.name)}</option>`).join("");
     const settings = new Map(groups.map(group => {
@@ -491,7 +502,7 @@
     node("test-receive").innerHTML = groups.map(group => {
       const setting = settings.get(group.tgid);
       return `<tr><td><input id="listen-${group.tgid}" type="checkbox" ${setting.muted ? "" : "checked"} aria-label="Listen to ${escape(group.alias)}"></td>
-        <td>${escape(group.alias)} (${escape(group.tgid)})</td><td><input id="volume-${group.tgid}" type="range" min="0" max="100" step="any" value="${escape(100 * (setting.volume ?? 1))}" aria-label="Volume (%) for ${escape(group.alias)}"><output for="volume-${group.tgid}"></output></td>
+        <td>${escape(group.alias)} (${escape(paddedID(group.tgid, 5))})</td><td><input id="volume-${group.tgid}" type="range" min="0" max="100" step="any" value="${escape(100 * (setting.volume ?? 1))}" aria-label="Volume (%) for ${escape(group.alias)}"><output for="volume-${group.tgid}"></output></td>
         <td><select id="pan-${group.tgid}" aria-label="Speaker for ${escape(group.alias)}">${[[-1,"Left"],[0,"Both"],[1,"Right"]].map(([value,name]) => `<option value="${value}" ${Number(setting.pan || 0) === value ? "selected" : ""}>${name}</option>`).join("")}</select></td><td id="call-${group.tgid}">Idle</td></tr>`;
     }).join("");
     for (const input of node("test-receive").querySelectorAll("input,select")) {
@@ -609,7 +620,6 @@
   });
   action("test-command-results", async () => { node("test-controller-results").textContent = readable(await request("/api/operator/radio-commands")); });
   action("test-units", async () => { node("test-controller-results").textContent = readable(await request("/api/operator/units?talkgroup_id=" + selected())); });
-  action("test-history", async () => { node("test-controller-results").textContent = readable(await request("/api/history/calls?limit=100")); });
   action("test-stats", async () => {
     if (!connection?.peer) throw new Error("Audio is not connected yet.");
     const reports = await connection.peer.getStats(), values = [];

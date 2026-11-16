@@ -1,10 +1,10 @@
 package rtpvoice
 
 import (
+	"open25.local/open25-fne/internal/p25rtp"
 	"reflect"
 	"testing"
 	"time"
-	"open25.local/open25-fne/internal/p25rtp"
 )
 
 func TestEngineRequestWaitGrantTimers(t *testing.T) {

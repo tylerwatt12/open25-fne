@@ -126,6 +126,7 @@ func TestFrameworkRadioNativeHelper(t *testing.T) {
 			out["epoch"], out["channelId"], out["channelNo"] = "1", 2, 81
 		case "/p25/site-state":
 			out["zoneConnected"] = body["zoneConnected"]
+		case "/p25/control-resources":
 		case "/p25/inhibit-policy":
 			out["record_count"], out["record_limit"], out["radios"] = 0, radio.InhibitRecordLimit, []any{}
 		default:

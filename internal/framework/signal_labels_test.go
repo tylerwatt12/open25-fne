@@ -55,7 +55,7 @@ func TestSystemSignalLabelCatalogsDistributeWithoutSiteTalkgroupScoping(t *testi
 		if !reflect.DeepEqual(received.StatusLabels, system.StatusLabels) || !reflect.DeepEqual(received.MessageLabels, system.MessageLabels) {
 			t.Fatalf("%s altered System-wide display catalogs", service.service.Config().InstanceID)
 		}
-		if received.ID != system.ID || received.Name != system.Name || received.WACN != system.WACN || received.SystemID != system.SystemID || received.Callsign != system.Callsign || !reflect.DeepEqual(received.Radios, system.Radios) {
+		if received.ID != system.ID || received.Name != system.Name || received.WACN != system.WACN || received.SystemID != system.SystemID || !reflect.DeepEqual(received.Radios, system.Radios) {
 			t.Fatal("display catalog distribution changed other System metadata")
 		}
 		if service.service.Config().Role == RoleSite {

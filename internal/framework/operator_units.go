@@ -5,7 +5,6 @@ import (
 	"sort"
 	"time"
 
-	"open25.local/open25-fne/internal/activity"
 	"open25.local/open25-fne/internal/radio"
 )
 
@@ -46,7 +45,13 @@ func (s *Service) operatorUnits(authority operatorAuthority, group int) ([]Opera
 		if status.State != "running" {
 			return nil, errors.New("the Site radio service is not running")
 		}
-		reports = []SiteReport{{ID: config.InstanceID, ReceivedAt: now, Radio: &status}}
+		state := s.radio.SourceState()
+		if !state.Active || state.SiteID != config.InstanceID || state.ObservedAt.IsZero() || now.Sub(state.ObservedAt) > operatorUnitReportAge {
+			return nil, errors.New("current radio affiliations are unavailable")
+		}
+		status.Affiliations = state.Affiliations
+		status.Registrations = state.Registrations
+		reports = []SiteReport{{ID: config.InstanceID, ReceivedAt: state.ObservedAt, Radio: &status}}
 	} else {
 		return nil, errors.New("current radio affiliations belong to Zone and Site controllers")
 	}
@@ -98,13 +103,12 @@ func (s *Service) operatorUnits(authority operatorAuthority, group int) ([]Opera
 			}
 		}
 	} else {
-		presence := []activity.Radio{}
-		for _, row := range view.Presence {
-			if _, known := sites[row.SiteID]; known && row.Kind == "rf" {
-				presence = append(presence, row)
+		state := s.radio.SourceState()
+		for _, affiliation := range state.Affiliations {
+			if state.Active && s.radio.SourceAllowed(affiliation.RID, affiliation.TGID, state.NativeStartedAt) {
+				owners[affiliation.RID] = affiliationOwner{SiteID: config.InstanceID, TGID: affiliation.TGID, At: affiliation.At}
 			}
 		}
-		owners = latestAffiliationOwners(accepted, presence, now)
 	}
 	units := []OperatorUnit{}
 	seen := map[int]bool{}

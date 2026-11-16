@@ -187,6 +187,6 @@ func (s *Service) operatorState(session Session) map[string]any {
 			groups = append(groups, map[string]any{"tgid": group.TGID, "alias": group.Alias, "enabled": true, "start_policy": group.StartPolicy, "priority": group.Priority, "admission_mode": group.AdmissionMode, "transmit_mode": group.TransmitMode, "algorithm_id": group.AlgorithmID, "key_id": group.KeyID})
 		}
 	}
-	result["system"] = map[string]any{"id": system.ID, "name": system.Name, "wacn": system.WACN, "system_id": system.SystemID, "callsign": system.Callsign, "talkgroups": groups}
+	result["system"] = map[string]any{"id": system.ID, "name": system.Name, "wacn": system.WACN, "system_id": system.SystemID, "talkgroups": groups}
 	return result
 }

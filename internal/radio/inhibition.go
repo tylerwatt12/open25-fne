@@ -194,8 +194,11 @@ func (c *Controller) ApplyInhibitionPolicy(ctx context.Context, desired []int) e
 	}
 	changed := !slices.Equal(c.inhibitDesired, desired) || !c.inhibitConfigured
 	c.inhibitDesired, c.inhibitConfigured = desired, true
-	interrupted := changed && (c.status.State == "starting" || c.siteRecovery != nil || (c.status.State != "running" && c.runContext != nil && c.runContext.Err() == nil))
-	if changed && c.status.State != "running" {
+	interrupted := changed && (c.status.State == "starting" || c.siteRecovery != nil || c.controlSwitch != nil || (c.status.State != "running" && c.runContext != nil && c.runContext.Err() == nil))
+	if changed && (c.status.State != "running" || c.controlSwitch != nil) {
+		if c.controlSwitch != nil {
+			c.controlSwitch.cancel()
+		}
 		c.stopEpoch++
 		c.withdrawSiteLocked()
 		c.cancelRunStartsLocked()
@@ -208,12 +211,19 @@ func (c *Controller) ApplyInhibitionPolicy(ctx context.Context, desired []int) e
 			}
 		}
 	}
+	// The unchanged desired policy is already cached. A pending switch must
+	// establish it on its new owner before admission resumes; it cannot be
+	// reconciled against the failed/retiring control worker.
+	if !changed && c.controlSwitch != nil && c.siteWanted {
+		c.mu.Unlock()
+		return nil
+	}
 	c.mu.Unlock()
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		c.mu.Lock()
-		current := slices.Equal(desired, c.inhibitDesired) && c.status.State == "running" && !c.status.InhibitionReady
+		current := slices.Equal(desired, c.inhibitDesired) && c.status.State == "running" && !c.status.InhibitionReady && !(c.controlSwitch != nil && c.siteWanted && !changed)
 		c.mu.Unlock()
 		if current {
 			return errors.Join(err, c.withdrawInhibition(context.Background(), err))
@@ -240,6 +250,7 @@ func (c *Controller) ApplyInhibitionPolicy(ctx context.Context, desired []int) e
 	}
 	running := c.status.State == "running"
 	alreadyApplied := !changed && c.status.InhibitionReady
+	deferredToSwitch := !changed && c.controlSwitch != nil && c.siteWanted
 	if err == nil {
 		c.profile.Inhibition = p.Inhibition
 	}
@@ -247,10 +258,13 @@ func (c *Controller) ApplyInhibitionPolicy(ctx context.Context, desired []int) e
 	if interrupted || err != nil {
 		return errors.Join(err, c.stop(ctx, false))
 	}
-	if !running || alreadyApplied {
+	if !running || alreadyApplied || deferredToSwitch {
 		return nil
 	}
 	if err = c.synchronizeInhibition(ctx, true); err != nil {
+		if !changed && (errors.Is(err, context.Canceled) || nativeContactLost(err)) {
+			return err
+		}
 		c.mu.Lock()
 		current := slices.Equal(c.inhibitDesired, desired)
 		c.mu.Unlock()
@@ -272,15 +286,23 @@ func (c *Controller) synchronizeInhibition(ctx context.Context, apply bool) erro
 		c.mu.Unlock()
 		return context.Canceled
 	}
+	if !apply && c.controlSwitch != nil && c.controlSwitch.outage.Load() {
+		c.mu.Unlock()
+		return context.Canceled
+	}
 	run, runCtx, p := c.runID, c.runContext, cloneProfile(c.profile)
 	if c.inhibitConfigured && !slices.Equal(c.inhibitDesired, p.Inhibition.Desired) {
 		c.mu.Unlock()
 		return context.Canceled
 	}
 	var control *child
+	var lostControl bool
 	voices := []*child{}
 	for _, v := range c.children {
 		if !v.readyNow() || !v.acceptsObservations() {
+			if v.role == "control" && !v.acceptsObservations() {
+				lostControl = true
+			}
 			continue
 		}
 		if v.role == "control" {
@@ -291,6 +313,9 @@ func (c *Controller) synchronizeInhibition(ctx context.Context, apply bool) erro
 	}
 	c.mu.Unlock()
 	if control == nil {
+		if lostControl {
+			return context.Canceled
+		}
 		return errors.New("inhibit policy requires the current control owner")
 	}
 	operation, cancel := context.WithCancel(ctx)

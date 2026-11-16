@@ -112,7 +112,7 @@ func (c *Controller) StartC4FMTest(ctx context.Context, p Profile, request C4FMT
 		return errors.New("choose a saved voice transmitter in the current Site run; restart the Site to apply changed settings")
 	}
 	recovery := c.recovery[channel.ID]
-	if row.Busy || row.Identifying || row.State != "ready" || !row.Ready || recovery == nil || recovery.attempt != nil {
+	if row.Busy || row.State != "ready" || !row.Ready || recovery == nil || recovery.attempt != nil {
 		c.mu.Unlock()
 		lease.Close()
 		return errors.New("wait for an operating voice channel to become idle")
@@ -186,7 +186,7 @@ func (c *Controller) StartC4FMTest(ctx context.Context, p Profile, request C4FMT
 	if err != nil {
 		return err
 	}
-	if err = c.verifyModem(startup, modemLease, modem.Device, false); err != nil {
+	if err = c.verifyModem(startup, modemLease, modem.Device); err != nil {
 		return err
 	}
 	dir := filepath.Join(c.rootDir, "c4fm-test")
@@ -358,7 +358,7 @@ func (c *Controller) finishC4FMTest(ctx context.Context, expected *c4fmTest, cau
 	c.mu.Unlock()
 	var cleanupErr error
 	if test.process != nil {
-		cleanupErr = test.process.stop(ctx, false)
+		cleanupErr = test.process.stop(ctx)
 	}
 	if cleanupErr == nil {
 		cleanupErr = test.startLease.Close()

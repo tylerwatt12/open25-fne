@@ -125,7 +125,8 @@ window.TrunkMessaging = {
         let row = rows.get(message.id);
         if (!row) {
           row = element("li"); row.dataset.message = String(message.id);
-          const sender = element("p", (message.sender_name || message.sender_id) + " · " + message.created_at);
+          const sender = element("p", (message.sender_name || message.sender_id) + " · ");
+          sender.append(open25Timestamps.create(message.created_at));
           const content = element("p", message.body); content.style.whiteSpace = "pre-wrap"; content.style.overflowWrap = "anywhere";
           row.append(sender, content); rows.set(message.id, row);
         }

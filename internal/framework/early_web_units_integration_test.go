@@ -49,7 +49,7 @@ func TestEarlyWebBandPlanUnitsSaveExactHzAndKeepFailedInput(t *testing.T) {
 		t.Fatal("planned Band Plan capability missing")
 	}
 	form := earlyWebForm(t, body, "base_frequency_hz")
-	if form.Get("base_frequency_hz") != "443.4375" || form.Get("channel_spacing_hz") != "12.5" || form.Get("uplink_offset_hz") != "5" || form.Get("bandwidth_hz") != "12.5" {
+	if form.Get("base_frequency_hz") != "433.437500" || form.Get("channel_spacing_hz") != "12.5" || form.Get("uplink_offset_hz") != "5.000000" || form.Get("bandwidth_hz") != "12.5" {
 		t.Fatal("Band Plan form did not show radio units", form)
 	}
 	beforeRaw, err := c.zone.service.Store.Config()
@@ -113,10 +113,20 @@ func TestEarlyWebRFChannelUsesBandPlanAndChannelNumber(t *testing.T) {
 	address := c.site.web.URL + "/channels/edit?row=0"
 	page := earlyWebGet(t, client, address, 200)
 	form := earlyWebForm(t, page, "channel_no")
-	if form.Has("tx_frequency_hz") || form.Has("rx_frequency_hz") || !bytes.Contains(page, []byte("443.45 MHz")) || !bytes.Contains(page, []byte("448.45 MHz")) {
+	if form.Has("tx_frequency_hz") || form.Has("rx_frequency_hz") || !bytes.Contains(page, []byte("433.450000 MHz")) || !bytes.Contains(page, []byte("438.450000 MHz")) {
 		t.Fatal("frequencies must be calculated output")
 	}
 	before, _ := c.site.service.Store.Config()
+	listPage := earlyWebGet(t, client, c.site.web.URL+"/channels", 200)
+	for _, want := range []string{"Frequency (MHz)", "<b>TX</b><span class=ts-numeric>433.450000</span>", "<b>RX</b><span class=ts-numeric>438.450000</span>"} {
+		if !bytes.Contains(listPage, []byte(want)) {
+			t.Fatalf("RF channel list missing %q", want)
+		}
+	}
+	afterList, _ := c.site.service.Store.Config()
+	if !bytes.Equal(before, afterList) {
+		t.Fatal("listing calculated frequencies changed stored configuration")
+	}
 	want, _ := webConfig(before)
 	form.Set("channel_no", "81")
 	form.Set("tx_frequency_hz", "1")
@@ -132,7 +142,18 @@ func TestEarlyWebRFChannelUsesBandPlanAndChannelNumber(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if profile.Site.Channels[0].TXHz != 444450000 || profile.Site.Channels[0].RXHz != 449450000 {
+	if profile.Site.Channels[0].TXHz != 434450000 || profile.Site.Channels[0].RXHz != 439450000 {
 		t.Fatal("runtime did not use Zone Band Plan")
+	}
+	listPage = earlyWebGet(t, client, c.site.web.URL+"/channels?q=439.45", 200)
+	if !bytes.Contains(listPage, []byte("<b>TX</b><span class=ts-numeric>434.450000</span>")) || !bytes.Contains(listPage, []byte("<b>RX</b><span class=ts-numeric>439.450000</span>")) {
+		t.Fatal("RF channel list did not recalculate or search frequencies after editing")
+	}
+	form = earlyWebForm(t, earlyWebGet(t, client, address, 200), "channel_no")
+	form.Set("identifier", "15")
+	webUnitsSubmit(t, client, address, c.site.web.URL, form, http.StatusSeeOther)
+	listPage = earlyWebGet(t, client, c.site.web.URL+"/channels", 200)
+	if bytes.Count(listPage, []byte("<span class=ts-numeric>Unavailable</span>")) != 2 {
+		t.Fatal("RF channel list must show unavailable frequencies for a missing Band Plan")
 	}
 }

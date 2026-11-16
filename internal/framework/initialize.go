@@ -371,7 +371,7 @@ func EnrollSite(root, id, publicURL, listen, internalURL, internalListen string)
 	if err = store.WriteCache("zone", zoneRaw); err != nil {
 		return "", err
 	}
-	raw, _ := json.Marshal(SiteConfig{ID: id, Modems: []Modem{}, Channels: []Channel{}, Identification: Identification{Enabled: true, Mode: "ham", WPM: 20, QuietSeconds: 60}, ControlPolicy: ControlPolicy{Mode: "static", RotationHours: 24}})
+	raw, _ := json.Marshal(SiteConfig{ID: id, Modems: []Modem{}, Channels: []Channel{}, Identification: Identification{Enabled: true}, ControlPolicy: ControlPolicy{Mode: "static", RotationHours: 0}})
 	if err = store.SaveConfig(raw); err != nil {
 		return "", err
 	}

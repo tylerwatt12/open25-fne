@@ -55,14 +55,14 @@ func TestAdminAgeLabelsRetainFullObservationTime(t *testing.T) {
 	for _, test := range []struct {
 		age  time.Duration
 		want string
-	}{{30 * time.Second, "just now"}, {2 * time.Minute, "2 minutes ago"}, {3 * time.Hour, "3 hours ago"}, {48 * time.Hour, "2 days ago"}, {-2 * time.Minute, "in 2 minutes"}} {
+	}{{30 * time.Second, "30 s ago"}, {2 * time.Minute, "2 minutes ago"}, {3 * time.Hour, "3 hours ago"}, {48 * time.Hour, "2 days ago"}, {-2 * time.Minute, "in 2 minutes"}} {
 		if got := webTimeAgo(at, at.Add(test.age)); got != test.want {
 			t.Fatalf("%v: %s", test.age, got)
 		}
 	}
 	var out bytes.Buffer
 	webScalar(&out, "at", at.Format(time.RFC3339Nano))
-	if !bytes.Contains(out.Bytes(), []byte(`title="2026-11-04 18:30:00 UTC"`)) || !bytes.Contains(out.Bytes(), []byte(`datetime="2026-11-04T18:30:00Z"`)) {
+	if !bytes.Contains(out.Bytes(), []byte(`title="Nov 4, 2026, 18:30:00 UTC"`)) || !bytes.Contains(out.Bytes(), []byte(`datetime="2026-11-04T18:30:00Z"`)) {
 		t.Fatal("age label lost exact observation time")
 	}
 }

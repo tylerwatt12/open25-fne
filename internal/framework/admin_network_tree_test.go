@@ -27,7 +27,7 @@ func TestStructuredProfileFormSavesOrderGainAndRetainsOtherPreferences(t *testin
 	client := earlyWebLogin(t, c.system)
 	page := earlyWebGet(t, client, c.system.web.URL+"/profiles/edit?row=0", http.StatusOK)
 	form := earlyWebForm(t, page, "selected_talkgroup")
-	if form.Get("receive_0_volume") != "75.3" || form.Get("zones_0_talkgroups") != "1001, 1002" {
+	if form.Get("receive_0_volume") != "75.3" || form.Get("zones_0_talkgroups") != "01001, 01002" {
 		t.Fatal("structured form lost stored order or percent", form)
 	}
 	form.Set("zones_0_name", "New layout")

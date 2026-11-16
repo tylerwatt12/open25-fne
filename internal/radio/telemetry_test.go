@@ -46,12 +46,12 @@ func TestModemReceiveStatisticsAreNativeRFReportsOnly(t *testing.T) {
 	var telemetry ModemTelemetry
 	start := time.Now().UTC()
 	telemetry.begin(start)
-	line := "I: 2001-01-02 12:34:56.789 (RF) P25, TDU, total frames: 44, bits: 50000, undecodable LC: 2, errors: 70, BER: 0.1400%"
+	line := "I: 2026-11-04 12:34:56.789 (RF) P25, TDU, total frames: 44, bits: 54253, undecodable LC: 2, errors: 86, BER: 0.1585%"
 	telemetry.observe(line, start)
-	if len(telemetry.Receive) != 1 || telemetry.Receive[0].BERPercent != .1400 || telemetry.Receive[0].Errors != 70 || telemetry.Receive[0].ProtectedBits != 50000 || telemetry.Receive[0].UndecodableLC != 2 || telemetry.Receive[0].NativeAt != "2001-01-02 12:34:56.789" {
+	if len(telemetry.Receive) != 1 || telemetry.Receive[0].BERPercent != .1585 || telemetry.Receive[0].Errors != 86 || telemetry.Receive[0].ProtectedBits != 54253 || telemetry.Receive[0].UndecodableLC != 2 || telemetry.Receive[0].NativeAt != "2026-11-04 12:34:56.789" {
 		t.Fatal("native report not preserved", telemetry.Receive)
 	}
-	for _, bad := range []string{strings.Replace(line, "(RF)", "(NET)", 1), strings.Replace(line, "P25", "DMR", 1), strings.Replace(line, "44,", "-1,", 1), strings.Replace(line, "50000", "99999999999999999999999999", 1)} {
+	for _, bad := range []string{strings.Replace(line, "(RF)", "(NET)", 1), strings.Replace(line, "P25", "DMR", 1), strings.Replace(line, "44,", "-1,", 1), strings.Replace(line, "54253", "99999999999999999999999999", 1)} {
 		telemetry.observe(bad, start)
 	}
 	if len(telemetry.Receive) != 1 {

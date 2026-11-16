@@ -51,7 +51,7 @@ func TestInitializedAndEnrolledSitesAuthenticateBothServiceDirections(t *testing
 		err = json.Unmarshal(raw, &zone)
 	}
 	if err == nil {
-		zone.Sites = append(zone.Sites, SiteIdentity{ID: "site-2", Name: "Second Site", SiteID: 2, NAC: 0x294, Endpoint: "http://127.0.0.1:15102"})
+		zone.Sites = append(zone.Sites, SiteIdentity{ID: "site-2", Name: "Second Site", SiteID: 2, Endpoint: "http://127.0.0.1:15102"})
 		err = store.SaveConfig(storeDoc(t, zone))
 	}
 	closeErr := store.Close()

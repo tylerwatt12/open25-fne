@@ -100,7 +100,7 @@ func TestAdminCloneIsUnsavedCopyAndDuplicateIdentityRemainsEditable(t *testing.T
 	page := earlyWebGet(t, client, c.system.web.URL+"/radios/edit?clone=0", 200)
 	form := earlyWebForm(t, page, "rid")
 	after, _ := s.Store.Config()
-	if !bytes.Equal(before, after) || form.Has("resource") || form.Get("rid") != "10001" || form.Get("alias") != "Portable" {
+	if !bytes.Equal(before, after) || form.Has("resource") || form.Get("rid") != "00010001" || form.Get("alias") != "Portable" {
 		t.Fatal("clone changed configuration or automatically changed copied values")
 	}
 	// Deliberately retain the duplicate identity; Save must not reject it.

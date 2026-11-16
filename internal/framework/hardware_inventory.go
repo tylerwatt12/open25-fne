@@ -39,7 +39,6 @@ type HardwareModemAssignment struct {
 type HardwareChannelAssignment struct {
 	ID             string    `json:"id"`
 	Name           string    `json:"name"`
-	Role           string    `json:"role"`
 	RuntimeRole    string    `json:"runtime_role"`
 	Enabled        bool      `json:"enabled"`
 	State          string    `json:"state"`
@@ -67,27 +66,29 @@ type HardwareDeviceView struct {
 }
 
 type HardwareAssignmentView struct {
-	SiteID         string    `json:"site_id"`
-	ModemID        string    `json:"modem_id"`
-	ModemName      string    `json:"modem_name"`
-	ChannelID      string    `json:"channel_id"`
-	ChannelName    string    `json:"channel_name"`
-	Role           string    `json:"role"`
-	RuntimeRole    string    `json:"runtime_role"`
-	State          string    `json:"state"`
-	Error          string    `json:"error"`
-	PID            int       `json:"pid"`
-	Ready          bool      `json:"ready"`
-	Enabled        bool      `json:"enabled"`
-	Local          bool      `json:"local"`
-	Stale          bool      `json:"stale"`
-	RecoveryWanted bool      `json:"recovery_wanted"`
-	ObservedAt     time.Time `json:"observed_at"`
-	ReceivedAt     time.Time `json:"received_at"`
-	RecoveryAt     time.Time `json:"recovery_at"`
+	SiteName         string    `json:"site_name"`
+	ModemRecordIndex int       `json:"modem_record_index"`
+	SiteID           string    `json:"site_id"`
+	ModemID          string    `json:"modem_id"`
+	ModemName        string    `json:"modem_name"`
+	ChannelID        string    `json:"channel_id"`
+	ChannelName      string    `json:"channel_name"`
+	RuntimeRole      string    `json:"runtime_role"`
+	State            string    `json:"state"`
+	Error            string    `json:"error"`
+	PID              int       `json:"pid"`
+	Ready            bool      `json:"ready"`
+	Enabled          bool      `json:"enabled"`
+	Local            bool      `json:"local"`
+	Stale            bool      `json:"stale"`
+	RecoveryWanted   bool      `json:"recovery_wanted"`
+	ObservedAt       time.Time `json:"observed_at"`
+	ReceivedAt       time.Time `json:"received_at"`
+	RecoveryAt       time.Time `json:"recovery_at"`
 }
 
 type HardwareOwner struct {
+	SiteName    string    `json:"site_name"`
 	PID         int       `json:"pid"`
 	Name        string    `json:"name"`
 	SiteID      string    `json:"site_id"`
@@ -105,7 +106,7 @@ func (s *Service) ownHardwareReport(site SiteConfig, status radio.Status) SiteHa
 	now := time.Now().UTC()
 	report := SiteHardwareReport{SiteID: s.Config().InstanceID, HostID: hostID, Hostname: hostname, BootID: bootID, ControllerPID: os.Getpid(), ControllerStartID: radio.HardwareProcessStartID(os.Getpid()), ObservedAt: now, ReceivedAt: now, Modems: []HardwareModemAssignment{}, Workers: []HardwareWorkerObservation{}}
 	for _, runtime := range status.Channels {
-		observation := HardwareChannelAssignment{ID: runtime.ID, Name: runtime.Name, Role: runtime.ConfiguredRole, RuntimeRole: runtime.Role, State: runtime.State, PID: runtime.PID, Ready: runtime.Ready, Error: runtime.Error, RecoveryWanted: runtime.RecoveryWanted, RecoveryAt: runtime.RecoveryAt}
+		observation := HardwareChannelAssignment{ID: runtime.ID, Name: runtime.Name, RuntimeRole: runtime.Role, State: runtime.State, PID: runtime.PID, Ready: runtime.Ready, Error: runtime.Error, RecoveryWanted: runtime.RecoveryWanted, RecoveryAt: runtime.RecoveryAt}
 		if runtime.PID > 0 {
 			observation.StartID = radio.HardwareProcessStartID(runtime.PID)
 		}
@@ -117,7 +118,7 @@ func (s *Service) ownHardwareReport(site SiteConfig, status radio.Status) SiteHa
 			if channel.ModemID != modem.ID {
 				continue
 			}
-			observation := HardwareChannelAssignment{ID: channel.ID, Name: channel.Name, Role: channel.Role, Enabled: channel.Enabled, State: "No observation"}
+			observation := HardwareChannelAssignment{ID: channel.ID, Name: channel.Name, Enabled: channel.Enabled, State: "No observation"}
 			if !status.Available {
 				observation.State, observation.Error = "unavailable", status.Error
 			} else if status.State == "stopped" {
@@ -140,8 +141,7 @@ func (s *Service) ownHardwareReport(site SiteConfig, status radio.Status) SiteHa
 
 // hardwareReportsForSite uses the existing authenticated Zone report cache.
 // Neither the browser nor the Site reads sibling configuration or databases.
-func (s *Service) hardwareReportsForSite(siteID string) []SiteHardwareReport {
-	reports := s.siteReports()
+func hardwareReportsForSite(reports []SiteReport, siteID string) []SiteHardwareReport {
 	hostID := ""
 	for _, report := range reports {
 		if report.ID == siteID && report.Hardware != nil {
@@ -190,7 +190,19 @@ func (s *Service) hardwareInventory() HardwareInventoryView {
 		}
 	}
 	inventory := radio.DiscoverHardware(paths)
-	return buildHardwareInventoryView(inventory, local.SiteID, reports, time.Duration(max(10, s.Config().PollSeconds*4))*time.Second)
+	result := buildHardwareInventoryView(inventory, local.SiteID, reports, time.Duration(max(10, s.Config().PollSeconds*4))*time.Second)
+	names := s.adminNames()
+	for i := range result.Devices {
+		for j := range result.Devices[i].Assignments {
+			a := &result.Devices[i].Assignments[j]
+			a.SiteName = adminName(names, "sites", a.SiteID)
+		}
+		for j := range result.Devices[i].Owners {
+			o := &result.Devices[i].Owners[j]
+			o.SiteName = adminName(names, "sites", o.SiteID)
+		}
+	}
+	return result
 }
 
 func buildHardwareInventoryView(inventory radio.HardwareInventory, localSiteID string, reports []SiteHardwareReport, staleAfter time.Duration) HardwareInventoryView {
@@ -205,20 +217,20 @@ func buildHardwareInventoryView(inventory radio.HardwareInventory, localSiteID s
 			stale := hardwareReportStale(report, inventory.ObservedAt, staleAfter)
 			for _, worker := range report.Workers {
 				if hardwarePathMatches(device, worker.Device) {
-					view.Observations = append(view.Observations, HardwareAssignmentView{SiteID: report.SiteID, ModemID: worker.ModemID, ChannelID: worker.ID, ChannelName: worker.Name, Role: worker.Role, RuntimeRole: worker.RuntimeRole, State: worker.State, Error: worker.Error, PID: worker.PID, Ready: worker.Ready, RecoveryWanted: worker.RecoveryWanted, RecoveryAt: worker.RecoveryAt, Local: local, Stale: stale, ObservedAt: report.ObservedAt, ReceivedAt: report.ReceivedAt})
+					view.Observations = append(view.Observations, HardwareAssignmentView{SiteID: report.SiteID, ModemID: worker.ModemID, ChannelID: worker.ID, ChannelName: worker.Name, RuntimeRole: worker.RuntimeRole, State: worker.State, Error: worker.Error, PID: worker.PID, Ready: worker.Ready, RecoveryWanted: worker.RecoveryWanted, RecoveryAt: worker.RecoveryAt, Local: local, Stale: stale, ObservedAt: report.ObservedAt, ReceivedAt: report.ReceivedAt})
 				}
 			}
-			for _, modem := range report.Modems {
+			for modemIndex, modem := range report.Modems {
 				if !hardwarePathMatches(device, modem.Device) {
 					continue
 				}
-				base := HardwareAssignmentView{SiteID: report.SiteID, ModemID: modem.ID, ModemName: modem.Name, Local: local, Stale: stale, ObservedAt: report.ObservedAt, ReceivedAt: report.ReceivedAt}
+				base := HardwareAssignmentView{ModemRecordIndex: modemIndex, SiteID: report.SiteID, ModemID: modem.ID, ModemName: modem.Name, Local: local, Stale: stale, ObservedAt: report.ObservedAt, ReceivedAt: report.ReceivedAt}
 				if len(modem.Channels) == 0 {
 					view.Assignments = append(view.Assignments, base)
 				}
 				for _, channel := range modem.Channels {
 					assignment := base
-					assignment.ChannelID, assignment.ChannelName, assignment.Role, assignment.State = channel.ID, channel.Name, channel.Role, channel.State
+					assignment.ChannelID, assignment.ChannelName, assignment.State = channel.ID, channel.Name, channel.State
 					assignment.PID, assignment.Ready, assignment.Enabled = channel.PID, channel.Ready, channel.Enabled
 					assignment.RuntimeRole, assignment.Error = channel.RuntimeRole, channel.Error
 					assignment.RecoveryWanted, assignment.RecoveryAt = channel.RecoveryWanted, channel.RecoveryAt

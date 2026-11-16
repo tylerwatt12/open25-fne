@@ -47,7 +47,7 @@ func TestInternalAndWebHandlersExposeSeparateRoutes(t *testing.T) {
 					}
 				})
 			}
-			s.config.AllowedCIDR = "198.51.100.0/24"
+			s.config.AllowedCIDR = "100.64.0.0/10"
 			for _, h := range []http.Handler{s.Handler(), s.InternalHandler()} {
 				r := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 				r.RemoteAddr = "192.0.2.1:1234"
@@ -282,7 +282,7 @@ func TestWebRetryStopsWithBackend(t *testing.T) {
 }
 
 func TestInternalOriginsAndSettingsAreExplicit(t *testing.T) {
-	base := FileConfig{Role: RoleZone, InstanceID: "zone-1", Listen: "127.0.0.1:5001", PublicURL: "http://127.0.0.1:5001", InternalListen: "198.51.100.1:5101", InternalURL: "http://198.51.100.1:5101", UpstreamURL: "http://198.51.100.2:5100", PollSeconds: 2, StateDir: t.TempDir(), CredentialFile: "credentials.json"}
+	base := FileConfig{Role: RoleZone, InstanceID: "zone-1", Listen: "127.0.0.1:5001", PublicURL: "http://127.0.0.1:5001", InternalListen: "100.64.0.1:5101", InternalURL: "http://100.64.0.1:5101", UpstreamURL: "http://100.64.0.2:5100", PollSeconds: 2, StateDir: t.TempDir(), CredentialFile: "credentials.json"}
 	if err := base.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -292,10 +292,10 @@ func TestInternalOriginsAndSettingsAreExplicit(t *testing.T) {
 	}{
 		{"missing_internal_url", func(c *FileConfig) { c.InternalURL = "" }},
 		{"missing_internal_listener", func(c *FileConfig) { c.InternalListen = "" }},
-		{"secure_internal_url", func(c *FileConfig) { c.InternalURL = "https://198.51.100.1:5101" }},
-		{"secure_upstream", func(c *FileConfig) { c.UpstreamURL = "https://198.51.100.2:5100" }},
+		{"secure_internal_url", func(c *FileConfig) { c.InternalURL = "https://100.64.0.1:5101" }},
+		{"secure_upstream", func(c *FileConfig) { c.UpstreamURL = "https://100.64.0.2:5100" }},
 		{"shared_listener", func(c *FileConfig) { c.InternalListen = c.Listen }},
-		{"network_web_http", func(c *FileConfig) { c.PublicURL = "http://198.51.100.1:5001" }},
+		{"network_web_http", func(c *FileConfig) { c.PublicURL = "http://100.64.0.1:5001" }},
 		{"mismatched_web_tls", func(c *FileConfig) { c.PublicURL = "https://127.0.0.1:5001" }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -312,7 +312,7 @@ func TestInternalOriginsAndSettingsAreExplicit(t *testing.T) {
 	store := storeOpen(t, RoleZone)
 	s := &Service{Store: store, config: base, configPath: filepath.Join(t.TempDir(), "service.json")}
 	settings := base.Settings()
-	settings.InternalURL = "http://198.51.100.3:5101"
+	settings.InternalURL = "http://100.64.0.3:5101"
 	if err := s.SaveSettings(settings); err != nil {
 		t.Fatal(err)
 	}
@@ -352,13 +352,13 @@ func TestReportsAndNavigationKeepAdministrationSeparate(t *testing.T) {
 		}
 	}
 	zone := storeFixtureZone()
-	zone.Sites[0].Endpoint = "http://198.51.100.1:5102"
+	zone.Sites[0].Endpoint = "http://100.64.0.1:5102"
 	zone.Sites[0].AdminURL = ""
 	isolated := &Service{Store: storeOpen(t, RoleZone), config: FileConfig{Role: RoleZone, PublicURL: "https://admin.example"}}
 	if got := isolated.adminTopology(&zone).SiteURLs["site-1"]; got != "" {
 		t.Fatal("missing administration URL fell back to internal endpoint")
 	}
-	if err := validateInternalURL("http://198.51.100.1:5102", false); err != nil || validateInternalURL("https://198.51.100.1:5102", false) == nil {
+	if err := validateInternalURL("http://100.64.0.1:5102", false); err != nil || validateInternalURL("https://100.64.0.1:5102", false) == nil {
 		t.Fatal("internal origin scheme changed")
 	}
 	if !strings.HasPrefix(c.system.service.Config().PublicURL, "http://127.0.0.1:") {

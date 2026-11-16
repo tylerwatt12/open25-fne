@@ -77,7 +77,7 @@ func TestControlRecoveryWaitsForSameBoardAndResumesWithMissingVoice(t *testing.T
 			}
 			return &recoveryLease{}, ctx.Err()
 		},
-		verify: func(ctx context.Context, _ io.Closer, _ string, _ bool) error { verified.Add(1); return ctx.Err() },
+		verify: func(ctx context.Context, _ io.Closer, _ string) error { verified.Add(1); return ctx.Err() },
 		same: func(lease io.Closer, path string) bool {
 			return available(path) && !lease.(*recoveryLease).closed.Load()
 		},
@@ -196,7 +196,7 @@ func TestControlRecoveryIdentityLossAndRejectedFirmwareProbe(t *testing.T) {
 			leaseMu.Unlock()
 			return lease, ctx.Err()
 		},
-		verify: func(ctx context.Context, _ io.Closer, path string, _ bool) error {
+		verify: func(ctx context.Context, _ io.Closer, path string) error {
 			if path == "/dev/serial/by-id/control" && !qualified.Load() {
 				return errors.New("selected board firmware identity is not qualified")
 			}
@@ -241,7 +241,7 @@ func TestControlRecoveryIdentityLossAndRejectedFirmwareProbe(t *testing.T) {
 	waitRadio(t, "qualified same board did not recover after reset", func() bool { return c.Status().State == "running" })
 }
 
-func TestInitialSiteStartStillRequiresEveryWantedVoiceModem(t *testing.T) {
+func TestInitialSiteStartReportsMissingVoiceWhileControlOperates(t *testing.T) {
 	c := testController(t, nil)
 	c.opts.AllowRF = true
 	lease := &recoveryLease{}
@@ -253,16 +253,20 @@ func TestInitialSiteStartStillRequiresEveryWantedVoiceModem(t *testing.T) {
 			}
 			return lease, ctx.Err()
 		},
-		verify: func(ctx context.Context, _ io.Closer, _ string, _ bool) error { return ctx.Err() },
+		verify: func(ctx context.Context, _ io.Closer, _ string) error { return ctx.Err() },
 	}
-	if err := c.Start(context.Background(), fixtureProfile(), "hardware"); err == nil {
-		t.Fatal("explicit initial Start silently chose degraded operation")
+	if err := c.Start(context.Background(), fixtureProfile(), "hardware"); err != nil {
+		t.Fatal(err)
 	}
-	c.mu.Lock()
-	wanted, pending, owners := c.siteWanted, c.siteRecovery, len(c.children)
-	c.mu.Unlock()
-	if !lease.closed.Load() || wanted || pending != nil || owners != 0 || c.Status().FNEPID != 0 {
-		t.Fatal("failed initial Start retained desired operation or resources")
+	status := c.Status()
+	if status.State != "running" || status.ActiveControlChannelID != "control-1" || selectedChannel(c, "voice-1").Ready || selectedChannel(c, "voice-1").State != "fault" {
+		t.Fatal("initial degraded operation did not report the missing voice modem", status)
+	}
+	if err := c.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !lease.closed.Load() {
+		t.Fatal("stopped control retained its modem lease")
 	}
 }
 

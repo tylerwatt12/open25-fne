@@ -17,7 +17,7 @@ func TestSiteControlPolicyFormsPreserveEnteredPolicyAndAssignments(t *testing.T)
 	c := integrationNewCluster(t)
 	s := c.site.service
 	config, _ := webConfig(storeDoc(t, storeFixtureSite()))
-	config["control_policy"] = map[string]any{"mode": "future-entered-mode", "rotation_enabled": true, "rotation_hours": json.Number("-0.125"), "keep": "unrelated policy field"}
+	config["control_policy"] = map[string]any{"mode": "future-entered-mode", "rotation_hours": json.Number("-0.125"), "keep": "unrelated policy field"}
 	beforeChannels, _ := json.Marshal(config["channels"])
 	beforeModems, _ := json.Marshal(config["modems"])
 	if err := s.Store.SaveConfig(storeDoc(t, config)); err != nil {
@@ -75,7 +75,7 @@ func TestSiteNewControlPolicyShowsApprovedStartingValuesWithoutSaving(t *testing
 	before, _ := s.Store.Config()
 	client := earlyWebLogin(t, c.site)
 	form := earlyWebForm(t, earlyWebGet(t, client, c.site.web.URL+"/control-policy", http.StatusOK), "control_policy.mode")
-	if form.Get("control_policy.mode") != "static" || form.Get("control_policy.rotation_hours") != "24" || form.Has("control_policy.rotation_enabled") {
+	if form.Get("control_policy.mode") != "static" || form.Get("control_policy.rotation_hours") != "0" || form.Has("control_policy.rotation_enabled") {
 		t.Fatal("new policy did not show approved static/off/24-hour initial choices")
 	}
 	after, _ := s.Store.Config()
@@ -99,7 +99,7 @@ func TestSiteControlSwitchFormListsConfiguredChoicesAndPreservesSelection(t *tes
 	if err := s.owned(&site); err != nil {
 		t.Fatal(err)
 	}
-	site.Channels = []Channel{{ID: "first", Name: "First <control>", Role: "control", Enabled: true}, {ID: "candidate", Name: "Candidate voice", Role: "voice", Enabled: true, ControlEligible: true}, {ID: "disabled", Name: "Disabled voice", Role: "voice", ControlEligible: true}}
+	site.Channels = []Channel{{ID: "first", Name: "First <control>", Enabled: true}, {ID: "candidate", Name: "Candidate voice", Enabled: true}, {ID: "disabled", Name: "Disabled voice"}}
 	if err := s.Store.SaveConfig(storeDoc(t, site)); err != nil {
 		t.Fatal(err)
 	}
@@ -118,25 +118,45 @@ func TestSiteControlSwitchFormListsConfiguredChoicesAndPreservesSelection(t *tes
 	}
 }
 
-func TestHardwareInventoryPresentationSeparatesAssignmentsFromActualOwners(t *testing.T) {
-	now := time.Date(2026, 11, 4, 17, 0, 0, 0, time.UTC)
-	inventory := HardwareInventoryView{Hostname: "radio-host", ObservedAt: now, Devices: []HardwareDeviceView{{
-		HardwareDevice: radio.HardwareDevice{ID: "device-one", Device: "/dev/serial/by-id/saved-device", UID: "hardware-serial", Product: "Modem <&>", Present: true, PresenceKnown: true, OwnershipKnown: false, Error: "Some descriptors unavailable"},
-		Assignments:    []HardwareAssignmentView{{SiteID: "site-one", ModemName: "Saved modem", ChannelID: "voice-one", ChannelName: "Saved channel", Role: "voice", RuntimeRole: "control", State: "fault", RecoveryWanted: true, RecoveryAt: now.Add(time.Minute), Error: "Selected modem unavailable", Local: true, ObservedAt: now}, {SiteID: "site-two", ChannelID: "control-two", ChannelName: "Old assignment", Role: "control", State: "running", Stale: true, ObservedAt: now.Add(-time.Hour)}},
-		Observations:   []HardwareAssignmentView{{SiteID: "site-one", ChannelID: "old-runtime", ChannelName: "Actual channel", RuntimeRole: "control", State: "fault", RecoveryWanted: true, RecoveryAt: now.Add(time.Minute), Error: "Selected modem unavailable", Local: true, ObservedAt: now}},
-		Owners:         []HardwareOwner{{PID: 4321, Name: "actual-process", SiteID: "site-two", ChannelID: "voice-two", Role: "voice", Stale: true, ObservedAt: now.Add(-time.Hour)}},
-	}}}
-	r := httptest.NewRequest(http.MethodGet, "/hardware?device=device-one", nil)
-	var output bytes.Buffer
-	webHardwareInventory(&output, r, inventory)
-	for _, want := range []string{"Modem &lt;&amp;&gt;", "hardware-serial", "Saved channel", "Old assignment", "PID 4321", "actual-process", "voice-two", "Incomplete visibility", "Reported · Stale", "Some descriptors unavailable", "Device details", "/dev/serial/by-id/saved-device", webReportTime(now.Add(-time.Hour)), "Recovery requested", "Retry after", "Selected modem unavailable", "Configured role", "Operating role", "Actual channel", "old-runtime", "Observed channels"} {
-		if !strings.Contains(output.String(), want) {
-			t.Errorf("hardware page missing %q", want)
-		}
+func TestHardwareInventoryPresentationShowsOnlyDevicePresenceAndSiteUse(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		present, known    bool
+		assignments       []HardwareAssignmentView
+		owners            []HardwareOwner
+		status, use, node string
+	}{
+		{"current Site", true, true, []HardwareAssignmentView{{Local: true}}, nil, "Present", "Allocated", "/dev/ttyACM2"},
+		{"another Site", true, true, []HardwareAssignmentView{{Local: false}}, nil, "Present", "Used elsewhere", "/dev/ttyACM2"},
+		{"unallocated", true, true, nil, nil, "Present", "Unallocated", "/dev/ttyACM2"},
+		{"missing allocated device", false, true, []HardwareAssignmentView{{Local: true}}, nil, "Unavailable", "Allocated", "—"},
+		{"presence unknown", true, false, nil, nil, "Unavailable", "Unallocated", "—"},
+		{"running local owner after assignment edit", true, true, nil, []HardwareOwner{{Local: true, PID: 4321, Name: "private-process"}}, "Present", "Allocated", "/dev/ttyACM2"},
+		{"another running owner", true, true, nil, []HardwareOwner{{PID: 4321, Name: "private-process"}}, "Present", "Used elsewhere", "/dev/ttyACM2"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			inventory := HardwareInventoryView{Hostname: "private-host", ObservedAt: time.Now(), Devices: []HardwareDeviceView{{HardwareDevice: radio.HardwareDevice{ID: "private-device-key", Device: "/dev/serial/by-id/saved-device", ResolvedDevice: "/dev/ttyACM2", UID: "hardware-serial", Product: "Modem <&>", Present: test.present, PresenceKnown: test.known, Error: "private-error"}, Assignments: test.assignments, Owners: test.owners}}}
+			var output bytes.Buffer
+			webHardwareInventory(&output, inventory, SiteReport{}, nil, time.Now())
+			body := output.String()
+			for _, want := range []string{"Modem &lt;&amp;&gt;", "hardware-serial", ">Device / modem</th>", ">Serial device path</th>", ">Hardware status</th>", ">Use</th>", ">" + test.status + "</span>", ">" + test.use, ">" + test.node + "</span>"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("USB inventory missing %q", want)
+				}
+			}
+			for _, forbidden := range []string{"Details", "Process use", "Saved assignment", "Modem assignments", "Channel operation", "Local host", "private-host", "private-process", "private-error", "4321", "name=config", "<input", "http-equiv=refresh"} {
+				if strings.Contains(body, forbidden) {
+					t.Errorf("USB inventory retains removed information %q", forbidden)
+				}
+			}
+			if test.status == "Unavailable" && strings.Contains(body, "/dev/ttyACM2") {
+				t.Fatal("absent device showed an old node as current")
+			}
+		})
 	}
-	for _, forbidden := range []string{"Available", "Healthy", "name=config", "<input", "http-equiv=refresh"} {
-		if strings.Contains(output.String(), forbidden) {
-			t.Errorf("hardware observation implies availability or contains settings: %q", forbidden)
-		}
+	var output bytes.Buffer
+	webHardwareInventory(&output, HardwareInventoryView{Error: "passive discovery failed"}, SiteReport{}, nil, time.Now())
+	if !strings.Contains(output.String(), "Hardware inventory unavailable.") {
+		t.Fatal("discovery failure represented as an empty successful observation")
 	}
 }

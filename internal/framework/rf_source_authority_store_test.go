@@ -524,21 +524,32 @@ func TestRFSourceAuthorityStoreInvalidUpdatesCannotAlterOrFenceAcceptedState(t *
 }
 
 func TestRFSourceAuthorityStoreControllerCoalescedWithdrawalFencesAcrossFailureAndRestart(t *testing.T) {
-	now := time.Now().UTC()
-	w := radio.SourceWithdrawal{RadioID: 10001, GroupID: 1002, AffiliatedAt: now.Add(-2 * time.Second), NativeStartedAt: now.Add(-3 * time.Second)}
-	state := radio.SourceState{SiteID: "site-b", NativeStartedAt: now.Add(-time.Second), ObservedAt: now, Revision: 7, Active: true, Withdrawals: []radio.SourceWithdrawal{w}}
+	raw, err := os.ReadFile("testdata/rf-source-coalesced.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state radio.SourceState
+	if err = DecodeStrict(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.SiteID != "site-b" || len(state.Withdrawals) != 1 || len(state.Affiliations) != 0 {
+		t.Fatal("not the synthetic empty-B2 controller vector", state)
+	}
+	w := state.Withdrawals[0]
 	aRun := w.NativeStartedAt.Add(-time.Second)
 	aAt := w.AffiliatedAt.Add(-100 * time.Millisecond)
 	d := rfAuthorityDocument{ZoneID: "zone-a", NativeRuns: map[string]time.Time{"site-a": aRun}, Units: map[int]rfAuthorityUnit{10001: {Affiliation: rfAuthorityFact{SiteID: "site-a", GroupID: 1001, At: aAt, NativeStartedAt: aRun}}}}
 	a, path := rfStoreTestOpen(t, d)
 	entered, _ := rfStoreTestBlockWrites(t, a)
+	// The synthetic serialized vector keeps fixed control-run and affiliation
+	// times; only replay freshness changes for the Store acceptance check.
 	state.ObservedAt = time.Now().UTC()
 	u := rfUpdateFromSource(state)
 	done := rfStoreTestApplyAsync(a, context.Background(), u)
 	request := rfStoreTestAwaitWrite(t, entered)
 	rfStoreTestFenced(t, a, 10001)
 	request.release <- errors.New("simulated storage failure")
-	if err := rfStoreTestAwaitApply(t, done); err == nil {
+	if err = rfStoreTestAwaitApply(t, done); err == nil {
 		t.Fatal("failed negative fact was acknowledged")
 	}
 	rfStoreTestFenced(t, a, 10001)
@@ -546,7 +557,7 @@ func TestRFSourceAuthorityStoreControllerCoalescedWithdrawalFencesAcrossFailureA
 	done = rfStoreTestApplyAsync(a, context.Background(), u)
 	request = rfStoreTestAwaitWrite(t, entered)
 	request.release <- nil
-	if err := rfStoreTestAwaitApply(t, done); err != nil {
+	if err = rfStoreTestAwaitApply(t, done); err != nil {
 		t.Fatal(err)
 	}
 	want := affiliationOwner{SiteID: "site-b", At: w.AffiliatedAt}
@@ -570,11 +581,23 @@ func TestRFSourceAuthorityStoreControllerCoalescedWithdrawalFencesAcrossFailureA
 }
 
 func TestRFSourceAuthorityStoreRetiredControlFactsFenceAcrossFailureAndReopen(t *testing.T) {
-	for _, kind := range []string{"registration", "null_affiliation", "deregistration"} {
-		t.Run(kind, func(t *testing.T) {
-			now := time.Now().UTC()
-			fact := radio.RetiredSourceFact{Kind: kind, RID: 10001, At: now.Add(-2 * time.Second), NativeStartedAt: now.Add(-3 * time.Second)}
-			state := radio.SourceState{SiteID: "site-b", NativeStartedAt: now.Add(-time.Second), ObservedAt: now, Revision: 7, Active: true, Retired: []radio.RetiredSourceFact{fact}}
+	raw, err := os.ReadFile("testdata/rf-source-retired-control.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var states []radio.SourceState
+	if err = DecodeStrict(raw, &states); err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 3 {
+		t.Fatal("expected synthetic registration/null/dereg vectors", len(states))
+	}
+	for _, state := range states {
+		t.Run(state.Retired[0].Kind, func(t *testing.T) {
+			if len(state.Retired) != 1 || state.SiteID != "site-b" {
+				t.Fatal("invalid controller vector", state)
+			}
+			fact := state.Retired[0]
 			aRun := fact.NativeStartedAt.Add(-time.Second)
 			aAt := fact.At.Add(-100 * time.Millisecond)
 			d := rfAuthorityDocument{ZoneID: "zone-a", NativeRuns: map[string]time.Time{"site-a": aRun}, Units: map[int]rfAuthorityUnit{10001: {Affiliation: rfAuthorityFact{SiteID: "site-a", GroupID: 1001, At: aAt, NativeStartedAt: aRun}}}}

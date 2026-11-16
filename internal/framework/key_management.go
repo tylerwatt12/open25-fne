@@ -50,6 +50,27 @@ type protectedKeys struct {
 	Ciphertext []byte `json:"ciphertext"`
 }
 
+// System owns this derived, process-local copy. Its fingerprint covers the
+// protected inventory, decrypted payload, recipient enrollment, signing identity
+// and System identity. No plaintext or recipient private key is retained here.
+// featureMu protects publication, and callers receive owned copies.
+type keyEnvelopeCache struct {
+	fingerprint [sha256.Size]byte
+	envelopes   map[string]keyEnvelope
+}
+
+func (c *keyEnvelopeCache) clone() map[string]keyEnvelope {
+	out := make(map[string]keyEnvelope, len(c.envelopes))
+	for id, env := range c.envelopes {
+		env.Signature = slices.Clone(env.Signature)
+		env.Public = slices.Clone(env.Public)
+		env.Nonce = slices.Clone(env.Nonce)
+		env.Ciphertext = slices.Clone(env.Ciphertext)
+		out[id] = env
+	}
+	return out
+}
+
 func privateBytes(path string, size int, create bool) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err == nil {
@@ -140,8 +161,14 @@ func (s *Service) readTrafficKeys() ([]trafficKey, error) {
 	if err != nil {
 		return nil, err
 	}
+	return s.openTrafficKeys(raw)
+}
+
+// Decode exactly the protected document used for envelope invalidation. Callers
+// handle an absent inventory without requiring an otherwise unused master key.
+func (s *Service) openTrafficKeys(raw json.RawMessage) ([]trafficKey, error) {
 	var sealed protectedKeys
-	if err = DecodeStrict(raw, &sealed); err != nil {
+	if err := DecodeStrict(raw, &sealed); err != nil {
 		return nil, errors.New("invalid protected key store")
 	}
 	master, e := privateBytes(filepath.Join(s.Config().StateDir, "crypto", "master.key"), 32, false)
@@ -253,9 +280,17 @@ func (s *Service) keyEnvelopes() (map[string]keyEnvelope, error) {
 	}
 	s.featureMu.Lock()
 	defer s.featureMu.Unlock()
-	keys, e := s.readTrafficKeys()
-	if e != nil {
+	protected, _, e := s.Store.ReadCache("traffic_keys")
+	keys := []trafficKey{}
+	if errors.Is(e, sql.ErrNoRows) {
+		protected = nil
+	} else if e != nil {
 		return nil, e
+	} else {
+		keys, e = s.openTrafficKeys(protected)
+		if e != nil {
+			return nil, e
+		}
 	}
 	creds, e := readCredentials(s.Config().CredentialFile)
 	if e != nil {
@@ -272,6 +307,24 @@ func (s *Service) keyEnvelopes() (map[string]keyEnvelope, error) {
 		return nil, e
 	}
 	defer clear(signing)
+	// Canonical JSON makes map iteration irrelevant. Include the exact sealed
+	// document as well as its validated payload, so rewriting protected material
+	// also invalidates the memo. Input buffers are cleared after hashing.
+	inputs, e := json.Marshal(struct {
+		Protected     [sha256.Size]byte
+		Payload       json.RawMessage
+		Recipients    map[string]string
+		SigningPublic ed25519.PublicKey
+		SystemID      string
+	}{sha256.Sum256(protected), plain, creds.CryptoRecipients, signing.Public().(ed25519.PublicKey), systemID})
+	if e != nil {
+		return nil, e
+	}
+	fingerprint := sha256.Sum256(inputs)
+	clear(inputs)
+	if cached := s.envelopeCache; cached != nil && cached.fingerprint == fingerprint {
+		return cached.clone(), nil
+	}
 	for recipient, raw := range creds.CryptoRecipients {
 		pub, e := hex.DecodeString(raw)
 		if !recordID.MatchString(recipient) || e != nil || len(pub) != 32 {
@@ -294,7 +347,10 @@ func (s *Service) keyEnvelopes() (map[string]keyEnvelope, error) {
 		env.Signature = ed25519.Sign(signing, envelopeMessage(env))
 		out[recipient] = env
 	}
-	return out, nil
+	// Publish only a complete successful generation. A malformed new enrollment
+	// or failed crypto operation cannot expose a partially refreshed inventory.
+	s.envelopeCache = &keyEnvelopeCache{fingerprint: fingerprint, envelopes: out}
+	return s.envelopeCache.clone(), nil
 }
 func openKeyEnvelope(private *ecdh.PrivateKey, systemID, recipient string, env keyEnvelope, systemPublic ed25519.PublicKey) ([]trafficKey, error) {
 	if env.Recipient != recipient {

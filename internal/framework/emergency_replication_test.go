@@ -303,7 +303,7 @@ func TestUnsupportedSnapshotsCannotCreateIncidentsOrClearForeignSite(t *testing.
 		})
 	}
 	zone, _, _ := operatorFixture(t, RoleZone)
-	zone.view().Zone.Sites = append(zone.view().Zone.Sites, SiteIdentity{ID: "site-2", SiteID: 2, NAC: 0x293})
+	zone.view().Zone.Sites = append(zone.view().Zone.Sites, SiteIdentity{ID: "site-2", SiteID: 2})
 	now := time.Now().UTC()
 	foreign := EmergencyIncident{ID: "foreign-rf", RadioID: 10001, TalkgroupID: 1001, ScopeID: "site-2", SourceKind: "rf", At: now, LastSeen: now}
 	if err := zone.mergeSiteOperatorSnapshot("site-2", OperatorSnapshot{Emergencies: []EmergencyIncident{foreign}}); err != nil {

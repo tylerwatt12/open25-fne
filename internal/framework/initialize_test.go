@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -81,7 +82,7 @@ func TestEnrollSiteUsesNewStoreAndScopedServiceCredential(t *testing.T) {
 	var zone ZoneConfig
 	raw, _ := zoneStore.Config()
 	_ = json.Unmarshal(raw, &zone)
-	zone.Sites = append(zone.Sites, SiteIdentity{ID: "site-2", Name: "Second", SiteID: 2, NAC: 0x293, Endpoint: "http://127.0.0.1:15102"})
+	zone.Sites = append(zone.Sites, SiteIdentity{ID: "site-2", Name: "Second", SiteID: 2, Endpoint: "http://127.0.0.1:15102"})
 	raw, _ = json.Marshal(zone)
 	if err = zoneStore.SaveConfig(raw); err != nil {
 		t.Fatal(err)
@@ -117,7 +118,7 @@ func TestEnrollSiteUsesNewStoreAndScopedServiceCredential(t *testing.T) {
 	}
 	raw, err = store.Config()
 	var enrolled SiteConfig
-	if err != nil || json.Unmarshal(raw, &enrolled) != nil || enrolled.ControlPolicy != (ControlPolicy{Mode: "static", RotationHours: 24}) {
+	if err != nil || json.Unmarshal(raw, &enrolled) != nil || !reflect.DeepEqual(enrolled.ControlPolicy, ControlPolicy{Mode: "static", RotationHours: 0}) {
 		t.Fatalf("newly enrolled Site does not have the approved editable control starting values: %+v (%v)", enrolled.ControlPolicy, err)
 	}
 	if _, err = EnrollSite(root, "site-2", cfg.PublicURL, cfg.Listen, cfg.InternalURL, cfg.InternalListen); err == nil {
@@ -131,7 +132,7 @@ func TestInitializePreservesMisconfiguredInitialSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	seed.System.WACN = 0
-	seed.Sites[0].ControlPolicy = ControlPolicy{Mode: "entered-mode", RotationEnabled: true, RotationHours: -3.5}
+	seed.Sites[0].ControlPolicy = ControlPolicy{Mode: "entered-mode", RotationHours: -3.5}
 	receipt, err := Initialize(seed, InitOptions{Root: filepath.Join(t.TempDir(), "installation")})
 	if err != nil {
 		t.Fatal(err)
@@ -150,7 +151,7 @@ func TestInitializePreservesMisconfiguredInitialSettings(t *testing.T) {
 	defer store.Close()
 	raw, err := store.Config()
 	var saved SiteConfig
-	if err != nil || json.Unmarshal(raw, &saved) != nil || saved.ControlPolicy != seed.Sites[0].ControlPolicy {
+	if err != nil || json.Unmarshal(raw, &saved) != nil || !reflect.DeepEqual(saved.ControlPolicy, seed.Sites[0].ControlPolicy) {
 		t.Fatalf("initialization replaced administrator-entered control settings: %+v (%v)", saved.ControlPolicy, err)
 	}
 }

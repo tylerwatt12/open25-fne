@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"open25.local/open25-fne/internal/activity"
+	"open25.local/open25-fne/internal/historypriority"
 	"open25.local/open25-fne/internal/radio"
 	"slices"
 	"strings"
@@ -21,16 +24,19 @@ type administratorRecord struct {
 	Hash     []byte `json:"password_hash"`
 }
 type catalog struct {
-	System          SystemConfig           `json:"system"`
-	Zone            *ZoneConfig            `json:"zone,omitempty"`
-	Administrator   administratorRecord    `json:"administrator"`
-	Users           []userRecord           `json:"users"`
-	Automations     []automationRecord     `json:"automations"`
-	KeyEnvelopes    map[string]keyEnvelope `json:"key_envelopes"`
-	Operator        OperatorSnapshot       `json:"operator"`
-	Inhibition      *radioInhibitionPolicy `json:"inhibition,omitempty"`
-	Topology        topology               `json:"topology"`
-	HardwareReports []SiteHardwareReport   `json:"hardware_reports,omitempty"`
+	SessionRevocations []sessionRevocation    `json:"session_revocations"`
+	System             SystemConfig           `json:"system"`
+	Zone               *ZoneConfig            `json:"zone,omitempty"`
+	Administrator      administratorRecord    `json:"administrator"`
+	Users              []userRecord           `json:"users"`
+	Automations        []automationRecord     `json:"automations"`
+	KeyEnvelopes       map[string]keyEnvelope `json:"key_envelopes"`
+	Operator           OperatorSnapshot       `json:"operator"`
+	Inhibition         *radioInhibitionPolicy `json:"inhibition,omitempty"`
+	Topology           topology               `json:"topology"`
+	HardwareReports    []SiteHardwareReport   `json:"hardware_reports,omitempty"`
+	NeighborSites      []radio.NeighborSite   `json:"neighbor_sites,omitempty"`
+	HistoryRetention   *activity.Retention    `json:"history_retention,omitempty"`
 }
 type Connection struct {
 	Name        string    `json:"name"`
@@ -93,6 +99,12 @@ func (s *Service) owned(target any) error {
 	return json.Unmarshal(raw, target)
 }
 func (s *Service) upstreamURL() string {
+	if s.parentIsolated.Load() {
+		return ""
+	}
+	return s.configuredUpstreamURL()
+}
+func (s *Service) configuredUpstreamURL() string {
 	c := s.Config()
 	if c.Role == RoleApplication {
 		var d ApplicationConfig
@@ -142,12 +154,16 @@ func (s *Service) internal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role := s.Config().Role
-	if r.URL.Path == "/internal/smtp" {
-		s.smtpInternal(w, r, peer)
+	if role == RoleSite && peer.Role == RoleZone && s.parentIsolated.Load() {
+		fail(w, 503, errors.New("parent Zone disconnected for testing"))
 		return
 	}
-	if r.URL.Path == "/internal/operator-history" {
-		s.operatorHistoryInternal(w, r, peer)
+	if strings.HasPrefix(r.URL.Path, "/internal/sso/") {
+		s.ssoInternal(w, r, peer)
+		return
+	}
+	if r.URL.Path == "/internal/smtp" {
+		s.smtpInternal(w, r, peer)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/internal/audio-identity/") {
@@ -220,23 +236,22 @@ func (s *Service) internal(w http.ResponseWriter, r *http.Request) {
 			fail(w, 503, err)
 			return
 		}
+		var neighbors []radio.NeighborSite
+		var hardwareReports []SiteHardwareReport
 		if peer.Role == RoleSite {
 			if zone == nil {
 				fail(w, 503, errors.New("zone settings are unavailable"))
 				return
 			}
-			found := false
-			for _, site := range zone.Sites {
-				if site.ID == peer.InstanceID {
-					found = true
-					zone.Sites = []SiteIdentity{site}
-					break
-				}
-			}
-			if !found {
+			siteIndex := slices.IndexFunc(zone.Sites, func(site SiteIdentity) bool { return site.ID == peer.InstanceID })
+			if siteIndex < 0 {
 				fail(w, 403, errors.New("site is not enrolled in this zone"))
 				return
 			}
+			reports := s.siteReports()
+			neighbors = s.zoneNeighborSites(system, *zone, peer.InstanceID, reports)
+			hardwareReports = hardwareReportsForSite(reports, peer.InstanceID)
+			zone.Sites = []SiteIdentity{zone.Sites[siteIndex]}
 			groups := []Talkgroup{}
 			for _, g := range system.Talkgroups {
 				if g.SiteAccess == "all" {
@@ -275,6 +290,9 @@ func (s *Service) internal(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		users = eligibleUsers(users, system)
+		// Directory maps have no order. Keep this wire projection stable without
+		// changing the owner's saved account/profile ordering.
+		slices.SortStableFunc(users, func(a, b userRecord) int { return strings.Compare(a.User.ID, b.User.ID) })
 		automations := []automationRecord{}
 		var automationErr error
 		if role == RoleSystem {
@@ -289,6 +307,7 @@ func (s *Service) internal(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		automations = eligibleAutomations(automations, system)
+		slices.SortStableFunc(automations, func(a, b automationRecord) int { return strings.Compare(a.Automation.ID, b.Automation.ID) })
 		var keys map[string]keyEnvelope
 		if peer.Role != RoleSite {
 			keys, err = s.keyEnvelopes()
@@ -313,11 +332,12 @@ func (s *Service) internal(w http.ResponseWriter, r *http.Request) {
 			}
 			inhibition = &radioInhibitionPolicy{Desired: desired}
 		}
-		var hardwareReports []SiteHardwareReport
-		if role == RoleZone && peer.Role == RoleSite {
-			hardwareReports = s.hardwareReportsForSite(peer.InstanceID)
+		revocations, revokeErr := s.sessionRevocations()
+		if revokeErr != nil {
+			fail(w, 500, revokeErr)
+			return
 		}
-		respond(w, 200, catalog{System: system, Zone: zone, Administrator: administratorRecord{username, hash}, Users: users, Automations: automations, KeyEnvelopes: keys, Operator: s.operatorSnapshot(), Inhibition: inhibition, Topology: s.adminTopology(zone), HardwareReports: hardwareReports})
+		respond(w, 200, catalog{SessionRevocations: revocations, System: system, Zone: zone, Administrator: administratorRecord{username, hash}, Users: users, Automations: automations, KeyEnvelopes: keys, Operator: s.operatorSnapshot(), Inhibition: inhibition, Topology: s.adminTopology(zone), HardwareReports: hardwareReports, NeighborSites: neighbors, HistoryRetention: s.historyRetentionPolicy()})
 	case "/internal/report":
 		if r.Method != "POST" {
 			w.WriteHeader(405)
@@ -399,7 +419,10 @@ func (s *Service) acceptSiteReport(peer PeerCredential, r SiteReport) error {
 		}
 	}
 	out = append(out, r)
-	err = s.writeCache("site_reports", out)
+	err = s.rememberReportTopology(nil, zone.Sites, []SiteReport{r})
+	if err == nil {
+		err = s.writeCache("site_reports", out)
+	}
 	s.reportMu.Unlock()
 	if err != nil {
 		return err
@@ -445,14 +468,70 @@ func (s *Service) acceptZoneReport(peer PeerCredential, r zoneReport) error {
 	if err := s.Store.WriteCache("zone", raw); err != nil {
 		return err
 	}
+	if err := s.rememberReportTopology(&r.AdminURL, r.Config.Sites, r.Sites); err != nil {
+		return err
+	}
 	if err := s.writeCache("site_reports", r.Sites); err != nil {
 		return err
 	}
 	return s.writeCache("zone_report", r)
 }
 
+// Keep just the accepted administration addresses durable. Navigation can then
+// survive a disconnected restart without loading telemetry or reviving a stale
+// report. The caller serializes report acceptance with reportMu; ordinary fresh
+// reports with unchanged addresses never enter the configuration writer.
+func (s *Service) rememberReportTopology(zoneURL *string, sites []SiteIdentity, reports []SiteReport) error {
+	tree := topology{SiteURLs: map[string]string{}}
+	raw, _, err := s.Store.ReadCache("topology")
+	if err == nil {
+		if err = json.Unmarshal(raw, &tree); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if tree.SiteURLs == nil {
+		tree.SiteURLs = map[string]string{}
+	}
+	changed := false
+	if zoneURL != nil && tree.ZoneURL != *zoneURL {
+		tree.ZoneURL = *zoneURL
+		changed = true
+	}
+	allowed := make(map[string]bool, len(sites))
+	for _, site := range sites {
+		allowed[site.ID] = true
+	}
+	for id := range tree.SiteURLs {
+		if !allowed[id] {
+			delete(tree.SiteURLs, id)
+			changed = true
+		}
+	}
+	for _, report := range reports {
+		if !allowed[report.ID] {
+			continue
+		}
+		if previous, exists := tree.SiteURLs[report.ID]; !exists || previous != report.AdminURL {
+			tree.SiteURLs[report.ID] = report.AdminURL
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.writeCache("topology", tree)
+}
+
 func (s *Service) upstreamRequest(ctx context.Context, method, path string, value any, target any) error {
-	if err := validateInternalURL(s.upstreamURL(), false); err != nil {
+	address := s.configuredUpstreamURL()
+	ctx, cancel, gateErr := s.parentRequestContext(ctx, address)
+	if gateErr != nil {
+		return gateErr
+	}
+	defer cancel()
+	if err := validateInternalURL(address, false); err != nil {
 		return err
 	}
 	c := s.Config()
@@ -471,7 +550,7 @@ func (s *Service) upstreamRequest(ctx context.Context, method, path string, valu
 		}
 		body = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(s.upstreamURL(), "/")+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(address, "/")+path, body)
 	if err != nil {
 		return err
 	}
@@ -480,7 +559,18 @@ func (s *Service) upstreamRequest(ctx context.Context, method, path string, valu
 	if value != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	response, err := s.client.Do(req)
+	client := s.client
+	if path == "/internal/events" {
+		// Archive work has its own deadline. Preserve the control client's timeout,
+		// redirect checks, credentials and transport; its active connections are not
+		// limited by the one serialized history worker.
+		client = &http.Client{Transport: s.client.Transport, CheckRedirect: s.client.CheckRedirect, Jar: s.client.Jar, Timeout: historyTransferBudget}
+	} else if path == "/internal/sso/revoke" {
+		// Only durable administrator revocation delivery may await its parent
+		// commit longer. The ordinary control and status client stays unchanged.
+		client = &http.Client{Transport: s.client.Transport, CheckRedirect: s.client.CheckRedirect, Jar: s.client.Jar, Timeout: revocationDeliveryBudget}
+	}
+	response, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -506,7 +596,13 @@ func (s *Service) SyncOnce(ctx context.Context) error {
 		return nil
 	}
 	var incoming catalog
+	revocationCtx, revokeCancel := context.WithTimeout(ctx, time.Second)
+	_ = s.flushSessionRevocations(revocationCtx)
+	revokeCancel()
 	err := s.upstreamRequest(ctx, "GET", "/internal/catalog", nil, &incoming)
+	if err == nil && s.parentIsolated.Load() {
+		err = errors.New("parent Zone disconnected for testing")
+	}
 	if err == nil {
 		err = s.acceptCatalog(incoming)
 	}
@@ -519,15 +615,23 @@ func (s *Service) SyncOnce(ctx context.Context) error {
 			}
 			err = policyErr
 		}
-		if err == nil {
-			s.uploadActivity(ctx)
-		}
 	}
 	if err == nil && c.Role == RoleSite {
 		var report SiteReport
 		report, err = s.ownSiteReport()
 		if err == nil {
 			err = s.upstreamRequest(ctx, "POST", "/internal/report", report, nil)
+		}
+	}
+	if c.Role == RoleSite && s.radio != nil && err == nil {
+		neighborCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		neighborErr := s.radio.ApplyNeighborSites(neighborCtx, incoming.NeighborSites)
+		cancel()
+		if neighborErr == nil {
+			s.neighborDeliveryError = ""
+		} else if ctx.Err() == nil && s.neighborDeliveryError != neighborErr.Error() {
+			s.neighborDeliveryError = neighborErr.Error()
+			_ = s.Store.AddEvent("neighbor_announcements", "Neighbor announcements could not be fully applied. "+neighborErr.Error())
 		}
 	}
 	if err == nil && c.Role == RoleZone {
@@ -556,12 +660,23 @@ func (s *Service) SyncOnce(ctx context.Context) error {
 		}
 	}
 	_ = s.writeCache("connection", connection)
-	if previous.State != connection.State || previous.Error != connection.Error {
-		message := "Upstream connected; accepted settings updated."
+	if previous.State == "" || (previous.State == "Connected") != (connection.State == "Connected") {
+		parent := "Parent controller"
+		if c.Role == RoleSite {
+			parent = "Parent Zone"
+		} else if c.Role == RoleZone {
+			parent = "System"
+		}
+		message, severity := parent+" connected; accepted settings updated.", "info"
 		if err != nil {
-			message = "Upstream unavailable; retained settings remain in use. " + connection.Error
+			message, severity = parent+" unavailable; retained settings remain in use.", "warning"
+		}
+		details := map[string]any{"parent": parent, "connected": err == nil}
+		if !previous.LastSuccess.IsZero() {
+			details["last_success"] = previous.LastSuccess
 		}
 		_ = s.Store.AddEvent("connection", message)
+		s.emit(activity.Event{Type: "connection", Message: message, Severity: severity, Audience: "operator", SourceKind: "controller", Details: details})
 	}
 	return err
 }
@@ -569,6 +684,15 @@ func (s *Service) SyncOnce(ctx context.Context) error {
 func (s *Service) acceptCatalog(incoming catalog) error {
 	if incoming.System.ID == "" {
 		return errors.New("upstream returned no system identity")
+	}
+	for _, revocation := range incoming.SessionRevocations {
+		if !revocation.Expires.After(time.Now()) {
+			continue
+		}
+		revocation.Pending = false
+		if err := s.recordRevocation(revocation); err != nil {
+			return err
+		}
 	}
 	var old SystemConfig
 	if s.readCache("system", &old) && old.ID != incoming.System.ID {
@@ -624,11 +748,68 @@ func (s *Service) acceptCatalog(incoming catalog) error {
 			return err
 		}
 	}
-	if err := s.writeCache("topology", incoming.Topology); err != nil {
+	// The parent owns upstream addresses; a Zone retains the direct Site
+	// addresses it has already accepted, including explicitly absent addresses.
+	// Serialize the small projection with report acceptance so an echoed older
+	// parent catalogue cannot undo a newer direct report.
+	tree := incoming.Topology
+	tree.SiteURLs = make(map[string]string, len(incoming.Topology.SiteURLs))
+	for id, address := range incoming.Topology.SiteURLs {
+		tree.SiteURLs[id] = address
+	}
+	var localZone ZoneConfig
+	if s.Config().Role == RoleZone {
+		if err := s.owned(&localZone); err != nil {
+			return err
+		}
+	}
+	s.reportMu.Lock()
+	switch c := s.Config(); c.Role {
+	case RoleZone:
+		tree.ZoneURL = c.PublicURL
+		var previous topology
+		raw, _, readErr := s.Store.ReadCache("topology")
+		if readErr == nil {
+			readErr = json.Unmarshal(raw, &previous)
+		}
+		if readErr != nil && !errors.Is(readErr, sql.ErrNoRows) {
+			s.reportMu.Unlock()
+			return readErr
+		}
+		allowed := make(map[string]bool, len(localZone.Sites))
+		for _, site := range localZone.Sites {
+			allowed[site.ID] = true
+			if address, exists := previous.SiteURLs[site.ID]; exists {
+				tree.SiteURLs[site.ID] = address
+			}
+		}
+		for id := range tree.SiteURLs {
+			if !allowed[id] {
+				delete(tree.SiteURLs, id)
+			}
+		}
+	case RoleSite:
+		tree.SiteURLs[c.InstanceID] = c.PublicURL
+	}
+	err = s.writeCache("topology", tree)
+	s.reportMu.Unlock()
+	if err != nil {
 		return err
 	}
 	if s.Config().Role == RoleSite {
 		if err := s.writeCache("hardware_reports", incoming.HardwareReports); err != nil {
+			return err
+		}
+		directory := make([]radio.NeighborSite, 0, len(incoming.NeighborSites))
+		for _, site := range incoming.NeighborSites {
+			directory = append(directory, radio.NeighborSite{ID: site.ID, Name: site.Name})
+		}
+		if err := s.writeCache("neighbor_directory", directory); err != nil {
+			return err
+		}
+	}
+	if incoming.HistoryRetention != nil {
+		if err := s.writeCache("history_retention", *incoming.HistoryRetention); err != nil {
 			return err
 		}
 	}
@@ -763,19 +944,55 @@ func (s *Service) State(session Session) (map[string]any, error) {
 	return map[string]any{"role": c.Role, "instance_id": c.InstanceID, "username": session.Username, "csrf": session.CSRF, "is_administrator": true, "radio": status, "capabilities": map[string]bool{"radio": c.Role == RoleSite && s.radio != nil, "activity": true, "users": c.Role == RoleSystem, "dispatch": c.Role == RoleApplication, "dispatch_wav": c.Role == RoleApplication}, "config": raw, "system": system, "zone": zone, "site_reports": s.siteReports(), "connections": connections, "settings": c.Settings(), "events": events, "topology": tree, "rf_enabled": status.State == "running"}, nil
 }
 
+// The System owns retention. Sources retain only the latest accepted policy
+// for their independently owned SMTP delivery history; missing policy is unknown.
+func (s *Service) historyRetentionPolicy() *activity.Retention {
+	if s.Config().Role == RoleSystem {
+		if retention, ok := s.activity.RetentionPolicy(); ok {
+			return &retention
+		}
+		return nil
+	}
+	var retention activity.Retention
+	if s.readCache("history_retention", &retention) {
+		return &retention
+	}
+	return nil
+}
+
+func completeActivityACK(events []activity.Event, ids []string) bool {
+	if len(events) != len(ids) {
+		return false
+	}
+	want := make(map[string]bool, len(events))
+	for _, event := range events {
+		if event.ID == "" || want[event.ID] {
+			return false
+		}
+		want[event.ID] = true
+	}
+	for _, id := range ids {
+		if !want[id] {
+			return false
+		}
+		delete(want, id)
+	}
+	return len(want) == 0
+}
+
 func (s *Service) uploadActivity(ctx context.Context) {
 	if s.activity == nil || s.Config().Role == RoleSystem {
 		return
 	}
-	events, err := s.activity.Pending(128)
+	events, err := s.activity.Pending(ctx, activity.EventBatchLimit)
 	if err != nil || len(events) == 0 {
 		return
 	}
 	var reply struct {
 		IDs []string `json:"ids"`
 	}
-	if s.upstreamRequest(ctx, "POST", "/internal/events", map[string]any{"events": events}, &reply) == nil {
-		_ = s.activity.Acknowledge(reply.IDs)
+	if s.upstreamRequest(ctx, "POST", "/internal/events", map[string]any{"events": events}, &reply) == nil && completeActivityACK(events, reply.IDs) {
+		_ = s.activity.Acknowledge(ctx, reply.IDs)
 	}
 }
 func (s *Service) activityInternal(w http.ResponseWriter, r *http.Request, p PeerCredential) {
@@ -787,8 +1004,12 @@ func (s *Service) activityInternal(w http.ResponseWriter, r *http.Request, p Pee
 	var input struct {
 		Events []activity.Event `json:"events"`
 	}
-	if err := readJSON(w, r, &input); err != nil || len(input.Events) > 256 {
+	if err := readJSON(w, r, &input); err != nil {
 		fail(w, 400, errors.New("invalid activity batch"))
+		return
+	}
+	if len(input.Events) > activity.EventBatchLimit {
+		fail(w, http.StatusBadRequest, fmt.Errorf("activity batches contain at most %d observations", activity.EventBatchLimit))
 		return
 	}
 	ids := []string{}
@@ -797,7 +1018,7 @@ func (s *Service) activityInternal(w http.ResponseWriter, r *http.Request, p Pee
 		fail(w, 503, errors.New("service enrollment is unavailable"))
 		return
 	}
-	for _, event := range input.Events {
+	for i, event := range input.Events {
 		if p.Role == RoleSite {
 			forwarded := false
 			if event.SourceKind == "application" || event.SourceKind == "automation" {
@@ -824,13 +1045,29 @@ func (s *Service) activityInternal(w http.ResponseWriter, r *http.Request, p Pee
 		if role == RoleSite && p.Role == RoleApplication {
 			event.SiteID = s.Config().InstanceID
 		}
-		if err := s.activity.Append(event); err != nil {
-			fail(w, 400, err)
-			return
-		}
+		input.Events[i] = event
 		ids = append(ids, event.ID)
 	}
-	s.refreshDirectory()
+	if role == RoleSystem {
+		if err := s.activity.InitializationError(); err != nil {
+			fail(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		if err := s.activity.Append(r.Context(), input.Events...); err != nil {
+			fail(w, 503, err)
+			return
+		}
+	} else {
+		// Relay without a local copy. A source retains its durable outbox until
+		// this complete batch has reached the System's committed archive.
+		var reply struct {
+			IDs []string `json:"ids"`
+		}
+		if err := s.upstreamRequest(r.Context(), "POST", "/internal/events", input, &reply); err != nil || !completeActivityACK(input.Events, reply.IDs) {
+			fail(w, http.StatusServiceUnavailable, errors.New("System history archive is unavailable"))
+			return
+		}
+	}
 	respond(w, 200, map[string]any{"ids": ids})
 }
 
@@ -842,8 +1079,9 @@ func topologySites(t topology) []string {
 	return out
 }
 
-// Navigation is built exclusively from explicit web addresses. Internal
-// endpoints never become administration links, including before a report.
+// Navigation reads only explicit web addresses and accepted programming. Report
+// acceptance refreshes this small topology; rendering must not reconstruct Site
+// reports, acquire operator locks or inspect local hardware.
 func (s *Service) adminTopology(zone *ZoneConfig) topology {
 	c := s.Config()
 	tree := topology{SiteURLs: map[string]string{}}
@@ -854,10 +1092,6 @@ func (s *Service) adminTopology(zone *ZoneConfig) topology {
 	switch c.Role {
 	case RoleSystem:
 		tree.SystemURL = c.PublicURL
-		var report zoneReport
-		if s.readCache("zone_report", &report) {
-			tree.ZoneURL = report.AdminURL
-		}
 	case RoleZone:
 		tree.ZoneURL = c.PublicURL
 	case RoleSite:
@@ -869,12 +1103,9 @@ func (s *Service) adminTopology(zone *ZoneConfig) topology {
 	if zone != nil {
 		for _, site := range zone.Sites {
 			allowed[site.ID] = true
-			tree.SiteURLs[site.ID] = site.AdminURL
-		}
-	}
-	for _, report := range s.siteReports() {
-		if allowed[report.ID] {
-			tree.SiteURLs[report.ID] = report.AdminURL
+			if _, observed := tree.SiteURLs[site.ID]; !observed {
+				tree.SiteURLs[site.ID] = site.AdminURL
+			}
 		}
 	}
 	if c.Role == RoleSite && allowed[c.InstanceID] {
@@ -886,4 +1117,37 @@ func (s *Service) adminTopology(zone *ZoneConfig) topology {
 		}
 	}
 	return tree
+}
+
+const historyTransferBudget = 60 * time.Second
+
+// History never shares a control sync cycle. Slow disk, an unreachable archive,
+// or pending acknowledgments may delay observations, never a Site report or RF
+// policy update. One worker bounds concurrency and is canceled with the service.
+func (s *Service) runActivityHistory(ctx context.Context) {
+	if err := historypriority.Enter(); err != nil {
+		log.Printf("history archive scheduling: %v", err)
+	}
+	if s.activity == nil || s.Config().Role == RoleSystem {
+		return
+	}
+	timer := time.NewTimer(time.Hour)
+	defer timer.Stop()
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		work, cancel := context.WithTimeout(ctx, historyTransferBudget)
+		s.uploadActivity(work)
+		cancel()
+		// The shared history turn owns SQL pacing. Keep one bounded archive
+		// cycle and a fixed retry/network rest; never amplify a slow SQL commit
+		// with another proportional delay in this separate worker.
+		timer.Reset(time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+	}
 }

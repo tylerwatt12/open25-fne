@@ -73,6 +73,7 @@ func (r *operationRadio) SourceAllowed(rid, tg int, run time.Time) bool {
 	_, found := findRFAffiliation(state.Affiliations, rid, tg)
 	return state.Active && state.NativeStartedAt.Equal(run) && found
 }
+func (r *operationRadio) ApplyNeighborSites(context.Context, []radio.NeighborSite) error { return nil }
 func (r *operationRadio) SetZoneConnected(connected bool) {
 	r.mu.Lock()
 	r.status.ZoneConnected = connected
@@ -146,6 +147,7 @@ func operationConfiguredFixture(t *testing.T, setup func(*Service)) (*Service, *
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitHistoryInitialization(t, events)
 	service := &Service{Store: store, config: FileConfig{Role: RoleSite, InstanceID: "site-1", PublicURL: "http://127.0.0.1:5002", StateDir: t.TempDir()}, operationCtx: ctx, operationCancel: cancel, operationWake: make(chan struct{}, 1), radio: runtime, activity: events}
 	service.peers = newMediaPeers(service)
 	service.broker = newCallBroker(service)
@@ -251,8 +253,8 @@ func TestPhysicalChangesRemainPendingWithoutAutomaticRadioRestart(t *testing.T) 
 	}
 }
 
-func TestNativeEventsPopulatePresenceAndPreserveDispatchSignaling(t *testing.T) {
-	site, _ := operationFixture(t)
+func TestNativeEventsPreserveSignalingInDurableSourceOutbox(t *testing.T) {
+	site, native := operationFixture(t)
 	now := time.Now().UTC()
 	code := 1
 	site.radioEvent(radio.Event{ID: "register-1", At: now, RID: 10001, Kind: "registered", Audience: "system_operator"})
@@ -261,29 +263,26 @@ func TestNativeEventsPopulatePresenceAndPreserveDispatchSignaling(t *testing.T) 
 	if err := site.activity.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	presence, err := site.activity.Presence()
-	if err != nil || len(presence) != 1 || !presence[0].Registered || presence[0].AffiliatedTalkgroup != 1001 {
-		t.Fatalf("accepted state was not materialized: %+v %v", presence, err)
+	events, err := site.activity.Pending(context.Background(), activity.EventBatchLimit)
+	if err != nil || len(events) != 3 {
+		t.Fatalf("native observations not durably queued: %+v %v", events, err)
 	}
-	events, err := site.activity.Events(activity.Query{Restricted: true, Groups: []int{1001}})
-	if err != nil || len(events) != 1 {
-		t.Fatalf("dispatcher did not receive its permitted signaling: %+v %v", events, err)
+	var event activity.Event
+	for _, candidate := range events {
+		if candidate.Type == "message" {
+			event = candidate
+		}
 	}
-	event := events[0]
-	if event.Type != "message" || event.TalkgroupID != 1001 || event.Details["code"] != float64(1) || event.Details["direction"] != "received" || event.Details["encrypted"] != true || event.Details["destination_id"] != float64(16777212) {
-		t.Fatalf("signaling fields were discarded: %+v", event)
+	if event.TalkgroupID != 1001 || event.Details["code"] != float64(1) || event.Details["direction"] != "received" || event.Details["encrypted"] != true || event.Details["destination_id"] != float64(16777212) {
+		t.Fatalf("signaling fields discarded: %+v", event)
 	}
-	site.radioEvent(radio.Event{ID: "unaffiliate-1", At: now.Add(3 * time.Millisecond), RID: 10001, Kind: "unaffiliated", Audience: "system_operator"})
-	_ = site.activity.Flush(context.Background())
-	presence, _ = site.activity.Presence()
-	if !presence[0].Registered || presence[0].AffiliatedTalkgroup != 0 {
-		t.Fatal("unaffiliation left stale talkgroup membership")
-	}
-	site.radioEvent(radio.Event{ID: "deregister-1", At: now.Add(4 * time.Millisecond), RID: 10001, Kind: "deregistered", Audience: "system_operator"})
-	_ = site.activity.Flush(context.Background())
-	presence, _ = site.activity.Presence()
-	if presence[0].Registered {
-		t.Fatal("deregistration left the radio registered")
+	// Observational events alone cannot publish or revive current RF presence.
+	native.mu.Lock()
+	native.status.Affiliations = nil
+	native.status.Registrations = nil
+	native.mu.Unlock()
+	if rows := site.currentRadioPresence(); len(rows) != 0 {
+		t.Fatal("history became current physical presence", rows)
 	}
 }
 
@@ -296,7 +295,7 @@ func TestDirectedNativeSignalingUsesAffiliationInsteadOfDestinationAsTalkgroup(t
 	if err := site.activity.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	events, err := site.activity.Events(activity.Query{Restricted: true, Groups: []int{1001}})
+	events, err := site.activity.Pending(context.Background(), activity.EventBatchLimit)
 	if err != nil || len(events) != 9 {
 		t.Fatalf("directed signaling disappeared from its affiliated group: %+v %v", events, err)
 	}

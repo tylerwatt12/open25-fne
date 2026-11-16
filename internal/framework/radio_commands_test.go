@@ -6,13 +6,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"open25.local/open25-fne/internal/activity"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
-	"open25.local/open25-fne/internal/activity"
 	"open25.local/open25-fne/internal/radio"
 )
 
@@ -26,7 +26,6 @@ func commandSiteFixture(t *testing.T) (*Service, *operationRadio, *integrationCl
 	if err = site.Store.SetAccount("administrator", hash); err != nil {
 		t.Fatal(err)
 	}
-	site.sessions = map[string]Session{}
 	site.attempts = map[string]loginAttempt{}
 	site.mu.Lock()
 	site.config.CredentialFile = filepath.Join(t.TempDir(), "service-credentials.json")
@@ -211,7 +210,7 @@ func TestSignalingLabelsAreCapturedWithRawNumericIDs(t *testing.T) {
 	if err := site.activity.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := site.activity.Events(activity.Query{Restricted: true, Groups: []int{1001}})
+	rows, err := site.activity.Pending(context.Background(), activity.EventBatchLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +231,7 @@ func TestSignalingLabelsAreCapturedWithRawNumericIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	site.refreshDirectory()
-	rows, _ = site.activity.Events(activity.Query{Restricted: true, Groups: []int{1001}})
+	rows, _ = site.activity.Pending(context.Background(), activity.EventBatchLimit)
 	for _, row := range rows {
 		if row.ID == "a" && row.Label != "READY" {
 			t.Fatal("later configuration silently rewrote historical event labels")

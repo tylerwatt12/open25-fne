@@ -210,12 +210,11 @@ func TestSystemUserAliasPropagatesThroughZoneToBothSiteProfiles(t *testing.T) {
 		site.Modems, site.Channels = nil, nil
 		for modem := 0; modem < 3; modem++ {
 			id := fmt.Sprintf("%s-modem-%d", site.ID, modem)
-			role := "voice"
 			if modem == 0 {
-				role = "control"
+				site.ControlPolicy.ChannelID = id + "-channel"
 			}
 			site.Modems = append(site.Modems, Modem{ID: id, Device: "/dev/serial/by-id/test-" + id, Baud: 115200})
-			site.Channels = append(site.Channels, Channel{ID: id + "-channel", Role: role, Identifier: 2, ChannelNo: index*3 + modem + 1, ModemID: id, Enabled: true})
+			site.Channels = append(site.Channels, Channel{ID: id + "-channel", Identifier: 2, ChannelNo: index*3 + modem + 1, ModemID: id, Enabled: true})
 		}
 		if err := pair.service.Store.SaveConfig(storeDoc(t, site)); err != nil {
 			t.Fatal(err)

@@ -50,13 +50,6 @@ func (c *Controller) observe(source *child, line string) {
 				c.status.Channels[i].Telemetry.begin(source.started)
 				c.status.Channels[i].Telemetry.observe(line, time.Now().UTC())
 			}
-			if state, ok := identificationLine(line); ok {
-				c.status.Channels[i].IdentificationState = state
-				c.status.Channels[i].Identifying = state == "identifying" || state == "restoring"
-			}
-			if strings.Contains(line, "CW, identification failed") {
-				c.status.Channels[i].Error = "Station identification failed."
-			}
 		}
 	}
 	if e == nil || !source.acceptsObservations() || (c.status.State != "running" && c.status.State != "starting") {
@@ -157,6 +150,11 @@ func (c *Controller) monitor(ctx context.Context, done chan struct{}) {
 			if ctx.Err() != nil {
 				return
 			}
+			c.mu.Lock()
+			control := child.role == "control"
+			changing := c.controlSwitch != nil && c.controlSwitch.handoff
+			hardware := c.status.Mode == "hardware"
+			c.mu.Unlock()
 			child.mu.Lock()
 			intentional := child.intentional
 			child.mu.Unlock()
@@ -168,8 +166,11 @@ func (c *Controller) monitor(ctx context.Context, done chan struct{}) {
 				continue
 			}
 			if !child.validDevice() {
+				if control && c.controlFailedWithFallback(child) {
+					continue
+				}
 				stop, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				_ = child.stop(stop, false)
+				_ = child.stop(stop)
 				cancel()
 				child.mu.Lock()
 				child.intentional = false
@@ -186,7 +187,7 @@ func (c *Controller) monitor(ctx context.Context, done chan struct{}) {
 			child.mu.Lock()
 			zoneNeeded := !child.zoneApplied || child.zoneState != c.zone.Load()
 			child.mu.Unlock()
-			if child.client.DispatchActive() && !zoneNeeded {
+			if !hardware && child.client.DispatchActive() && !zoneNeeded {
 				continue
 			}
 			request, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
@@ -208,23 +209,53 @@ func (c *Controller) monitor(ctx context.Context, done chan struct{}) {
 				c.nativeStatusFailed(child, err)
 				continue
 			}
+			var modemFresh bool
+			if hardware && (json.Unmarshal(data["modemFresh"], &modemFresh) != nil || !modemFresh) {
+				if !control || !c.controlFailedWithFallback(child) {
+					c.nativeExited(child)
+				}
+				continue
+			}
 			child.mu.Lock()
 			child.lastSeen = time.Now()
 			child.mu.Unlock()
 			c.applyNativeStatus(child, data)
-			if child.role == "control" {
+			if control && !changing {
 				if child.client.DispatchActive() {
 					continue
 				}
 				request, cancel = context.WithTimeout(ctx, 350*time.Millisecond)
 				policyErr := c.synchronizeInhibition(request, false)
 				cancel()
+				if ctx.Err() != nil {
+					return
+				}
 				if policyErr != nil && child.client.DispatchActive() {
+					continue
+				}
+				if nativeContactLost(policyErr) {
+					// Fence admission immediately, but retain desired operation.
+					// Retire this unconfirmed owner before fallback, even if
+					// its general status endpoint still responds. A real rejection still
+					// follows the RF-withdrawal path below.
+					c.mu.Lock()
+					if c.children[child.id] == child {
+						c.status.InhibitionReady = false
+						c.withdrawSourceFactsLocked()
+					}
+					c.mu.Unlock()
+					stop, stopCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					_ = child.stop(stop)
+					stopCancel()
+					child.mu.Lock()
+					child.intentional = false
+					child.mu.Unlock()
+					c.nativeExited(child)
 					continue
 				}
 				if policyErr != nil && !errors.Is(policyErr, context.Canceled) {
 					c.mu.Lock()
-					current := c.children[child.id] == child && c.status.State == "running"
+					current := c.children[child.id] == child && c.status.State == "running" && child.acceptsObservations()
 					if current {
 						c.status.InhibitionReady = false
 						c.withdrawSiteLocked()
@@ -251,6 +282,14 @@ func (c *Controller) monitor(ctx context.Context, done chan struct{}) {
 				}
 			}
 		}
+		c.mu.Lock()
+		changing := c.controlSwitch != nil && c.controlSwitch.handoff
+		c.mu.Unlock()
+		if !changing {
+			resources, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			_ = c.synchronizeControlResources(resources) // Retry on the next pass.
+			cancel()
+		}
 		c.recoverVoiceChannels(time.Now())
 		c.scheduleControlRotation(time.Now())
 		if fne != nil && (!fne.alive() || !fneReady) {
@@ -266,18 +305,19 @@ func (c *Controller) nativeExited(child *child) {
 	if intentional {
 		return
 	}
-	if child.role == "control" {
+	c.mu.Lock()
+	control := child.role == "control"
+	current := c.children[child.id] == child && (c.status.State == "running" || c.status.State == "starting")
+	c.mu.Unlock()
+	if control {
 		c.controlFailed(child)
 		return
 	}
-	c.mu.Lock()
-	current := c.children[child.id] == child && (c.status.State == "running" || c.status.State == "starting")
-	c.mu.Unlock()
 	if !current {
 		return
 	}
 	stop, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	cleanupErr := child.stop(stop, false)
+	cleanupErr := child.stop(stop)
 	cancel()
 	c.mu.Lock()
 	if c.children[child.id] != child || (c.status.State != "running" && c.status.State != "starting") {
@@ -343,7 +383,7 @@ func (c *Controller) nativeStatusFailed(child *child, err error) {
 	}
 	c.mu.Unlock()
 	stop, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	_ = child.stop(stop, false)
+	_ = child.stop(stop)
 	cancel()
 	child.mu.Lock()
 	child.intentional = false
@@ -359,10 +399,9 @@ func (c *Controller) applyNativeStatus(child *child, data map[string]json.RawMes
 	if intentional {
 		return
 	}
-	var tx, identifying bool
+	var tx bool
 	var rid, tg int
 	_ = json.Unmarshal(data["tx"], &tx)
-	_ = json.Unmarshal(data["isTxCW"], &identifying)
 	_ = json.Unmarshal(data["lastSrcId"], &rid)
 	_ = json.Unmarshal(data["lastDstId"], &tg)
 	var ended *Event
@@ -370,6 +409,20 @@ func (c *Controller) applyNativeStatus(child *child, data map[string]json.RawMes
 	if c.children[child.id] != child || !child.acceptsObservations() || (c.status.State != "running" && c.status.State != "starting") {
 		c.mu.Unlock()
 		return
+	}
+	if child.role == "control" {
+		child.adjacentSite = nil
+		var adjacent *AdjacentSite
+		if json.Unmarshal(data["adjacent_site"], &adjacent) == nil && adjacent != nil {
+			for _, channel := range c.profile.Site.Channels {
+				if channel.ID == child.id && channel.Identifier == adjacent.Identifier && channel.ChannelNo == adjacent.ChannelNo {
+					adjacent.WACN = c.profile.System.WACN
+					adjacent.TXHz, adjacent.RXHz = channel.TXHz, channel.RXHz
+					child.adjacentSite = adjacent
+					break
+				}
+			}
+		}
 	}
 	for i := range c.status.Channels {
 		ch := &c.status.Channels[i]
@@ -386,7 +439,6 @@ func (c *Controller) applyNativeStatus(child *child, data map[string]json.RawMes
 		if admissionError != "" {
 			ch.State, ch.Error = "fault", admissionError
 		}
-		ch.Identifying = identifying
 		if child.role == "voice" {
 			if ch.Busy && !tx {
 				ended = &Event{Kind: "call_ended", Audience: "operator", ChannelID: child.id, RID: ch.RID, TGID: ch.TGID, Message: "Voice transmission ended.", Direction: "state"}
@@ -394,7 +446,7 @@ func (c *Controller) applyNativeStatus(child *child, data map[string]json.RawMes
 				ch.RID = 0
 				ch.TGID = 0
 			}
-			if tx && !identifying {
+			if tx {
 				ch.Busy = true
 				if rid > 0 {
 					ch.RID = rid
@@ -451,6 +503,7 @@ func (c *Controller) restartFNE(ctx context.Context, old *child) {
 		return
 	}
 	run, dir := c.runID, old.dir
+	profile, network := cloneProfile(c.profile), cloneNetwork(c.network)
 	first := c.status.FNEReady
 	c.status.FNEReady = false
 	c.status.Error = "Local audio routing is unavailable; RF engines remain supervised."
@@ -459,7 +512,7 @@ func (c *Controller) restartFNE(ctx context.Context, old *child) {
 	}
 	c.mu.Unlock()
 	stop, cancel := context.WithTimeout(ctx, 2*time.Second)
-	err := old.stop(stop, false)
+	err := old.stop(stop)
 	cancel()
 	if err != nil {
 		c.fneReplacementFailed(old, run, err, false)
@@ -479,7 +532,14 @@ func (c *Controller) restartFNE(ctx context.Context, old *child) {
 	}
 	// Keep launch and ownership publication together with respect to Stop's
 	// snapshot. Output callbacks wait for mu and then see their actual owner.
-	process, err := launch(c.opts.FNEPath, dir, "fne.yml", "media", "media", nil, c.observe)
+	files, err := RenderFNE(profile, network)
+	if err == nil {
+		err = writeFiles(dir, files)
+	}
+	var process *child
+	if err == nil {
+		process, err = launch(c.opts.FNEPath, dir, "fne.yml", "media", "media", old.client, c.observe)
+	}
 	if err != nil {
 		c.status.FNEPID = 0 // the old owner was successfully retired
 		c.status.Error = "Local audio routing restart failed: " + err.Error()
@@ -508,7 +568,7 @@ func (c *Controller) restartFNE(ctx context.Context, old *child) {
 	if ctx.Err() != nil {
 		cancel() // Stop/Close need forced retirement, not another grace wait
 	}
-	cleanupErr := process.stop(stop, false)
+	cleanupErr := process.stop(stop)
 	cancel()
 	c.fneReplacementFailed(process, run, errors.Join(err, cleanupErr), cleanupErr == nil)
 }

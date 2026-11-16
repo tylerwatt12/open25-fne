@@ -50,12 +50,18 @@ Native distributions must include the complete corresponding source used to
 produce their binaries and the applicable build/install materials and notices.
 The maintainer also reiterated that source availability requirement in
 [the follow-up comment](https://github.com/DVMProject/dvmhost/issues/137#issuecomment-6926811752).
-The license-adjusted native revision `a2ca11b6` passes a seven-target Linux ARM64
+The selected native revision `a3513e8e` retains that clarification and adds the
+reviewed features through the running `0092` baseline. It passes a seven-target Linux ARM64
 Release build and the selected offline native regressions in a Debian 13 ARM64 VM without
 source overlays. Collection verifies its complete source archive, authoritative
 licensing documents, provenance and relocated runtime-library closure. This
 revision has not been deployed or executed on the physical Pi; no RF or
 subscriber-roaming qualification follows from these software checks.
+
+The fork's `LICENSE-CLARIFICATION.json` is an immutable receipt for the earlier
+header corrections, rather than a current source-file manifest. Its
+`OPEN25-RUNNING-BASELINE.json` records the later functional import. Original
+notices, per-file terms and downstream modification dates remain in the source.
 
 The [native collector](tools/framework/collect-native.sh) includes:
 

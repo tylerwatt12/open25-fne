@@ -68,7 +68,7 @@ var userPermissions = []string{"ptt", "secure_ptt", "emergency", "patch", "radio
 
 func (s *Store) userRecords() ([]userRecord, error) {
 	var raw []byte
-	err := s.db.QueryRow("SELECT document FROM framework_documents WHERE name=?", s.usersKey()).Scan(&raw)
+	err := s.readDB.QueryRow("SELECT document FROM framework_documents WHERE name=?", s.usersKey()).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return []userRecord{}, nil
 	}

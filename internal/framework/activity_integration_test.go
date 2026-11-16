@@ -19,7 +19,7 @@ func TestSiteForwardsDispatchActivityToCentralHistoryWithoutClaimingRF(t *testin
 	}
 	c.site.service.uploadActivity(ctx)
 	c.zone.service.uploadActivity(ctx)
-	rows, err := c.system.service.activity.Events(activity.Query{Limit: 10})
+	rows, err := c.system.service.activity.Events(activity.Query{ID: event.ID, Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

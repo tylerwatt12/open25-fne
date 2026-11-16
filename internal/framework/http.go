@@ -73,9 +73,8 @@ func (s *Service) session(r *http.Request) (Session, bool) {
 	if err != nil {
 		return Session{}, false
 	}
-	s.mu.Lock()
-	v, ok := s.sessions[cookie.Value]
-	s.mu.Unlock()
+	var v Session
+	ok := s.Store != nil && s.Store.authRead("session", cookie.Value, &v) == nil
 	valid := ok && !time.Now().After(v.Expires)
 	if valid && v.UserID != "" {
 		u, hash, e := s.Store.User(v.UserID)
@@ -88,10 +87,13 @@ func (s *Service) session(r *http.Request) (Session, bool) {
 		username, hash, e := s.Store.Account()
 		valid = e == nil && v.Username == username && v.AccountDigest == sha256.Sum256(hash)
 	}
+	if valid {
+		valid = !s.sharedSessionRevoked(v.FamilyID)
+	}
 	if !valid {
-		s.mu.Lock()
-		delete(s.sessions, cookie.Value)
-		s.mu.Unlock()
+		if ok {
+			_ = s.Store.authDelete("session", cookie.Value)
+		}
 		return Session{}, false
 	}
 	v.Key = cookie.Value
@@ -158,29 +160,16 @@ func (s *Service) login(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, errors.New("invalid username or password"))
 		return
 	}
-	token, err := randomToken()
-	if err != nil {
-		fail(w, 500, errors.New("could not create session"))
+	v := Session{Username: username, Expires: now.Add(8 * time.Hour), AccountDigest: digest, UserID: userID, PositionID: positionID}
+	if err := s.createSession(w, r, &v); err != nil {
+		fail(w, 500, errors.New("could not persist session"))
 		return
 	}
-	csrf, err := randomToken()
-	if err != nil {
-		fail(w, 500, errors.New("could not create session"))
-		return
-	}
-	v := Session{Username: username, CSRF: csrf, Expires: now.Add(8 * time.Hour), AccountDigest: digest, UserID: userID, PositionID: positionID, Key: token}
 	s.mu.Lock()
 	delete(s.attempts, ip)
-	for k, old := range s.sessions {
-		if now.After(old.Expires) {
-			delete(s.sessions, k)
-		}
-	}
-	s.sessions[token] = v
 	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: s.cookieName(), Value: token, Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: 28800})
 	s.emit(activity.Event{Type: "login", Message: "User signed in.", Audience: "security", Severity: "info", Outcome: "accepted", SourceKind: "application", Details: map[string]any{"username": username, "user_id": userID}})
-	s.sessionResponse(w, withCookie(r, s.cookieName(), token))
+	s.sessionResponse(w, withCookie(r, s.cookieName(), v.Key))
 }
 
 func withCookie(r *http.Request, name, value string) *http.Request {
@@ -283,16 +272,13 @@ func (s *Service) handler(internalOnly bool) http.Handler {
 				w.WriteHeader(405)
 				return
 			}
-			if c, err := r.Cookie(s.cookieName()); err == nil {
-				if s.hub != nil {
-					s.hub.InvalidateSession(c.Value)
-				}
-				s.mu.Lock()
-				delete(s.sessions, c.Value)
-				s.mu.Unlock()
+			delivered, err := s.signOutSession(v)
+			if err != nil {
+				fail(w, 500, errors.New("could not record shared sign-out"))
+				return
 			}
 			http.SetCookie(w, &http.Cookie{Name: s.cookieName(), Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode})
-			respond(w, 200, map[string]bool{"ok": true})
+			respond(w, 200, map[string]bool{"ok": true, "revocation_pending": !delivered})
 		case "/api/state":
 			if r.Method != "GET" {
 				w.WriteHeader(405)
@@ -319,6 +305,7 @@ func (s *Service) handler(internalOnly bool) http.Handler {
 				return
 			}
 			s.refreshDirectory()
+			s.emit(activity.Event{Type: "configuration", Message: "Configuration saved.", Audience: "diagnostic", Outcome: "saved", SourceKind: "application"})
 			respond(w, 200, map[string]bool{"saved": true})
 		case "/api/settings":
 			if r.Method != "PUT" {
@@ -334,6 +321,7 @@ func (s *Service) handler(internalOnly bool) http.Handler {
 				fail(w, 400, err)
 				return
 			}
+			s.emit(activity.Event{Type: "configuration", Message: "Server connection settings saved.", Audience: "diagnostic", Outcome: "saved", SourceKind: "application"})
 			respond(w, 200, map[string]bool{"saved": true})
 		case "/api/account":
 			s.changePassword(w, r)

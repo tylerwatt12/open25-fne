@@ -23,7 +23,7 @@ func TestHistoryCountsMultiselectAndSiteDestinationsWithoutLosingGroups(t *testi
 					e.At = start.Add(5 * time.Second)
 					e.Outcome = "completed"
 				}
-				if err := s.Append(e); err != nil {
+				if err := s.Append(context.Background(), e); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -65,7 +65,7 @@ func TestHistoryCursorPaginationUsesStableTieBreakerAndDateScope(t *testing.T) {
 	at := time.Now().UTC()
 	for i := 0; i < 7; i++ {
 		e := event(fmt.Sprintf("event-%d", i), "status", "site-1", at)
-		if err := s.Append(e); err != nil {
+		if err := s.Append(context.Background(), e); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -104,16 +104,16 @@ func TestLocationHistoryKeepsActualFixesAndReportsStaleness(t *testing.T) {
 	at := time.Now().UTC().Add(-10 * time.Minute)
 	old := event("old-location-log", "location", "site-1", at)
 	old.Details = map[string]any{"fix_at": at}
-	if err := s.Append(old); err != nil {
+	if err := s.Append(context.Background(), old); err != nil {
 		t.Fatal(err)
 	}
 	e := event("actual-fix", "location", "site-1", at)
 	e.SourceKind = "application"
 	e.Details = map[string]any{"fix_at": at, "latitude": 41.5, "longitude": -81.7, "accuracy": 8.5, "scope_id": "zone-1"}
-	if err := s.Append(e); err != nil {
+	if err := s.Append(context.Background(), e); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(e); err != nil {
+	if err := s.Append(context.Background(), e); err != nil {
 		t.Fatal(err)
 	}
 	page, err := s.LocationHistory(Query{}, time.Now().UTC())
@@ -130,22 +130,22 @@ func TestLocationHistoryKeepsActualFixesAndReportsStaleness(t *testing.T) {
 	}
 	e.ID = "invalid-fix"
 	e.Details["latitude"] = 91
-	if err = s.Append(e); err == nil {
+	if err = s.Append(context.Background(), e); err == nil {
 		t.Fatal("invalid coordinate accepted")
 	}
 }
 
-func TestHistoryRetentionBoundsRowsAndReportsUndeliveredLoss(t *testing.T) {
+func TestSystemHistoryRetentionBoundsRows(t *testing.T) {
 	s := activityOpen(t)
 	now := time.Now().UTC()
 	for i := 0; i < 105; i++ {
 		e := event(fmt.Sprintf("retained-%03d", i), "status", "site-1", now.Add(time.Duration(i)*time.Millisecond))
-		if err := s.Append(e); err != nil {
+		if err := s.Append(context.Background(), e); err != nil {
 			t.Fatal(err)
 		}
 	}
 	old := event("expired", "status", "site-1", now.Add(-31*24*time.Hour))
-	if err := s.Append(old); err != nil {
+	if err := s.Append(context.Background(), old); err != nil {
 		t.Fatal(err)
 	}
 	r := defaultRetention
@@ -153,8 +153,9 @@ func TestHistoryRetentionBoundsRowsAndReportsUndeliveredLoss(t *testing.T) {
 	if err := s.SaveRetention(context.Background(), r); err != nil {
 		t.Fatal(err)
 	}
+	waitCleanupState(t, s, func(v CleanupStatus) bool { return !v.Pending && !v.Running && v.LastCompletedAt != nil })
 	status, err := s.HistoryStatus(context.Background())
-	if err != nil || status.Events != 100 || status.PrunedUnuploaded != 6 || status.PendingUpload != 100 {
+	if err != nil || status.Events != 100 {
 		t.Fatalf("retention not bounded or silent loss: %+v %v", status, err)
 	}
 	entered := Retention{Days: 0, MaxEvents: -1, MaxCalls: 0, MaxLocations: 7, StaleSeconds: 1}
@@ -173,54 +174,63 @@ func TestArchiveHasNoUpstreamQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err = s.Append(event("central", "status", "site-1", time.Now())); err != nil {
+	waitActivityReady(t, s)
+	if err = s.Append(context.Background(), event("central", "status", "site-1", time.Now())); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := s.Pending(20)
+	pending, err := s.Pending(context.Background(), 20)
 	if err != nil || len(pending) != 0 {
 		t.Fatal("central archive reported a nonexistent upstream backlog")
 	}
 }
 
-func TestExplicitHistoryRebuildPreservesEventsAndUploadAcknowledgments(t *testing.T) {
+func TestExplicitHistoryRebuildPreservesOriginalEvents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "activity.db")
-	s, err := Open(path)
+	s, err := OpenArchive(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitActivityReady(t, s)
 	for _, tg := range []int{1001, 1002} {
 		e := event(fmt.Sprint(tg), "call_start", "site-1", time.Now())
 		e.TalkgroupID = tg
 		e.CallID = "original-call"
-		if err = s.Append(e); err != nil {
+		if err = s.Append(context.Background(), e); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err = s.Acknowledge([]string{"1001"}); err != nil {
-		t.Fatal(err)
 	}
 	s.Close()
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = db.Exec("CREATE TABLE radio_calls(id TEXT PRIMARY KEY)")
+	// Damage only current derived rows. Rebuilding must repair them from the
+	// retained observations without changing the originals.
+	_, err = db.Exec("DELETE FROM calls; DELETE FROM call_destinations; DELETE FROM call_allocations")
 	db.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stale, err := Open(path); err == nil {
-		stale.Close()
-		t.Fatal("obsolete schema silently used")
+	damaged, err := OpenArchive(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitActivityReady(t, damaged)
+	if page, err := damaged.CallHistory(Query{}); err != nil || len(page.Calls) != 0 {
+		t.Fatal("ordinary opening replayed retained history into its derived rows", err)
+	}
+	if err = damaged.Close(); err != nil {
+		t.Fatal(err)
 	}
 	if err = RebuildHistory(path); err != nil {
 		t.Fatal(err)
 	}
-	s, err = Open(path)
+	s, err = OpenArchive(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	waitActivityReady(t, s)
 	page, err := s.CallHistory(Query{})
 	if err != nil || len(page.Calls) != 1 || len(page.Calls[0].Destinations) != 2 {
 		t.Fatalf("rebuild lost original projections: %+v %v", page, err)
@@ -229,8 +239,5 @@ func TestExplicitHistoryRebuildPreservesEventsAndUploadAcknowledgments(t *testin
 	if err != nil || len(events) != 2 {
 		t.Fatal("original evidence lost")
 	}
-	pending, err := s.Pending(20)
-	if err != nil || len(pending) != 1 || pending[0].ID != "1002" {
-		t.Fatal("upload acknowledgment lost")
-	}
+
 }

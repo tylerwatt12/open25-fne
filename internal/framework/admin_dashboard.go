@@ -7,14 +7,17 @@ import (
 	"net/url"
 	"strings"
 	"time"
-
-	"open25.local/open25-fne/internal/radio"
 )
 
 func (s *Service) webConnectionRows() []map[string]any {
 	rows := []map[string]any{}
 	var connection Connection
 	if s.readCache("connection", &connection) {
+		if s.parentIsolated.Load() {
+			connection.State = "Test isolation"
+			connection.Error = "Parent Zone disconnected for testing"
+			connection.URL = s.configuredUpstreamURL()
+		}
 		freshness := "Last contact"
 		if connection.LastSuccess.IsZero() {
 			freshness = "No successful contact"
@@ -32,48 +35,51 @@ func (s *Service) webConnectionRows() []map[string]any {
 
 // The map groups known owners, not unmeasured RF or physical cabling.
 func (s *Service) webTopologyMap(w io.Writer) {
-	fmt.Fprint(w, `<section class=ts-panel aria-label="Administration topology"><div class=ts-panelhead><h2>Network location</h2></div><div class=ts-network-diagram>`)
+	fmt.Fprint(w, `<section class="ts-panel location-strip" aria-label="Administration topology"><div class=ts-panelhead><h2>Network location</h2></div><div class=ts-network-diagram>`)
 	nodes := adminVisibleInstances(s.adminInstances())
-	node := func(n adminInstance) {
-		current := ""
-		if n.Current {
-			current = " aria-current=true"
+	for _, role := range []Role{RoleSystem, RoleZone, RoleSite, RoleApplication} {
+		present := false
+		for _, n := range nodes {
+			present = present || n.Role == role
 		}
-		fmt.Fprintf(w, `<div class=ts-node%s><div class=ts-nodebranch>%s%s</div><strong>%s</strong>`, current, adminIcon(n.Icon), esc(strings.TrimPrefix(adminRoleName(n.Role), "Open25 ")), esc(n.Name))
-		if n.Current {
-			fmt.Fprintf(w, `<span class="ts-badge ts-selected">You are here</span>`)
-		} else if n.URL != "" {
-			fmt.Fprintf(w, `<a class=ts-link href="%s">Open administration%s</a>`, esc(n.URL), adminPortalIcon())
-		} else {
-			fmt.Fprint(w, `<small>Address unavailable</small>`)
+		if !present {
+			continue
 		}
-		fmt.Fprint(w, `</div>`)
-	}
-	for _, role := range []Role{RoleSystem, RoleZone, RoleSite} {
-		if role != RoleSystem {
+		if role == RoleApplication {
+			fmt.Fprint(w, `<div class=ts-network-app><span class=ts-caption>Application connection</span>`)
+		} else if role != RoleSystem {
 			fmt.Fprint(w, `<div class=ts-network-edge aria-hidden=true></div>`)
 		}
-		fmt.Fprint(w, `<div class=ts-network-tier>`)
+		fmt.Fprint(w, `<div class=compact-topology>`)
 		for _, n := range nodes {
-			if n.Role == role {
-				node(n)
+			if n.Role != role {
+				continue
+			}
+			label := adminInstanceLabel(n)
+			switch {
+			case n.Current:
+				fmt.Fprintf(w, `<a href=/dashboard aria-current=page aria-label="%s — You are here">%s%s</a>`, esc(label), adminIcon(n.Icon), esc(label))
+			case n.URL != "":
+				fmt.Fprintf(w, `<a href="%s">%s%s%s</a>`, esc(n.URL), adminIcon(n.Icon), esc(label), adminPortalIcon())
+			default:
+				fmt.Fprintf(w, `<span>%s · Address unavailable</span>`, esc(label))
 			}
 		}
 		fmt.Fprint(w, `</div>`)
-	}
-	fmt.Fprint(w, `<div class=ts-network-app><span class=ts-caption>Application connection</span>`)
-	for _, n := range nodes {
-		if n.Role == RoleApplication {
-			node(n)
+		if role == RoleApplication {
+			fmt.Fprint(w, `</div>`)
 		}
 	}
-	fmt.Fprint(w, `</div></div></section>`)
+	fmt.Fprint(w, `</div></section>`)
 }
 
 func (s *Service) webDashboard(w http.ResponseWriter, r *http.Request, session Session) {
+	if s.Config().Role == RoleSite {
+		s.webSiteDashboard(w, r, session)
+		return
+	}
 	s.webHeader(w, r, "Overview", session, false)
 	defer webFooter(w)
-	fmt.Fprint(w, `<div class=ts-toolbar><a class=ts-button href=/dashboard>Refresh</a></div>`)
 	connections := s.webConnectionRows()
 	attention := []adminLink{}
 	for _, c := range connections {
@@ -81,13 +87,6 @@ func (s *Service) webDashboard(w http.ResponseWriter, r *http.Request, session S
 			attention = append(attention, adminLink{"connections", webText(c["connection"]) + ": " + message})
 		} else if c["freshness"] == "Stale" || c["freshness"] == "No successful contact" {
 			attention = append(attention, adminLink{"connections", webText(c["connection"]) + ": " + webText(c["freshness"])})
-		}
-	}
-	var local radio.Status
-	if s.Config().Role == RoleSite {
-		local = s.radioStatus()
-		if local.Error != "" {
-			attention = append(attention, adminLink{"live-status", local.Error})
 		}
 	}
 	if len(connections) == 0 && s.Config().Role != RoleSystem {
@@ -119,16 +118,16 @@ func (s *Service) webDashboard(w http.ResponseWriter, r *http.Request, session S
 			}
 		}
 	}
-	class := "ts-panel"
+	class := "ts-panel summary-strip"
 	if len(attention) > 0 {
 		class += " ts-attention"
 	}
-	fmt.Fprintf(w, `<section class="%s"><div class=ts-panelhead><h2>Needs attention</h2></div><ul class=ts-list>`, class)
+	fmt.Fprintf(w, `<section class="%s"><h2>Needs attention</h2><ul class=ts-list>`, class)
 	for _, item := range attention {
 		fmt.Fprintf(w, `<li><div class=ts-itemline><span>%s</span><a class=ts-link href="/%s">Details</a></div></li>`, esc(item.Label), esc(item.Path))
 	}
 	if len(attention) == 0 {
-		fmt.Fprint(w, `<li class=ts-muted>No issues in the available observations.</li>`)
+		fmt.Fprint(w, `<li class=ts-muted>No current faults in the available observations.</li>`)
 	}
 	fmt.Fprint(w, `</ul></section>`)
 	s.webTopologyMap(w)
@@ -153,7 +152,7 @@ func (s *Service) webDashboard(w http.ResponseWriter, r *http.Request, session S
 		}
 	}
 	if len(incidents) > 0 {
-		webTable(w, []webColumn{{"radio_id", "Radio ID"}, {"talkgroup_id", "Talkgroup"}, {"source", "Source"}, {"last_seen", "Last seen"}}, incidents)
+		s.webTable(w, []webColumn{{"radio_id", "Radio ID"}, {"talkgroup_id", "Talkgroup"}, {"source", "Source"}, {"last_seen", "Last seen"}}, incidents)
 	} else {
 		fmt.Fprint(w, `<p class=ts-muted>No active incident in the stored observations.</p>`)
 	}
@@ -162,35 +161,25 @@ func (s *Service) webDashboard(w http.ResponseWriter, r *http.Request, session S
 	} else {
 		fmt.Fprint(w, `<p class=ts-muted>Current call allocation count unavailable here.</p>`)
 	}
-	fmt.Fprint(w, `<a class=ts-link href=/activity-status>Activity details</a></section></div>`)
-	if s.Config().Role == RoleSite {
-		fmt.Fprint(w, `<section class=ts-panel><div class=ts-panelhead><h2>Local radio readiness</h2></div>`)
-		webProperties(w, map[string]any{"state": local.State, "mode": local.Mode, "error": local.Error}, []webColumn{{"state", "Operating state"}, {"mode", "Mode"}, {"error", "Last error"}})
-		rows := []map[string]any{}
-		for _, ch := range local.Channels {
-			rows = append(rows, map[string]any{"channel": ch.Name, "role": ch.Role, "state": ch.State, "ready": ch.Ready, "busy": ch.Busy, "radio_id": ch.RID, "talkgroup_id": ch.TGID})
-		}
-		webTable(w, []webColumn{{"channel", "Channel"}, {"role", "Role"}, {"state", "State"}, {"ready", "Ready"}, {"busy", "Busy"}, {"radio_id", "Radio ID"}, {"talkgroup_id", "Talkgroup"}}, rows)
-		fmt.Fprint(w, `<a class=ts-link href=/live-status>Channel details</a></section>`)
-	} else if s.Config().Role == RoleApplication {
+	fmt.Fprint(w, `</section></div>`)
+	if s.Config().Role == RoleApplication {
 		fmt.Fprint(w, `<section class=ts-panel><div class=ts-panelhead><h2>Application readiness</h2></div><div class=ts-actions><a class=ts-link href=/connections>Controller and media connections</a><a class=ts-link href=/enrollment-status>Key enrollment</a><a class=ts-link href=/dispatch-test>Open25 Dispatch</a><a class=ts-link href=/ptt-test>Open25 PTT</a></div></section>`)
 	} else {
 		s.webDashboardSites(w)
 	}
-	fmt.Fprint(w, `<section class=ts-panel><div class=ts-panelhead><h2>Recent activity and outcomes</h2></div>`)
-	result := s.webAPI(r, session, "/api/activity", "GET", nil)
-	if result.code >= 300 {
-		webJSONResult(w, result)
+	fmt.Fprint(w, `<section class=ts-panel><div class=ts-panelhead><h2>Recent diagnostics</h2></div>`)
+	events, err := s.Store.Events(6)
+	if err != nil {
+		fmt.Fprint(w, `<p>Activity records unavailable.</p>`)
 	} else {
-		record, _ := webConfig(result.Bytes())
-		rows := webObservationRows(record["events"], []string{"at", "label", "radio_id", "site_id", "outcome", "message"})
-		if len(rows) > 6 {
-			rows = rows[:6]
-		}
-		webTable(w, []webColumn{{"at", "Time"}, {"label", "Event"}, {"site_id", "Site"}, {"outcome", "Result"}, {"message", "Message"}}, rows)
+		s.webTable(w, []webColumn{{"at", "Time"}, {"kind", "Event"}, {"message", "Message"}}, events)
 	}
-	fmt.Fprint(w, `<div class=ts-actions><a class=ts-link href=/activity-status>Activity and details</a><a class=ts-link href=/notification-delivery>Notification delivery</a></div></section>`)
-	fmt.Fprint(w, `<section class=ts-panel><div class=ts-panelhead><h2>Configuration shortcuts</h2></div><div class=ts-actions>`)
+
+	fmt.Fprint(w, `<div class=ts-actions><a class=ts-link href=/notification-delivery>Notification delivery</a></div></section>`)
+	if s.Config().Role != RoleSystem {
+		s.webHistoryDelivery(w)
+	}
+	fmt.Fprint(w, `<section class=ts-panel><div class=ts-panelhead><h2>Configuration</h2></div><div class=ts-actions>`)
 	for _, path := range adminPrimaryPages[s.Config().Role] {
 		fmt.Fprintf(w, `<a class=ts-button href="/%s">%s%s</a>`, path, adminIcon(adminIcons[path]), esc(adminLabel(s.Config().Role, path, path)))
 	}

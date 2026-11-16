@@ -2,9 +2,9 @@ package routing
 
 import (
 	"context"
-	"testing"
 	"open25.local/open25-fne/internal/dispatch"
 	"open25.local/open25-fne/internal/p25rtp"
+	"testing"
 )
 
 func TestRFReservationBindsActualIdentityForEachSourceEpoch(t *testing.T) {

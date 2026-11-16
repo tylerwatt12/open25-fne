@@ -36,7 +36,7 @@ func (s *Store) automationKey() string {
 
 func (s *Store) automationRecords() ([]automationRecord, error) {
 	var raw []byte
-	err := s.db.QueryRow("SELECT document FROM framework_documents WHERE name=?", s.automationKey()).Scan(&raw)
+	err := s.readDB.QueryRow("SELECT document FROM framework_documents WHERE name=?", s.automationKey()).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return []automationRecord{}, nil
 	}

@@ -10,12 +10,22 @@ import (
 
 func activityOpen(t *testing.T) *Store {
 	t.Helper()
-	s, err := Open(filepath.Join(t.TempDir(), "activity.db"))
+	s, err := OpenArchive(filepath.Join(t.TempDir(), "activity.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	waitActivityReady(t, s)
 	return s
+}
+
+func waitActivityReady(t *testing.T, s *Store) {
+	t.Helper()
+	ready, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Flush(ready); err != nil {
+		t.Fatal(err)
+	}
 }
 func event(id, kind, site string, at time.Time) Event {
 	return Event{ID: id, Origin: "site:" + site, SiteID: site, At: at, Type: kind, Label: kind, Message: "Observed radio activity", Audience: "dispatcher", Severity: "info", RadioID: 10001, TalkgroupID: 1001, SourceKind: "subscriber"}
@@ -24,7 +34,7 @@ func event(id, kind, site string, at time.Time) Event {
 func TestActivityDuplicateUploadDoesNotRewriteOriginalObservation(t *testing.T) {
 	s := activityOpen(t)
 	e := event("event-1", "affiliation", "site-1", time.Now().Add(-time.Minute))
-	if err := s.Append(e); err != nil {
+	if err := s.Append(context.Background(), e); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := s.Events(Query{})
@@ -34,7 +44,7 @@ func TestActivityDuplicateUploadDoesNotRewriteOriginalObservation(t *testing.T) 
 	first := rows[0]
 	e.Message = "Retry must not replace original"
 	e.TalkgroupID = 1002
-	if err = s.Append(e); err != nil {
+	if err = s.Append(context.Background(), e); err != nil {
 		t.Fatal(err)
 	}
 	rows, err = s.Events(Query{})
@@ -44,10 +54,7 @@ func TestActivityDuplicateUploadDoesNotRewriteOriginalObservation(t *testing.T) 
 	if rows[0].Message != first.Message || !rows[0].ReceivedAt.Equal(first.ReceivedAt) {
 		t.Fatal("retry rewrote the accepted event")
 	}
-	presence, err := s.Presence()
-	if err != nil || len(presence) != 1 || presence[0].AffiliatedTalkgroup != 1001 {
-		t.Fatal("duplicate altered presence")
-	}
+
 }
 
 func TestActivityPendingSurvivesRestartUntilAcknowledged(t *testing.T) {
@@ -57,11 +64,12 @@ func TestActivityPendingSurvivesRestartUntilAcknowledged(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range []string{"event-1", "event-2", "event-3"} {
-		if err = s.Append(event(id, "status", "site-1", time.Now())); err != nil {
-			t.Fatal(err)
+		if !s.Enqueue(event(id, "status", "site-1", time.Now())) {
+			t.Fatal("source capture rejected")
 		}
 	}
-	if err = s.Acknowledge([]string{"event-2"}); err != nil {
+	waitActivityReady(t, s)
+	if err = s.Acknowledge(context.Background(), []string{"event-2"}); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.Close(); err != nil {
@@ -72,7 +80,8 @@ func TestActivityPendingSurvivesRestartUntilAcknowledged(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	pending, err := s.Pending(256)
+	waitActivityReady(t, s)
+	pending, err := s.Pending(context.Background(), 256)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,16 +95,15 @@ func TestActivityPendingSurvivesRestartUntilAcknowledged(t *testing.T) {
 	if !seen["event-1"] || !seen["event-3"] || seen["event-2"] {
 		t.Fatal("wrong retry set")
 	}
-	if err = s.Acknowledge([]string{"event-1", "event-3", "event-1"}); err != nil {
+	if err = s.Acknowledge(context.Background(), []string{"event-1", "event-3", "event-1"}); err != nil {
 		t.Fatal(err)
 	}
-	pending, err = s.Pending(256)
+	pending, err = s.Pending(context.Background(), 256)
 	if err != nil || len(pending) != 0 {
 		t.Fatal("acknowledged events retried")
 	}
-	rows, err := s.Events(Query{})
-	if err != nil || len(rows) != 3 {
-		t.Fatal("acknowledgement removed central history")
+	if health := s.IngestionHealth(); health.OutboxPending != 0 || health.OldestPendingAt != nil {
+		t.Fatal("durably acknowledged outbox rows remained", health)
 	}
 }
 
@@ -105,14 +113,14 @@ func TestActivityOneCallKeepsIndependentSiteLegs(t *testing.T) {
 	for _, site := range []string{"site-1", "site-2"} {
 		e := event("start-"+site, "call_start", site, start)
 		e.CallID = "call-1"
-		if err := s.Append(e); err != nil {
+		if err := s.Append(context.Background(), e); err != nil {
 			t.Fatal(err)
 		}
 	}
 	end := event("end-site-1", "call_end", "site-1", start.Add(time.Second))
 	end.CallID = "call-1"
 	end.Outcome = "completed"
-	if err := s.Append(end); err != nil {
+	if err := s.Append(context.Background(), end); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := s.Calls()
@@ -137,47 +145,18 @@ func TestActivityOneCallKeepsIndependentSiteLegs(t *testing.T) {
 	}
 }
 
-func TestActivityLateUploadCannotRegressPresence(t *testing.T) {
-	s := activityOpen(t)
-	now := time.Now()
-	newer := event("new-affiliation", "affiliation", "site-1", now)
-	newer.TalkgroupID = 1002
-	if err := s.Append(newer); err != nil {
-		t.Fatal(err)
-	}
-	older := event("old-affiliation", "affiliation", "site-1", now.Add(-time.Hour))
-	if err := s.Append(older); err != nil {
-		t.Fatal(err)
-	}
-	rows, err := s.Presence()
-	if err != nil || len(rows) != 1 {
-		t.Fatal(err)
-	}
-	if rows[0].AffiliatedTalkgroup != 1002 || !rows[0].LastSeen.Equal(now) {
-		t.Fatal("a reconnect upload replaced current presence with an older affiliation")
-	}
-	oldOff := event("old-deregistration", "deregistration", "site-1", now.Add(-time.Minute))
-	if err = s.Append(oldOff); err != nil {
-		t.Fatal(err)
-	}
-	rows, _ = s.Presence()
-	if !rows[0].Registered {
-		t.Fatal("old deregistration cleared current registration")
-	}
-}
-
 func TestActivityCallEndBeforeStartDoesNotLeavePhantomActiveCall(t *testing.T) {
 	s := activityOpen(t)
 	now := time.Now()
 	end := event("call-end", "call_end", "site-1", now)
 	end.CallID = "reordered-call"
 	end.Outcome = "completed"
-	if err := s.Append(end); err != nil {
+	if err := s.Append(context.Background(), end); err != nil {
 		t.Fatal(err)
 	}
 	start := event("call-start", "call_start", "site-1", now.Add(-5*time.Second))
 	start.CallID = end.CallID
-	if err := s.Append(start); err != nil {
+	if err := s.Append(context.Background(), start); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := s.Calls()
@@ -197,7 +176,7 @@ func TestActivityRestrictedQueryContainsOnlyPermittedOperatorEvents(t *testing.T
 	records[2].Audience = "diagnostic"
 	records[3].Audience = "security"
 	for _, e := range records {
-		if err := s.Append(e); err != nil {
+		if err := s.Append(context.Background(), e); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -217,6 +196,7 @@ func TestActivityQueueDrainsOnCloseAndRejectsNewEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitActivityReady(t, s)
 	for i := 0; i < 128; i++ {
 		if !s.Enqueue(event(NewID(), "status", "site-1", time.Now())) {
 			t.Fatal("normal queue unexpectedly rejected observation")
@@ -233,9 +213,9 @@ func TestActivityQueueDrainsOnCloseAndRejectsNewEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	rows, err := s.Events(Query{Limit: 1000})
-	if err != nil || len(rows) != 128 {
-		t.Fatalf("accepted observations lost during close: %d %v", len(rows), err)
+	waitActivityReady(t, s)
+	if health := s.IngestionHealth(); health.OutboxPending != 128 {
+		t.Fatalf("accepted observations lost during close: %+v", health)
 	}
 }
 

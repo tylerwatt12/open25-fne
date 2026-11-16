@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
+
+	"modernc.org/sqlite"
 
 	"open25.local/open25-fne/internal/activity"
 	"open25.local/open25-fne/internal/framework"
@@ -22,6 +25,13 @@ func main() {
 	}
 }
 func run(args []string) error {
+	if runtime.GOOS == "linux" {
+		// Sync data and recovery metadata without forcing timestamp-only journal
+		// updates. SQLite FULL durability and every database owner stay intact.
+		if _, err := sqlite.Fdatasync(true); err != nil {
+			return fmt.Errorf("enable SQLite fdatasync: %w", err)
+		}
+	}
 	if len(args) == 0 {
 		return errors.New("use init, system, zone, site, application, enroll-site, enroll-application, or radio")
 	}

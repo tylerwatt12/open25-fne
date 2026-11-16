@@ -8,6 +8,28 @@ import (
 	"strings"
 )
 
+func webDecimalWidth(key string) int {
+	return map[string]int{"talkgroups": 5, "transmit_talkgroups": 5, "affiliation_radio_ids": 8, "transmit_radio_ids": 8, "tgid": 5, "talkgroup_id": 5, "talkgroup": 5, "affiliated_talkgroup": 5, "selected_talkgroup": 5, "profile.selected_talkgroup": 5, "rid": 8, "radio_id": 8, "source_radio_id": 8, "target_radio_id": 8}[key]
+}
+
+func webDecimalText(key, text string) string {
+	width := webDecimalWidth(key)
+	n, ok := new(big.Int).SetString(text, 10)
+	if width == 0 || !ok {
+		return text
+	}
+	sign := ""
+	if n.Sign() < 0 {
+		sign = "-"
+		n.Abs(n)
+	}
+	text = n.String()
+	if len(text) < width {
+		text = strings.Repeat("0", width-len(text)) + text
+	}
+	return sign + text
+}
+
 // Width pads a representation; it never limits or changes the saved identity.
 func webHexWidth(field webField) int {
 	if field.Kind != "number" && field.Kind != "select-number" {
@@ -34,7 +56,7 @@ func webHexText(text string, width int) string {
 }
 
 func webNumberPair(w io.Writer, field webField, value any, submitted url.Values) {
-	decimal := webText(value)
+	decimal := webDecimalText(field.Name, webText(value))
 	hex := webHexText(decimal, webHexWidth(field))
 	base := "decimal"
 	if submitted != nil {
@@ -44,5 +66,5 @@ func webNumberPair(w io.Writer, field webField, value any, submitted url.Values)
 			base = "hex"
 		}
 	}
-	fmt.Fprintf(w, `<div class=ts-numberpair data-hex-width=%d><input type=hidden data-number-source name="%s__base" value="%s"><label for="f-%s">Decimal<input id="f-%s" type=number step=1 data-number-decimal name="%s" value="%s"></label><label for="h-%s">Hexadecimal<input id="h-%s" type=text spellcheck=false data-number-hex data-hex-width=%d name="%s__hex" value="%s"></label></div>`, webHexWidth(field), esc(field.Name), base, esc(field.Name), esc(field.Name), esc(field.Name), esc(decimal), esc(field.Name), esc(field.Name), webHexWidth(field), esc(field.Name), esc(hex))
+	fmt.Fprintf(w, `<div class=ts-numberpair data-hex-width=%d data-decimal-width=%d><input type=hidden data-number-source name="%s__base" value="%s"><label for="f-%s">Decimal<input id="f-%s" type=number step=1 data-number-decimal name="%s" value="%s"></label><label for="h-%s">Hexadecimal<input id="h-%s" type=text spellcheck=false data-number-hex data-hex-width=%d name="%s__hex" value="%s"></label></div>`, webHexWidth(field), webDecimalWidth(field.Name), esc(field.Name), base, esc(field.Name), esc(field.Name), esc(field.Name), esc(decimal), esc(field.Name), esc(field.Name), webHexWidth(field), esc(field.Name), esc(hex))
 }

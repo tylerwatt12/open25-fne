@@ -88,9 +88,15 @@ func (s *Service) webAdmin(w http.ResponseWriter, r *http.Request, session Sessi
 		s.webDirectoryPage(w, r, session, path)
 		return true
 	case "history":
+		if role != RoleSystem {
+			return false
+		}
 		s.webHistoryPage(w, r, session)
 		return true
 	case "history-settings":
+		if role != RoleSystem {
+			return false
+		}
 		s.webHistorySettings(w, r, session)
 		return true
 	case "topology":
@@ -105,14 +111,28 @@ func (s *Service) webAdmin(w http.ResponseWriter, r *http.Request, session Sessi
 		s.webDashboard(w, r, session)
 		return true
 	case "connections":
+		if role == RoleSite {
+			s.webSiteStatus(w, r, session)
+			return true
+		}
 		s.webLocalStatus(w, r, session, false)
 		return true
 	case "activity-status":
+		if role == RoleSystem {
+			return false
+		}
 		s.webActivityStatus(w, r, session)
 		return true
+
 	case "planned":
-		s.webHeader(w, r, "Planned Capabilities", session, false)
+		s.webHeader(w, r, "Planned features", session, false)
 		defer webFooter(w)
+		webSitePanel(w, "Infrastructure alarms", "")
+		fmt.Fprint(w, `<div class=table-wrap><table class=record-table><thead><tr><th>Feature</th><th>Implementation</th></tr></thead><tbody>`)
+		for _, link := range []adminLink{{"alarms", "Current alarms"}, {"alarm-history", "Alarm history"}, {"alarm-settings", "Alarm settings"}, {"notification-rules", "Notification rules"}, {"alarm-actions", "Alarm acknowledgment"}} {
+			fmt.Fprintf(w, `<tr><td><a href="/%s">%s</a></td><td>Planned</td></tr>`, link.Path, link.Label)
+		}
+		fmt.Fprint(w, `</tbody></table></div></section>`)
 		webFeatureCoverage(w)
 		return true
 	case "zone-status":
@@ -147,7 +167,7 @@ func (s *Service) webAdmin(w http.ResponseWriter, r *http.Request, session Sessi
 			return false
 		}
 		if role == RoleSite {
-			s.webLocalStatus(w, r, session, true)
+			s.webSiteStatus(w, r, session)
 		} else {
 			s.webSiteReports(w, r, session)
 		}
@@ -155,6 +175,10 @@ func (s *Service) webAdmin(w http.ResponseWriter, r *http.Request, session Sessi
 	case "modem-status":
 		if role != RoleSite && role != RoleZone && role != RoleSystem {
 			return false
+		}
+		if role == RoleSite {
+			http.Redirect(w, r, "/hardware", http.StatusSeeOther)
+			return true
 		}
 		s.webModemStatus(w, r, session)
 		return true
@@ -189,7 +213,11 @@ func (s *Service) webAdmin(w http.ResponseWriter, r *http.Request, session Sessi
 		}
 		fmt.Fprint(w, "<form method=post>")
 		webHidden(w, session.CSRF)
-		webFields(w, fields, record)
+		var submitted url.Values
+		if r.Method == http.MethodPost {
+			submitted = r.PostForm
+		}
+		s.adminEditorFields(w, "radio-commands", fields, record, submitted)
 		fmt.Fprint(w, "<p><button>Send command</button></p></form>")
 		fmt.Fprint(w, "<p><a href=/command-results>Command results</a></p>")
 		return true
@@ -203,29 +231,17 @@ func (s *Service) webAdmin(w http.ResponseWriter, r *http.Request, session Sessi
 		webLoaded(w)
 		s.webCommandResults(w, r, session)
 		return true
+	case "parent-zone":
+		if role != RoleSite {
+			return false
+		}
+		s.webParentLink(w, r, session)
+		return true
 	case "radio-operation":
 		if role != RoleSite {
 			return false
 		}
-		s.webHeader(w, r, "Radio Operation", session, false)
-		defer webFooter(w)
-		if r.Method == "POST" {
-			action := r.FormValue("action")
-			if action == "start" || action == "stop" {
-				webJSONResult(w, s.webAPI(r, session, "/api/radio/"+action, "POST", map[string]string{"channel_id": r.FormValue("channel_id")}))
-			} else if action == "switch-control" {
-				webJSONResult(w, s.webAPI(r, session, "/api/radio/switch-control", "POST", map[string]string{"channel_id": r.FormValue("target_channel_id")}))
-			}
-		}
-		status := s.radioStatus()
-		webControlObservations(w, status)
-		fmt.Fprint(w, "<h3>Start or stop</h3>")
-		fmt.Fprint(w, "<form method=post>")
-		webHidden(w, session.CSRF)
-		s.adminEditorFields(w, "radio-operation", []webField{{Name: "channel_id", Label: "Channel record ID", Kind: "text", Help: "Leave empty to apply the operation to all channels."}}, map[string]any{"channel_id": r.FormValue("channel_id")})
-		fmt.Fprint(w, "<p><button name=action value=start>Start</button> <button name=action value=stop>Stop</button></p></form>")
-		s.webControlSwitchForm(w, r, session)
-		fmt.Fprint(w, "<p><a href=/live-status>Local radio status</a> · <a href=/hardware>Radio hardware</a> · <a href=/control-policy>Control channel policy</a></p>")
+		s.webSiteOperation(w, r, session)
 		return true
 	case "c4fm-test":
 		if role != RoleSite {
@@ -283,6 +299,13 @@ func (s *Service) webSingleForm(w http.ResponseWriter, r *http.Request, session 
 }
 
 func webDataField(w io.Writer, key string, value any) {
+	if (key == "radio_id" || key == "talkgroup_id") && webText(value) == "0" {
+		return
+	}
+	if _, ok := value.([]any); ok && webDecimalWidth(key) > 0 {
+		fmt.Fprintf(w, `<span class=ts-numeric>%s</span>`, esc(webUnitText(key, value)))
+		return
+	}
 	if _, places := webUnit(key); places != 0 && value != nil {
 		fmt.Fprint(w, esc(webUnitText(key, value)))
 		return
@@ -298,7 +321,7 @@ func webDataField(w io.Writer, key string, value any) {
 	}
 	if width := webHexWidth(webField{Name: identifier, Kind: "number"}); numeric && width > 0 {
 		if notation := webHexText(webText(value), width); notation != "" {
-			fmt.Fprintf(w, "%s / %s hex", esc(webText(value)), esc(notation))
+			fmt.Fprintf(w, `<span class=ts-numeric>%s / %s hex</span>`, esc(webDecimalText(identifier, webText(value))), esc(notation))
 			return
 		}
 	}
@@ -322,7 +345,7 @@ func webLabel(key string) string {
 		}
 	}
 	words := strings.Split(key, "_")
-	names := map[string]string{"id": "ID", "ids": "IDs", "rid": "Radio ID", "tgid": "Talkgroup ID", "rfss": "RFSS", "nac": "NAC", "wacn": "WACN", "url": "URL", "urls": "URLs", "rx": "RX", "tx": "TX", "rf": "RF", "hz": "Hz", "api": "API", "ptt": "PTT", "p25": "P25", "baud": "Serial Rate", "wpm": "Morse Speed"}
+	names := map[string]string{"id": "ID", "ids": "IDs", "rid": "Radio ID", "tgid": "Talkgroup ID", "rfss": "RFSS", "nac": "NAC", "wacn": "WACN", "url": "URL", "urls": "URLs", "rx": "RX", "tx": "TX", "rf": "RF", "hz": "Hz", "api": "API", "ptt": "PTT", "p25": "P25", "baud": "Serial Rate"}
 	for i, word := range words {
 		if label, ok := names[word]; ok {
 			words[i] = label
@@ -390,6 +413,9 @@ func (s *Service) webDirectoryPage(w http.ResponseWriter, r *http.Request, sessi
 		if encoded := r.PostForm.Get("record"); encoded != "" {
 			record, err = webConfig([]byte(encoded))
 		}
+		if selected && adminInternalRecord(kind) {
+			record["id"] = resource
+		}
 		target, method := api, "POST"
 		if selected {
 			target += "/" + url.PathEscape(resource)
@@ -414,7 +440,16 @@ func (s *Service) webDirectoryPage(w http.ResponseWriter, r *http.Request, sessi
 				}
 				record["profile"] = profile
 			} else if err == nil {
-				err = webReadFields(r, fields, record)
+				saveFields := append([]webField(nil), fields...)
+				for i := range saveFields {
+					if adminManagedID(kind, saveFields[i].Name) {
+						saveFields[i].Kind = "internal"
+					}
+				}
+				err = webReadFields(r, saveFields, record)
+				if err == nil && adminInternalRecord(kind) && !selected && webText(record["id"]) == "" {
+					record["id"] = webNewRecord(kind)["id"]
+				}
 				if kind == "keys" && r.FormValue("material") == "" {
 					delete(record, "material")
 				}
@@ -572,26 +607,84 @@ func webReadProfile(input, profile map[string]any) error {
 }
 
 func (s *Service) webHistorySettings(w http.ResponseWriter, r *http.Request, session Session) {
-	settings := s.webAPI(r, session, "/api/history/settings", "GET", nil)
-	if settings.code >= 300 {
-		s.webHeader(w, r, "History Storage", session, false)
-		defer webFooter(w)
-		webJSONResult(w, settings)
-		return
+	fields := []webField{{Name: "retention_days", Label: "Retention (days)", Kind: "number"}, {Name: "max_events", Label: "Maximum events", Kind: "number"}, {Name: "max_calls", Label: "Maximum calls", Kind: "number"}, {Name: "max_locations", Label: "Maximum location reports", Kind: "number"}, {Name: "location_stale_seconds", Label: "Location becomes stale after (seconds)", Kind: "number"}}
+	var result *webResult
+	record := map[string]any{}
+	if r.Method == http.MethodPost {
+		if r.FormValue("action") == "cleanup" {
+			result = s.webAPI(r, session, "/api/history/cleanup", http.MethodPost, map[string]any{})
+			if result.code < 300 {
+				http.Redirect(w, r, r.URL.Path+"?cleanup=1", http.StatusSeeOther)
+				return
+			}
+		} else if err := webReadFields(r, fields, record); err != nil {
+			s.webHeader(w, r, "History Storage", session, false)
+			defer webFooter(w)
+			webError(w, err)
+			s.webForm(w, session, "history-settings", fields, record, r.PostForm)
+			return
+		} else {
+			result = s.webAPI(r, session, "/api/history/settings", http.MethodPut, record)
+			if result.code < 300 {
+				http.Redirect(w, r, r.URL.Path+"?saved=1", http.StatusSeeOther)
+				return
+			}
+		}
 	}
-	status, err := webConfig(settings.Bytes())
-	if err != nil {
-		s.webHeader(w, r, "History Storage", session, false)
-		defer webFooter(w)
+	s.webHeader(w, r, "History Storage", session, false)
+	defer webFooter(w)
+	if result != nil {
+		webJSONResult(w, result)
+	}
+	if r.Method == http.MethodGet && r.URL.Query().Has("saved") {
+		fmt.Fprint(w, "<p role=status>Settings saved. Cleanup runs in the background.</p>")
+	}
+	if r.Method == http.MethodGet && r.URL.Query().Has("cleanup") {
+		fmt.Fprint(w, "<p role=status>Cleanup queued.</p>")
+	}
+	if err := s.activity.InitializationError(); err != nil {
 		webError(w, err)
 		return
 	}
-	record, _ := status["settings"].(map[string]any)
-	if record == nil {
-		record = map[string]any{}
+	cleanup := s.activity.CleanupStatus()
+	state := "Not run"
+	if cleanup.LastCompletedAt != nil {
+		state = "Completed"
 	}
-	fields := []webField{{Name: "retention_days", Label: "Retention (days)", Kind: "number"}, {Name: "max_events", Label: "Maximum events", Kind: "number"}, {Name: "max_calls", Label: "Maximum calls", Kind: "number"}, {Name: "max_locations", Label: "Maximum location reports", Kind: "number"}, {Name: "location_stale_seconds", Label: "Location becomes stale after (seconds)", Kind: "number"}}
-	s.webSingleForm(w, r, session, "History Storage", fields, record, "/api/history/settings", "PUT")
+	if cleanup.LastError != "" {
+		state = "Failed"
+	}
+	if cleanup.Pending {
+		state = "Queued"
+	}
+	if cleanup.Running {
+		state = "Running"
+	}
+	fmt.Fprint(w, "<section><h3>Background cleanup</h3>")
+	webProperties(w, map[string]any{"state": state, "last_completed_at": cleanup.LastCompletedAt, "last_error": cleanup.LastError}, []webColumn{{"state", "Status"}, {"last_completed_at", "Last completed"}, {"last_error", "Last error"}})
+	fmt.Fprint(w, "<div class=ts-actions><form method=post>")
+	webHidden(w, session.CSRF)
+	fmt.Fprint(w, "<button name=action value=cleanup>Clean up now</button></form></div></section>")
+	if len(record) == 0 {
+		settings := s.webAPI(r, session, "/api/history/settings", http.MethodGet, nil)
+		if settings.code >= 300 {
+			webJSONResult(w, settings)
+			return
+		}
+		status, err := webConfig(settings.Bytes())
+		if err != nil {
+			webError(w, err)
+			return
+		}
+		record, _ = status["settings"].(map[string]any)
+	}
+	fmt.Fprint(w, "<section>")
+	var submitted url.Values
+	if r.Method == http.MethodPost && r.FormValue("action") != "cleanup" {
+		submitted = r.PostForm
+	}
+	s.webForm(w, session, "history-settings", fields, record, submitted)
+	fmt.Fprint(w, "</section>")
 }
 
 func (s *Service) webHistoryPage(w http.ResponseWriter, r *http.Request, session Session) {
@@ -617,7 +710,8 @@ func (s *Service) webHistoryPage(w http.ResponseWriter, r *http.Request, session
 		filters["record"] = kind
 	}
 	fmt.Fprint(w, "<nav class=ts-editor-nav aria-label=\"History records\">")
-	for _, tab := range []struct{ Key, Label string }{{"events", "Events"}, {"calls", "Calls"}, {"locations", "Location reports"}, {"statistics", "Statistics"}} {
+	tabs := []struct{ Key, Label string }{{"events", "Events"}, {"calls", "Calls"}, {"locations", "Location reports"}, {"statistics", "Statistics"}}
+	for _, tab := range tabs {
 		current := ""
 		if kind == tab.Key {
 			current = " aria-current=page"
@@ -626,18 +720,20 @@ func (s *Service) webHistoryPage(w http.ResponseWriter, r *http.Request, session
 	}
 	fmt.Fprintf(w, "</nav><form class=history-filters method=get><input type=hidden name=record value=\"%s\">", esc(kind))
 	s.adminEditorFields(w, "history", queryFields, filters)
-	fmt.Fprint(w, "<p><button>Read records</button></p></form>")
+	fmt.Fprint(w, "<p><button>Search</button></p></form>")
 	if kind == "events" || kind == "calls" || kind == "locations" || kind == "statistics" {
 		api := "/api/history/" + kind
 		page := s.webAPI(r, session, api+"?"+query.Encode(), "GET", nil)
 		webLoaded(w)
 		webHistoryResults(w, r, kind, page)
-		csv := url.Values{}
-		for name, values := range query {
-			csv[name] = values
+		if kind != "statistics" {
+			csv := url.Values{}
+			for name, values := range query {
+				csv[name] = values
+			}
+			csv.Set("format", "csv")
+			fmt.Fprintf(w, "<p><a href=\"%s?%s\">Download CSV</a></p>", api, esc(csv.Encode()))
 		}
-		csv.Set("format", "csv")
-		fmt.Fprintf(w, "<p><a href=\"%s?%s\">Download CSV</a></p>", api, esc(csv.Encode()))
 		var data map[string]any
 		_ = json.Unmarshal(page.Bytes(), &data)
 		if cursor := webText(data["next_cursor"]); cursor != "" {
@@ -652,7 +748,7 @@ func (s *Service) webHistoryPage(w http.ResponseWriter, r *http.Request, session
 		webJSONResult(w, settings)
 	} else {
 		status, _ := webConfig(settings.Bytes())
-		webProperties(w, status, []webColumn{{"events", "Stored events"}, {"calls", "Stored calls"}, {"locations", "Stored location reports"}, {"pending_upload", "Awaiting upload"}, {"pruned_unuploaded", "Removed before upload"}})
+		webProperties(w, status, []webColumn{{"events", "Stored events"}, {"calls", "Stored calls"}, {"locations", "Stored location reports"}})
 		fmt.Fprint(w, "<h3>Capture observations</h3>")
 		webProperties(w, status["ingestion"], []webColumn{{"started_at", "Counters started"}, {"queue_depth", "Queued records"}, {"queue_capacity", "Queue capacity"}, {"queue_dropped", "Dropped records"}, {"rejected_observations", "Rejected observations"}, {"write_failures", "Write failures"}, {"maintenance_failures", "Maintenance failures"}, {"last_write_success_at", "Last successful write"}})
 	}

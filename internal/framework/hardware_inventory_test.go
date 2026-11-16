@@ -12,7 +12,7 @@ import (
 )
 
 func hardwareReportFixture(now time.Time, siteID, hostID string) SiteHardwareReport {
-	report := SiteHardwareReport{SiteID: siteID, HostID: hostID, Hostname: "display-hostname", BootID: "boot-a", ControllerPID: 101, ControllerStartID: "start-controller", ObservedAt: now, ReceivedAt: now, Modems: []HardwareModemAssignment{{ID: "modem-a", Name: "Assigned modem", Device: "/dev/serial/by-id/assigned", Channels: []HardwareChannelAssignment{{ID: "channel-a", Name: "Voice promoted to control", Role: "voice", RuntimeRole: "control", Enabled: true, State: "running", PID: 202, StartID: "start-worker", Ready: true}}}}}
+	report := SiteHardwareReport{SiteID: siteID, HostID: hostID, Hostname: "display-hostname", BootID: "boot-a", ControllerPID: 101, ControllerStartID: "start-controller", ObservedAt: now, ReceivedAt: now, Modems: []HardwareModemAssignment{{ID: "modem-a", Name: "Assigned modem", Device: "/dev/serial/by-id/assigned", Channels: []HardwareChannelAssignment{{ID: "channel-a", Name: "Voice promoted to control", RuntimeRole: "control", Enabled: true, State: "running", PID: 202, StartID: "start-worker", Ready: true}}}}}
 	report.Workers = []HardwareWorkerObservation{{ModemID: "modem-a", Device: report.Modems[0].Device, HardwareChannelAssignment: report.Modems[0].Channels[0]}}
 	return report
 }
@@ -26,7 +26,7 @@ func TestHardwareInventorySeparatesAssignmentsFromObservedOwners(t *testing.T) {
 		t.Fatalf("wrong inventory projection: %+v", got)
 	}
 	assignment := got.Devices[0].Assignments[0]
-	if assignment.SiteID != "site-2" || assignment.Role != "voice" || assignment.RuntimeRole != "control" || assignment.Local || assignment.Stale || !assignment.Ready {
+	if assignment.SiteID != "site-2" || assignment.RuntimeRole != "control" || assignment.Local || assignment.Stale || !assignment.Ready {
 		t.Fatalf("configuration and actual role became mixed: %+v", assignment)
 	}
 	owners := got.Devices[0].Owners
@@ -113,21 +113,21 @@ func TestHardwareReportsRelayOnlyNarrowSameHostAssignments(t *testing.T) {
 	if err := zone.writeCache("site_reports", reports); err != nil {
 		t.Fatal(err)
 	}
-	if got := zone.hardwareReportsForSite("site-1"); len(got) != 1 || got[0].SiteID != "site-1" {
+	if got := hardwareReportsForSite(zone.siteReports(), "site-1"); len(got) != 1 || got[0].SiteID != "site-1" {
 		t.Fatalf("different host leaked into local inventory: %+v", got)
 	}
 	first.HostID = ""
 	if err := zone.writeCache("site_reports", reports); err != nil {
 		t.Fatal(err)
 	}
-	if got := zone.hardwareReportsForSite("site-1"); len(got) != 0 {
+	if got := hardwareReportsForSite(zone.siteReports(), "site-1"); len(got) != 0 {
 		t.Fatalf("unknown host was guessed from hostname: %+v", got)
 	}
 }
 
 func TestOwnHardwareReportRetainsConfiguredRoleAndActualRecovery(t *testing.T) {
 	c := integrationNewCluster(t)
-	site := SiteConfig{ID: "site-1", Modems: []Modem{{ID: "modem-a", Device: "/dev/serial/by-id/a"}, {ID: "unassigned", Device: "/dev/serial/by-id/missing"}}, Channels: []Channel{{ID: "channel-a", Name: "Alternate", ModemID: "modem-a", Role: "voice", Enabled: true}}}
+	site := SiteConfig{ID: "site-1", Modems: []Modem{{ID: "modem-a", Device: "/dev/serial/by-id/a"}, {ID: "unassigned", Device: "/dev/serial/by-id/missing"}}, Channels: []Channel{{ID: "channel-a", Name: "Alternate", ModemID: "modem-a", Enabled: true}}}
 	next := time.Now().Add(time.Second).UTC()
 	status := radio.Status{Channels: []radio.ChannelStatus{{ID: "channel-a", ModemID: "modem-a", Device: "/dev/serial/by-id/a", Role: "control", State: "retrying", Error: "Actual modem result", RecoveryWanted: true, RecoveryAt: next}}}
 	got := c.site.service.ownHardwareReport(site, status)
@@ -135,15 +135,15 @@ func TestOwnHardwareReportRetainsConfiguredRoleAndActualRecovery(t *testing.T) {
 		t.Fatalf("unassigned modem was hidden: %+v", got)
 	}
 	channel := got.Modems[0].Channels[0]
-	if channel.Role != "voice" || channel.RuntimeRole != "control" || channel.State != "retrying" || channel.Error != "Actual modem result" || !channel.RecoveryWanted || !channel.RecoveryAt.Equal(next) {
+	if channel.RuntimeRole != "control" || channel.State != "retrying" || channel.Error != "Actual modem result" || !channel.RecoveryWanted || !channel.RecoveryAt.Equal(next) {
 		t.Fatalf("configured and observed settings were mixed: %+v", channel)
 	}
 }
 
 func TestHardwareInventoryKeepsLiveWorkersSeparateAfterSavedBindingChanges(t *testing.T) {
 	c := integrationNewCluster(t)
-	site := SiteConfig{ID: "site-1", Modems: []Modem{{ID: "modem-new", Device: "/dev/serial/by-id/new"}}, Channels: []Channel{{ID: "channel-a", ModemID: "modem-new", Role: "voice", Enabled: true}}}
-	status := radio.Status{Channels: []radio.ChannelStatus{{ID: "channel-a", Name: "Actual old worker", ModemID: "modem-old", Device: "/dev/serial/by-id/old", Role: "control", ConfiguredRole: "control", State: "running", Ready: true, PID: 202}}}
+	site := SiteConfig{ID: "site-1", Modems: []Modem{{ID: "modem-new", Device: "/dev/serial/by-id/new"}}, Channels: []Channel{{ID: "channel-a", ModemID: "modem-new", Enabled: true}}}
+	status := radio.Status{Channels: []radio.ChannelStatus{{ID: "channel-a", Name: "Actual old worker", ModemID: "modem-old", Device: "/dev/serial/by-id/old", Role: "control", State: "running", Ready: true, PID: 202}}}
 	report := c.site.service.ownHardwareReport(site, status)
 	if report.Modems[0].Channels[0].Ready || report.Modems[0].Channels[0].PID != 0 || len(report.Workers) != 1 || report.Workers[0].Device != "/dev/serial/by-id/old" {
 		t.Fatalf("saved rebinding inherited old worker readiness: %+v", report)

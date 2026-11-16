@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"open25.local/open25-fne/internal/activity"
 	"open25.local/open25-fne/internal/radio"
 )
 
@@ -391,19 +390,7 @@ func TestRFAuthorityMergeMatchesOrdinaryRegistrationAffiliationAndDeregistration
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			rfMergeTestPermutations(test.updates, func(ordered []rfAuthorityUpdate) {
-				reports := make([]SiteReport, 0, len(ordered))
-				var presence []activity.Radio
-				for _, u := range ordered {
-					reports = append(reports, SiteReport{ID: u.SiteID, ReceivedAt: u.ObservedAt, Radio: &radio.Status{Affiliations: u.Affiliations, Registrations: u.Registrations}})
-					for _, r := range u.Terminals {
-						presence = append(presence, activity.Radio{RID: r.RID, SiteID: u.SiteID, LastSeen: r.At})
-					}
-				}
-				legacy := latestAffiliationOwners(reports, presence, rfMergeTestTime(59))
-				if !reflect.DeepEqual(legacy, test.want) {
-					t.Fatalf("ordinary ownership reference = %#v, want %#v", legacy, test.want)
-				}
-				rfMergeTestOwners(t, rfMergeTestApply(t, ordered, true), legacy)
+				rfMergeTestOwners(t, rfMergeTestApply(t, ordered, true), test.want)
 			})
 		})
 	}

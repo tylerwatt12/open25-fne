@@ -4,11 +4,11 @@ package routing
 import (
 	"context"
 	"errors"
+	"open25.local/open25-fne/internal/p25crypto"
 	"slices"
 	"sort"
 	"sync"
 	"time"
-	"open25.local/open25-fne/internal/p25crypto"
 
 	"open25.local/open25-fne/internal/dispatch"
 )

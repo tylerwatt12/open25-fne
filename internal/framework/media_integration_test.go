@@ -100,7 +100,12 @@ type mediaCluster struct {
 
 func newMediaCluster(t *testing.T) *mediaCluster {
 	t.Helper()
-	c := &mediaCluster{integrationCluster: integrationNewCluster(t), natives: map[string]*mediaNative{}, codecs: map[string]*mediaCodec{}, radios: map[string]*operationRadio{}}
+	return newMediaClusterFromIntegration(t, integrationNewCluster(t))
+}
+
+func newMediaClusterFromIntegration(t *testing.T, cluster *integrationCluster) *mediaCluster {
+	t.Helper()
+	c := &mediaCluster{integrationCluster: cluster, natives: map[string]*mediaNative{}, codecs: map[string]*mediaCodec{}, radios: map[string]*operationRadio{}}
 	c.dispatch.service.hub.Close()
 	// Drive catalog synchronization explicitly so the test can isolate media
 	// connection lifetimes and controller loss from background polling.
@@ -153,7 +158,7 @@ func newMediaCluster(t *testing.T) *mediaCluster {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dispatchCredentials.Peers[zoneCredentials.OutboundID] = PeerCredential{Role: RoleZone, InstanceID: "zone-1", Token: zoneCredentials.OutboundToken}
+	dispatchCredentials.Peers[zoneCredentials.OutboundID] = PeerCredential{Role: RoleZone, InstanceID: c.zone.service.Config().InstanceID, Token: zoneCredentials.OutboundToken}
 	for _, node := range []*integrationService{c.site, c.otherSite} {
 		sc, e := readCredentials(node.service.Config().CredentialFile)
 		if e != nil {
@@ -170,11 +175,11 @@ func newMediaCluster(t *testing.T) *mediaCluster {
 		if err != nil {
 			t.Fatal(err)
 		}
-		credentials.Peers[zoneCredentials.OutboundID] = PeerCredential{Role: RoleZone, InstanceID: "zone-1", Token: zoneCredentials.OutboundToken}
+		credentials.Peers[zoneCredentials.OutboundID] = PeerCredential{Role: RoleZone, InstanceID: c.zone.service.Config().InstanceID, Token: zoneCredentials.OutboundToken}
 		if err = WritePrivateJSON(s.Config().CredentialFile, credentials); err != nil {
 			t.Fatal(err)
 		}
-		runtime := &operationRadio{status: radio.Status{SiteID: s.Config().InstanceID, State: "running", Mode: "null"}}
+		runtime := &operationRadio{status: radio.Status{SiteID: s.Config().InstanceID, State: "running", Mode: "null", NAC: 659}}
 		s.radio = runtime
 		c.radios[s.Config().InstanceID] = runtime
 		native := &mediaNative{}

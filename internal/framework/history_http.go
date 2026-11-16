@@ -43,7 +43,7 @@ func (s *Service) historyPageAliases(value any) map[int]string {
 	return aliases
 }
 
-func (s *Service) historyQuery(r *http.Request, session Session) (activity.Query, error) {
+func (s *Service) historyQuery(r *http.Request) (activity.Query, error) {
 	values := r.URL.Query()
 	q := activity.Query{Context: r.Context(), Limit: 200, SiteID: values.Get("site_id"), Audience: values.Get("audience"), Type: values.Get("type"), SourceKind: values.Get("source_kind"), ChannelID: values.Get("channel_id"), CallID: values.Get("call_id"), Cursor: values.Get("cursor")}
 	for _, f := range []struct {
@@ -77,41 +77,51 @@ func (s *Service) historyQuery(r *http.Request, session Session) (activity.Query
 	if q.Audience != "" && !slices.Contains([]string{"dispatcher", "operator", "diagnostic", "security"}, q.Audience) {
 		return q, errors.New("invalid audience")
 	}
-	if s.Config().Role == RoleSite {
-		q.SiteID = s.Config().InstanceID
-	}
-	if session.UserID != "" {
-		record, ok := s.view().Users[session.UserID]
-		if !ok {
-			return q, dispatch.ErrPermission
-		}
-		user, _, err := resolveUserPosition(record.User, s.view().System, session.PositionID)
-		if err != nil {
-			return q, dispatch.ErrPermission
-		}
-		q.Restricted = true
-		q.Groups = user.Talkgroups
-		q.Audience = ""
-		if !slices.Contains(user.Permissions, "location_view") {
-			q.LocationRadioID = user.RadioID
-		}
-		if r.URL.Path == "/api/history/locations" && !slices.Contains(user.Permissions, "location_view") {
-			if q.RadioID != 0 && q.RadioID != user.RadioID {
-				return q, dispatch.ErrPermission
-			}
-			q.RadioID = user.RadioID
-		}
-	}
 	return q, nil
 }
 
 func (s *Service) historyHTTP(w http.ResponseWriter, r *http.Request, session Session) {
-	if s.Config().Role == RoleApplication && session.UserID != "" && historyReadPath(r.URL.Path) {
-		s.proxyHistoryHTTP(w, r, session)
+	if session.UserID != "" {
+		fail(w, http.StatusForbidden, dispatch.ErrPermission)
 		return
 	}
+	// Sources expose only their own cached delivery health. All historical reads
+	// and retention belong to System Administration.
+	if s.Config().Role != RoleSystem && r.URL.Path != "/api/history/health" {
+		http.NotFound(w, r)
+		return
+	}
+
 	w.Header().Set("X-History-Scope-Role", string(s.Config().Role))
 	w.Header().Set("X-History-Scope-ID", s.Config().InstanceID)
+	if r.URL.Path == "/api/history/cleanup" {
+		if session.UserID != "" {
+			fail(w, http.StatusForbidden, dispatch.ErrPermission)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if err := s.activity.InitializationError(); err != nil {
+			fail(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		if r.Method == http.MethodGet {
+			respond(w, http.StatusOK, s.activity.CleanupStatus())
+			return
+		}
+		if err := r.Context().Err(); err != nil {
+			fail(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		if err := s.activity.RequestCleanup(); err != nil {
+			fail(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		respond(w, http.StatusAccepted, map[string]any{"accepted": true, "cleanup": s.activity.CleanupStatus()})
+		return
+	}
 	if r.URL.Path == "/api/history/health" {
 		if session.UserID != "" {
 			fail(w, http.StatusForbidden, dispatch.ErrPermission)
@@ -121,12 +131,24 @@ func (s *Service) historyHTTP(w http.ResponseWriter, r *http.Request, session Se
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		respond(w, http.StatusOK, s.activity.IngestionHealth())
+		status := http.StatusOK
+		if s.activity.InitializationError() != nil {
+			status = http.StatusServiceUnavailable
+		}
+		respond(w, status, s.activity.IngestionHealth())
 		return
 	}
 	if r.URL.Path == "/api/history/settings" {
 		if session.UserID != "" {
 			fail(w, 403, dispatch.ErrPermission)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if err := s.activity.InitializationError(); err != nil {
+			fail(w, http.StatusServiceUnavailable, err)
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -145,7 +167,7 @@ func (s *Service) historyHTTP(w http.ResponseWriter, r *http.Request, session Se
 				storageFailure(err)
 				return
 			}
-			respond(w, 200, v)
+			respond(w, http.StatusOK, v)
 		case "PUT":
 			var input activity.Retention
 			if err := readJSON(w, r, &input); err != nil {
@@ -156,12 +178,7 @@ func (s *Service) historyHTTP(w http.ResponseWriter, r *http.Request, session Se
 				storageFailure(err)
 				return
 			}
-			v, err := s.activity.HistoryStatus(ctx)
-			if err != nil {
-				storageFailure(err)
-				return
-			}
-			respond(w, 200, v)
+			respond(w, http.StatusOK, map[string]any{"settings": input, "cleanup": s.activity.CleanupStatus()})
 		default:
 			w.WriteHeader(405)
 		}
@@ -175,7 +192,7 @@ func (s *Service) historyHTTP(w http.ResponseWriter, r *http.Request, session Se
 		w.WriteHeader(405)
 		return
 	}
-	q, err := s.historyQuery(r, session)
+	q, err := s.historyQuery(r)
 	if err != nil {
 		status := 400
 		if errors.Is(err, dispatch.ErrPermission) {
@@ -187,6 +204,10 @@ func (s *Service) historyHTTP(w http.ResponseWriter, r *http.Request, session Se
 	format := r.URL.Query().Get("format")
 	if format != "" && format != "csv" {
 		fail(w, 400, errors.New("format must be csv"))
+		return
+	}
+	if err := s.activity.InitializationError(); err != nil {
+		fail(w, http.StatusServiceUnavailable, err)
 		return
 	}
 	switch r.URL.Path {

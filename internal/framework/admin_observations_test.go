@@ -29,7 +29,7 @@ func TestAdminReportedStatusExposesObservationsOnly(t *testing.T) {
 		ID: zone.Sites[0].ID, Name: "Test Site", Endpoint: "http://private-native-endpoint.invalid", AdminURL: c.site.web.URL,
 		ObservedAt: observed, ReceivedAt: received,
 		Config: SiteConfig{ID: zone.Sites[0].ID, Modems: []Modem{{ID: "control", Device: "do-not-return-usb-path", Baud: 12345}}, Channels: []Channel{{ID: "control", Identifier: 99}}},
-		Radio:  &radio.Status{State: "running", Mode: "hardware", Channels: []radio.ChannelStatus{{ID: "control", Name: "Control", State: "running", Ready: true, TXHz: 443459999, RXHz: 448459999, PowerPercent: 47, RPCPort: 15999, RESTPort: 16001}}, Registrations: []radio.Registration{{RID: 10001, At: observed}}, Affiliations: []radio.Affiliation{{RID: 10001, TGID: 1001, At: observed}}},
+		Radio:  &radio.Status{State: "running", Mode: "hardware", Channels: []radio.ChannelStatus{{ID: "control", Name: "Control", State: "running", Ready: true, TXHz: 433459999, RXHz: 438459999, PowerPercent: 47, RPCPort: 15999, RESTPort: 16001}}, Registrations: []radio.Registration{{RID: 10001, At: observed}}, Affiliations: []radio.Affiliation{{RID: 10001, TGID: 1001, At: observed}}},
 	}
 	if err := s.writeCache("site_reports", []SiteReport{report}); err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestAdminReportedStatusExposesObservationsOnly(t *testing.T) {
 			t.Errorf("status missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"do-not-return-usb-path", "12345", "443459999", "448459999", "15999", "16001", "private-native-endpoint", "name=config", "name=record", "name=tx_frequency_hz", "name=material"} {
+	for _, forbidden := range []string{"do-not-return-usb-path", "12345", "433459999", "438459999", "15999", "16001", "private-native-endpoint", "name=config", "name=record", "name=tx_frequency_hz", "name=material"} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("status exposes configuration/private field %q", forbidden)
 		}
@@ -155,30 +155,40 @@ func TestAdminDirectoryParseErrorPreservesHexAndOtherEdits(t *testing.T) {
 	}
 }
 
-func TestAdminActivityStatusDoesNotExposeArbitraryEventDetails(t *testing.T) {
+func TestSourceDeliveryAndSystemHistoryDoNotExposeArbitraryEventDetails(t *testing.T) {
 	c := integrationNewCluster(t)
-	if err := c.system.service.activity.Append(activity.Event{ID: "status-projection-test", Origin: "site-1", Audience: "operator", Type: "radio_status", Message: "Observed status message", RadioID: 10001, TalkgroupID: 1001, SiteID: "site-1", SourceKind: "rf", Details: map[string]any{"future_private_field": "never-expose-arbitrary-details"}}); err != nil {
-		t.Fatal(err)
-	}
+	integrationSyncAll(t, c)
+	sourceClient := earlyWebLogin(t, c.site)
+	event := activity.Event{ID: "status-projection-test", Audience: "operator", Type: "radio_status", Message: "Observed status message", RadioID: 10001, TalkgroupID: 1001, SiteID: "site-1", SourceKind: "rf", Details: map[string]any{"future_private_field": "never-expose-arbitrary-details"}}
+	c.site.service.emit(event)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := c.system.service.activity.Flush(ctx); err != nil {
+	if err := c.site.service.activity.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	client := earlyWebLogin(t, c.system)
-	body := string(earlyWebGet(t, client, c.system.web.URL+"/activity-status", http.StatusOK))
-	if !strings.Contains(body, "Observed status message") || strings.Contains(body, "never-expose-arbitrary-details") || strings.Contains(body, "future_private_field") {
-		t.Fatal("activity status omitted the observation or exposed arbitrary details")
+	source := string(earlyWebGet(t, sourceClient, c.site.web.URL+"/activity-status", http.StatusOK))
+	for _, want := range []string{"History delivery", "Awaiting acknowledgment", "Outbox limit", "Oldest pending"} {
+		if !strings.Contains(source, want) {
+			t.Errorf("source delivery missing %q", want)
+		}
 	}
-	detail := string(earlyWebGet(t, client, c.system.web.URL+"/activity-status?kind=events&id=status-projection-test", http.StatusOK))
-	for _, want := range []string{"Selected record", "status-projection-test", "Observed status message"} {
+	for _, forbidden := range []string{"Observed status message", "status-projection-test", "future_private_field", "never-expose-arbitrary-details"} {
+		if strings.Contains(source, forbidden) {
+			t.Errorf("source status exposed an outbox payload %q", forbidden)
+		}
+	}
+	c.site.service.uploadActivity(ctx)
+	systemClient := earlyWebLogin(t, c.system)
+	earlyWebGet(t, systemClient, c.system.web.URL+"/activity-status", http.StatusNotFound)
+	detail := string(earlyWebGet(t, systemClient, c.system.web.URL+"/history?record=events&type=radio_status&id=status-projection-test", http.StatusOK))
+	for _, want := range []string{"Record details", "status-projection-test", "Observed status message"} {
 		if !strings.Contains(detail, want) {
-			t.Errorf("selected activity detail missing %q", want)
+			t.Errorf("System history omitted %q", want)
 		}
 	}
 	for _, forbidden := range []string{"View records", "never-expose-arbitrary-details", "future_private_field"} {
 		if strings.Contains(detail, forbidden) {
-			t.Errorf("selected activity detail exposes generic/private content %q", forbidden)
+			t.Errorf("System detail exposed arbitrary content %q", forbidden)
 		}
 	}
 }

@@ -23,7 +23,11 @@ func TestAdminDashboardKeepsCurrentLocationAndReadOnlyScope(t *testing.T) {
 			result := httptest.NewRecorder()
 			s.webDashboard(result, httptest.NewRequest(http.MethodGet, "/", nil), Session{Username: "administrator"})
 			body := result.Body.String()
-			for _, want := range []string{"Overview", "Administration topology", "You are here", "aria-label=Breadcrumb", "Service connections"} {
+			connectionTitle := "Service connections"
+			if s.Config().Role == RoleSite {
+				connectionTitle = "Zone connection"
+			}
+			for _, want := range []string{"Overview", "Administration topology", "You are here", "aria-label=Breadcrumb", connectionTitle} {
 				if !strings.Contains(body, want) {
 					t.Errorf("dashboard missing %q", want)
 				}
@@ -56,7 +60,7 @@ func TestAdminDashboardReportsMissingAndStaleEvidenceWithoutInventedHealth(t *te
 		t.Fatal(err)
 	}
 	observed := time.Now().Add(-time.Hour).UTC()
-	report := SiteReport{ID: zone.Sites[0].ID, ObservedAt: observed, ReceivedAt: observed.Add(time.Minute), Config: SiteConfig{Modems: []Modem{{Device: "never-return-private-usb"}}}, Radio: &radio.Status{State: "running", Error: "Recorded channel failure", Channels: []radio.ChannelStatus{{TXHz: 443459999, RPCPort: 15999}}}}
+	report := SiteReport{ID: zone.Sites[0].ID, ObservedAt: observed, ReceivedAt: observed.Add(time.Minute), Config: SiteConfig{Modems: []Modem{{Device: "never-return-private-usb"}}}, Radio: &radio.Status{State: "running", Error: "Recorded channel failure", Channels: []radio.ChannelStatus{{TXHz: 433459999, RPCPort: 15999}}}}
 	if err := s.writeCache("site_reports", []SiteReport{report}); err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +72,7 @@ func TestAdminDashboardReportsMissingAndStaleEvidenceWithoutInventedHealth(t *te
 			t.Errorf("dashboard missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{">Healthy<", ">Online<", "never-return-private-usb", "443459999", "15999"} {
+	for _, forbidden := range []string{">Healthy<", ">Online<", "never-return-private-usb", "433459999", "15999"} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("dashboard invented health or exposed configuration %q", forbidden)
 		}

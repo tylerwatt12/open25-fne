@@ -2,10 +2,10 @@ package siteaudio
 
 import (
 	"context"
-	"testing"
-	"time"
 	"open25.local/open25-fne/internal/dispatch"
 	"open25.local/open25-fne/internal/p25rtp"
+	"testing"
+	"time"
 )
 
 func TestPendingRFIdentityBindsActualMediaUntilSpurtEnds(t *testing.T) {

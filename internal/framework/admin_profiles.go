@@ -71,13 +71,25 @@ func webProfileRow(w io.Writer, f webField, token string, row map[string]any, su
 	}
 	fmt.Fprintf(w, `<div data-profile-row><input type=hidden name="%s_row" value="%s"><div class="ts-gridrow%s">`, f.Kind, esc(token), class)
 	input := func(key, label, kind string, value any) {
-		fmt.Fprintf(w, `<label>%s<input type=%s step=any name="%s%s" value="%s"></label>`, esc(label), kind, prefix, key, esc(webText(value)))
+		class := ""
+		if webDecimalWidth(key) > 0 {
+			class = "ts-numeric"
+		}
+		fmt.Fprintf(w, `<label>%s<input type=%s class="%s" step=any name="%s%s" value="%s"></label>`, esc(label), kind, class, prefix, key, esc(webText(value)))
 	}
 	if zone {
 		input("name", "Zone name", "text", row["name"])
-		input("talkgroups", "Talkgroup identities", "text", row["talkgroups"])
+		talkgroups := row["talkgroups"]
+		if !submitted {
+			talkgroups = webUnitText("talkgroups", talkgroups)
+		}
+		input("talkgroups", "Talkgroup identities", "text", talkgroups)
 	} else {
-		fmt.Fprintf(w, `<label>Talkgroup<div class=ts-relation><input type=number step=any name="%stalkgroup_id" value="%s">`, prefix, esc(webText(row["talkgroup_id"])))
+		talkgroup := webText(row["talkgroup_id"])
+		if !submitted {
+			talkgroup = webDecimalText("talkgroup_id", talkgroup)
+		}
+		fmt.Fprintf(w, `<label>Talkgroup<div class=ts-relation><input type=number class=ts-numeric step=any name="%stalkgroup_id" value="%s">`, prefix, esc(talkgroup))
 		webChooserButton(w, "talkgroups", prefix+"talkgroup_id", false)
 		fmt.Fprint(w, `</div></label>`)
 		volume := row["volume"]
@@ -113,7 +125,8 @@ func webReadProfileRows(r *http.Request, kind string) ([]any, error) {
 				if _, err := strconv.ParseInt(id, 10, 64); err != nil {
 					return nil, fmt.Errorf("could not read a Talkgroup ID as a number")
 				}
-				ids = append(ids, json.Number(id))
+				canonical, _ := webScaleDecimal(id, 0)
+				ids = append(ids, json.Number(canonical))
 			}
 			row["talkgroups"] = ids
 		} else {
@@ -131,7 +144,11 @@ func webReadProfileRows(r *http.Request, kind string) ([]any, error) {
 						}
 						text = scaled
 					}
-					value = json.Number(text)
+					canonical, err := webScaleDecimal(text, 0)
+					if err != nil {
+						return nil, err
+					}
+					value = json.Number(canonical)
 				}
 				row[name] = value
 			}

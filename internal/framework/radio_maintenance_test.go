@@ -288,7 +288,7 @@ func admissionService(t *testing.T) (*Service, *maintenanceRadio) {
 		id := "modem-voice-" + suffix
 		site.Modems = append(site.Modems, Modem{ID: id, Name: "Voice " + suffix, Device: "/offline/" + id, Baud: 115200})
 		channel := site.Channels[0]
-		channel.ID, channel.Name, channel.Role, channel.ModemID = "voice-"+suffix, "Voice "+suffix, "voice", id
+		channel.ID, channel.Name, channel.ModemID = "voice-"+suffix, "Voice "+suffix, id
 		channel.ChannelNo += i + 1
 		site.Channels = append(site.Channels, channel)
 	}
@@ -469,7 +469,7 @@ func TestRadioAdmissionConfigurationCancelsOlderAcceptedWork(t *testing.T) {
 			s, runtime := admissionService(t)
 			a, b := testAdmission(t, s, "voice-a"), testAdmission(t, s, "voice-b")
 			system := s.view().System
-			system.Callsign = "K9TEST"
+			system.SystemID = 2
 			if err := s.Store.WriteCache("system", storeDoc(t, system)); err != nil {
 				t.Fatal(err)
 			}

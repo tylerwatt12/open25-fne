@@ -66,16 +66,16 @@ func TestAdminNumberPaddingIsNotARangeRestriction(t *testing.T) {
 
 func TestAdminFailedHexKeepsSubmittedPhysicalUnits(t *testing.T) {
 	fields := []webField{{Name: "identifier", Kind: "number"}, {Name: "tx_frequency_hz", Kind: "number"}, {Name: "channel_spacing_hz", Kind: "number"}, {Name: "calibration.rx_level", Kind: "number"}}
-	values := url.Values{"identifier": {"2"}, "identifier__base": {"hex"}, "identifier__hex": {"G"}, "tx_frequency_hz": {"443.450001"}, "channel_spacing_hz": {"12.5"}, "calibration.rx_level": {"50"}}
+	values := url.Values{"identifier": {"2"}, "identifier__base": {"hex"}, "identifier__hex": {"G"}, "tx_frequency_hz": {"433.450001"}, "channel_spacing_hz": {"12.5"}, "calibration.rx_level": {"50"}}
 	r := httptest.NewRequest("POST", "/", strings.NewReader(values.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	record := map[string]any{"identifier": 2, "tx_frequency_hz": 443450000, "channel_spacing_hz": 12500, "calibration": map[string]any{"rx_level": 50}}
+	record := map[string]any{"identifier": 2, "tx_frequency_hz": 433450000, "channel_spacing_hz": 12500, "calibration": map[string]any{"rx_level": 50}}
 	if webReadFields(r, fields, record) == nil {
 		t.Fatal("partial hex should produce a parsing error")
 	}
 	var output bytes.Buffer
 	webFields(&output, fields, record, r.PostForm)
-	for _, value := range []string{`name="tx_frequency_hz" value="443.450001"`, `name="channel_spacing_hz" value="12.5"`, `name="calibration.rx_level" value="50"`, `name="identifier__hex" value="G"`} {
+	for _, value := range []string{`name="tx_frequency_hz" value="433.450001"`, `name="channel_spacing_hz" value="12.5"`, `name="calibration.rx_level" value="50"`, `name="identifier__hex" value="G"`} {
 		if !strings.Contains(output.String(), value) {
 			t.Fatal("submitted representation changed", value)
 		}

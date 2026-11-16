@@ -1,6 +1,7 @@
 package activity
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,7 +16,7 @@ func TestAllocationHistoryKeepsRejoinedDestinationOpenAfterLateOldEnd(t *testing
 		e.CallID = "one-conversation"
 		e.ChannelID = allocation + "-channel"
 		e.Details = map[string]any{"allocation_id": allocation}
-		if err := s.Append(e); err != nil {
+		if err := s.Append(context.Background(), e); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -50,73 +51,82 @@ func TestAllocationHistoryKeepsRejoinedDestinationOpenAfterLateOldEnd(t *testing
 	}
 }
 
-func TestOfflineAllocationProjectionRebuildPreservesOriginalEventsAndUploadAcknowledgments(t *testing.T) {
+func TestOfflineAllocationProjectionRebuildPreservesOriginalEvents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "activity.db")
-	s, err := Open(path)
+	s, err := OpenArchive(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitActivityReady(t, s)
 	at := time.Now().UTC().Add(-time.Minute)
-	ids := []string{}
 	for i, row := range []struct{ allocation, kind string }{{"first", "call_start"}, {"first", "call_end"}, {"second", "call_start"}, {"second", "call_end"}} {
 		id := row.allocation + "-" + row.kind
 		e := event(id, row.kind, "site-1", at.Add(time.Duration(i)*time.Second))
 		e.CallID = "original-conversation"
 		e.Details = map[string]any{"allocation_id": row.allocation}
-		if err = s.Append(e); err != nil {
+		if err = s.Append(context.Background(), e); err != nil {
 			t.Fatal(err)
 		}
-		ids = append(ids, id)
 	}
-	if err = s.Acknowledge(ids); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = s.db.Exec("DROP TABLE call_allocations"); err != nil {
+	if _, err = s.db.Exec("DELETE FROM call_allocations"); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if broken, err := Open(path); err == nil {
-		broken.Close()
-		t.Fatal("old projection opened without explicit rebuild")
+	damaged, err := OpenArchive(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitActivityReady(t, damaged)
+	var beforeRebuild int
+	if err = damaged.db.QueryRow("SELECT COUNT(*) FROM call_allocations").Scan(&beforeRebuild); err != nil || beforeRebuild != 0 {
+		t.Fatal("ordinary opening replayed allocation history", beforeRebuild, err)
+	}
+	if err = damaged.Close(); err != nil {
+		t.Fatal(err)
 	}
 	if err = RebuildHistory(path); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path)
+	reopened, err := OpenArchive(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
+	waitActivityReady(t, reopened)
 	page, err := reopened.CallHistory(Query{})
 	if err != nil || len(page.Calls) != 1 || page.Calls[0].ID != "original-conversation" || page.Calls[0].LifetimeMS == nil || *page.Calls[0].LifetimeMS != 3000 {
 		t.Fatalf("offline projection lost original allocation facts: %#v %v", page, err)
 	}
-	var originalCount, unuploaded, allocations int
-	if err = reopened.db.QueryRow("SELECT COUNT(*),SUM(uploaded=0) FROM radio_events").Scan(&originalCount, &unuploaded); err != nil || originalCount != 4 || unuploaded != 0 {
-		t.Fatal("rebuild changed original observations or acknowledgments", originalCount, unuploaded, err)
+	var originalCount, allocations int
+	if err = reopened.db.QueryRow("SELECT COUNT(*) FROM radio_events").Scan(&originalCount); err != nil || originalCount != 4 {
+		t.Fatal("rebuild changed original observations", originalCount, err)
 	}
 	if err = reopened.db.QueryRow("SELECT COUNT(*) FROM call_allocations").Scan(&allocations); err != nil || allocations != 2 {
 		t.Fatal("rebuild did not restore one-use allocations", allocations, err)
 	}
 }
 
-func TestOldDestinationProjectionRequiresExplicitOfflineRebuild(t *testing.T) {
+func TestCurrentSchemaInitializationDoesNotBackfillDerivedFacts(t *testing.T) {
 	s := activityOpen(t)
 	e := event("original", "call_start", "site-1", time.Now())
 	e.CallID = "kept-conversation"
-	if err := s.Append(e); err != nil {
+	if err := s.Append(context.Background(), e); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.Exec("DROP TABLE call_allocations"); err != nil {
+	if _, err := s.db.Exec("DELETE FROM call_allocations"); err != nil {
 		t.Fatal(err)
 	}
-	if err := historySchema(s.db); err == nil {
-		t.Fatal("old projection silently accepted without allocation facts")
+	if err := historySchema(s.db); err != nil {
+		t.Fatal(err)
 	}
 	var originals int
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM radio_events WHERE id='original'").Scan(&originals); err != nil || originals != 1 {
-		t.Fatal("refusing an old projection modified original observations")
+		t.Fatal("initializing the current schema modified original observations")
+	}
+	var allocations int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM call_allocations").Scan(&allocations); err != nil || allocations != 0 {
+		t.Fatal("schema initialization backfilled derived allocation facts", allocations, err)
 	}
 }

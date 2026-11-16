@@ -186,7 +186,7 @@ func TestEarlyWebAuthenticatedFormSavesPreserveUneditedConfiguration(t *testing.
 		pair                *integrationService
 		route, field, value string
 	}{
-		{c.system, "/system", "callsign", "  entered lowercase  "},
+		{c.system, "/system", "name", "  entered lowercase  "},
 		{c.zone, "/zone", "system_id", "unresolved-system"},
 		{c.site, "/modems/edit?row=0", "name", "  Control modem renamed  "},
 		{c.dispatch, "/application-settings", "connection_url", "unavailable controller"},
@@ -231,7 +231,7 @@ func TestEarlyWebAuthenticatedFormSavesPreserveUneditedConfiguration(t *testing.
 			}
 			switch pair {
 			case c.system:
-				if saved["callsign"] != test.value || webText(saved["wacn"]) != "0" {
+				if saved["name"] != test.value || webText(saved["wacn"]) != "0" {
 					t.Fatal("entered values were changed")
 				}
 			case c.zone:
@@ -327,7 +327,7 @@ func TestEarlyWebBrowserFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence := filepath.Join(repo, "build", "admin-ui-test", "browser")
+	evidence := t.TempDir()
 	if target := os.Getenv("OPEN25_ADMIN_BROWSER_EVIDENCE"); target != "" {
 		evidence = target
 	}

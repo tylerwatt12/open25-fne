@@ -32,7 +32,7 @@ func TestNativeYAMLContractFixtures(t *testing.T) {
 	profile.System.Talkgroups = []Talkgroup{all, selected, empty}
 	profile.Inhibition = InhibitPolicy{Desired: []int{10001}, Restore: []InhibitRestore{{RadioID: 10003, Blocked: true, PendingUninhibit: true}}}
 	// Explicitly synthetic credentials; these files cannot address a modem.
-	network := Network{Address: "127.0.0.1", Port: 60001, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), ControlPeerID: 70000, VoicePeerIDs: map[string]int{"voice-1": 70001}, ConsolePeerIDs: map[int]int{1001: 71001, 1002: 71002, 1003: 71003}}
+	network := Network{Address: "127.0.0.1", Port: 60001, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), PeerBase: 70000, ChannelPeerIDs: map[string]int{"control-1": 70000, "voice-1": 70001}, ConsolePeerIDs: map[int]int{1001: 71001, 1002: 71002, 1003: 71003}}
 	write := func(name string, p Profile, n Network) {
 		t.Helper()
 		files, err := RenderFNE(p, n)
@@ -63,7 +63,7 @@ func TestNativeYAMLContractFixtures(t *testing.T) {
 		profile.System.Talkgroups[i].AffiliationRadioIDs, profile.System.Talkgroups[i].TransmitRadioIDs = nil, nil
 		profile.System.Talkgroups[i].StartPolicy = ""
 	}
-	network.VoicePeerIDs = map[string]int{}
+	network.ChannelPeerIDs = map[string]int{"control-1": 70000}
 	write("empty-physical", profile, network)
 	profile.System.Talkgroups = nil
 	if err := os.WriteFile(filepath.Join(directory, "empty-group-rules.yml"), []byte(RenderLookups(profile)["talkgroup_rules.yml"]), 0600); err != nil {
@@ -178,7 +178,7 @@ func TestSubscriberPolicySignatureCanonicalizesSelectionOrderAndDefaults(t *test
 func TestEveryNativeHostReceivesPhysicalInventoryIndependentOfEnabled(t *testing.T) {
 	profile := fixtureProfile()
 	profile.System.Radios = append(profile.System.Radios, Radio{RID: 10003, Kind: "subscriber", Alias: "Disabled physical"}, Radio{RID: 10004, Kind: "mobile", Alias: "Mobile app", Enabled: true}, Radio{RID: 10005, Kind: "automation", Alias: "Announcement", Enabled: true})
-	network := Network{Address: "127.0.0.1", Port: 62031, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), ControlPeerID: 100, VoicePeerIDs: map[string]int{"voice-1": 101}}
+	network := Network{Address: "127.0.0.1", Port: 62031, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), PeerBase: 100, ChannelPeerIDs: map[string]int{"control-1": 100, "voice-1": 101}}
 	for i, ch := range profile.Site.Channels {
 		files, err := RenderChannel(profile, ch, network, 25100+i*2, 25101+i*2, "null")
 		if err != nil {
@@ -248,7 +248,7 @@ func TestSubscriberNativeDenialsNeverCreateAcceptedAffiliationOrRFDemand(t *test
 
 func TestRenderedFNERejectsUnknownIdentitiesEvenOnTrustedConsolePeers(t *testing.T) {
 	profile := fixtureProfile()
-	files, err := RenderFNE(profile, Network{Address: "127.0.0.1", Port: 62031, Secret: strings.Repeat("a", 64), ControlPeerID: 100, VoicePeerIDs: map[string]int{"voice-1": 101}, ConsolePeerIDs: map[int]int{10002: 102}})
+	files, err := RenderFNE(profile, Network{Address: "127.0.0.1", Port: 62031, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), PeerBase: 100, ChannelPeerIDs: map[string]int{"control-1": 100, "voice-1": 101}, ConsolePeerIDs: map[int]int{10002: 102}})
 	if err != nil {
 		t.Fatal(err)
 	}

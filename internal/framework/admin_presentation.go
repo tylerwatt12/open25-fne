@@ -2,6 +2,7 @@ package framework
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,6 +22,11 @@ func webTime(at time.Time) string {
 	}
 	return fmt.Sprintf(`<time datetime="%s" title="%s">%s</time>`, esc(at.Format(time.RFC3339Nano)), esc(webReportTime(at)), esc(webTimeAgo(at, time.Now())))
 }
+
+func webReportTime(at time.Time) string {
+	return at.UTC().Format("Jan 2, 2006, 15:04:05 UTC")
+}
+
 func webTimeAgo(at, now time.Time) string {
 	seconds := int64(now.Sub(at) / time.Second)
 	future := seconds < 0
@@ -28,6 +34,12 @@ func webTimeAgo(at, now time.Time) string {
 		seconds = -seconds
 	}
 	if seconds < 60 {
+		if seconds >= 2 {
+			if future {
+				return fmt.Sprintf("in %d s", seconds)
+			}
+			return fmt.Sprintf("%d s ago", seconds)
+		}
 		if future {
 			return "in a moment"
 		}
@@ -56,25 +68,52 @@ func webStatus(text string) string {
 		class = " ts-good"
 	case "failed", "disconnected", "rejected", "timed out", "timed_out", "error", "fault", "not connected", "emergency":
 		class = " ts-bad"
-	case "stale", "pending", "connecting", "starting", "stopping", "cached settings", "recovering", "unconfirmed":
+	case "contact stale", "status unavailable", "stale", "pending", "connecting", "starting", "stopping", "cached settings", "recovering", "unconfirmed":
 		class = " ts-amber"
 	}
 	return `<span class="ts-badge ts-status` + class + `">` + esc(text) + `</span>`
 }
 
-func webUSBChoices(inventory HardwareInventoryView) []adminChoice {
+func webUSBChoices(inventory HardwareInventoryView, currentModem ...string) []adminChoice {
 	choices := []adminChoice{}
 	seen := map[string]bool{}
 	for _, device := range inventory.Devices {
 		if device.Kind != "usb" || !device.PresenceKnown || !device.Present {
 			continue
 		}
+		owners := []string{}
+		for _, assignment := range device.Assignments {
+			if len(currentModem) > 0 && assignment.Local && assignment.ModemID == currentModem[0] && (len(currentModem) == 1 || strconv.Itoa(assignment.ModemRecordIndex) == currentModem[1]) {
+				continue
+			}
+			siteName := assignment.SiteName
+			if siteName == "" {
+				siteName = "Site"
+			}
+			modemName := assignment.ModemName
+			if modemName == "" {
+				modemName = "USB modem"
+			}
+			label := siteName + " / " + modemName
+			if assignment.Stale {
+				label += " · last reported assignment"
+			}
+			owners = append(owners, label)
+		}
 		for _, path := range append([]string{device.Device}, device.Paths...) {
 			if !strings.HasPrefix(path, "/dev/serial/by-id/") || seen[path] {
 				continue
 			}
 			seen[path] = true
-			choices = append(choices, adminChoice{ID: path, Name: device.Product})
+			name := device.Product
+			if device.UID != "" {
+				name = strings.TrimSpace(name + " · " + device.UID)
+			}
+			choice := adminChoice{ID: path, Name: name, Disabled: len(owners) > 0}
+			if choice.Disabled {
+				choice.InUse = "Already in use by " + strings.Join(owners, ", ")
+			}
+			choices = append(choices, choice)
 		}
 	}
 	return choices

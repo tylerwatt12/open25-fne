@@ -164,15 +164,22 @@ func (c *Controller) retireSourceFactsLocked() {
 }
 
 func (c *Controller) adoptSourceOwnerLocked(owner *child) bool {
-	if owner == nil || owner.role != "control" || owner.started.IsZero() || owner.started.Before(c.source.nativeStartedAt) || c.sourceOwnerLocked() != owner || c.closing || c.stopRequests != 0 || !owner.acceptsObservations() || (c.status.State != "starting" && c.status.State != "running") {
+	if owner == nil || owner.role != "control" || owner.started.IsZero() || c.sourceOwnerLocked() != owner || c.closing || c.stopRequests != 0 || !owner.acceptsObservations() || (c.status.State != "starting" && c.status.State != "running") {
 		return false
 	}
-	if c.source.owner != owner {
+	started := owner.started
+	if !owner.controlSince.IsZero() {
+		started = owner.controlSince
+	}
+	if started.Before(c.source.nativeStartedAt) {
+		return false
+	}
+	if c.source.owner != owner || !c.source.nativeStartedAt.Equal(started) {
 		c.retireSourceFactsLocked()
 		c.withdrawSourceFactsLocked()
 		c.refreshSourceScopeLocked()
 		c.source.owner = owner
-		c.source.nativeStartedAt = owner.started.UTC()
+		c.source.nativeStartedAt = started.UTC()
 		c.source.affiliations = map[int]Affiliation{}
 		c.source.registrations = map[int]Registration{}
 		c.source.nullAffiliations = map[int]Registration{}

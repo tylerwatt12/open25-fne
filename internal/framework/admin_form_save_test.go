@@ -14,7 +14,7 @@ func TestEarlyWebSaveUsesSubmittedConfigurationAfterAnotherSaveOrDelete(t *testi
 		t.Fatal(err)
 	}
 	config["radios"] = []any{}
-	config["callsign"] = "another administrator"
+	config["name"] = "another administrator"
 	if err = c.system.service.Store.SaveConfig(storeDoc(t, config)); err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +26,7 @@ func TestEarlyWebSaveUsesSubmittedConfigurationAfterAnotherSaveOrDelete(t *testi
 		t.Fatal(err)
 	}
 	radios := saved["radios"].([]any)
-	if len(radios) != 1 || radios[0].(map[string]any)["alias"] != "submitted last" || saved["callsign"] != "another administrator" {
+	if len(radios) != 1 || radios[0].(map[string]any)["alias"] != "submitted last" || saved["name"] != "another administrator" {
 		t.Fatal("Save lost the submitted record or changed settings outside that form")
 	}
 	form.Set("action", "delete")

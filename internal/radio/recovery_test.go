@@ -70,7 +70,7 @@ func TestVoiceRecoveryWaitsForSameModemBacksOffAndHonorsExplicitStop(t *testing.
 			}
 			return &recoveryLease{}, ctx.Err()
 		},
-		verify: func(ctx context.Context, _ io.Closer, _ string, _ bool) error { return ctx.Err() },
+		verify: func(ctx context.Context, _ io.Closer, _ string) error { return ctx.Err() },
 		same:   func(lease io.Closer, _ string) bool { return available.Load() && !lease.(*recoveryLease).closed.Load() },
 	}
 	if err := c.Start(context.Background(), fixtureProfile(), "null"); err != nil {
@@ -229,7 +229,7 @@ func TestFailedReplacementCleanupRetainsLeaseAndControllerOwnership(t *testing.T
 	t.Cleanup(func() { lease.fail.Store(false) })
 	c.modem = modemOperations{
 		acquire: func(context.Context, string) (io.Closer, error) { return lease, nil },
-		verify:  func(context.Context, io.Closer, string, bool) error { return nil },
+		verify:  func(context.Context, io.Closer, string) error { return nil },
 		same:    func(io.Closer, string) bool { return true },
 	}
 	if err := c.Start(context.Background(), fixtureProfile(), "null"); err != nil {

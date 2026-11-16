@@ -93,7 +93,7 @@ func validateURL(value string, optional bool) error {
 	}
 	u, err := url.Parse(value)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
-		return errors.New("enter a server address such as https://192.0.2.89:5001, without a path or password")
+		return errors.New("enter a server address such as https://192.0.2.10:5001, without a path or password")
 	}
 	if u.Scheme == "http" && !loopbackHost(u.Hostname()) {
 		return errors.New("use HTTPS for a server outside this computer")
@@ -109,7 +109,7 @@ func validateInternalURL(value string, optional bool) error {
 	}
 	u, err := url.Parse(value)
 	if err != nil || u.Scheme != "http" || u.Host == "" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || u.Opaque != "" {
-		return errors.New("enter an internal HTTP server address such as http://198.51.100.2:5101, without a path or password")
+		return errors.New("enter an internal HTTP server address such as http://100.64.0.2:5101, without a path or password")
 	}
 	return nil
 }

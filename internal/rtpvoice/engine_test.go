@@ -7,11 +7,11 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+	"open25.local/open25-fne/internal/p25rtp"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
-	"open25.local/open25-fne/internal/p25rtp"
 )
 
 var engineFrameTypes = [18]p25rtp.FrameType{p25rtp.FR1, p25rtp.FR2, p25rtp.FR3, p25rtp.FR4, p25rtp.FR5, p25rtp.FR6, p25rtp.FR7, p25rtp.FR8, p25rtp.FR9, p25rtp.FR10, p25rtp.FR11, p25rtp.FR12, p25rtp.FR13, p25rtp.FR14, p25rtp.FR15, p25rtp.FR16, p25rtp.FR17, p25rtp.FR18}

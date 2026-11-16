@@ -31,6 +31,7 @@ func TestAdminChooserLargeDirectoriesBoundPagesAndKeepAllIdentities(t *testing.T
 		zone.Sites = append(zone.Sites, SiteIdentity{ID: fmt.Sprintf("site-%05d", i), Name: fmt.Sprintf("Site %05d", i)})
 		users = append(users, userRecord{User: User{ID: fmt.Sprintf("login-%05d", i), Username: fmt.Sprintf("Person %05d", i)}, PasswordHash: []byte("private-verifier-never-in-chooser")})
 	}
+	system.Talkgroups[0].SiteIDs = []string{"missing site", "unknown"}
 	if err := s.Store.SaveConfig(storeDoc(t, system)); err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +94,7 @@ func TestAdminChooserLargeDirectoriesBoundPagesAndKeepAllIdentities(t *testing.T
 		if err := os.WriteFile(fixture, data, 0600); err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { _ = os.Remove(fixture) })
 		command := exec.Command("node", "../../tools/framework/admin-chooser-check.mjs", fixture, evidence)
 		command.Stdout = os.Stdout
 		command.Stderr = os.Stderr
@@ -128,7 +130,7 @@ func TestBandPlanFrequenciesAndPerSiteBroadcastPolicy(t *testing.T) {
 	for _, row := range []struct {
 		id, ch int
 		tx, rx int64
-	}{{2, 0, 443437500, 448437500}, {2, 1, 443450000, 448450000}, {2, 81, 444450000, 449450000}} {
+	}{{2, 0, 433437500, 438437500}, {2, 1, 433450000, 438450000}, {2, 81, 434450000, 439450000}} {
 		tx, rx, ok := bandPlanFrequencies(&zone, row.id, row.ch)
 		if !ok || tx != row.tx || rx != row.rx {
 			t.Fatal("Phase1 equation", row, tx, rx, ok)

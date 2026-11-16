@@ -1,0 +1,19 @@
+{
+  "site_id": "site-b",
+  "native_started_at": "2025-01-01T02:01:12.702316Z",
+  "observed_at": "2025-01-01T02:01:12.702323Z",
+  "revision": 7,
+  "active": true,
+  "affiliations": [],
+  "registrations": [],
+  "null_affiliations": [],
+  "terminals": [],
+  "withdrawals": [
+    {
+      "radio_id": 10001,
+      "group_id": 1002,
+      "affiliated_at": "2025-01-01T02:01:12.702265Z",
+      "native_started_at": "2025-01-01T02:01:11.70222Z"
+    }
+  ]
+}

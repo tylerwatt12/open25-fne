@@ -11,7 +11,7 @@ directly; no additional patches from this directory are applied:
 
 ```sh
 git clone https://github.com/tylerwatt12/dvmhost.git
-git -C dvmhost checkout --detach a2ca11b6d81821cc29819b1760cdef9b17f6b63d
+git -C dvmhost checkout --detach a3513e8ec0c258198e80b2a0f49a250276a5b00e
 ```
 
 Follow `OPEN25.md` in the checked-out native tree for build and test instructions.
@@ -26,6 +26,15 @@ Make future native changes and their tests in the fork. Update the exact source
 pin here only after review and appropriate qualification. The Go startup
 preflight remains owned by Open25 FNE; it is the supported caller's early error
 path and must stay synchronized with the native operating policy.
+
+This revision includes the native feature changes through the running `0092`
+baseline. The fork's `OPEN25-RUNNING-BASELINE.json` records their provenance.
+The restored WACN restriction and clarified licensing are retained. The fork
+also keeps Linux TUN/TAP compilation and the correct 460800-baud constant,
+rather than two platform adjustments in the historical build archive. This
+selects the running features with those reviewed differences; it does not claim
+to reproduce the installed executable bytes. Later uninstalled candidates are
+excluded.
 
 ## Historical patch snapshot
 
@@ -88,7 +97,7 @@ The combined vocoder library and DVMBridge use GPL-3.0-or-later. Host and FNE
 retain their GPL-2.0-only terms and do not link that vocoder library. See
 [THIRD_PARTY.md](../../THIRD_PARTY.md) for the component summary.
 
-The selected license-adjusted native revision passes a fresh seven-target
+The selected running-baseline native revision passes a fresh seven-target
 Linux ARM64 Release build in a Debian 13 ARM64 VM without source overlays.
 Its offline P25, EDAC/crypto, FNE and WACN suites pass, including all 783 real
 Host/Bridge/Patch startup fixtures. The collected payload passes exact source,

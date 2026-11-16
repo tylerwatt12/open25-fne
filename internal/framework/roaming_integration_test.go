@@ -108,9 +108,7 @@ func TestZoneRetainsDeregistrationAcrossEmptyReportsAndRejectsVirtualPresence(t 
 	if status := upload("site-2", "o", event); status != 200 {
 		t.Fatalf("Site deregistration report rejected: %d", status)
 	}
-	if rows := zone.view().Presence; len(rows) != 1 || rows[0].Registered || rows[0].SiteID != "site-2" {
-		t.Fatalf("accepted terminal state was not cached from the activity table: %+v", rows)
-	}
+
 	request := routing.Request{CallRequest: dispatch.CallRequest{ID: "demand", RadioID: 10002, Talkgroups: []int{1001}}, SourceKind: "application"}
 	if targets := zone.broker.targets(request).Targets; len(targets) != 1 || targets[0].ID != "site-1" {
 		t.Fatalf("history upload changed independently accepted RF authority: %+v", targets)
@@ -131,10 +129,8 @@ func TestZoneRetainsDeregistrationAcrossEmptyReportsAndRejectsVirtualPresence(t 
 	if status := upload("application-1", "d", fake); status != 403 {
 		t.Fatalf("Dispatch fabricated presence under application source: %d", status)
 	}
-	if rows := zone.view().Presence; len(rows) != 1 || rows[0].Registered {
-		t.Fatalf("rejected virtual report changed radio presence: %+v", rows)
-	}
-	// Re-reading the persisted table cannot turn the old report into current demand.
+
+	// Refreshing observations cannot turn the old report into current demand.
 	zone.refreshDirectory()
 	if targets := zone.broker.targets(request).Targets; len(targets) != 0 {
 		t.Fatalf("ownership changed while refreshing the retained table: %+v", targets)

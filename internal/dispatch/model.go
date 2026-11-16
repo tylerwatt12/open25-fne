@@ -6,9 +6,9 @@ package dispatch
 import (
 	"context"
 	"errors"
-	"time"
 	"open25.local/open25-fne/internal/p25crypto"
 	"open25.local/open25-fne/internal/p25rtp"
+	"time"
 )
 
 const (

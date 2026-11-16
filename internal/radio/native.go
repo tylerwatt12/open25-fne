@@ -31,14 +31,20 @@ type NativeClient struct {
 var nativePath = regexp.MustCompile(`^/[A-Za-z0-9/_-]+$`)
 
 type NativeError struct {
-	HTTPStatus int
-	Status     int
-	Message    string
-	Possible   bool
-	Response   map[string]json.RawMessage
+	ContactLost bool
+	HTTPStatus  int
+	Status      int
+	Message     string
+	Possible    bool
+	Response    map[string]json.RawMessage
 }
 
 func (e *NativeError) Error() string { return e.Message }
+
+func nativeContactLost(err error) bool {
+	var native *NativeError
+	return errors.As(err, &native) && native.ContactLost
+}
 
 func NewNativeClient(address, password string) (*NativeClient, error) {
 	host, port, err := net.SplitHostPort(address)
@@ -118,7 +124,7 @@ func (c *NativeClient) exchange(ctx context.Context, method, path, token string,
 	}
 	conn, err := (&net.Dialer{Timeout: 800 * time.Millisecond}).DialContext(ctx, "tcp", c.address)
 	if err != nil {
-		return nil, &NativeError{Message: "Native radio control endpoint is unavailable."}
+		return nil, &NativeError{ContactLost: true, Message: "Native radio control endpoint is unavailable."}
 	}
 	defer conn.Close()
 	deadline := time.Now().Add(1200 * time.Millisecond)
@@ -138,7 +144,7 @@ func (c *NativeClient) exchange(ctx context.Context, method, path, token string,
 	}
 	n, err := io.WriteString(conn, request)
 	if err != nil || n != len(request) {
-		return nil, &NativeError{Message: "Native request was incomplete; its outcome is unconfirmed.", Possible: n > 0}
+		return nil, &NativeError{ContactLost: true, Message: "Native request was incomplete; its outcome is unconfirmed.", Possible: n > 0}
 	}
 	maxBody := 16384
 	if path == "/p25/report-affiliations" {
@@ -146,11 +152,14 @@ func (c *NativeClient) exchange(ctx context.Context, method, path, token string,
 	}
 	response, err := http.ReadResponse(bufio.NewReader(io.LimitReader(conn, int64(maxBody+16384))), &http.Request{Method: method})
 	if err != nil {
-		return nil, &NativeError{Message: "Native response was unavailable; its outcome is unconfirmed.", Possible: true}
+		return nil, &NativeError{ContactLost: true, Message: "Native response was unavailable; its outcome is unconfirmed.", Possible: true}
 	}
 	defer response.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, int64(maxBody+1)))
-	if err != nil || len(raw) > maxBody {
+	if err != nil {
+		return nil, &NativeError{ContactLost: true, Message: "Native response body was unavailable; its outcome is unconfirmed.", Possible: true}
+	}
+	if len(raw) > maxBody {
 		return nil, &NativeError{Message: "Native response exceeded the allowed size.", Possible: true}
 	}
 	var result map[string]json.RawMessage

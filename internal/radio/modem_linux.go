@@ -72,7 +72,7 @@ func acquireDevice(ctx context.Context, path string) (io.Closer, error) {
 	return f, nil
 }
 
-func verifyFirmware(ctx context.Context, lease io.Closer, device string, cwid20 bool) error {
+func verifyFirmware(ctx context.Context, lease io.Closer, device string) error {
 	f, ok := lease.(*os.File)
 	if !ok {
 		return errors.New("modem lease is unavailable")
@@ -138,9 +138,6 @@ func verifyFirmware(ctx context.Context, lease io.Closer, device string, cwid20 
 			if frame[3] != 4 || !strings.Contains(string(frame[21:]), "P25") {
 				return errors.New("modem firmware does not provide the qualified P25 protocol")
 			}
-			if cwid20 && !strings.Contains(string(frame[21:]), "CWID20") {
-				return errors.New("this modem needs the qualified 20 WPM identification firmware")
-			}
 			if strings.HasPrefix(device, "/dev/serial/by-id/") {
 				resolved, _ := filepath.EvalSymlinks(device)
 				node, _ := filepath.EvalSymlinks(filepath.Join("/sys/class/tty", filepath.Base(resolved), "device"))
@@ -152,9 +149,10 @@ func verifyFirmware(ctx context.Context, lease io.Closer, device string, cwid20 
 						continue
 					}
 					product, _ := os.ReadFile(filepath.Join(here, "idProduct"))
+					name, _ := os.ReadFile(filepath.Join(here, "product"))
 					serialRaw, _ := os.ReadFile(filepath.Join(here, "serial"))
 					serial = strings.TrimSpace(string(serialRaw))
-					matched = strings.TrimSpace(string(vendor)) == "1eaf" && strings.TrimSpace(string(product)) == "0004"
+					matched = strings.TrimSpace(string(vendor)) == "1eaf" && strings.TrimSpace(string(product)) == "0004" && strings.TrimSpace(string(name)) == "DVM HS USB Lab"
 					break
 				}
 				if !matched || len(serial) != 24 || !strings.EqualFold(serial, hex.EncodeToString(frame[5:17])) {

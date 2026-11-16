@@ -18,7 +18,7 @@ func TestHistoryHealthIsAdministratorOnlyAndIndependentOfStorageQueries(t *testi
 	if err := s.activity.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.activity.Append(activity.Event{ID: "failed-write", Origin: "site-1", Type: "status"}); err == nil {
+	if err := s.activity.Append(context.Background(), activity.Event{ID: "failed-write", Origin: "site-1", Type: "status"}); err == nil {
 		t.Fatal("closed activity storage accepted a write")
 	}
 	result := make(chan *httptest.ResponseRecorder, 1)

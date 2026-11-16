@@ -22,22 +22,26 @@ func modemObservationFixture(now time.Time) radio.Status {
 	return radio.Status{State: "running", Mode: "hardware", SiteID: "site-1", Channels: []radio.ChannelStatus{{
 		ID: "channel-1", Name: "Control", Role: "control", State: "ready", Ready: true,
 		StartedAt: started, OperatingModemID: "modem-1", OperatingModemName: "Control modem",
-		TXHz: 443450000, RXHz: 448450000, RPCPort: 15999, RESTPort: 16000, Device: "private-device-path",
-		Telemetry: radio.ModemTelemetry{StartedAt: started, Samples: []radio.ModemSample{{At: now.Add(-time.Second), TX: &off, RX: &on, RXState: "Receiving voice"}, {At: now, TX: &on, RX: &on, RXState: "Receiving voice"}}, Receive: []radio.ReceiveStatistics{{At: now.Add(-5 * time.Second), Frames: 44, ProtectedBits: 50000, Errors: 70, UndecodableLC: 2, BERPercent: .1400}}},
+		TXHz: 433450000, RXHz: 438450000, RPCPort: 15999, RESTPort: 16000, Device: "private-device-path",
+		Telemetry: radio.ModemTelemetry{StartedAt: started, Samples: []radio.ModemSample{{At: now.Add(-time.Second), TX: &off, RX: &on, RXState: "Receiving voice"}, {At: now, TX: &on, RX: &on, RXState: "Receiving voice"}}, Receive: []radio.ReceiveStatistics{{At: now.Add(-5 * time.Second), Frames: 44, ProtectedBits: 54253, Errors: 86, UndecodableLC: 2, BERPercent: .1585}}},
 	}}}
 }
 
 func TestModemStatusUsesExistingReportsAndProjectsOnlyObservations(t *testing.T) {
 	c := integrationNewCluster(t)
+	// Join supervision before installing this read-only observation fixture.
+	c.site.service.operationCancel()
+	c.site.service.operationWG.Wait()
 	operation := &operationRadio{status: modemObservationFixture(time.Now().UTC()), applications: make(chan policyApplication, 16)}
 	c.site.service.radio = operation
 	integrationSyncAll(t, c)
-	for _, pair := range []*integrationService{c.site, c.zone, c.system} {
+	for _, pair := range []*integrationService{c.zone, c.system} {
 		before, _ := pair.service.Store.Config()
 		client := earlyWebLogin(t, pair)
 		for _, suffix := range []string{"", "?fragment=1"} {
 			body := string(earlyWebGet(t, client, pair.web.URL+"/modem-status"+suffix, http.StatusOK))
-			for _, want := range []string{"Control modem", "443.45", "448.45", "0.1400%", "70 reported bit errors", "2 undecodable LC", "Sampled TX / RX activity", "<circle"} {
+			decodeLabel := "2 undecodable link-control messages"
+			for _, want := range []string{"Control modem", "433.45", "438.45", "0.1585%", "86 reported bit errors", decodeLabel, "Sampled TX / RX activity", "<circle"} {
 				if !strings.Contains(body, want) {
 					t.Errorf("%s%s missing %q", pair.service.Config().Role, suffix, want)
 				}
@@ -87,7 +91,7 @@ func TestModemStatusStalenessUnknownsAndChangedBindings(t *testing.T) {
 	if body := render(now); !strings.Contains(body, ">Transmitting</td>") || !strings.Contains(body, ">Receiving voice</td>") {
 		t.Fatal("simultaneous TX/RX hidden", body)
 	}
-	if body := render(now.Add(5 * time.Second)); strings.Contains(body, ">Transmitting</td>") || strings.Contains(body, ">Receiving voice</td>") || !strings.Contains(body, "0.1400%") {
+	if body := render(now.Add(5 * time.Second)); strings.Contains(body, ">Transmitting</td>") || strings.Contains(body, ">Receiving voice</td>") || !strings.Contains(body, "0.1585%") {
 		t.Fatal("stale native sample became current, or historical call report was lost")
 	}
 	if body := render(now.Add(time.Hour)); !strings.Contains(body, "Stale · current state unknown") {
@@ -145,7 +149,7 @@ func TestModemStatusBrowser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	output := filepath.Join(repo, "build", "modem-status-ui-test", "browser")
+	output := t.TempDir()
 	if target := os.Getenv("TRUNKSYSTEM_MODEM_BROWSER_EVIDENCE"); target != "" {
 		output = target
 	}
@@ -158,7 +162,7 @@ func TestModemStatusBrowser(t *testing.T) {
 	fixture := struct {
 		Roles []fixtureRole `json:"roles"`
 	}{}
-	for _, pair := range []*integrationService{c.site, c.zone, c.system} {
+	for _, pair := range []*integrationService{c.zone, c.system} {
 		pair.service.assets = frameworkui.Assets()
 		fixture.Roles = append(fixture.Roles, fixtureRole{pair.service.Config().Role, pair.web.URL, "administrator", integrationPassword})
 	}

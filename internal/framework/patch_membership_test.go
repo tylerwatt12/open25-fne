@@ -60,6 +60,7 @@ func TestPatchMembershipUpdatePreservesIdentityRoutingHistoryAndRestart(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitHistoryInitialization(t, store)
 	s.activity = store
 	t.Cleanup(func() { store.Close() })
 	state := operatorApply(t, s, "patch", editMembership(before, 1003, 1001), desk)
@@ -79,7 +80,7 @@ func TestPatchMembershipUpdatePreservesIdentityRoutingHistoryAndRestart(t *testi
 	if err := store.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	events, err := store.Events(activity.Query{Type: "patch_update", Limit: 10})
+	events, err := store.Pending(context.Background(), activity.EventBatchLimit)
 	if err != nil || len(events) != 1 {
 		t.Fatalf("update history: %v %v", events, err)
 	}

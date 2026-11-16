@@ -30,7 +30,8 @@ type Session struct {
 	AccountDigest  [32]byte
 	UserID         string
 	PositionID     string
-	Key            string
+	FamilyID       string
+	Key            string `json:"-"`
 }
 type loginAttempt struct {
 	Count int
@@ -39,6 +40,11 @@ type loginAttempt struct {
 
 type Service struct {
 	Store                   *Store
+	parentIsolated          atomic.Bool
+	parentActionMu          sync.Mutex
+	parentLinkMu            sync.Mutex
+	parentContext           context.Context
+	parentCancel            context.CancelFunc
 	messages                *messaging.Store
 	messageMu               sync.Mutex
 	smtpMu                  sync.Mutex
@@ -49,14 +55,18 @@ type Service struct {
 	mu                      sync.Mutex
 	settingsMu              sync.Mutex
 	config                  FileConfig
-	sessions                map[string]Session
 	attempts                map[string]loginAttempt
+	ssoMu                   sync.Mutex
+	ssoPending              map[[32]byte]ssoPending
+	ssoCodes                map[[32]byte]ssoGrant
 	client                  *http.Client
 	assets                  fs.FS
 	lock                    *os.File
 	shutdownDeadline        atomic.Int64
 	reportMu                sync.Mutex
 	syncMu                  sync.Mutex
+	directoryMu             sync.Mutex // snapshot publication only; never held during I/O
+	neighborDeliveryError   string     // guarded by syncMu
 	runWG                   sync.WaitGroup
 	activity                *activity.Store
 	radio                   radioRuntime
@@ -79,6 +89,8 @@ type Service struct {
 	radioAppliedProfile     radio.Profile
 	radioOperation          *radioOperation
 	radioStarts             map[string]*radioStartAdmission
+	radioStartupCancel      context.CancelFunc // operationMu; pending startup for this service lifetime only.
+	radioStartupError       string
 	radioChannelStops       map[string]*radioOperation
 	radioRunActive          bool
 	radioRunStartedAt       time.Time
@@ -88,11 +100,14 @@ type Service struct {
 	operatorPolicy          atomic.Pointer[operatorPolicySnapshot]
 	patchMu                 sync.RWMutex
 	crypto                  *keyRuntime
+	envelopeCache           *keyEnvelopeCache // featureMu; System-owned encrypted distribution memo.
 	audioLeaseMu            sync.Mutex
 	audioLeases             map[int]audioIdentityLease
 	rfAdmissions            *rfAdmissionManager
 	rfAuthority             *rfSourceAuthority
 	rfAuthorityError        error
+	admissionTimings        chan admissionTiming // Optional, bounded diagnostics; set before admitting calls.
+	admissionTimingDrops    atomic.Uint64
 	commandMu               sync.Mutex
 	inhibitionMu            sync.Mutex
 	inhibition              atomic.Pointer[radioInhibitionSnapshot]
@@ -151,7 +166,12 @@ func OpenService(configPath string, assets fs.FS) (*Service, error) {
 		return nil, fmt.Errorf("administrator account is missing: %w", err)
 	}
 	client := newHTTPClient()
-	s := &Service{Store: store, config: c, configPath: configPath, client: client, assets: assets, lock: lock, sessions: map[string]Session{}, attempts: map[string]loginAttempt{}}
+	s := &Service{Store: store, config: c, configPath: configPath, client: client, assets: assets, lock: lock, attempts: map[string]loginAttempt{}}
+	if err = s.loadParentIsolation(); err != nil {
+		store.Close()
+		closeLock()
+		return nil, err
+	}
 	if c.Role == RoleApplication {
 		s.messages, err = messaging.Open(filepath.Join(c.StateDir, "messages.db"))
 		if err != nil {
@@ -170,7 +190,7 @@ func OpenService(configPath string, assets fs.FS) (*Service, error) {
 		closeLock()
 		return nil, err
 	}
-	_ = store.AddEvent("service", "Service started. Radio operation requires an explicit Site start.")
+	_ = store.AddEvent("service", "Service started.")
 	return s, nil
 }
 
@@ -186,6 +206,11 @@ func releaseServiceLock(lock *os.File) {
 	}
 }
 func (s *Service) Close() error {
+	s.parentLinkMu.Lock()
+	if s.parentCancel != nil {
+		s.parentCancel()
+	}
+	s.parentLinkMu.Unlock()
 	shutdown, cancel := s.shutdownContext()
 	defer cancel()
 	s.messageClose.Do(func() {
@@ -255,6 +280,8 @@ func (s *Service) Run(ctx context.Context) error {
 		return err
 	}
 	loopCtx, cancel := context.WithCancel(ctx)
+	// Register startup intent before exposing local Start/Stop operations.
+	startup := s.radioStartupContext(loopCtx)
 	closeControl, err := s.startLocalControl(loopCtx)
 	if err != nil {
 		cancel()
@@ -275,6 +302,12 @@ func (s *Service) Run(ctx context.Context) error {
 	go func() { defer s.runWG.Done(); s.serveWeb(loopCtx, web, c) }()
 	go func() { defer s.runWG.Done(); result <- internal.Serve(internalListener) }()
 	go func() { defer s.runWG.Done(); s.RunSync(loopCtx) }()
+	s.runWG.Add(1)
+	go func() { defer s.runWG.Done(); s.runActivityHistory(loopCtx) }()
+	if startup != nil {
+		s.runWG.Add(1)
+		go func() { defer s.runWG.Done(); s.runRadioStartup(startup) }()
+	}
 	fmt.Printf("%s service: %s (internal %s)\n", c.Role, c.PublicURL, c.InternalURL)
 	select {
 	case <-ctx.Done():

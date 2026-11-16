@@ -1,6 +1,7 @@
 package activity
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -13,7 +14,7 @@ func TestDelayedOldAllocationObservationsDoNotReplaceFinalMeasurements(t *testin
 		e := event(id, kind, "site-1", at.Add(after))
 		e.CallID = "measured-conversation"
 		e.Details = map[string]any{"allocation_id": "one-allocation", "allocated_ms": allocated, "speech_ms": speech}
-		if err := s.Append(e); err != nil {
+		if err := s.Append(context.Background(), e); err != nil {
 			t.Fatal(err)
 		}
 	}

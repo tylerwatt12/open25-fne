@@ -69,6 +69,10 @@ func (m *mediaClient) Ensure() {
 }
 func (m *mediaClient) selectEndpoint(address string, e voiceEndpoint) {
 	m.mu.Lock()
+	if m.s.parentIsolated.Load() && address == m.s.configuredUpstreamURL() {
+		address = ""
+		e = voiceEndpoint{}
+	}
 	changed := m.activeURL != address || m.endpoint.Generation != e.Generation || m.endpoint.URI != e.URI
 	old := m.endpoint
 	if changed {
@@ -168,6 +172,11 @@ func (m *mediaClient) Close() {
 }
 
 func (s *Service) requestAt(ctx context.Context, address, method, path string, value, target any, recipient *PeerCredential) error {
+	ctx, cancel, gateErr := s.parentRequestContext(ctx, address)
+	if gateErr != nil {
+		return gateErr
+	}
+	defer cancel()
 	if address == "" {
 		return dispatch.ErrUnavailable
 	}

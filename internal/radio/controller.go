@@ -63,6 +63,7 @@ type Controller struct {
 	inhibitConfigured bool
 	archive           *nativearchive.Writer
 	controlSwitch     *controlSwitchAttempt
+	controlTurns      []string
 	c4fm              *c4fmTest
 	c4fmStatus        C4FMTestStatus
 	c4fmEpoch         uint64
@@ -182,19 +183,21 @@ func (c *Controller) NetworkFor(p Profile) (Network, error) {
 	if !validSecret(n.Secret) || n.Port < 1024 || n.Port > 65535 {
 		return Network{}, errors.New("local media assignment is invalid")
 	}
-	n.PeerBase = 100000000 + p.Zone.RFSSID*100000 + identity.SiteID*256
-	n.ControlPeerID = n.PeerBase
-	n.VoicePeerIDs = map[string]int{}
-	n.ConsolePeerIDs = map[int]int{}
-	voices := orderedChannels(p)
-	index := 1
-	for _, ch := range voices {
-		if ch.Role == "voice" {
-			n.VoicePeerIDs[ch.ID] = n.PeerBase + index
-			index++
+	if n.RPCSecret == "" {
+		n.RPCSecret, err = newSecret()
+		if err != nil {
+			return Network{}, err
 		}
 	}
-	index = 128
+	authority := sha256.Sum256([]byte("P25 control authority " + n.RPCSecret))
+	n.ControlAuthority = hex.EncodeToString(authority[:8])
+	n.PeerBase = 100000000 + p.Zone.RFSSID*100000 + identity.SiteID*256
+	n.ChannelPeerIDs = map[string]int{}
+	n.ConsolePeerIDs = map[int]int{}
+	for slot, channel := range orderedChannels(p) {
+		n.ChannelPeerIDs[channel.ID] = n.PeerBase + slot
+	}
+	index := 128
 	for _, g := range allowedGroups(p) {
 		if !g.Enabled {
 			continue
@@ -210,9 +213,9 @@ func (c *Controller) NetworkFor(p Profile) (Network, error) {
 
 func cloneNetwork(n Network) Network {
 	copy := n
-	copy.VoicePeerIDs = map[string]int{}
-	for k, v := range n.VoicePeerIDs {
-		copy.VoicePeerIDs[k] = v
+	copy.ChannelPeerIDs = map[string]int{}
+	for k, v := range n.ChannelPeerIDs {
+		copy.ChannelPeerIDs[k] = v
 	}
 	copy.ConsolePeerIDs = map[int]int{}
 	for k, v := range n.ConsolePeerIDs {
@@ -229,6 +232,13 @@ func (c *Controller) Status() Status {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	v := c.status
+	if c.status.State == "running" {
+		v.AppliedRFConfiguration = RFConfigurationSignature(c.configuredProfile)
+		if child := c.children[v.ActiveControlChannelID]; v.Mode == "hardware" && v.FNEReady && child != nil && child.alive() && child.readyNow() && child.acceptsObservations() && child.adjacentSite != nil {
+			adjacent := *child.adjacentSite
+			v.AdjacentSite = &adjacent
+		}
+	}
 	v.MaintenanceSupported = c.opts.MaintenanceLockPath != ""
 	v.Channels = append([]ChannelStatus{}, c.status.Channels...)
 	for i := range v.Channels {
@@ -244,7 +254,7 @@ func (c *Controller) Status() Status {
 		}
 		for _, configured := range c.configuredProfile.Site.Channels {
 			if configured.ID == row.ID {
-				row.ConfiguredRole, row.ModemID, row.ControlEligible = configured.Role, configured.ModemID, configured.ControlEligible
+				row.ModemID = configured.ModemID
 				if modem, ok := findModem(c.configuredProfile, configured.ModemID); ok {
 					row.Device = modem.Device
 				}
@@ -285,6 +295,11 @@ func (c *Controller) HasRFInterest(tgid int) bool {
 	if !c.status.InhibitionReady {
 		return false
 	}
+	for _, group := range c.profile.System.Talkgroups {
+		if group.TGID == tgid && group.Enabled && groupAllowedAtSite(group, c.profile.Site.ID) && slices.Contains(group.RequestedSiteIDs, c.profile.Site.ID) {
+			return true
+		}
+	}
 	for _, a := range c.affiliations {
 		if a.TGID == tgid && !inhibitionBlocked(c.status.Inhibition, a.RID) && !slices.Contains(c.profile.Inhibition.Desired, a.RID) {
 			for _, r := range c.profile.System.Radios {
@@ -302,6 +317,9 @@ func (c *Controller) HasRFInterest(tgid int) bool {
 }
 
 func (c *Controller) Start(ctx context.Context, p Profile, mode string) error {
+	if err := validateOperatingWACN(p.System.WACN); err != nil {
+		return err
+	}
 	lease, err := c.startLease()
 	if err != nil {
 		return err
@@ -341,6 +359,9 @@ func (c *Controller) prepareSiteStart(ctx context.Context) (uint64, error) {
 	return epoch, nil
 }
 func (c *Controller) start(ctx context.Context, p Profile, mode string) error {
+	if err := validateOperatingWACN(p.System.WACN); err != nil {
+		return err
+	}
 	lease, err := c.startLease()
 	if err != nil {
 		return err
@@ -358,15 +379,64 @@ func (c *Controller) startAtEpoch(ctx context.Context, p Profile, mode string, v
 
 // Explicit startup remains strict. Only recovery of an already desired Site
 // may leave an unavailable voice resource faulted for its own retry loop.
-func (c *Controller) startSite(ctx context.Context, p Profile, mode string, voiceIntent map[string]bool, epoch uint64, recovering *siteAttempt) (err error) {
-	controlID := ""
-	if recovering != nil {
-		controlID = recovering.controlID
+func (c *Controller) startSite(ctx context.Context, p Profile, mode string, voiceIntent map[string]bool, epoch uint64, recovering *siteAttempt) error {
+	if err := validateOperatingWACN(p.System.WACN); err != nil {
+		return err
 	}
-	return c.startSiteOnControl(ctx, p, mode, voiceIntent, epoch, recovering, controlID)
+	if recovering != nil && recovering.controlID != "" {
+		return c.startSiteOnControl(ctx, p, mode, voiceIntent, epoch, recovering, recovering.controlID)
+	}
+	c.mu.Lock()
+	c.controlTurns = nil
+	candidates := controlCandidates(p)
+	available := []string{}
+	for _, ch := range candidates {
+		available = append(available, ch.ID)
+	}
+	order := []string{}
+	if p.Site.ControlPolicy.Mode == "static" && slices.Contains(available, p.Site.ControlPolicy.ChannelID) {
+		order = append(order, p.Site.ControlPolicy.ChannelID)
+		available = slices.DeleteFunc(available, func(id string) bool { return id == p.Site.ControlPolicy.ChannelID })
+	}
+	for len(available) > 0 {
+		id := c.chooseControlLocked(p, available, "")
+		if id == "" {
+			break
+		}
+		order = append(order, id)
+		available = slices.DeleteFunc(available, func(v string) bool { return v == id })
+	}
+	// Consume startup choices only when attempted; the rest keep their turns.
+	c.controlTurns = slices.Clone(order)
+	c.mu.Unlock()
+	if len(order) == 0 {
+		return errors.New("configure an enabled control candidate for this Site")
+	}
+	var result error
+	for _, id := range order {
+		c.mu.Lock()
+		c.controlTurns = slices.DeleteFunc(c.controlTurns, func(v string) bool { return v == id })
+		c.mu.Unlock()
+		err := c.startSiteOnControl(ctx, p, mode, voiceIntent, epoch, recovering, id)
+		if err == nil {
+			return nil
+		}
+		result = errors.Join(result, fmt.Errorf("control candidate %s: %w", id, err))
+		c.mu.Lock()
+		retired := len(c.children) == 0 && c.fne == nil
+		cancelled := c.stopEpoch != epoch || c.stopRequests != 0 || c.closing
+		c.mu.Unlock()
+		if !retired || cancelled || ctx.Err() != nil {
+			return result
+		}
+	}
+	return result
 }
 
 func (c *Controller) startSiteOnControl(ctx context.Context, p Profile, mode string, voiceIntent map[string]bool, epoch uint64, recovering *siteAttempt, controlID string) (err error) {
+	if err := validateOperatingWACN(p.System.WACN); err != nil {
+		return err
+	}
 	lease, err := c.startLease()
 	if err != nil {
 		c.mu.Lock()
@@ -404,7 +474,7 @@ func (c *Controller) startSiteOnControl(ctx context.Context, p Profile, mode str
 	if mode == "hardware" && !c.opts.AllowRF {
 		return errors.New("RF operation is not enabled for this Site service")
 	}
-	if policy := p.Site.ControlPolicy.Mode; policy != "" && policy != "static" && policy != "dynamic" {
+	if policy := p.Site.ControlPolicy.Mode; policy != "static" && policy != "random" {
 		return errors.New("the configured control assignment policy is not implemented")
 	}
 	if _, err := nativeExecutable(c.opts.EnginePath); err != nil {
@@ -444,10 +514,6 @@ func (c *Controller) startSiteOnControl(ctx context.Context, p Profile, mode str
 		}
 	}
 	n, err := c.NetworkFor(p)
-	if err != nil {
-		return err
-	}
-	n.RPCSecret, err = newSecret()
 	if err != nil {
 		return err
 	}
@@ -512,11 +578,11 @@ func (c *Controller) startSiteOnControl(ctx context.Context, p Profile, mode str
 					leases[ch.ID] = lease
 				}
 				if err == nil {
-					err = c.verifyModem(ctx, lease, m.Device, p.Site.Identification.Enabled && p.Site.Identification.Mode == "ham")
+					err = c.verifyModem(ctx, lease, m.Device)
 				}
 			}
 			if err != nil {
-				if recovering != nil && ch.Role == "voice" && ctx.Err() == nil {
+				if ch.Role == "voice" && ctx.Err() == nil {
 					if lease := leases[ch.ID]; lease != nil {
 						delete(leases, ch.ID)
 						if cleanupErr := c.releaseStartupLeases(map[string]io.Closer{ch.ID: lease}, p); cleanupErr != nil {
@@ -558,6 +624,7 @@ func (c *Controller) startSiteOnControl(ctx context.Context, p Profile, mode str
 	c.status.State = "starting"
 	c.status.Mode = mode
 	c.status.SiteID = p.Site.ID
+	c.status.NAC = p.Site.NAC
 	c.status.StartedAt = time.Now().UTC()
 	c.status.ActiveControlChannelID = ""
 	if c.controlSwitch == nil {
@@ -626,7 +693,12 @@ func (c *Controller) startSiteOnControl(ctx context.Context, p Profile, mode str
 		c.mu.Unlock()
 		return context.Canceled
 	}
-	fne, err := launch(c.opts.FNEPath, fneDir, "fne.yml", "media", "media", nil, c.observe)
+	fneClient, err := NewNativeClient(net.JoinHostPort(n.Address, fmt.Sprint(n.Port)), n.RPCSecret)
+	if err != nil {
+		c.mu.Unlock()
+		return c.startFailure(err)
+	}
+	fne, err := launch(c.opts.FNEPath, fneDir, "fne.yml", "media", "media", fneClient, c.observe)
 	if err != nil {
 		c.mu.Unlock()
 		return c.startFailure(err)
@@ -709,7 +781,7 @@ func (c *Controller) startSiteOnControl(ctx context.Context, p Profile, mode str
 			}
 			cancel()
 			if err != nil {
-				if recovering != nil && ch.Role == "voice" && ctx.Err() == nil {
+				if ch.Role == "voice" && ctx.Err() == nil {
 					if cleanupErr := c.retireUnavailableVoice(ctx, child, err, recovering); cleanupErr == nil {
 						unavailable[ch.ID] = err
 						continue
@@ -728,6 +800,9 @@ func (c *Controller) startSiteOnControl(ctx context.Context, p Profile, mode str
 			}
 			c.mu.Unlock()
 		}
+	}
+	if err = c.synchronizeControlResources(ctx); err != nil {
+		return c.startFailure(err)
 	}
 	if err = c.synchronizeInhibition(ctx, true); err != nil {
 		return c.startFailure(err)
@@ -829,7 +904,6 @@ func (c *Controller) stop(ctx context.Context, graceful bool) error {
 		children = append(children, child)
 	}
 	fne := c.fne
-	identification := c.profile.Site.Identification.Enabled && c.profile.Site.Identification.Mode == "ham" && c.status.Mode == "hardware" && graceful
 	c.status.State = "stopping"
 	c.withdrawSourceFactsLocked()
 	c.status.InhibitionReady = false
@@ -846,7 +920,7 @@ func (c *Controller) stop(ctx context.Context, graceful bool) error {
 	var stopping sync.WaitGroup
 	for _, native := range children {
 		stopping.Add(1)
-		go func(process *child) { defer stopping.Done(); errorsCh <- process.stop(ctx, identification) }(native)
+		go func(process *child) { defer stopping.Done(); errorsCh <- process.stop(ctx) }(native)
 	}
 	stopping.Wait()
 	close(errorsCh)
@@ -854,7 +928,7 @@ func (c *Controller) stop(ctx context.Context, graceful bool) error {
 		result = errors.Join(result, err)
 	}
 	if fne != nil {
-		if err := fne.stop(ctx, false); err != nil {
+		if err := fne.stop(ctx); err != nil {
 			result = errors.Join(result, err)
 		}
 	}
@@ -933,7 +1007,7 @@ func (c *Controller) SetZoneConnected(connected bool) { c.zone.Store(connected) 
 func (c *Controller) ControlClient() (*NativeClient, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.status.State != "running" || c.runContext == nil || c.runContext.Err() != nil || !c.status.InhibitionReady {
+	if c.status.State != "running" || c.runContext == nil || c.runContext.Err() != nil || !c.status.InhibitionReady || c.controlSwitch != nil && c.controlSwitch.handoff {
 		return nil, errors.New("control channel is not ready")
 	}
 	for _, child := range c.children {
@@ -946,7 +1020,7 @@ func (c *Controller) ControlClient() (*NativeClient, error) {
 func (c *Controller) ChannelClient(id string) (*NativeClient, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.status.State != "running" || c.runContext == nil || c.runContext.Err() != nil || !c.status.InhibitionReady {
+	if c.status.State != "running" || c.runContext == nil || c.runContext.Err() != nil || !c.status.InhibitionReady || c.controlSwitch != nil && c.controlSwitch.handoff {
 		return nil, errors.New("RF channel is not ready")
 	}
 	if child := c.children[id]; child != nil && child.alive() && child.readyNow() {
@@ -964,8 +1038,18 @@ func (c *Controller) ApplyPolicy(ctx context.Context, p Profile) error {
 	p = cloneProfile(p)
 	configured := cloneProfile(p)
 	c.mu.Lock()
+	// Neighbor programming takes effect only on an explicit Site Start.
+	configured.Site.NeighborMode = c.configuredProfile.Site.NeighborMode
+	configured.Site.NeighborSiteIDs = slices.Clone(c.configuredProfile.Site.NeighborSiteIDs)
+	p.Site.NeighborMode, p.Site.NeighborSiteIDs = configured.Site.NeighborMode, configured.Site.NeighborSiteIDs
 	if c.status.ActiveControlChannelID != "" {
 		p = promotedProfile(p, c.status.ActiveControlChannelID)
+	} else if candidates := controlCandidates(p); len(candidates) > 0 {
+		id := candidates[0].ID
+		if p.Site.ControlPolicy.Mode == "static" {
+			id = p.Site.ControlPolicy.ChannelID
+		}
+		p = promotedProfile(p, id)
 	}
 	if c.controlSwitch != nil && recoverySettingsDigest(c.configuredProfile) != recoverySettingsDigest(configured) {
 		c.controlSwitch.cancel()
@@ -1086,6 +1170,7 @@ func cloneProfile(p Profile) Profile {
 	p.System.Talkgroups = append([]Talkgroup(nil), p.System.Talkgroups...)
 	for i := range p.System.Talkgroups {
 		p.System.Talkgroups[i].SiteIDs = append([]string(nil), p.System.Talkgroups[i].SiteIDs...)
+		p.System.Talkgroups[i].RequestedSiteIDs = slices.Clone(p.System.Talkgroups[i].RequestedSiteIDs)
 		p.System.Talkgroups[i].AffiliationRadioIDs = append([]int(nil), p.System.Talkgroups[i].AffiliationRadioIDs...)
 		p.System.Talkgroups[i].TransmitRadioIDs = append([]int(nil), p.System.Talkgroups[i].TransmitRadioIDs...)
 	}
@@ -1093,6 +1178,8 @@ func cloneProfile(p Profile) Profile {
 	p.Zone.Sites = append([]SiteIdentity(nil), p.Zone.Sites...)
 	p.Site.Modems = append([]Modem(nil), p.Site.Modems...)
 	p.Site.Channels = append([]Channel(nil), p.Site.Channels...)
+	p.Site.ControlPolicy.CandidateIDs = slices.Clone(p.Site.ControlPolicy.CandidateIDs)
+	p.Site.NeighborSiteIDs = slices.Clone(p.Site.NeighborSiteIDs)
 	p.Network = cloneNetwork(p.Network)
 	p.Inhibition.Desired = slices.Clone(p.Inhibition.Desired)
 	p.Inhibition.Restore = slices.Clone(p.Inhibition.Restore)
@@ -1109,7 +1196,7 @@ func PolicySignature(p Profile) string {
 	}
 	type groupRule struct {
 		ID                                    int
-		Enabled, SiteAllowed                  bool
+		Enabled, SiteAllowed, Requested       bool
 		StartPolicy                           string
 		Priority                              int
 		AdmissionMode                         string
@@ -1147,7 +1234,7 @@ func PolicySignature(p Profile) string {
 			transmitIDs = append(transmitIDs, g.TransmitRadioIDs...)
 			slices.Sort(transmitIDs)
 		}
-		value.Groups = append(value.Groups, groupRule{g.TGID, g.Enabled, groupAllowedAtSite(g, p.Site.ID), start, priority, mode, affiliation, transmit, affiliationIDs, transmitIDs})
+		value.Groups = append(value.Groups, groupRule{g.TGID, g.Enabled, groupAllowedAtSite(g, p.Site.ID), slices.Contains(g.RequestedSiteIDs, p.Site.ID), start, priority, mode, affiliation, transmit, affiliationIDs, transmitIDs})
 	}
 	sort.Slice(value.Radios, func(i, j int) bool { return value.Radios[i].ID < value.Radios[j].ID })
 	sort.Slice(value.Groups, func(i, j int) bool { return value.Groups[i].ID < value.Groups[j].ID })
@@ -1157,6 +1244,13 @@ func PolicySignature(p Profile) string {
 }
 
 func physicalDigest(p Profile) string {
+	p = cloneProfile(p)
+	slices.Sort(p.Site.ControlPolicy.CandidateIDs)
+	p.Site.ControlPolicy.CandidateIDs = slices.Compact(p.Site.ControlPolicy.CandidateIDs)
+	p.Site.NeighborMode, p.Site.NeighborSiteIDs = "", nil
+	for i := range p.Site.Channels {
+		p.Site.Channels[i].Role = ""
+	}
 	p.System.Radios = nil
 	p.System.Talkgroups = nil
 	p.System.Name = ""
@@ -1186,4 +1280,17 @@ func collectLines(reader io.Reader, callback func(string)) {
 			callback(text)
 		}
 	}
+}
+
+// RFConfigurationSignature identifies the RF programming represented by a run.
+func RFConfigurationSignature(p Profile) string {
+	signature := physicalDigest(p)
+	if p.Site.NeighborMode != "selected" {
+		return signature
+	}
+	ids := append([]string{}, p.Site.NeighborSiteIDs...)
+	slices.Sort(ids)
+	selected, _ := json.Marshal(slices.Compact(ids))
+	sum := sha256.Sum256(append([]byte(signature), selected...))
+	return hex.EncodeToString(sum[:])
 }

@@ -11,6 +11,12 @@ const {chromium}=await import(process.env.TRUNKSYSTEM_PLAYWRIGHT || 'playwright'
 const browser=await chromium.launch({headless:true,channel:'chrome'});
 const report={scope:'Five disposable Go instances; production renderers, navigation, presentation, intercepted radio-configuration Save, real disposable SMTP saves and planned-alarm rejection. No production endpoint, audio, RF, USB or firmware action.',instances:[],failures:[]};
 const retired=['/app.js','/desktop.js','/desktop.css','/radio.js','/radio.css','/relay_icons.js','/sw.js','/manifest.webmanifest'];
+const zoomScope=process.env.OPEN25_ADMIN_ZOOM_SCOPE||'enlarged';
+assert.ok(['normal','enlarged'].includes(zoomScope),'explicit normal or enlarged test scope');
+report.zoomScope=zoomScope;
+const viewportScope=process.env.OPEN25_ADMIN_VIEWPORT_SCOPE||'responsive';
+assert.ok(['desktop','responsive'].includes(viewportScope),'explicit desktop or responsive viewport scope');
+report.viewportScope=viewportScope;
 const geometry=[];
 async function auditGeometry(page,label,width,appearance){
  const data=await page.evaluate(appearance=>{
@@ -25,7 +31,7 @@ async function auditGeometry(page,label,width,appearance){
    const actions=[...document.querySelectorAll('.ts-actions,.ts-relation')].filter(visible).map(group=>[...group.children].filter(n=>n.matches('button,a.ts-button,input')&&visible(n)).map(n=>({label:n.textContent||n.name,box:rect(n)})));
    const arrows=[...document.querySelectorAll('.ts-instance-tree a .ts-external')].filter(visible).map(n=>({label:n.parentElement.textContent,box:rect(n)}));
    const profiles=[...document.querySelectorAll('.ts-gridrow')].filter(visible).map(row=>({columns:getComputedStyle(row).gridTemplateColumns.split(' ').length,inputs:[...row.querySelectorAll('input:not([type=checkbox])')].map(rect),button:rect(row.querySelector('button')),check:row.querySelector('input[type=checkbox]')&&rect(row.querySelector('input[type=checkbox]'))}));
-   const pickers=[...document.querySelectorAll('.ts-relation')].filter(visible).map(row=>({columns:getComputedStyle(row).gridTemplateColumns.split(' ').length,button:rect(row.querySelector('button')),input:rect(row.querySelector('input:not([type=hidden])'))}));
+   const pickers=[...document.querySelectorAll('.ts-relation')].filter(visible).map(row=>{const value=row.querySelector('input:not([type=hidden]),output');return {columns:getComputedStyle(row).gridTemplateColumns.split(' ').length,button:rect(row.querySelector('button')),value:rect(value),output:value.tagName==='OUTPUT'};});
    const orders=[...document.querySelectorAll('.ts-orderlist')].filter(visible).map(list=>[...list.querySelectorAll('.ts-orderitem .ts-actions')].map(rect));
    const disclosures=[...document.querySelectorAll('.ts-navbranch>summary,.ts-advanced>summary')].filter(visible).map(n=>({row:rect(n),arrow:n.querySelector('svg')&&rect(n.querySelector('svg'))}));
    const buttons=[...document.querySelectorAll('button:not(.ts-link),a.ts-button')].filter(visible).map(n=>({label:n.textContent||n.getAttribute('aria-label'),box:rect(n)}));
@@ -43,14 +49,14 @@ async function auditGeometry(page,label,width,appearance){
   near(row.button.y,row.inputs[0].y,'profile delete alignment');
   if(row.check)near(row.check.y+row.check.height/2,row.inputs[0].y+row.inputs[0].height/2,'profile checkbox alignment');
  }
- for(const row of data.pickers)if(row.columns>1){near(row.button.y,row.input.y,'picker alignment');near(row.button.height,row.input.height,'picker height');}
+ for(const row of data.pickers)if(row.columns>1){if(row.output)near(row.button.y+row.button.height/2,row.value.y+row.value.height/2,'picker selected-name alignment');else{near(row.button.y,row.value.y,'picker input alignment');near(row.button.height,row.value.height,'picker input height');}}
  for(const list of data.orders)for(const item of list)near(item.right,list[0].right,'profile reorder column');
  for(const row of data.disclosures){assert.ok(row.arrow,'shared disclosure arrow');near(row.arrow.y+row.arrow.height/2,row.row.y+row.row.height/2,'disclosure centre');}
  for(const button of data.buttons)near(button.box.height,40*data.scale,'button height '+button.label);
 }
 async function dimensions(page,label){
  const rows=[];
- for(const width of [1440,1024,736,320]){
+ for(const width of (viewportScope==='desktop'?[1440]:[1440,1024,736,320])){
   await page.setViewportSize({width,height:1000});
   for(const appearance of ['light','dark'])await auditGeometry(page,label,width,appearance);
   if(label==='profile-dynamic-rows'||label==='/c4fm-test')await page.screenshot({path:path.join(output,label.replaceAll('/','')+'-'+width+'.png'),fullPage:true});
@@ -58,12 +64,16 @@ async function dimensions(page,label){
   assert.ok(size.scroll<=size.client+1,JSON.stringify({label,width,...size}));rows.push({width,...size});
  }
  await page.setViewportSize({width:1440,height:1000});
+ if(zoomScope==='normal')return rows;
  await page.evaluate(()=>document.documentElement.style.zoom='2');
  try {
   for(const appearance of ['light','dark'])await auditGeometry(page,label+'-zoom-200',1440,appearance);
   if(label==='profile-dynamic-rows'||label==='/c4fm-test')await page.screenshot({path:path.join(output,label.replaceAll('/','')+'-zoom-200.png'),fullPage:true});
   const size=await page.evaluate(()=>({scroll:document.documentElement.scrollWidth,client:document.documentElement.clientWidth}));
   assert.ok(size.scroll<=size.client+1,'200% layout '+label);
+ } catch(error) {
+  await page.screenshot({path:path.join(output,'zoom-failure-'+new URL(page.url()).pathname.replaceAll('/','-')+'.png'),fullPage:true});
+  throw error;
  } finally {await page.evaluate(()=>document.documentElement.style.zoom='');}
  return rows;
 }
@@ -110,10 +120,11 @@ try{
    const foreign=page.locator('.ts-instance-tree a:not([aria-current])');
    assert.equal(await foreign.locator('.ts-external').count(),await foreign.count(),'every other portal has an outside-link icon');
    assert.equal(await page.locator('.ts-breadcrumb a:not(:has(.ts-external))').count(),0,'ancestor portal links are marked');
-   assert.equal(await page.locator('.ts-network-diagram a:not(:has(.ts-external))').count(),0,'topology portal links are marked');
+   assert.equal(await page.locator('.ts-network-diagram a:not([aria-current]):not(:has(.ts-external))').count(),0,'foreign topology portal links are marked');
+   assert.equal(await page.locator('.ts-network-diagram a[aria-current=page] .ts-external').count(),0,'current topology portal has no outside marker');
    assert.equal(await page.locator('.ts-sidebar > nav > a .ts-external').count(),0,'ordinary local navigation has no marker');
 
-   assert.equal(await page.locator('.ts-network-diagram [aria-current=true]').count(),1);
+   assert.equal(await page.locator('.ts-network-diagram a[aria-current=page]').count(),1);
    assert.equal(await page.locator('.ts-page').getAttribute('data-page-group'),'dashboard');
    const crumbs=await page.locator('.ts-breadcrumb').innerText();assert.ok(crumbs.includes('System:'));
    if(role.role==='site'||role.role==='zone')assert.ok(crumbs.includes('Zone:'));
@@ -121,16 +132,18 @@ try{
    assert.equal(await page.locator('.ts-instance-tree > li > ul > li > ul > li').count(),role.role==='site'?1:2,'known Sites nested inside their Zone');
    for(const clutter of ['Local administration','Read only · Loaded','Stored observations','Explicit Save'])assert.ok(!(await page.locator('.ts-main,.ts-contextbar').allTextContents()).join(' ').includes(clutter));
 
-   assert.deepEqual(await page.locator('.ts-page h2').allTextContents().then(t=>[t[0],t[1],t.at(-1)]),['Needs attention','Network location','Configuration shortcuts']);
+   assert.deepEqual(await page.locator('.ts-page h2').allTextContents().then(t=>[t[0],t[1],t.at(-1)]),['Needs attention','Network location','Configuration']);
    assert.equal(await page.locator('.ts-main form[method=post]').count(),0);
    item.layouts.push({page:'overview',sizes:await dimensions(page,'overview')});
    for(const appearance of ['light','dark']){
     if(await page.locator('body').getAttribute('data-theme')!==appearance)await page.locator('[data-admin-theme]').click();
     await page.screenshot({path:path.join(output,role.instance+'-overview-'+appearance+'.png'),fullPage:true});
    }
+   if(zoomScope==='enlarged'){
    await page.evaluate(()=>document.documentElement.style.zoom='2');
    const zoom=await page.evaluate(()=>({width:document.documentElement.clientWidth,scroll:document.documentElement.scrollWidth}));assert.ok(zoom.scroll<=zoom.width+1,'200% zoom fits');
    await page.evaluate(()=>document.documentElement.style.zoom='');
+   }
    const queue=await page.locator('.ts-sidebar a').evaluateAll(nodes=>nodes.map(n=>n.href)),seen=new Set();queue.push(role.origin+'/installation');
    while(queue.length){
     const address=queue.shift(),url=new URL(address);if(url.origin!==role.origin||seen.has(url.pathname+url.search)||['/dispatch-test','/ptt-test'].includes(url.pathname))continue;seen.add(url.pathname+url.search);
@@ -234,15 +247,15 @@ if(role.role==='system'&&process.env.OPEN25_REFERENCE_URL)item.reference=await c
     await page.goto(role.origin+'/channels/edit?row=0');
     assert.equal(await page.locator('input[name=tx_frequency_hz],input[name=rx_frequency_hz]').count(),0,'frequencies are calculated outputs');
     await page.locator('[name=channel_no]').fill('81');await page.locator('[name=channel_no]').blur();
-    assert.match(await page.locator('[data-band-frequency=tx_frequency_hz]').innerText(),/^444\.45/);
-    assert.match(await page.locator('[data-band-frequency=rx_frequency_hz]').innerText(),/^449\.45/);
+    assert.match(await page.locator('[data-band-frequency=tx_frequency_hz]').innerText(),/^434\.45/);
+    assert.match(await page.locator('[data-band-frequency=rx_frequency_hz]').innerText(),/^439\.45/);
     const calls=requests.length;
     await page.locator('[name=identifier]').fill('99');await page.locator('[name=identifier]').blur();
     await page.locator('[data-band-result]').filter({hasText:'No matching Band Plan'}).waitFor();
     assert.equal(await page.locator('[name=identifier]').inputValue(),'99','reference lookup never repairs input');
     assert.equal(await page.locator('[data-band-frequency=tx_frequency_hz]').innerText(),'Unavailable');
     await page.locator('[data-chooser-kind=bands]').click();await page.locator('.ts-chooser tbody input[value="2"]').waitFor();await page.locator('.ts-chooser tbody input[value="2"]').check();await page.locator('[data-chooser-apply]').click();
-    await page.waitForFunction(()=>document.querySelector('[data-band-frequency=tx_frequency_hz]').textContent.startsWith('444.45'));
+    await page.waitForFunction(()=>document.querySelector('[data-band-frequency=tx_frequency_hz]').textContent.startsWith('434.45'));
     assert.ok(requests.slice(calls).every(r=>r.method==='GET'&&new URL(r.url).pathname==='/chooser'),'frequency preview uses only explicit owned reference reads');
     await dimensions(page,'calculated-rf-fields');await page.screenshot({path:path.join(output,role.instance+'-calculated-rf.png'),fullPage:true});
    }

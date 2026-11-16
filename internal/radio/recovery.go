@@ -38,7 +38,7 @@ type siteAttempt struct {
 
 type modemOperations struct {
 	acquire func(context.Context, string) (io.Closer, error)
-	verify  func(context.Context, io.Closer, string, bool) error
+	verify  func(context.Context, io.Closer, string) error
 	same    func(io.Closer, string) bool
 	resolve func(string) (string, error)
 }
@@ -56,11 +56,11 @@ func (c *Controller) acquireModem(ctx context.Context, path string) (io.Closer, 
 	}
 	return acquireDevice(ctx, path)
 }
-func (c *Controller) verifyModem(ctx context.Context, lease io.Closer, path string, identification bool) error {
+func (c *Controller) verifyModem(ctx context.Context, lease io.Closer, path string) error {
 	if c.modem.verify != nil {
-		return c.modem.verify(ctx, lease, path, identification)
+		return c.modem.verify(ctx, lease, path)
 	}
-	return verifyFirmware(ctx, lease, path, identification)
+	return verifyFirmware(ctx, lease, path)
 }
 
 // Public Stop/Close signal before opMu: a slow modem/startup cannot prevent the
@@ -192,14 +192,14 @@ func (c *Controller) markSiteRetryLocked(attempt *siteAttempt, err error) {
 // fails warmup, but only after that worker and its descriptor are retired.
 func (c *Controller) retireUnavailableVoice(ctx context.Context, process *child, cause error, attempt *siteAttempt) error {
 	stop, cancel := context.WithTimeout(ctx, 3*time.Second)
-	cleanupErr := process.stop(stop, false)
+	cleanupErr := process.stop(stop)
 	cancel()
 	if cleanupErr != nil {
 		return errors.Join(cause, cleanupErr)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.currentSiteAttemptLocked(attempt) || c.children[process.id] != process {
+	if (attempt != nil && !c.currentSiteAttemptLocked(attempt)) || ctx.Err() != nil || c.children[process.id] != process {
 		return context.Canceled
 	}
 	delete(c.children, process.id)
@@ -219,11 +219,11 @@ func (c *Controller) retireUnavailableVoice(ctx context.Context, process *child,
 }
 
 func (c *Controller) controlFailed(process *child) {
-	if c.dynamicControlFailed(process) {
+	if c.controlFailedWithFallback(process) {
 		return
 	}
 	c.mu.Lock()
-	if c.children[process.id] != process || (c.status.State != "running" && c.status.State != "starting") {
+	if c.children[process.id] != process || c.status.ActiveControlChannelID != process.id || (c.status.State != "running" && c.status.State != "starting") {
 		c.mu.Unlock()
 		return
 	}
@@ -317,7 +317,7 @@ func recoveryDelay(failures uint) time.Duration {
 func (c *Controller) recoverVoiceChannels(now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closing || c.status.State != "running" || c.runContext == nil || c.runContext.Err() != nil {
+	if c.closing || c.status.State != "running" || c.runContext == nil || c.runContext.Err() != nil || c.controlSwitch != nil && c.controlSwitch.outage.Load() {
 		return
 	}
 	for _, row := range c.status.Channels {
@@ -371,7 +371,7 @@ func (c *Controller) cancelChannelStart(id string) {
 		return
 	}
 	for _, row := range c.status.Channels {
-		if row.ID != id || row.Role != "voice" || row.Busy || row.Identifying {
+		if row.ID != id || row.Role != "voice" || row.Busy {
 			continue
 		}
 		if recovery := c.recovery[id]; recovery != nil && recovery.attempt != nil {

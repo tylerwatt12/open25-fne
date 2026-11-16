@@ -13,13 +13,13 @@ import (
 )
 
 func storeFixtureSystem() SystemConfig {
-	return SystemConfig{ID: "system-1", Name: "Laboratory", WACN: 1, SystemID: 1, Callsign: "N0TEST", Radios: []Radio{{RID: 10001, Alias: "Portable", Enabled: true, Kind: "subscriber"}}, Talkgroups: []Talkgroup{{TGID: 1001, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Test 1", Enabled: true, SiteAccess: "all", SiteIDs: []string{}}}}
+	return SystemConfig{ID: "system-1", Name: "Laboratory", WACN: 1, SystemID: 1, Radios: []Radio{{RID: 10001, Alias: "Portable", Enabled: true, Kind: "subscriber"}}, Talkgroups: []Talkgroup{{TGID: 1001, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Test 1", Enabled: true, SiteAccess: "all", SiteIDs: []string{}}}}
 }
 func storeFixtureZone() ZoneConfig {
-	return ZoneConfig{ID: "zone-1", SystemID: "system-1", Name: "Zone 1", RFSSID: 1, ChannelIdentifiers: []ChannelIdentifier{{Identifier: 2, BaseHz: 443437500, SpacingHz: 12500, OffsetHz: 5000000, BandwidthHz: 12500}}, Sites: []SiteIdentity{{ID: "site-1", Name: "Site 1", SiteID: 1, NAC: 0x293, Endpoint: "http://localhost:5102", AdminURL: "https://localhost:5002"}}}
+	return ZoneConfig{ID: "zone-1", SystemID: "system-1", Name: "Zone 1", RFSSID: 1, ChannelIdentifiers: []ChannelIdentifier{{Identifier: 2, BaseHz: 433437500, SpacingHz: 12500, OffsetHz: 5000000, BandwidthHz: 12500}}, Sites: []SiteIdentity{{ID: "site-1", Name: "Site 1", SiteID: 1, Endpoint: "http://localhost:5102", AdminURL: "https://localhost:5002"}}}
 }
 func storeFixtureSite() SiteConfig {
-	return SiteConfig{BroadcastBandPlan: true, ID: "site-1", Modems: []Modem{{ID: "modem-1", Name: "Control modem", Device: "/dev/trunksystem-control", Baud: 115200}}, Channels: []Channel{{ID: "channel-1", Name: "Control", Role: "control", Identifier: 2, ChannelNo: 1, PowerPercent: 95, ModemID: "modem-1", Enabled: true}}, Identification: Identification{Mode: "ham", WPM: 20, QuietSeconds: 60}}
+	return SiteConfig{NAC: 659, ControlPolicy: ControlPolicy{Mode: "static", ChannelID: "channel-1", CandidateIDs: []string{"channel-1"}}, BroadcastBandPlan: true, ID: "site-1", Modems: []Modem{{ID: "modem-1", Name: "Control modem", Device: "/dev/trunksystem-control", Baud: 115200}}, Channels: []Channel{{ID: "channel-1", Name: "Control", Identifier: 2, ChannelNo: 1, PowerPercent: 95, ModemID: "modem-1", Enabled: true}}, Identification: Identification{Callsign: "N0TEST"}}
 }
 func storeDoc(t *testing.T, value any) json.RawMessage {
 	t.Helper()
@@ -92,8 +92,8 @@ func TestFrameworkStoreRetainsLocalConfigurationAndAccount(t *testing.T) {
 		t.Fatalf("database privacy: %v %v", info, err)
 	}
 	events, err := s.Events(20)
-	if err != nil || len(events) != 1 || events[0].Kind != "configuration" {
-		t.Fatalf("saved event: %#v %v", events, err)
+	if err != nil || len(events) != 0 {
+		t.Fatalf("process diagnostics revived after restart: %#v %v", events, err)
 	}
 }
 
@@ -268,9 +268,7 @@ func TestFrameworkCatalogUnchangedWritesSkipUpdatesAndChangesRemainAtomic(t *tes
 		BEGIN SELECT RAISE(FAIL, 'unexpected administrator update'); END;`); err != nil {
 		t.Fatal(err)
 	}
-	if err = accept(); err != nil {
-		t.Fatal("unchanged catalog attempted an UPDATE:", err)
-	}
+	withOccupiedConfigurationWriter(t, s, accept)
 	for name, value := range snapshot() {
 		if value != before[name] {
 			t.Fatal("unchanged catalog changed", name)
@@ -354,7 +352,7 @@ func TestFrameworkStorePreservesMisconfigurationAndRejectsMalformedJSONAtomicall
 	config := storeFixtureSite()
 	config.Channels[0].Identifier = 99
 	config.Channels[0].ModemID = "missing"
-	config.Identification.WPM = 25
+	config.Identification.BSIProfile = "entered-profile"
 	raw := storeDoc(t, config)
 	if err := s.SaveConfig(raw); err != nil {
 		t.Fatal(err)
@@ -406,9 +404,9 @@ func TestFrameworkUpstreamPlanDoesNotRewriteOrBlockLocalConfiguration(t *testing
 
 func TestFrameworkConfigurationPreservesEnteredValuesForEveryOwner(t *testing.T) {
 	documents := map[Role]json.RawMessage{
-		RoleSystem:      json.RawMessage(`{"id":"","wacn":0,"callsign":" n0test ","voice_mfid":256,"bsi_profile":"future","radios":[{"rid":1},{"rid":1}],"talkgroups":[{"tgid":100,"secure_mode":"clear","algorithm_id":132,"key_id":7,"site_ids":["missing"]}],"future_setting":true}`),
+		RoleSystem:      json.RawMessage(`{"id":"","wacn":0,"voice_mfid":256,"bsi_profile":"future","radios":[{"rid":1},{"rid":1}],"talkgroups":[{"tgid":100,"secure_mode":"clear","algorithm_id":132,"key_id":7,"site_ids":["missing"]}],"future_setting":true}`),
 		RoleZone:        json.RawMessage(`{"system_id":"missing","rfssid":999,"sites":[{"id":"duplicate","nac":4095},{"id":"duplicate","nac":4094}],"channel_identifiers":[{"identifier":16}]}`),
-		RoleSite:        json.RawMessage(`{"id":"","channels":[{"modem_id":"missing","rx_hz":1}],"identification":{"wpm":25}}`),
+		RoleSite:        json.RawMessage(`{"id":"","channels":[{"modem_id":"missing","rx_hz":1}],"identification":{"bsi_profile":"entered-profile"}}`),
 		RoleApplication: json.RawMessage(`{"name":"","connection_url":"https://unreachable.invalid","future_setting":null}`),
 	}
 	for role, raw := range documents {
@@ -429,22 +427,6 @@ func TestFrameworkConfigurationPreservesEnteredValuesForEveryOwner(t *testing.T)
 				t.Fatal("cache changed configuration", err)
 			}
 		})
-	}
-}
-
-func TestSystemSavePreservesWACNRestrictedForOperation(t *testing.T) {
-	s := storeOpen(t, RoleSystem)
-	for _, wacn := range []int{0xBEE00, 0xBEE80, 0xBEEFF} {
-		config := storeFixtureSystem()
-		config.WACN = wacn
-		raw := storeDoc(t, config)
-		if err := s.SaveConfig(raw); err != nil {
-			t.Fatal("operating restriction blocked administrator Save", err)
-		}
-		saved, err := s.Config()
-		if err != nil || !bytes.Equal(raw, saved) {
-			t.Fatalf("operating restriction altered saved WACN %05X: %s %v", wacn, saved, err)
-		}
 	}
 }
 

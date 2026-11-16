@@ -4,7 +4,9 @@ if(document.body.classList.contains("administration")){
  const dialog=document.createElement('dialog');dialog.className='ts-chooser';dialog.setAttribute('aria-labelledby','chooser-title');
  dialog.innerHTML=`<div class=ts-itemline><h2 id=chooser-title>Choose entries</h2><button type=button data-chooser-close aria-label="Close chooser"><span aria-hidden=true>×</span></button></div><form method=dialog data-chooser-search><label class=ts-field>Search by name or identity<input type=search name=q autocomplete=off></label><button type=submit>Search</button></form><p role=status data-chooser-status></p><div class=ts-chooser-table><table><thead><tr><th>Select</th><th>Identity</th><th>Name</th></tr></thead><tbody data-chooser-results></tbody></table></div><div class=ts-toolbar><button type=button data-chooser-prev>Previous</button><span data-chooser-page></span><button type=button data-chooser-next>Next</button></div><div class=ts-actions><button type=button data-chooser-close>Cancel</button><button type=button class=ts-primary data-chooser-apply>Use selection</button></div>`;
  const search=dialog.querySelector('[data-chooser-search]'),results=dialog.querySelector('[data-chooser-results]'),status=dialog.querySelector('[data-chooser-status]');
- const split=(value,kind)=>value.split(['radios','talkgroups'].includes(kind)?/[,\s]+/:/[,\n\r]+/).map(id=>id.trim()).filter(Boolean);
+ const canonical=(id,kind)=>['radios','talkgroups'].includes(kind)&&/^-?\d+$/.test(id)?BigInt(id).toString():id;
+ const opaque=kind=>!['radios','talkgroups','bands','keys'].includes(kind);
+ const split=(value,kind)=>value.split(['radios','talkgroups'].includes(kind)?/[,\s]+/:/[,\n\r]+/).map(id=>canonical(id.trim(),kind)).filter(Boolean);
  let state=null,request=null,generation=0;
  function selected(id){return state.added.has(id)||(state.initial.has(id)&&!state.removed.has(id));}
  function selectionCount(){return new Set([...state.original.filter(id=>!state.removed.has(id)),...state.added]).size;}
@@ -13,6 +15,7 @@ if(document.body.classList.contains("administration")){
  async function load(offset){
   request?.abort();request=new AbortController();const current=++generation;
   const query=new URLSearchParams({kind:state.kind,q:search.elements.q.value,offset:String(offset)});
+  if(['modems','usb'].includes(state.kind)&&state.owner){query.set('owner',state.owner);query.set('owner_occurrence',state.ownerOccurrence);}
   status.textContent='Loading…';
   try{
    const response=await fetch('/chooser?'+query,{credentials:'same-origin',signal:request.signal,headers:{Accept:'application/json'}});
@@ -23,7 +26,7 @@ if(document.body.classList.contains("administration")){
    for(const item of page.items){
     if(selected(item.ID))state.names[item.ID]=item.Name;
     const row=document.createElement('tr'),cell=document.createElement('td'),input=document.createElement('input');
-    input.type=state.multiple?'checkbox':'radio';input.name='chooser-selection';input.value=item.ID;input.checked=selected(item.ID);input.setAttribute('aria-label',item.Name+' · '+item.ID);
+    input.type=state.multiple?'checkbox':'radio';input.name='chooser-selection';input.value=item.ID;input.checked=selected(item.ID);input.disabled=!!item.Disabled;input.setAttribute('aria-label',(item.Name||'Unnamed entry')+(opaque(state.kind)?'':' · '+(item.DisplayID||item.ID))+(item.InUse?' · '+item.InUse:''));
     input.addEventListener('change',()=>{
      if(!state.multiple){state.added.clear();state.removed=new Set(state.original);}
      if(input.checked){state.removed.delete(item.ID);if(!state.initial.has(item.ID)||!state.multiple)state.added.add(item.ID);}
@@ -32,7 +35,8 @@ if(document.body.classList.contains("administration")){
      showSelection();
     });
     cell.append(input);row.append(cell);
-    for(const text of [item.ID,item.Name]){const td=document.createElement('td');td.textContent=text;row.append(td);}
+    const identityCell=document.createElement('td');identityCell.textContent=item.DisplayID||item.ID;if(opaque(state.kind))identityCell.className='ts-hidden-identity';else identityCell.className='ts-numeric';row.append(identityCell);
+    const nameCell=document.createElement('td');nameCell.textContent=(item.Name||'Unnamed entry')+(item.InUse?' · '+item.InUse:'');row.append(nameCell);
     results.append(row);
    }
    if(!page.items.length){const row=document.createElement('tr'),cell=document.createElement('td');cell.colSpan=3;cell.textContent='No matching entries.';row.append(cell);results.append(row);}
@@ -43,13 +47,16 @@ if(document.body.classList.contains("administration")){
   }catch(error){if(current===generation&&dialog.open&&error.name!=='AbortError')status.textContent=error.message;}
  }
  document.addEventListener('click',event=>{
+  const clear=event.target.closest('[data-relation-clear]');
+  if(clear){const field=clear.closest('.ts-field'),input=field.querySelector('input[type=hidden]');input.value='';field.querySelector('[data-relation-display]').textContent='None selected';input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new Event('change',{bubbles:true}));return;}
   const trigger=event.target.closest('[data-chooser-kind]');if(!trigger)return;
   const form=trigger.closest('form'),input=form?.elements.namedItem(trigger.dataset.chooserTarget)||document.getElementById(trigger.dataset.chooserTarget);if(!input)return;
   if(!dialog.isConnected)document.querySelector('.ts-admin').append(dialog);
-  const original=trigger.dataset.chooserKind==='keys'?[form.elements.algorithm_id.value+'/'+input.value]:(trigger.dataset.chooserMultiple==='true'?split(input.value,trigger.dataset.chooserKind):[input.value].filter(Boolean));
-  state={trigger,input,navigate:trigger.hasAttribute('data-chooser-navigate'),edit:trigger.dataset.chooserEdit,kind:trigger.dataset.chooserKind,multiple:trigger.dataset.chooserMultiple==='true',original,initial:new Set(original),added:new Set(),removed:new Set(),names:JSON.parse(input.dataset.choiceLabels||'{}'),offset:0};
+  const original=trigger.dataset.chooserKind==='keys'?[form.elements.algorithm_id.value+'/'+input.value]:(trigger.dataset.chooserMultiple==='true'?split(input.value,trigger.dataset.chooserKind):[canonical(input.value,trigger.dataset.chooserKind)].filter(Boolean));
+  state={trigger,input,owner:form?.elements.namedItem('resource')?.value||'',ownerOccurrence:form?.elements.namedItem('resource_occurrence')?.value||'0',navigate:trigger.hasAttribute('data-chooser-navigate'),edit:trigger.dataset.chooserEdit,kind:trigger.dataset.chooserKind,multiple:trigger.dataset.chooserMultiple==='true',original,initial:new Set(original),added:new Set(),removed:new Set(),names:JSON.parse(input.dataset.choiceLabels||'{}'),offset:0};
   dialog.querySelector('#chooser-title').textContent='Choose '+({bands:'Band Plan',usb:'USB modem',users:'login',instances:'administration instance'}[state.kind]||state.kind);
   dialog.querySelector('thead th:nth-child(2)').textContent=state.kind==='keys'?'Algorithm / Key ID':'Identity';
+  dialog.querySelector('thead th:nth-child(2)').classList.toggle('ts-hidden-identity',opaque(state.kind));
   search.reset();search.querySelector('button').textContent=state.kind==='usb'?'Refresh':'Search';results.replaceChildren();dialog.querySelector('[data-chooser-page]').textContent='';dialog.showModal();search.elements.q.focus();showSelection();load(0);
  });
  search.addEventListener('submit',event=>{event.preventDefault();load(0);});
@@ -61,8 +68,10 @@ if(document.body.classList.contains("administration")){
   if(state.added.size||state.removed.size){
    const values=[...state.original.filter(id=>!state.removed.has(id)),...state.added].filter((id,i,all)=>state.multiple||i===all.length-1);
    const value=state.multiple?values.join(', '):(values.at(-1)||'');
-   if(state.kind==='keys'){const [algorithm,key]=value.split('/');const algorithmInput=state.input.form.elements.algorithm_id;algorithmInput.value=algorithm;state.input.value=key;algorithmInput.dispatchEvent(new Event('input',{bubbles:true}));}else state.input.value=value;
+   if(state.kind==='keys'){const [algorithm,key]=value.split('/');const algorithmInput=state.input.form.elements.algorithm_id;algorithmInput.value=algorithm;state.input.value=key;algorithmInput.dispatchEvent(new Event('input',{bubbles:true}));}else state.input.value=['radios','talkgroups'].includes(state.kind)&&!state.multiple?value.padStart(state.kind==='radios'?8:5,'0'):value;
    const names={};for(const id of values)if(state.names[id])names[id]=state.names[id];state.input.dataset.choiceLabels=JSON.stringify(names);
+   const display=state.input.closest('.ts-field')?.querySelector('[data-relation-display]');
+   if(display)display.textContent=values.slice(0,50).map(id=>names[id]||'Unnamed entry').join(', ')+(values.length>50?' · '+(values.length-50)+' more':'')||'None selected';
    if(state.navigate||state.edit){const link=document.createElement('a');link.href=state.edit?state.edit+'?'+new URLSearchParams({identity:state.input.value}):state.input.value;document.body.append(link);dialog.close();link.click();link.remove();return;}
    state.input.dispatchEvent(new Event('input',{bubbles:true}));
    state.input.dispatchEvent(new Event('change',{bubbles:true}));

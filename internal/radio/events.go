@@ -227,14 +227,6 @@ func ParseEvent(line string) *Event {
 	return e
 }
 
-func identificationLine(line string) (string, bool) {
-	for _, state := range []string{"idle", "quiet", "draining", "identifying", "restoring"} {
-		if strings.HasSuffix(strings.TrimSpace(line), "CW, state "+state) {
-			return state, true
-		}
-	}
-	return "", false
-}
 func sensitiveLine(line string) bool {
 	lower := strings.ToLower(line)
 	for _, word := range []string{"password", "secret", "unique id", "udid", "auth token", "authentication token"} {

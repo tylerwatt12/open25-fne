@@ -1,0 +1,62 @@
+[
+  {
+    "site_id": "site-b",
+    "native_started_at": "2025-01-01T03:05:39.140588Z",
+    "observed_at": "2025-01-01T03:05:39.140592Z",
+    "revision": 7,
+    "active": true,
+    "affiliations": [],
+    "registrations": [],
+    "null_affiliations": [],
+    "terminals": [],
+    "withdrawals": [],
+    "retired": [
+      {
+        "kind": "registration",
+        "rid": 10001,
+        "at": "2025-01-01T03:05:39.140565Z",
+        "native_started_at": "2025-01-01T03:05:38.140543Z"
+      }
+    ]
+  },
+  {
+    "site_id": "site-b",
+    "native_started_at": "2025-01-01T03:05:39.141121Z",
+    "observed_at": "2025-01-01T03:05:39.141124Z",
+    "revision": 7,
+    "active": true,
+    "affiliations": [],
+    "registrations": [],
+    "null_affiliations": [],
+    "terminals": [],
+    "withdrawals": [],
+    "retired": [
+      {
+        "kind": "null_affiliation",
+        "rid": 10001,
+        "at": "2025-01-01T03:05:39.14108Z",
+        "native_started_at": "2025-01-01T03:05:38.141078Z"
+      }
+    ]
+  },
+  {
+    "site_id": "site-b",
+    "native_started_at": "2025-01-01T03:05:39.14186Z",
+    "observed_at": "2025-01-01T03:05:39.141861Z",
+    "revision": 7,
+    "active": true,
+    "affiliations": [],
+    "registrations": [],
+    "null_affiliations": [],
+    "terminals": [],
+    "withdrawals": [],
+    "retired": [
+      {
+        "kind": "deregistration",
+        "rid": 10001,
+        "at": "2025-01-01T03:05:39.141852Z",
+        "native_started_at": "2025-01-01T03:05:38.14185Z"
+      }
+    ]
+  }
+]

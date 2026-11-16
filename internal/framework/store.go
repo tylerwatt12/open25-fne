@@ -21,9 +21,33 @@ import (
 // Store owns one application's configuration. A different role must use a
 // different file; upstream data is retained only in named read-only caches.
 type Store struct {
-	mu   sync.Mutex
-	db   *sql.DB
-	role Role
+	mu     sync.Mutex
+	db     *sql.DB
+	readDB *sql.DB
+	role   Role
+
+	diagnosticMu     sync.RWMutex
+	diagnostics      []Event
+	diagnosticNextID int64
+
+	// Current observations have no authority after a process restart. Keep them
+	// separate from durable programming/authentication and never revive old SQL
+	// copies. Only the four fixed keys below can occupy this map.
+	observationMu sync.RWMutex
+	observations  map[string]cacheObservation
+}
+
+type cacheObservation struct {
+	raw json.RawMessage
+	at  time.Time
+}
+
+func transientCache(name string) bool {
+	switch name {
+	case "connection", "site_reports", "zone_report", "hardware_reports":
+		return true
+	}
+	return false
 }
 
 func OpenStore(path string, role Role) (*Store, error) {
@@ -66,6 +90,14 @@ func OpenStore(path string, role Role) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	readDSN := url.URL{Scheme: "file", Path: absolutePath}
+	readDSN.RawQuery = url.Values{"mode": {"ro"}, "_pragma": {"busy_timeout(5000)"}}.Encode()
+	s.readDB, err = sql.Open("sqlite", readDSN.String())
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	s.readDB.SetMaxOpenConns(1)
 	return s, nil
 }
 
@@ -91,8 +123,7 @@ func (s *Store) initialize() error {
 	if len(tables) == 0 {
 		_, err = s.db.Exec(`CREATE TABLE framework_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE framework_documents(name TEXT PRIMARY KEY,document BLOB NOT NULL,at TEXT NOT NULL);
-CREATE TABLE framework_administrator(singleton INTEGER PRIMARY KEY CHECK(singleton=1),username TEXT NOT NULL,password_hash BLOB NOT NULL);
-CREATE TABLE framework_events(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT NOT NULL,kind TEXT NOT NULL,message TEXT NOT NULL);`)
+CREATE TABLE framework_administrator(singleton INTEGER PRIMARY KEY CHECK(singleton=1),username TEXT NOT NULL,password_hash BLOB NOT NULL);`)
 		if err != nil {
 			return err
 		}
@@ -100,7 +131,7 @@ CREATE TABLE framework_events(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT NOT N
 			return err
 		}
 	} else {
-		for _, name := range []string{"framework_metadata", "framework_documents", "framework_administrator", "framework_events"} {
+		for _, name := range []string{"framework_metadata", "framework_documents", "framework_administrator"} {
 			if !tables[name] {
 				return errors.New("not a current framework database; use a separate empty database file")
 			}
@@ -114,7 +145,6 @@ CREATE TABLE framework_events(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT NOT N
 		"framework_metadata":      {"key", "value"},
 		"framework_documents":     {"name", "document", "at"},
 		"framework_administrator": {"singleton", "username", "password_hash"},
-		"framework_events":        {"id", "at", "kind", "message"},
 	} {
 		columns, err := s.db.Query("PRAGMA table_info(" + table + ")")
 		if err != nil {
@@ -151,11 +181,11 @@ CREATE TABLE framework_events(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT NOT N
 	return err
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error { return errors.Join(s.readDB.Close(), s.db.Close()) }
 
 func (s *Store) Config() (json.RawMessage, error) {
 	var raw []byte
-	err := s.db.QueryRow("SELECT document FROM framework_documents WHERE name='config'").Scan(&raw)
+	err := s.readDB.QueryRow("SELECT document FROM framework_documents WHERE name='config'").Scan(&raw)
 	return json.RawMessage(raw), err
 }
 
@@ -195,24 +225,25 @@ func (s *Store) SaveConfig(raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
+	if _, err = s.db.Exec("INSERT INTO framework_documents(name,document,at) VALUES('config',?,?) ON CONFLICT(name) DO UPDATE SET document=excluded.document,at=excluded.at", []byte(canonical), nowStamp()); err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	if _, err = tx.Exec("INSERT INTO framework_documents(name,document,at) VALUES('config',?,?) ON CONFLICT(name) DO UPDATE SET document=excluded.document,at=excluded.at", []byte(canonical), nowStamp()); err != nil {
-		return err
-	}
-	if _, err = tx.Exec("INSERT INTO framework_events(at,kind,message) VALUES(?,?,?)", nowStamp(), "configuration", "Configuration saved."); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.AddEvent("configuration", "Configuration saved.")
 }
 
 func (s *Store) ReadCache(name string) (json.RawMessage, time.Time, error) {
+	if transientCache(name) {
+		s.observationMu.RLock()
+		observation, ok := s.observations[name]
+		s.observationMu.RUnlock()
+		if !ok {
+			return nil, time.Time{}, sql.ErrNoRows
+		}
+		return bytes.Clone(observation.raw), observation.at, nil
+	}
 	var raw []byte
 	var at string
-	err := s.db.QueryRow("SELECT document,at FROM framework_documents WHERE name=?", "cache:"+name).Scan(&raw, &at)
+	err := s.readDB.QueryRow("SELECT document,at FROM framework_documents WHERE name=?", "cache:"+name).Scan(&raw, &at)
 	if err != nil {
 		return nil, time.Time{}, err
 	}
@@ -233,9 +264,34 @@ func (s *Store) WriteCache(name string, raw json.RawMessage) error {
 		return err
 	}
 	canonical := out.Bytes()
+	if transientCache(name) {
+		s.observationMu.Lock()
+		if s.observations == nil {
+			s.observations = make(map[string]cacheObservation, 4)
+		}
+		s.observations[name] = cacheObservation{raw: canonical, at: time.Now().UTC()}
+		s.observationMu.Unlock()
+		return nil
+	}
+	// A repeated accepted cache can linearize at this committed read, without
+	// queuing behind a slow unrelated durable write. Changed data is rechecked
+	// under the writer's ownership below before it is committed.
+	var previous []byte
+	if err := s.readDB.QueryRow("SELECT document FROM framework_documents WHERE name=?", "cache:"+name).Scan(&previous); err == nil && bytes.Equal(previous, canonical) {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec("INSERT INTO framework_documents(name,document,at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET document=excluded.document,at=excluded.at WHERE framework_documents.document <> excluded.document", "cache:"+name, canonical, nowStamp())
+	// Synchronization may repeatedly receive identical programming. Avoid even
+	// entering a write statement for it; explicit administrator Save is separate.
+	err := s.db.QueryRow("SELECT document FROM framework_documents WHERE name=?", "cache:"+name).Scan(&previous)
+	if err == nil && bytes.Equal(previous, canonical) {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	_, err = s.db.Exec("INSERT INTO framework_documents(name,document,at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET document=excluded.document,at=excluded.at WHERE framework_documents.document <> excluded.document", "cache:"+name, canonical, nowStamp())
 	return err
 }
 
@@ -304,6 +360,66 @@ func (s *Store) AcceptCatalog(systemRaw, zoneRaw json.RawMessage, username strin
 			return err
 		}
 	}
+	documents := map[string]json.RawMessage{
+		"system": canonicalSystem, "zone": canonicalZone, "radio-inhibition": inhibitionRaw,
+		"users": usersRaw, "automations": automationsRaw,
+	}
+	// A repeated catalogue is a read, not a durable operation. Compare its
+	// complete document/account bundle in one committed reader snapshot so it
+	// cannot queue behind an unrelated fsync or mistake mixed commits for a
+	// coherent accepted bundle. Actual changes still use the atomic writer below.
+	unchanged, err := func() (bool, error) {
+		tx, err := s.readDB.Begin()
+		if err != nil {
+			return false, err
+		}
+		defer tx.Rollback()
+		for name, raw := range documents {
+			if len(raw) == 0 {
+				continue
+			}
+			var previous []byte
+			if err = tx.QueryRow("SELECT document FROM framework_documents WHERE name=?", "cache:"+name).Scan(&previous); errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			} else if err != nil {
+				return false, err
+			}
+			if !bytes.Equal(previous, raw) {
+				return false, nil
+			}
+		}
+		// An omitted Zone means retain it, including its home-System guard.
+		// Supplied matching documents have already passed the checks above.
+		if len(canonicalZone) == 0 {
+			var previous []byte
+			err = tx.QueryRow("SELECT document FROM framework_documents WHERE name='cache:zone'").Scan(&previous)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return false, err
+			}
+			if err == nil {
+				var retained ZoneConfig
+				if err = json.Unmarshal(previous, &retained); err != nil {
+					return false, err
+				}
+				if retained.SystemID != system.ID {
+					return false, errors.New("retained Zone belongs to a different home system")
+				}
+			}
+		}
+		var previousUsername string
+		var previousHash []byte
+		err = tx.QueryRow("SELECT username,password_hash FROM framework_administrator WHERE singleton=1").Scan(&previousUsername, &previousHash)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return err == nil && previousUsername == username && bytes.Equal(previousHash, hash), err
+	}()
+	if err != nil {
+		return err
+	}
+	if unchanged {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	oldSystem, oldZone, err := s.upstreamLocked()
@@ -322,7 +438,7 @@ func (s *Store) AcceptCatalog(systemRaw, zoneRaw json.RawMessage, username strin
 	}
 	defer tx.Rollback()
 	at := nowStamp()
-	for name, raw := range map[string]json.RawMessage{"system": canonicalSystem, "zone": canonicalZone, "radio-inhibition": inhibitionRaw} {
+	for name, raw := range documents {
 		if len(raw) == 0 {
 			continue
 		}
@@ -333,19 +449,13 @@ func (s *Store) AcceptCatalog(systemRaw, zoneRaw json.RawMessage, username strin
 	if _, err = tx.Exec("INSERT INTO framework_administrator(singleton,username,password_hash) VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET username=excluded.username,password_hash=excluded.password_hash WHERE framework_administrator.username <> excluded.username OR framework_administrator.password_hash <> excluded.password_hash", username, hash); err != nil {
 		return err
 	}
-	if _, err = tx.Exec("INSERT INTO framework_documents(name,document,at) VALUES('cache:users',?,?) ON CONFLICT(name) DO UPDATE SET document=excluded.document,at=excluded.at WHERE framework_documents.document <> excluded.document", []byte(usersRaw), at); err != nil {
-		return err
-	}
-	if _, err = tx.Exec("INSERT INTO framework_documents(name,document,at) VALUES('cache:automations',?,?) ON CONFLICT(name) DO UPDATE SET document=excluded.document,at=excluded.at WHERE framework_documents.document <> excluded.document", automationsRaw, at); err != nil {
-		return err
-	}
 	return tx.Commit()
 }
 
 func (s *Store) Account() (string, []byte, error) {
 	var username string
 	var hash []byte
-	err := s.db.QueryRow("SELECT username,password_hash FROM framework_administrator WHERE singleton=1").Scan(&username, &hash)
+	err := s.readDB.QueryRow("SELECT username,password_hash FROM framework_administrator WHERE singleton=1").Scan(&username, &hash)
 	return username, hash, err
 }
 
@@ -369,39 +479,41 @@ func (s *Store) SetAccount(username string, hash []byte) error {
 	return err
 }
 
+// Diagnostics describe this process only. They never enter the configuration
+// database; durable historical observations belong to the activity owner.
+const diagnosticLimit = 100
+
 func (s *Store) AddEvent(kind, message string) error {
 	kind = strings.TrimSpace(kind)
 	message = strings.TrimSpace(message)
 	if kind == "" || len(kind) > 80 || message == "" || len(message) > 2000 {
 		return errors.New("event kind or message is invalid")
 	}
-	_, err := s.db.Exec("INSERT INTO framework_events(at,kind,message) VALUES(?,?,?)", nowStamp(), kind, message)
-	return err
+	s.diagnosticMu.Lock()
+	defer s.diagnosticMu.Unlock()
+	s.diagnosticNextID++
+	event := Event{ID: s.diagnosticNextID, At: time.Now().UTC(), Kind: kind, Message: message}
+	if len(s.diagnostics) == diagnosticLimit {
+		copy(s.diagnostics, s.diagnostics[1:])
+		s.diagnostics[len(s.diagnostics)-1] = event
+	} else {
+		s.diagnostics = append(s.diagnostics, event)
+	}
+	return nil
 }
 
 func (s *Store) Events(limit int) ([]Event, error) {
-	if limit < 1 || limit > 1000 {
-		limit = 100
+	if limit < 1 || limit > diagnosticLimit {
+		limit = diagnosticLimit
 	}
-	rows, err := s.db.Query("SELECT id,at,kind,message FROM framework_events ORDER BY id DESC LIMIT ?", limit)
-	if err != nil {
-		return nil, err
+	s.diagnosticMu.RLock()
+	defer s.diagnosticMu.RUnlock()
+	count := min(limit, len(s.diagnostics))
+	events := make([]Event, count)
+	for i := range events {
+		events[i] = s.diagnostics[len(s.diagnostics)-1-i]
 	}
-	defer rows.Close()
-	events := []Event{}
-	for rows.Next() {
-		var e Event
-		var at string
-		if err = rows.Scan(&e.ID, &at, &e.Kind, &e.Message); err != nil {
-			return nil, err
-		}
-		e.At, err = time.Parse(time.RFC3339Nano, at)
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, e)
-	}
-	return events, rows.Err()
+	return events, nil
 }
 
 func nowStamp() string { return time.Now().UTC().Format(time.RFC3339Nano) }

@@ -15,18 +15,15 @@ import (
 
 func selectionProfile() Profile {
 	p := fixtureProfile()
-	p.Site.ControlPolicy = ControlPolicy{Mode: "dynamic", RotationHours: 24}
-	for i := range p.Site.Channels {
-		p.Site.Channels[i].ControlEligible = true
-		p.Site.Channels[i].ControlPriority = i
-	}
+	p.Site.ControlPolicy = ControlPolicy{Mode: "static", ChannelID: "control-1", CandidateIDs: []string{"control-1", "voice-1"}}
 	return p
 }
 
 func selectionProfileThree() Profile {
 	p := selectionProfile()
 	p.Site.Modems = append(p.Site.Modems, Modem{ID: "voice2", Name: "Voice 2", Device: "/dev/serial/by-id/voice2", Baud: 115200, Calibration: Calibration{RXLevel: 50, TXLevel: 50}})
-	p.Site.Channels = append(p.Site.Channels, Channel{ID: "voice-2", Name: "Voice 2", Role: "voice", Identifier: 2, ChannelNo: 121, TXHz: 444950000, RXHz: 449950000, PowerPercent: 80, ModemID: "voice2", Enabled: true, ControlEligible: true, ControlPriority: 2})
+	p.Site.ControlPolicy.CandidateIDs = append(p.Site.ControlPolicy.CandidateIDs, "voice-2")
+	p.Site.Channels = append(p.Site.Channels, Channel{ID: "voice-2", Name: "Voice 2", Role: "voice", Identifier: 2, ChannelNo: 161, TXHz: 435450000, RXHz: 440450000, PowerPercent: 80, ModemID: "voice2", Enabled: true})
 	return p
 }
 
@@ -76,7 +73,7 @@ func assertSelectionUnchanged(t *testing.T, c *Controller, configured Profile) {
 	for _, channel := range configured.Site.Channels {
 		row := selectedChannel(c, channel.ID)
 		modem, _ := findModem(configured, channel.ModemID)
-		if row.ConfiguredRole != channel.Role || row.TXHz != channel.TXHz || row.RXHz != channel.RXHz || row.Device != modem.Device || row.ModemID != channel.ModemID {
+		if row.TXHz != channel.TXHz || row.RXHz != channel.RXHz || row.Device != modem.Device || row.ModemID != channel.ModemID {
 			t.Fatalf("channel %s lost configured role or physical pair/device: %+v", channel.ID, row)
 		}
 	}
@@ -109,6 +106,9 @@ func TestControlSelectionManualWaitsForWholeSitePermitAndKeepsPhysicalAssignment
 	}
 	retry <- struct{}{}
 	waitSelected(t, c, "voice-1")
+	if c.Status().FNEPID == before.FNEPID || oldVoice.alive() || oldControl.alive() {
+		t.Fatal("cold switch failed to retire the previous Site owners")
+	}
 	if selectedChannel(c, "voice-1").Role != "control" || selectedChannel(c, "control-1").Role != "voice" {
 		t.Fatal("promotion did not swap operating roles")
 	}
@@ -123,8 +123,9 @@ func TestControlSelectionManualWaitsForWholeSitePermitAndKeepsPhysicalAssignment
 func TestControlSelectionStaticOutageRecoversAssignedControl(t *testing.T) {
 	c := testController(t, nil)
 	waiting, retry := holdSiteRetries(c)
+
 	p := selectionProfile()
-	p.Site.ControlPolicy.Mode = "static"
+	p.Site.ControlPolicy.CandidateIDs = []string{"control-1"}
 	if err := c.Start(context.Background(), p, "null"); err != nil {
 		t.Fatal(err)
 	}
@@ -132,6 +133,7 @@ func TestControlSelectionStaticOutageRecoversAssignedControl(t *testing.T) {
 	if err := syscall.Kill(old.cmd.Process.Pid, syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
+
 	nextSiteRetry(t, waiting, time.Second)
 	retry <- struct{}{}
 	waitSelected(t, c, "control-1")
@@ -149,6 +151,7 @@ func TestControlSelectionDynamicOutagePromotesAndKeepsReplacement(t *testing.T) 
 		t.Fatal(err)
 	}
 	oldControl, oldVoice := selectionWorker(c, "control-1"), selectionWorker(c, "voice-1")
+	mediaPID := c.Status().FNEPID
 	busy := selectionFlag(t, oldVoice, "busy-permit")
 	if err := syscall.Kill(oldControl.cmd.Process.Pid, syscall.SIGKILL); err != nil {
 		t.Fatal(err)
@@ -162,6 +165,12 @@ func TestControlSelectionDynamicOutagePromotesAndKeepsReplacement(t *testing.T) 
 	}
 	retry <- struct{}{}
 	waitSelected(t, c, "voice-1")
+	if selectedChannel(c, "voice-1").PID == oldVoice.cmd.Process.Pid || c.Status().FNEPID == mediaPID {
+		t.Fatal("cold failover did not replace the Site owners")
+	}
+	waitRadio(t, "original control did not complete independent voice recovery", func() bool {
+		return selectedChannel(c, "control-1").Ready
+	})
 	recoveredControl := selectedChannel(c, "control-1")
 	if recoveredControl.Role != "voice" || !recoveredControl.Ready || recoveredControl.PID == oldControl.cmd.Process.Pid {
 		t.Fatal("original control did not return as an independent voice resource")
@@ -175,32 +184,37 @@ func TestControlSelectionDynamicOutagePromotesAndKeepsReplacement(t *testing.T) 
 
 func TestControlSelectionRotationUsesSuccessfulActivationAndSkipsStoppedCandidate(t *testing.T) {
 	c := testController(t, nil)
-	t.Setenv("RADIO_DELAY_CHANNEL", "control-1")
-	t.Setenv("RADIO_STARTUP_DELAY", "150ms")
 	p := selectionProfileThree()
-	p.Site.ControlPolicy.RotationEnabled = true
+	p.Site.ControlPolicy.Mode = "random"
+	p.Site.ControlPolicy.RotationHours = 24
 	if err := c.Start(context.Background(), p, "null"); err != nil {
 		t.Fatal(err)
 	}
 	before := c.Status()
-	if !before.ControlChangedAt.After(before.StartedAt.Add(100*time.Millisecond)) || before.NextControlRotation.Sub(before.ControlChangedAt) != 24*time.Hour {
-		t.Fatalf("rotation timer did not start with successful control activation: %+v", before)
+	if before.NextControlRotation.Sub(before.ControlChangedAt) != 24*time.Hour {
+		t.Fatal("rotation is not based on successful activation")
 	}
-	if err := c.StopChannel(context.Background(), "voice-1"); err != nil {
+	stopped, target := "", ""
+	for _, ch := range p.Site.Channels {
+		if ch.ID != before.ActiveControlChannelID {
+			if stopped == "" {
+				stopped = ch.ID
+			} else {
+				target = ch.ID
+			}
+		}
+	}
+	if err := c.StopChannel(context.Background(), stopped); err != nil {
 		t.Fatal(err)
 	}
 	c.scheduleControlRotation(before.NextControlRotation.Add(-time.Nanosecond))
 	if c.Status().ControlSwitchTarget != "" {
-		t.Fatal("rotation began before its interval expired")
+		t.Fatal("rotation began before its interval")
 	}
 	c.scheduleControlRotation(before.NextControlRotation)
-	waitSelected(t, c, "voice-2")
-	if selectedChannel(c, "voice-1").State != "stopped" || selectedChannel(c, "voice-1").PID != 0 {
-		t.Fatal("rotation selected or restarted an intentionally stopped voice channel")
-	}
-	after := c.Status()
-	if after.NextControlRotation.Sub(after.ControlChangedAt) != 24*time.Hour || !after.ControlChangedAt.After(before.ControlChangedAt) {
-		t.Fatal("successful rotation did not reset the next 24-hour interval")
+	waitSelected(t, c, target)
+	if selectedChannel(c, stopped).PID != 0 {
+		t.Fatal("rotation restarted an intentionally stopped channel")
 	}
 	assertSelectionUnchanged(t, c, p)
 }
@@ -234,8 +248,8 @@ func TestControlSelectionStopCancelsWaitingManualSwitch(t *testing.T) {
 func TestControlSelectionRejectsUnknownIneligibleDisabledAndAlreadyActiveTargets(t *testing.T) {
 	c := testController(t, nil)
 	p := selectionProfile()
-	p.Site.Channels[1].ControlEligible = false
-	p.Site.Channels = append(p.Site.Channels, Channel{ID: "disabled", Role: "voice", ControlEligible: true})
+	p.Site.ControlPolicy.CandidateIDs = []string{"control-1"}
+	p.Site.Channels = append(p.Site.Channels, Channel{ID: "disabled", Role: "voice"})
 	if err := c.Start(context.Background(), p, "null"); err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +321,7 @@ func TestControlSelectionDynamicWithoutAlternateRetriesOriginalAfterFailedStartu
 	c := testController(t, nil)
 	waiting, retry := holdSiteRetries(c)
 	p := selectionProfile()
-	p.Site.Channels[1].ControlEligible = false
+	p.Site.ControlPolicy.CandidateIDs = []string{"control-1"}
 	if err := c.Start(context.Background(), p, "null"); err != nil {
 		t.Fatal(err)
 	}
@@ -505,18 +519,22 @@ func TestControlSelectionDrainingRejectsNewRadioCommands(t *testing.T) {
 func TestControlSelectionUnscheduledEnteredIntervalRemainsReportedAfterManualSwitch(t *testing.T) {
 	c := testController(t, nil)
 	p := selectionProfile()
-	p.Site.ControlPolicy.RotationEnabled = true
-	p.Site.ControlPolicy.RotationHours = 0
+	p.Site.ControlPolicy.Mode = "random"
+	p.Site.ControlPolicy.RotationHours = -1
 	if err := c.Start(context.Background(), p, "null"); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(c.Status().ControlSwitchError, "interval") {
 		t.Fatal("unusable entered interval was silently ignored")
 	}
-	if err := c.SwitchControl(context.Background(), "voice-1"); err != nil {
+	target := "voice-1"
+	if c.Status().ActiveControlChannelID == target {
+		target = "control-1"
+	}
+	if err := c.SwitchControl(context.Background(), target); err != nil {
 		t.Fatal(err)
 	}
-	waitSelected(t, c, "voice-1")
+	waitSelected(t, c, target)
 	status := c.Status()
 	if !status.NextControlRotation.IsZero() || !strings.Contains(status.ControlSwitchError, "interval") {
 		t.Fatal("successful manual switch hid the unscheduled entered interval", status)

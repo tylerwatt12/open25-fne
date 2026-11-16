@@ -73,19 +73,18 @@ type Retention struct {
 	StaleSeconds int `json:"location_stale_seconds"`
 }
 type Removed struct {
-	Events     int64 `json:"events"`
-	Calls      int64 `json:"calls"`
-	Locations  int64 `json:"locations"`
-	Unuploaded int64 `json:"unuploaded"`
+	Events    int64 `json:"events"`
+	Calls     int64 `json:"calls"`
+	Locations int64 `json:"locations"`
+	more      bool
 }
 type HistoryStatus struct {
-	Ingestion        IngestionHealth `json:"ingestion"`
-	Settings         Retention       `json:"settings"`
-	Events           int64           `json:"events"`
-	Calls            int64           `json:"calls"`
-	Locations        int64           `json:"locations"`
-	PendingUpload    int64           `json:"pending_upload"`
-	PrunedUnuploaded int64           `json:"pruned_unuploaded"`
+	Cleanup   CleanupStatus   `json:"cleanup"`
+	Ingestion IngestionHealth `json:"ingestion"`
+	Settings  Retention       `json:"settings"`
+	Events    int64           `json:"events"`
+	Calls     int64           `json:"calls"`
+	Locations int64           `json:"locations"`
 }
 type Statistics struct {
 	Calls          int64            `json:"calls"`
@@ -105,36 +104,20 @@ CREATE INDEX IF NOT EXISTS calls_time ON calls(started_at,id);
 CREATE TABLE IF NOT EXISTS call_destinations(call_id TEXT NOT NULL,site_id TEXT NOT NULL,talkgroup_id INTEGER NOT NULL,channel_id TEXT NOT NULL,started_at TEXT NOT NULL,ended_at TEXT,outcome TEXT NOT NULL,allocated_ms INTEGER,speech_ms INTEGER,PRIMARY KEY(call_id,site_id,talkgroup_id));
 CREATE INDEX IF NOT EXISTS destinations_scope ON call_destinations(site_id,talkgroup_id,call_id);
 CREATE TABLE IF NOT EXISTS call_allocations(call_id TEXT NOT NULL,site_id TEXT NOT NULL,talkgroup_id INTEGER NOT NULL,allocation_id TEXT NOT NULL,channel_id TEXT NOT NULL,started_at TEXT NOT NULL,ended_at TEXT,outcome TEXT NOT NULL,allocated_ms INTEGER,speech_ms INTEGER,PRIMARY KEY(call_id,site_id,talkgroup_id,allocation_id));
-CREATE INDEX IF NOT EXISTS allocations_call ON call_allocations(call_id,site_id,talkgroup_id);
+CREATE INDEX IF NOT EXISTS allocations_site ON call_allocations(site_id,call_id,talkgroup_id,channel_id);
 CREATE TABLE IF NOT EXISTS position_history(id TEXT PRIMARY KEY,radio_id INTEGER NOT NULL,talkgroup_id INTEGER NOT NULL,site_id TEXT NOT NULL,scope_id TEXT NOT NULL,latitude REAL NOT NULL,longitude REAL NOT NULL,accuracy REAL NOT NULL,fix_at TEXT NOT NULL,received_at TEXT NOT NULL,source_kind TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS positions_radio_time ON position_history(radio_id,fix_at,id);
-CREATE TABLE IF NOT EXISTS history_settings(id INTEGER PRIMARY KEY CHECK(id=1),retention_days INTEGER NOT NULL,max_events INTEGER NOT NULL,max_calls INTEGER NOT NULL,max_locations INTEGER NOT NULL,stale_seconds INTEGER NOT NULL,pruned_unuploaded INTEGER NOT NULL DEFAULT 0);
-INSERT OR IGNORE INTO history_settings VALUES(1,30,100000,20000,50000,300,0);`
+CREATE INDEX IF NOT EXISTS positions_time ON position_history(fix_at,id);
+CREATE TABLE IF NOT EXISTS history_settings(id INTEGER PRIMARY KEY CHECK(id=1),retention_days INTEGER NOT NULL,max_events INTEGER NOT NULL,max_calls INTEGER NOT NULL,max_locations INTEGER NOT NULL,stale_seconds INTEGER NOT NULL);
+INSERT OR IGNORE INTO history_settings VALUES(1,30,100000,20000,50000,300);`
 
 func historySchema(db *sql.DB) error {
-	var old int
-	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='radio_calls'").Scan(&old); err != nil {
-		return err
-	}
-	if old != 0 {
-		return errors.New("activity projections need rebuilding; stop the service and run history-rebuild --database PATH")
-	}
-	var calls, allocations int
-	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='calls'").Scan(&calls); err != nil {
-		return err
-	}
-	if err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='call_allocations'").Scan(&allocations); err != nil {
-		return err
-	}
-	if calls != 0 && allocations == 0 {
-		return errors.New("activity projections need rebuilding; stop the service and run history-rebuild --database PATH")
-	}
 	_, err := db.Exec(projectionSchema)
 	return err
 }
 
-// RebuildHistory is an explicit offline maintenance action. Original events and
-// their upload acknowledgments survive; no compatibility schema stays in use.
+// RebuildHistory is an explicit offline System archive maintenance action.
+// Original events survive; no compatibility schema stays in use.
 func RebuildHistory(path string) error {
 	if _, err := os.Stat(path); err != nil {
 		return err
@@ -163,7 +146,7 @@ func RebuildHistory(path string) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec("DROP TABLE IF EXISTS radio_calls; DROP TABLE IF EXISTS calls; DROP TABLE IF EXISTS call_destinations; DROP TABLE IF EXISTS call_allocations; DROP TABLE IF EXISTS position_history;" + projectionSchema); err != nil {
+	if _, err = tx.Exec("DROP TABLE IF EXISTS calls; DROP TABLE IF EXISTS call_destinations; DROP TABLE IF EXISTS call_allocations; DROP TABLE IF EXISTS position_history;" + projectionSchema); err != nil {
 		return err
 	}
 	lastAt, lastID := "", ""
@@ -387,6 +370,12 @@ func (s *Store) EventHistory(q Query) (EventPage, error) {
 }
 
 func (s *Store) CallHistory(q Query) (_ CallPage, err error) {
+	if err := s.InitializationError(); err != nil {
+		return CallPage{}, err
+	}
+	if !s.archive {
+		return CallPage{}, ErrArchiveOnly
+	}
 	ctx := q.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -408,7 +397,9 @@ func (s *Store) CallHistory(q Query) (_ CallPage, err error) {
 	}
 	whereSQL := strings.Join(where, " AND ")
 	args = append(args, limit+1)
-	rows, err := s.db.QueryContext(ctx, `SELECT id,radio_id,MIN(started_at),source_kind FROM (SELECT c.id,c.radio_id,c.started_at,c.source_kind,d.site_id,d.talkgroup_id,d.channel_id FROM calls c JOIN call_allocations d ON d.call_id=c.id) WHERE `+whereSQL+` GROUP BY id,radio_id,source_kind ORDER BY MIN(started_at) DESC,id DESC LIMIT ?`, args...)
+	rows, err := s.readDB.QueryContext(ctx, `SELECT c.id,c.radio_id,c.started_at,c.source_kind FROM calls c WHERE EXISTS (
+ SELECT 1 FROM (SELECT c.id,c.radio_id,c.started_at,c.source_kind,d.site_id,d.talkgroup_id,d.channel_id FROM call_allocations d WHERE d.call_id=c.id)
+ WHERE `+whereSQL+`) ORDER BY c.started_at DESC,c.id DESC LIMIT ?`, args...)
 	if err != nil {
 		return CallPage{}, err
 	}
@@ -473,6 +464,12 @@ func (s *Store) CallHistory(q Query) (_ CallPage, err error) {
 // channels when it rejoins; filtering its previous channel must not disappear
 // merely because its latest allocation used another voice resource.
 func (s *Store) destinationHistory(q Query, callID string) (_ []Destination, err error) {
+	if err := s.InitializationError(); err != nil {
+		return nil, err
+	}
+	if !s.archive {
+		return nil, ErrArchiveOnly
+	}
 	ctx := q.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -489,7 +486,7 @@ func (s *Store) destinationHistory(q Query, callID string) (_ []Destination, err
 		where = append(where, "channel_id=?")
 		args = append(args, q.ChannelID)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT site_id,talkgroup_id,channel_id,started_at,ended_at,outcome,allocated_ms,speech_ms FROM (SELECT d.*,c.radio_id,c.source_kind FROM call_allocations d JOIN calls c ON c.id=d.call_id) WHERE `+strings.Join(where, " AND ")+` ORDER BY site_id,talkgroup_id,started_at,allocation_id`, args...)
+	rows, err := s.readDB.QueryContext(ctx, `SELECT site_id,talkgroup_id,channel_id,started_at,ended_at,outcome,allocated_ms,speech_ms FROM (SELECT d.*,c.radio_id,c.source_kind FROM call_allocations d JOIN calls c ON c.id=d.call_id) WHERE `+strings.Join(where, " AND ")+` ORDER BY site_id,talkgroup_id,started_at,allocation_id`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -563,6 +560,12 @@ func (s *Store) destinationHistory(q Query, callID string) (_ []Destination, err
 }
 
 func (s *Store) LocationHistory(q Query, now time.Time) (_ LocationPage, err error) {
+	if err := s.InitializationError(); err != nil {
+		return LocationPage{}, err
+	}
+	if !s.archive {
+		return LocationPage{}, ErrArchiveOnly
+	}
 	ctx := q.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -578,7 +581,7 @@ func (s *Store) LocationHistory(q Query, now time.Time) (_ LocationPage, err err
 	}
 	limit := pageLimit(q)
 	args = append(args, limit+1)
-	rows, err := s.db.QueryContext(ctx, "SELECT id,radio_id,talkgroup_id,site_id,scope_id,latitude,longitude,accuracy,fix_at,received_at,source_kind FROM position_history WHERE "+strings.Join(where, " AND ")+" ORDER BY fix_at DESC,id DESC LIMIT ?", args...)
+	rows, err := s.readDB.QueryContext(ctx, "SELECT id,radio_id,talkgroup_id,site_id,scope_id,latitude,longitude,accuracy,fix_at,received_at,source_kind FROM position_history WHERE "+strings.Join(where, " AND ")+" ORDER BY fix_at DESC,id DESC LIMIT ?", args...)
 	if err != nil {
 		return LocationPage{}, err
 	}
@@ -607,7 +610,8 @@ func (s *Store) LocationHistory(q Query, now time.Time) (_ LocationPage, err err
 	return page, rows.Err()
 }
 
-const maintenanceBudget = 5 * time.Second
+const maintenanceBatch = 32
+const cleanupPause = 250 * time.Millisecond
 
 const retentionQuery = "SELECT retention_days,max_events,max_calls,max_locations,stale_seconds FROM history_settings WHERE id=1"
 
@@ -625,47 +629,116 @@ func contextSQLError(ctx context.Context, err error) error {
 }
 
 func (s *Store) Retention(ctx context.Context) (Retention, error) {
-	r, err := scanRetention(s.db.QueryRowContext(ctx, retentionQuery))
+	if err := s.InitializationError(); err != nil {
+		return Retention{}, err
+	}
+	if !s.archive {
+		return Retention{}, ErrArchiveOnly
+	}
+	r, err := scanRetention(s.readDB.QueryRowContext(ctx, retentionQuery))
 	return r, contextSQLError(ctx, err)
 }
 
-// Settings and their immediate cleanup are one accepted operation. A timeout
-// or cleanup failure must not leave new limits saved with only partial pruning.
-func (s *Store) SaveRetention(ctx context.Context, r Retention) (err error) {
-	defer func() { err = contextSQLError(ctx, err); s.observeMaintenance(err) }()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+// RetentionPolicy is the last committed System-owned policy, published for
+// catalog observation without making control synchronization query history SQL.
+func (s *Store) RetentionPolicy() (Retention, bool) {
+	if s.InitializationError() != nil || !s.archive {
+		return Retention{}, false
 	}
-	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, "UPDATE history_settings SET retention_days=?,max_events=?,max_calls=?,max_locations=?,stale_seconds=? WHERE id=1", r.Days, r.MaxEvents, r.MaxCalls, r.MaxLocations, r.StaleSeconds); err != nil {
-		return err
+	r := s.retention.Load()
+	if r == nil {
+		return Retention{}, false
 	}
-	if _, err = pruneInTransaction(ctx, tx, r, time.Now().UTC()); err != nil {
-		return err
+	return *r, true
+}
+
+// SaveRetention durably saves the submitted policy. Its enforcement belongs to
+// the Store worker and progresses in independently committed, bounded batches.
+// An HTTP deadline never rolls back a whole retention backlog.
+func (s *Store) SaveRetention(ctx context.Context, r Retention) error {
+	if !s.archive {
+		return ErrArchiveOnly
 	}
-	return tx.Commit()
+	return s.command(ctx, write{retention: &r})
+}
+func (s *Store) saveRetention(ctx context.Context, r Retention) (err error) {
+	defer func() { err = contextSQLError(ctx, err) }()
+	_, err = s.db.ExecContext(ctx, "UPDATE history_settings SET retention_days=?,max_events=?,max_calls=?,max_locations=?,stale_seconds=? WHERE id=1", r.Days, r.MaxEvents, r.MaxCalls, r.MaxLocations, r.StaleSeconds)
+	if err == nil {
+		s.retention.Store(&r)
+	}
+	return err
 }
 func (s *Store) HistoryStatus(ctx context.Context) (HistoryStatus, error) {
-	v := HistoryStatus{Ingestion: s.IngestionHealth()}
-	err := s.db.QueryRowContext(ctx, `SELECT retention_days,max_events,max_calls,max_locations,stale_seconds,
-(SELECT COUNT(*) FROM radio_events),(SELECT COUNT(*) FROM calls),(SELECT COUNT(*) FROM position_history),
-(SELECT COUNT(*) FROM radio_events WHERE uploaded=0),pruned_unuploaded FROM history_settings WHERE id=1`).Scan(&v.Settings.Days, &v.Settings.MaxEvents, &v.Settings.MaxCalls, &v.Settings.MaxLocations, &v.Settings.StaleSeconds, &v.Events, &v.Calls, &v.Locations, &v.PendingUpload, &v.PrunedUnuploaded)
+	if err := s.InitializationError(); err != nil {
+		return HistoryStatus{Ingestion: s.IngestionHealth()}, err
+	}
+	if !s.archive {
+		return HistoryStatus{Ingestion: s.IngestionHealth()}, ErrArchiveOnly
+	}
+	v := HistoryStatus{Ingestion: s.IngestionHealth(), Cleanup: s.CleanupStatus()}
+	err := s.readDB.QueryRowContext(ctx, `SELECT retention_days,max_events,max_calls,max_locations,stale_seconds,
+(SELECT COUNT(*) FROM radio_events),(SELECT COUNT(*) FROM calls),(SELECT COUNT(*) FROM position_history)
+FROM history_settings WHERE id=1`).Scan(&v.Settings.Days, &v.Settings.MaxEvents, &v.Settings.MaxCalls, &v.Settings.MaxLocations, &v.Settings.StaleSeconds, &v.Events, &v.Calls, &v.Locations)
 	return v, contextSQLError(ctx, err)
 }
-func (s *Store) Prune(ctx context.Context, now time.Time) (removed Removed, err error) {
+
+type pruneResult struct {
+	removed Removed
+	err     error
+}
+
+// Prune performs one bounded batch through the same owning writer. Normal
+// operational cleanup uses RequestCleanup and never waits for SQL.
+func (s *Store) Prune(ctx context.Context, now time.Time) (Removed, error) {
+	if err := ctx.Err(); err != nil {
+		return Removed{}, err
+	}
+	if !s.archive {
+		return Removed{}, ErrArchiveOnly
+	}
+	result := make(chan pruneResult, 1)
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return Removed{}, errors.New("activity store is closed")
+	}
+	if s.initErr != nil {
+		s.mu.RUnlock()
+		return Removed{}, ErrUnavailable
+	}
+	select {
+	case s.commands <- write{ctx: ctx, pruneAt: &now, pruned: result}:
+		s.mu.RUnlock()
+	default:
+		s.mu.RUnlock()
+		return Removed{}, errors.New("history writer is busy; try again")
+	}
+	select {
+	case r := <-result:
+		return r.removed, r.err
+	case <-ctx.Done():
+		return Removed{}, ctx.Err()
+	}
+}
+
+func (s *Store) prune(ctx context.Context, now time.Time) (removed Removed, err error) {
 	defer func() { err = contextSQLError(ctx, err); s.observeMaintenance(err) }()
+	return s.pruneStep(ctx, now)
+}
+func (s *Store) pruneStep(ctx context.Context, now time.Time) (Removed, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Removed{}, err
 	}
 	defer tx.Rollback()
-	r, err := scanRetention(tx.QueryRowContext(ctx, retentionQuery))
+	removed, err := s.pruneTransaction(ctx, tx, now)
 	if err != nil {
 		return Removed{}, err
 	}
-	if removed, err = pruneInTransaction(ctx, tx, r, now); err != nil {
-		return Removed{}, err
+	if removed.Events+removed.Calls+removed.Locations == 0 {
+		// A read-only cleanup check must not create WAL pages or force a sync.
+		return removed, tx.Rollback()
 	}
 	if err = tx.Commit(); err != nil {
 		return Removed{}, err
@@ -673,39 +746,80 @@ func (s *Store) Prune(ctx context.Context, now time.Time) (removed Removed, err 
 	return removed, nil
 }
 
-// The caller owns the transaction and its one maintenance outcome. This helper
-// never commits or records another failure count.
-func pruneInTransaction(ctx context.Context, tx *sql.Tx, r Retention, now time.Time) (Removed, error) {
-	cutoff := now.Add(-time.Duration(r.Days) * 24 * time.Hour).UTC().Format(stampFormat)
-	v := Removed{}
-	condition := "at<? OR id IN (SELECT id FROM radio_events ORDER BY at DESC,id DESC LIMIT -1 OFFSET ?)"
-	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM radio_events WHERE uploaded=0 AND ("+condition+")", cutoff, r.MaxEvents).Scan(&v.Unuploaded); err != nil {
-		return Removed{}, err
-	}
-	result, err := tx.ExecContext(ctx, "DELETE FROM radio_events WHERE "+condition, cutoff, r.MaxEvents)
+func (s *Store) pruneTransaction(ctx context.Context, tx *sql.Tx, now time.Time) (Removed, error) {
+	r, err := scanRetention(tx.QueryRowContext(ctx, retentionQuery))
 	if err != nil {
 		return Removed{}, err
 	}
-	v.Events, _ = result.RowsAffected()
+	return pruneInTransaction(ctx, tx, r, now)
+}
+
+// Cleanup commits bounded batches so a backlog makes durable progress.
+// The caller owns the transaction; policy persistence is independent.
+func pruneInTransaction(ctx context.Context, tx *sql.Tx, r Retention, now time.Time) (Removed, error) {
+	cutoff := now.Add(-time.Duration(r.Days) * 24 * time.Hour).UTC().Format(stampFormat)
+	v := Removed{}
 	for _, p := range []struct {
 		table, column string
 		max           int
 		count         *int64
-	}{{"calls", "started_at", r.MaxCalls, &v.Calls}, {"position_history", "fix_at", r.MaxLocations, &v.Locations}} {
-		result, err = tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s<? OR id IN (SELECT id FROM %s ORDER BY %s DESC,id DESC LIMIT -1 OFFSET ?)", p.table, p.column, p.table, p.column), cutoff, p.max)
+	}{{"radio_events", "at", r.MaxEvents, &v.Events}, {"calls", "started_at", r.MaxCalls, &v.Calls}, {"position_history", "fix_at", r.MaxLocations, &v.Locations}} {
+		// The first row beyond the cap defines the same survivor set as OFFSET.
+		// Combining its ordered boundary with the age boundary avoids an unbounded
+		// overflow-ID subquery and lets the time index select the oldest batch.
+		var at, id string
+		err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT %s,id FROM %s ORDER BY %s DESC,id DESC LIMIT 1 OFFSET ?", p.column, p.table, p.column), p.max).Scan(&at, &id)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return Removed{}, err
+		}
+		condition := p.column + "<?"
+		args := []any{cutoff}
+		if err == nil && at >= cutoff {
+			condition = "(" + p.column + ",id)<=(?,?)"
+			args = []any{at, id}
+		}
+		rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT id FROM %s WHERE %s ORDER BY %s,id LIMIT ?", p.table, condition, p.column), append(args, maintenanceBatch+1)...)
 		if err != nil {
 			return Removed{}, err
 		}
-		*p.count, _ = result.RowsAffected()
-	}
-	if _, err = tx.ExecContext(ctx, "DELETE FROM call_destinations WHERE call_id NOT IN (SELECT id FROM calls)"); err != nil {
-		return Removed{}, err
-	}
-	if _, err = tx.ExecContext(ctx, "DELETE FROM call_allocations WHERE call_id NOT IN (SELECT id FROM calls)"); err != nil {
-		return Removed{}, err
-	}
-	if _, err = tx.ExecContext(ctx, "UPDATE history_settings SET pruned_unuploaded=pruned_unuploaded+? WHERE id=1", v.Unuploaded); err != nil {
-		return Removed{}, err
+		ids := []any{}
+		for rows.Next() {
+			var id string
+			err = rows.Scan(&id)
+			if err != nil {
+				rows.Close()
+				return Removed{}, err
+			}
+			if len(ids) < maintenanceBatch {
+				ids = append(ids, id)
+			} else {
+				// One extra read distinguishes a full final batch from debt.
+				v.more = true
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return Removed{}, err
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+		if p.table == "calls" {
+			for _, child := range []string{"call_destinations", "call_allocations"} {
+				if _, err = tx.ExecContext(ctx, "DELETE FROM "+child+" WHERE call_id IN ("+placeholders+")", ids...); err != nil {
+					return Removed{}, err
+				}
+			}
+		}
+		result, err := tx.ExecContext(ctx, "DELETE FROM "+p.table+" WHERE id IN ("+placeholders+")", ids...)
+		if err != nil {
+			return Removed{}, err
+		}
+		n, _ := result.RowsAffected()
+		*p.count += n
+
 	}
 	return v, nil
 }
@@ -713,6 +827,12 @@ func pruneInTransaction(ctx context.Context, tx *sql.Tx, r Retention, now time.T
 // Statistics groups allocation facts in two bounded queries. It does not load
 // every call page or take one SQL connection round trip per conversation.
 func (s *Store) Statistics(q Query) (v Statistics, err error) {
+	if err := s.InitializationError(); err != nil {
+		return Statistics{}, err
+	}
+	if !s.archive {
+		return Statistics{}, ErrArchiveOnly
+	}
 	q.Cursor = ""
 	ctx := q.Context
 	if ctx == nil {
@@ -724,7 +844,7 @@ func (s *Store) Statistics(q Query) (v Statistics, err error) {
 		return Statistics{}, err
 	}
 	v = Statistics{ByType: map[string]int64{}}
-	rows, err := s.db.QueryContext(ctx, "SELECT type,COUNT(*) FROM radio_events WHERE "+strings.Join(where, " AND ")+" GROUP BY type", args...)
+	rows, err := s.readDB.QueryContext(ctx, "SELECT type,COUNT(*) FROM radio_events WHERE "+strings.Join(where, " AND ")+" GROUP BY type", args...)
 	if err != nil {
 		return v, err
 	}
@@ -755,7 +875,7 @@ func (s *Store) Statistics(q Query) (v Statistics, err error) {
 		where = append(where, "channel_id=?")
 		args = append(args, q.ChannelID)
 	}
-	rows, err = s.db.QueryContext(ctx, `WITH selected AS (
+	rows, err = s.readDB.QueryContext(ctx, `WITH selected AS (
  SELECT c.id,c.radio_id,c.started_at,c.source_kind,d.site_id,d.talkgroup_id,d.channel_id,d.ended_at,d.speech_ms
  FROM calls c JOIN call_allocations d ON d.call_id=c.id
 ), destinations AS (

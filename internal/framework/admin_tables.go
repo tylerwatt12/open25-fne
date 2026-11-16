@@ -16,7 +16,17 @@ func webTable(w io.Writer, columns []webColumn, value any) {
 	rows, _ := webPresentationValue(value).([]any)
 	fmt.Fprint(w, "<div class=table-wrap tabindex=0 aria-label=\"Scrollable records\"><table class=record-table><thead><tr>")
 	for _, column := range columns {
-		fmt.Fprintf(w, "<th scope=col>%s</th>", esc(column.Label))
+		fmt.Fprintf(w, "<th scope=col>%s", esc(column.Label))
+		hasReady := false
+		for _, col := range columns {
+			hasReady = hasReady || col.Key == "ready"
+		}
+		if hasReady {
+			if help := adminRadioColumnHelp(column.Key); help != "" {
+				fmt.Fprint(w, webHelp(column.Label, help))
+			}
+		}
+		fmt.Fprint(w, "</th>")
 	}
 	fmt.Fprint(w, "</tr></thead><tbody>")
 	for _, row := range rows {
@@ -45,7 +55,11 @@ func webProperties(w io.Writer, value any, columns []webColumn) {
 	record, _ := webPresentationValue(value).(map[string]any)
 	fmt.Fprint(w, "<dl class=observation-list>")
 	for _, column := range columns {
-		fmt.Fprintf(w, "<div><dt>%s</dt><dd>", esc(column.Label))
+		fmt.Fprintf(w, "<div><dt>%s", esc(column.Label))
+		if column.Key == "state" && (column.Label == "Operating state" || column.Label == "Radio state") {
+			fmt.Fprint(w, webHelp(column.Label, "Stopped: no Site run. Starting: resources are starting or warming up. Running: the Site run is active; check each channel's readiness. Stopping: resources are shutting down. Fault: the run encountered an error; inspect Last error."))
+		}
+		fmt.Fprint(w, "</dt><dd>")
 		webDataField(w, column.Key, webValue(record, column.Key))
 		fmt.Fprint(w, "</dd></div>")
 	}
@@ -98,7 +112,7 @@ func webScalar(w io.Writer, key string, value any) {
 	}
 	if flag, ok := value.(bool); ok {
 		if flag {
-			if key == "ready" || key == "zone_connected" || key == "fne_ready" {
+			if key == "zone_connected" || key == "fne_ready" {
 				label := "Ready"
 				if key == "zone_connected" {
 					label = "Connected"

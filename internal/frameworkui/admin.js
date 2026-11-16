@@ -5,7 +5,7 @@ if (document.body.classList.contains("administration")) {
   function theme(value) {
     root.style.colorScheme = value;
     document.body.dataset.theme = value;
-    for (const button of document.querySelectorAll("[data-admin-theme]")) button.textContent = value === "dark" ? "Light" : "Dark";
+    for (const button of document.querySelectorAll("[data-admin-theme]")) {button.textContent = "Theme";button.setAttribute("aria-label",value === "dark" ? "Switch to light theme" : "Switch to dark theme");}
   }
   let preference;
   try { preference = localStorage.getItem(themeKey); } catch (_) {}
@@ -28,15 +28,20 @@ if (document.body.classList.contains("administration")) {
     pendingDestination = destination;
     let notice = document.querySelector("[data-unsaved-navigation]");
     if (!notice) {
-      notice = document.createElement("div"); notice.className = "ts-dirty"; notice.dataset.unsavedNavigation = ""; notice.setAttribute("role", "alert");
+      notice = document.createElement("dialog"); notice.className = "ts-chooser ts-unsaved"; notice.dataset.unsavedNavigation = ""; notice.setAttribute("aria-label", "Unsaved changes");
       const text = document.createElement("span"); text.textContent = "You have unsaved changes."; notice.append(text);
-      for (const [action, label] of [["save", "Save and continue"], ["discard", "Discard and continue"], ["stay", "Stay here"]]) {
+      for (const [action, label] of [["save", "Save"], ["discard", "Discard"], ["stay", "Stay"]]) {
         const button = document.createElement("button"); button.type = "button"; button.dataset.unsavedAction = action; button.textContent = label; notice.append(button);
       }
       document.querySelector(".ts-main").prepend(notice);
     }
-    notice.querySelector("button").focus(); notice.scrollIntoView({block:"nearest"});
+    if (!notice.open) notice.showModal();
+    notice.querySelector("button").focus();
   }
+  document.addEventListener("input", event => {
+    const offset = event.target.closest("[data-signed-offset]");
+    if (offset) offset.querySelector("span").textContent = event.target.value !== "" && !event.target.value.startsWith("-") ? "+" : "";
+  });
   function numberPair(input) {
     const pair = input.closest(".ts-numberpair"); if (!pair) return;
     const decimal = pair.querySelector("[data-number-decimal]"), hex = pair.querySelector("[data-number-hex]"), source = pair.querySelector("[data-number-source]");
@@ -44,7 +49,10 @@ if (document.body.classList.contains("administration")) {
     const fromHex = input === hex; source.value = fromHex ? "hex" : "decimal";
     try {
       if (!input.value.trim()) (fromHex ? decimal : hex).value = "";
-      else if (fromHex) decimal.value = (input.value.startsWith("-") ? -BigInt("0x" + input.value.slice(1)) : BigInt("0x" + input.value)).toString();
+      else if (fromHex) {
+        const n = input.value.startsWith("-") ? -BigInt("0x" + input.value.slice(1)) : BigInt("0x" + input.value);
+        decimal.value = (n < 0n ? "-" : "") + (n < 0n ? -n : n).toString().padStart(Number(pair.dataset.decimalWidth || 0), "0");
+      }
       else { const n = BigInt(input.value); hex.value = (n < 0n ? "-" : "") + (n < 0n ? -n : n).toString(16).toUpperCase().padStart(Number(hex.dataset.hexWidth || 0), "0"); }
     } catch (_) { /* Unfinished text stays for ordinary form parsing. */ }
   }
@@ -55,7 +63,9 @@ if (document.body.classList.contains("administration")) {
     values.slice(offset,offset+50).forEach((id, localIndex) => {
       const index=offset+localIndex;
       const item = document.createElement("div"); item.className = "ts-orderitem";
-      const label = document.createElement("span"); label.textContent = names[id] ? names[id]+" · "+id : id; item.append(label);
+      const label = document.createElement("span");
+      if (names[id]) label.append(document.createTextNode(names[id]+" · "));
+      const identity = document.createElement("span"); identity.className="ts-numeric";identity.textContent=id.padStart(5,"0");label.append(identity);item.append(label);
       const actions = document.createElement("div"); actions.className = "ts-actions";
       const controls = row.closest("[data-profile-grid]").querySelector("template[data-zone-controls]").content.cloneNode(true);
       for (const button of controls.querySelectorAll("button")) button.dataset.zoneIndex = index;
@@ -77,7 +87,7 @@ if (document.body.classList.contains("administration")) {
       const form = [...changedForms].find(f => f.isConnected), action = dirtyAction.dataset.unsavedAction;
       if (action === "discard") { changedForms.clear(); location.assign(pendingDestination); }
       else if (action === "save" && form) {
-        const savedPath = new URL(form.action || location.href).pathname.replace(/\/edit$/, "");
+        const savedPath = new URL(form.getAttribute("action") || location.href, location.href).pathname.replace(/\/edit$/, "");
         try { sessionStorage.setItem(navigationKey,JSON.stringify({savedPath,destination:pendingDestination})); } catch (_) {}
         form.requestSubmit();
       } else { document.querySelector("[data-unsaved-navigation]").remove(); form?.querySelector("input:not([type=hidden]),select,textarea")?.focus(); }
@@ -113,20 +123,6 @@ if (document.body.classList.contains("administration")) {
     if (named) named.value = input.closest(".ts-field").querySelector("[data-number-decimal]").value;
         const row = input.closest("[data-profile-row]"); if (row) zoneOrder(row);
   });
-  // Age labels update locally; observation times and full-date titles stay unchanged.
-  function relativeTimes() {
-    const now = Date.now();
-    for (const node of document.querySelectorAll("time[datetime][title]")) {
-      const delta = now - Date.parse(node.dateTime); if (!Number.isFinite(delta)) continue;
-      const seconds = Math.floor(Math.abs(delta) / 1000), future = delta < 0;
-      if (seconds < 60) { node.textContent = future ? "in a moment" : "just now"; continue; }
-      const unit = seconds >= 86400 ? "day" : seconds >= 3600 ? "hour" : "minute";
-      const count = Math.floor(seconds / ({day:86400,hour:3600,minute:60}[unit]));
-      const text = count + " " + unit + (count === 1 ? "" : "s");
-      node.textContent = future ? "in " + text : text + " ago";
-    }
-  }
-  relativeTimes(); setInterval(relativeTimes,30000);
   // Same component on every administration page, clamped inside the viewport.
   function positionHelp(help) {
     const body = help.querySelector(".ts-helpbody"), rect = help.getBoundingClientRect();

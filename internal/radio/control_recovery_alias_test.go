@@ -39,15 +39,12 @@ func TestControlRecoveryAliasUpdateDuringRetryReachesRecoveredNativeLookups(t *t
 	assertRecoveredAliases(t, c, updatedAlias)
 }
 
-func TestControlRecoveryAliasUpdateAfterStaticManualPromotionKeepsSelectedControl(t *testing.T) {
+func TestControlRecoveryAliasUpdateKeepsExplicitlySelectedControl(t *testing.T) {
 	c := testController(t, nil)
 	waiting, retry := holdSiteRetries(c)
 	p := selectionProfile()
-	p.Site.ControlPolicy.Mode = "static"
+	p.Site.ControlPolicy = ControlPolicy{Mode: "static", ChannelID: "voice-1", CandidateIDs: []string{"voice-1"}}
 	if err := c.Start(context.Background(), p, "null"); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.SwitchControl(context.Background(), "voice-1"); err != nil {
 		t.Fatal(err)
 	}
 	waitSelected(t, c, "voice-1")

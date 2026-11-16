@@ -15,10 +15,11 @@ import (
 func TestHistoryStorageRequestCancellationReturnsUnavailableWithoutSaving(t *testing.T) {
 	for _, method := range []string{http.MethodGet, http.MethodPut} {
 		t.Run(method, func(t *testing.T) {
-			store, err := activity.Open(filepath.Join(t.TempDir(), "activity.db"))
+			store, err := activity.OpenArchive(filepath.Join(t.TempDir(), "activity.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
+			waitHistoryInitialization(t, store)
 			defer store.Close()
 			s := &Service{config: FileConfig{Role: RoleSystem, InstanceID: "system-1"}, activity: store}
 			before, err := store.Retention(context.Background())

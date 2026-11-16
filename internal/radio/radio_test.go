@@ -55,12 +55,11 @@ func nativeHelper() {
 			return
 		}
 	}
+	configName := "config.yml"
 	if name == "media" {
-		fmt.Println("I: (HOST) FNE is up and running on offline-test")
-		<-stop
-		return
+		configName = "fne.yml"
 	}
-	config, _ := os.ReadFile("config.yml")
+	config, _ := os.ReadFile(configName)
 	portMatch := regexp.MustCompile(`restPort: ([0-9]+)`).FindStringSubmatch(string(config))
 	secretMatch := regexp.MustCompile(`restPassword: "([a-f0-9]+)"`).FindStringSubmatch(string(config))
 	if len(portMatch) < 2 || len(secretMatch) < 2 {
@@ -100,12 +99,20 @@ func nativeHelper() {
 		case "/status":
 			out["p25Enabled"] = true
 			out["tx"] = false
+			_, statusErr := os.Stat("modem-stale")
+			out["modemFresh"] = os.IsNotExist(statusErr)
 			out["lastSrcId"] = 0
 			out["lastDstId"] = 0
 		case "/p25/report-affiliations":
 			out["affiliations"] = []any{}
+		case "/p25/control-peer", "/p25/control-role":
 		case "/p25/site-state":
 			out["zoneConnected"] = body["zoneConnected"]
+		case "/p25/control-resources":
+			raw, _ := json.Marshal(body["ready"])
+			if err := os.WriteFile("ready-resources.json", raw, 0600); err != nil {
+				out["status"] = http.StatusServiceUnavailable
+			}
 		case "/p25/control-quiesce":
 			if _, err := os.Stat("reject-quiesce"); err == nil {
 				w.WriteHeader(http.StatusServiceUnavailable)
@@ -145,6 +152,13 @@ func nativeHelper() {
 				}
 			}
 		case "/p25/inhibit-policy":
+			if _, err := os.Stat("inhibit-contact-lost"); err == nil {
+				connection, _, err := w.(http.Hijacker).Hijack()
+				if err == nil {
+					connection.Close()
+				}
+				return
+			}
 			policyMu.Lock()
 			defer policyMu.Unlock()
 			if r.Method == "PUT" {
@@ -191,7 +205,11 @@ func nativeHelper() {
 		_ = json.NewEncoder(w).Encode(out)
 	})}
 	go server.Serve(listener)
-	fmt.Println("I: (HOST) Host is up and running on offline-test")
+	if name == "media" {
+		fmt.Println("I: (HOST) FNE is up and running on offline-test")
+	} else {
+		fmt.Println("I: (HOST) Host is up and running on offline-test")
+	}
 	<-stop
 	if os.Getenv("RADIO_IGNORE_STOP") == "1" {
 		select {}
@@ -202,7 +220,7 @@ func nativeHelper() {
 }
 
 func fixtureProfile() Profile {
-	return Profile{System: System{ID: "system-1", Name: "Test", WACN: 1, SystemID: 1, Callsign: "N0TEST", Radios: []Radio{{RID: 10001, Alias: "Portable", Enabled: true, Kind: "subscriber"}, {RID: 10002, Alias: "Console", Enabled: true, Kind: "console"}}, Talkgroups: []Talkgroup{{TGID: 1001, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Test 1", Enabled: true, SiteAccess: "all", SiteIDs: []string{}}, {TGID: 1099, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Denied", Enabled: false, SiteAccess: "all", SiteIDs: []string{}}}}, Zone: Zone{ID: "zone-1", SystemID: "system-1", RFSSID: 1, ChannelIdentifiers: []Identifier{{Identifier: 2, BaseHz: 443437500, SpacingHz: 12500, OffsetHz: 5000000, BandwidthHz: 12500}}, Sites: []SiteIdentity{{ID: "site-1", Name: "Main", SiteID: 1, NAC: 0x293}}}, Site: Site{BroadcastBandPlan: true, ID: "site-1", Modems: []Modem{{ID: "control", Name: "Control modem", Device: "/dev/serial/by-id/control", Baud: 115200, Calibration: Calibration{RXLevel: 50, TXLevel: 50}}, {ID: "voice", Name: "Voice modem", Device: "/dev/serial/by-id/voice", Baud: 115200, Calibration: Calibration{RXLevel: 45, TXLevel: 48, RXOffsetHz: 12, TXOffsetHz: -24}}}, Channels: []Channel{{ID: "control-1", Name: "Control", Role: "control", Identifier: 2, ChannelNo: 1, TXHz: 443450000, RXHz: 448450000, PowerPercent: 95, ModemID: "control", Enabled: true}, {ID: "voice-1", Name: "Voice", Role: "voice", Identifier: 2, ChannelNo: 81, TXHz: 444450000, RXHz: 449450000, PowerPercent: 80, ModemID: "voice", Enabled: true}}, Identification: Identification{Enabled: false, Mode: "ham", WPM: 20, QuietSeconds: 60}}}
+	return Profile{System: System{ID: "system-1", Name: "Test", WACN: 1, SystemID: 1, Radios: []Radio{{RID: 10001, Alias: "Portable", Enabled: true, Kind: "subscriber"}, {RID: 10002, Alias: "Console", Enabled: true, Kind: "console"}}, Talkgroups: []Talkgroup{{TGID: 1001, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Test 1", Enabled: true, SiteAccess: "all", SiteIDs: []string{}}, {TGID: 1099, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Denied", Enabled: false, SiteAccess: "all", SiteIDs: []string{}}}}, Zone: Zone{ID: "zone-1", SystemID: "system-1", RFSSID: 1, ChannelIdentifiers: []Identifier{{Identifier: 2, BaseHz: 433437500, SpacingHz: 12500, OffsetHz: 5000000, BandwidthHz: 12500}}, Sites: []SiteIdentity{{ID: "site-1", Name: "Main", SiteID: 1}}}, Site: Site{NAC: 659, ControlPolicy: ControlPolicy{Mode: "static", ChannelID: "control-1", CandidateIDs: []string{"control-1"}}, BroadcastBandPlan: true, ID: "site-1", Modems: []Modem{{ID: "control", Name: "Control modem", Device: "/dev/serial/by-id/control", Baud: 115200, Calibration: Calibration{RXLevel: 50, TXLevel: 50}}, {ID: "voice", Name: "Voice modem", Device: "/dev/serial/by-id/voice", Baud: 115200, Calibration: Calibration{RXLevel: 45, TXLevel: 48, RXOffsetHz: 12, TXOffsetHz: -24}}}, Channels: []Channel{{ID: "control-1", Name: "Control", Role: "control", Identifier: 2, ChannelNo: 1, TXHz: 433450000, RXHz: 438450000, PowerPercent: 95, ModemID: "control", Enabled: true}, {ID: "voice-1", Name: "Voice", Role: "voice", Identifier: 2, ChannelNo: 81, TXHz: 434450000, RXHz: 439450000, PowerPercent: 80, ModemID: "voice", Enabled: true}}, Identification: Identification{Callsign: "N0TEST", Enabled: false}}}
 }
 func freeBase(t *testing.T) int {
 	t.Helper()
@@ -244,7 +262,13 @@ func testController(t *testing.T, events chan Event) *Controller {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opts := Options{StateDir: t.TempDir(), EnginePath: binary, FNEPath: binary, BaseRPCPort: freeBase(t), StartupTimeout: 3 * time.Second}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	opts := Options{StateDir: t.TempDir(), EnginePath: binary, FNEPath: binary, BaseRPCPort: freeBase(t), FNEPort: port, StartupTimeout: 3 * time.Second}
 	if events != nil {
 		opts.OnEvent = func(e Event) {
 			select {
@@ -282,7 +306,7 @@ func TestRendererUsesRealChannelIdentityAndSeparatedLocalPorts(t *testing.T) {
 	if strings.Contains(s, "rpcPassword: "+quoted(n.Secret)) {
 		t.Fatal("RPC and media credentials were conflated")
 	}
-	if !strings.Contains(files["iden_table.dat"], "2,443437500,12.500000,5.000000,12.500000") {
+	if !strings.Contains(files["iden_table.dat"], "2,433437500,12.500000,5.000000,12.500000") {
 		t.Fatal("channel table units wrong")
 	}
 	fne, err := RenderFNE(p, n)
@@ -315,7 +339,7 @@ func TestMissingExecutablesDoNotClaimAvailableOperation(t *testing.T) {
 }
 
 func TestProfileRejectsUnrepresentablePairsAndSharedModemBeforeStart(t *testing.T) {
-	cases := []func(*Profile){func(p *Profile) { p.Site.Channels[1].RXHz++ }, func(p *Profile) { p.Site.Channels[1].ChannelNo = 1 }, func(p *Profile) { p.Site.Channels[1].ModemID = "control" }, func(p *Profile) { p.Zone.ChannelIdentifiers[0].OffsetHz++ }, func(p *Profile) { p.Site.Identification.WPM = 19 }, func(p *Profile) { p.System.WACN = 0xFFFFF }, func(p *Profile) { p.Site.Channels[1].ID = ".." }, func(p *Profile) { p.System.Radios[0].Kind = "" }}
+	cases := []func(*Profile){func(p *Profile) { p.Site.Channels[1].RXHz++ }, func(p *Profile) { p.Site.Channels[1].ChannelNo = 1 }, func(p *Profile) { p.Site.Channels[1].ModemID = "control" }, func(p *Profile) { p.Zone.ChannelIdentifiers[0].OffsetHz++ }, func(p *Profile) { p.System.WACN = 0xFFFFF }, func(p *Profile) { p.Site.Channels[1].ID = ".." }, func(p *Profile) { p.System.Radios[0].Kind = "" }}
 	for _, mutate := range cases {
 		p := fixtureProfile()
 		mutate(&p)
@@ -746,6 +770,10 @@ func TestVoiceFailureCanRecoverWithoutControlRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := c.Status()
+	resources := filepath.Join(controlOwner(c).dir, "ready-resources.json")
+	if data, _ := os.ReadFile(resources); string(data) != "[8273]" {
+		t.Fatalf("expected the ready voice channel at startup, got %s", data)
+	}
 	_ = syscall.Kill(before.Channels[1].PID, syscall.SIGKILL)
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) && c.Status().Channels[1].State != "fault" {
@@ -754,12 +782,20 @@ func TestVoiceFailureCanRecoverWithoutControlRestart(t *testing.T) {
 	if c.Status().Channels[1].State != "fault" || c.Status().State != "running" {
 		t.Fatal("voice failure was not contained")
 	}
+	waitRadio(t, "failed voice channel stayed in the control resource list", func() bool {
+		data, _ := os.ReadFile(resources)
+		return string(data) == "[]"
+	})
 	if err := c.StartChannel(context.Background(), "voice-1"); err != nil {
 		t.Fatal(err)
 	}
 	if c.Status().Channels[0].PID != before.Channels[0].PID || c.Status().FNEPID != before.FNEPID {
 		t.Fatal("voice recovery restarted unrelated processes")
 	}
+	waitRadio(t, "recovered voice channel did not return to the control resource list", func() bool {
+		data, _ := os.ReadFile(resources)
+		return string(data) == "[8273]"
+	})
 }
 
 func TestFaultRestartReapsEveryPreviousResourceBeforeReplacement(t *testing.T) {

@@ -23,7 +23,7 @@ func TestMessagingBrowserRealApplicationServer(t *testing.T) {
 	}
 	evidence := os.Getenv("TRUNKSYSTEM_MESSAGING_BROWSER_EVIDENCE")
 	if evidence == "" {
-		evidence = filepath.Join(repo, "build", "messaging-ui-test", "browser")
+		evidence = t.TempDir()
 	}
 	if err = os.MkdirAll(evidence, 0700); err != nil {
 		t.Fatal(err)

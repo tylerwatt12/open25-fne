@@ -59,7 +59,7 @@ func stopTestChild(t *testing.T, process *child) {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if err := process.stop(ctx, false); err != nil {
+		if err := process.stop(ctx); err != nil {
 			t.Error(err)
 		}
 	})
@@ -84,7 +84,7 @@ func TestChildShutdownReapsDespiteBlockedObserver(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	started := time.Now()
-	if err = process.stop(ctx, false); err != nil {
+	if err = process.stop(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if time.Since(started) > 500*time.Millisecond || lease.closed.Load() != 1 || process.alive() {
@@ -101,7 +101,7 @@ func TestChildShutdownReapsDespiteBlockedObserver(t *testing.T) {
 	// Once ownership is retired, a repeated stop must not touch that numeric
 	// process group again. It may have been reused by the operating system.
 	process.cmd.Process = nil
-	if err = process.stop(ctx, false); err != nil || lease.closed.Load() != 1 {
+	if err = process.stop(ctx); err != nil || lease.closed.Load() != 1 {
 		t.Fatal("repeated stop did not preserve retired ownership", err)
 	}
 }
@@ -126,7 +126,7 @@ func TestChildShutdownRetiresInheritedWriterBeforeLeaseRelease(t *testing.T) {
 	process.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err = process.stop(ctx, false); err != nil {
+	if err = process.stop(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if lease.closed.Load() != 1 || !process.groupRetired {
@@ -135,9 +135,9 @@ func TestChildShutdownRetiresInheritedWriterBeforeLeaseRelease(t *testing.T) {
 	awaitChild(t, process.outputDone, "owned reader did not close after child exit")
 }
 
-func TestChildShutdownPreservesFinalIdentificationOutput(t *testing.T) {
+func TestChildShutdownPreservesFinalOutput(t *testing.T) {
 	lines := make(chan string, 8)
-	process, err := launch("/bin/sh", t.TempDir(), "trap 'printf \"I: CW, state idle\\n\"; exit 0' INT; printf 'ready\\n'; while :; do sleep 0.05; done", "voice-1", "voice", nil, func(_ *child, line string) { lines <- line })
+	process, err := launch("/bin/sh", t.TempDir(), "trap 'printf \"I: native shutdown complete\\n\"; exit 0' TERM; printf 'ready\\n'; while :; do sleep 0.05; done", "voice-1", "voice", nil, func(_ *child, line string) { lines <- line })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,16 +149,16 @@ func TestChildShutdownPreservesFinalIdentificationOutput(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err = process.stop(ctx, true); err != nil {
+	if err = process.stop(ctx); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case line := <-lines:
-		if line != "I: CW, state idle" {
+		if line != "I: native shutdown complete" {
 			t.Fatal("unexpected final output", line)
 		}
 	default:
-		t.Fatal("final station identification output was discarded")
+		t.Fatal("final native output was discarded")
 	}
 }
 
@@ -180,21 +180,21 @@ func TestLateNativeObservationCannotMutateReplacementRun(t *testing.T) {
 	current := currentObservedChild(t, c, "voice-1", "voice")
 	sequence := c.sequence.Load()
 	for _, line := range []string{
-		"I: CW, state identifying",
+		"I: native stale observation",
 		"I: (HOST) P25 Affiliation, group affiliation, srcId = 10001, dstId = 1001",
 		"I: (RF) P25 Voice Call, srcId = 10001, dstId = 1001",
 	} {
 		c.observe(old, line)
 	}
 	c.applyAffiliations(old, map[string]json.RawMessage{"affiliations": json.RawMessage(`[{"srcId":10001,"grpId":1001}]`)}, c.SourceState().Revision)
-	if status := c.Status(); status.Channels[0].Identifying || status.Channels[0].Busy || len(status.Affiliations) != 0 {
+	if status := c.Status(); status.Channels[0].Busy || len(status.Affiliations) != 0 {
 		t.Fatal("late native output changed a replacement run", status)
 	}
 	waitRadio(t, "late output archive did not drain to its original run", func() bool {
 		raw, err := os.ReadFile(filepath.Join(oldDir, "native-voice-1.log"))
-		return err == nil && strings.Contains(string(raw), "state identifying")
+		return err == nil && strings.Contains(string(raw), "native stale observation")
 	})
-	if raw, err := os.ReadFile(filepath.Join(oldDir, "native-voice-1.log")); err != nil || !strings.Contains(string(raw), "state identifying") {
+	if raw, err := os.ReadFile(filepath.Join(oldDir, "native-voice-1.log")); err != nil || !strings.Contains(string(raw), "native stale observation") {
 		t.Fatal("late output did not remain in its original log", err)
 	}
 	if _, err := os.Stat(filepath.Join(newDir, "native-voice-1.log")); !os.IsNotExist(err) {

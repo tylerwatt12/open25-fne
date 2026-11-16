@@ -35,6 +35,11 @@ func (s *Service) hasRFInterest(tg int) bool {
 		return false
 	}
 	view := s.view()
+	for _, group := range view.System.Talkgroups {
+		if group.TGID == tg && talkgroupAtSite(group, s.Config().InstanceID) && slices.Contains(group.RequestedSiteIDs, s.Config().InstanceID) {
+			return true
+		}
+	}
 	for _, affiliation := range s.radio.Status().Affiliations {
 		if affiliation.TGID == tg && !s.radioServiceInhibited(affiliation.RID) && subscriberGroupAllowed(view.System, affiliation.RID, tg, false) {
 			return true

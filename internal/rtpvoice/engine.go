@@ -6,10 +6,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"open25.local/open25-fne/internal/p25rtp"
 	"sync"
 	"sync/atomic"
 	"time"
-	"open25.local/open25-fne/internal/p25rtp"
 )
 
 type queuedFrame struct {

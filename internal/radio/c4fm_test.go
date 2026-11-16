@@ -94,7 +94,7 @@ func c4fmController(t *testing.T) (*Controller, Profile, func() []*recoveryLease
 			mu.Unlock()
 			return lease, ctx.Err()
 		},
-		verify: func(ctx context.Context, _ io.Closer, _ string, _ bool) error { return ctx.Err() },
+		verify: func(ctx context.Context, _ io.Closer, _ string) error { return ctx.Err() },
 		same: func(lease io.Closer, _ string) bool {
 			return !lease.(*recoveryLease).closed.Load()
 		},

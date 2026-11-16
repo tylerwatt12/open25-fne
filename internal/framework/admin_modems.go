@@ -19,7 +19,7 @@ func (s *Service) webModemStatus(w http.ResponseWriter, r *http.Request, session
 		s.webModemReports(w, time.Now().UTC())
 		return
 	}
-	s.webHeader(w, r, "Live Modems", session, false)
+	s.webHeader(w, r, "Modem activity", session, false)
 	defer webFooter(w)
 	fmt.Fprint(w, "<script src=/modem-status.js defer></script><div class=modem-controls><button type=button data-modem-pause hidden>Pause updates</button><a class=button href=\"\">Refresh</a><span role=status data-modem-update>Updating automatically</span>"+webHelp("About modem measurements", "TX shows the modem’s transmit indication; RX shows the P25 decoder state. Charts retain recent worker samples and receive reports. Missing samples are unknown. Use external test equipment to measure RF output or modulation quality.")+"</div>")
 	s.webModemReports(w, time.Now().UTC())
@@ -38,7 +38,7 @@ func (s *Service) webModemReports(w io.Writer, now time.Time) {
 			return
 		}
 		status := s.radioStatus()
-		reports = []SiteReport{{ID: site.ID, Name: site.ID, Config: site, Radio: &status, ObservedAt: now}}
+		reports = []SiteReport{{ID: site.ID, Name: adminName(s.adminNames(), "sites", site.ID), Config: site, Radio: &status, ObservedAt: now}}
 	} else {
 		reports = s.siteReports()
 	}
@@ -77,10 +77,10 @@ func (s *Service) webModemReports(w io.Writer, now time.Time) {
 	for index, report := range reports {
 		name := report.Name
 		if name == "" {
-			name = report.ID
+			name = "Unnamed Site"
 		}
 		fmt.Fprintf(w, `<section class=modem-site><h3>%s</h3>`, esc(name))
-		webReportMeta(w, report.ID, via, role == RoleSite, report.ObservedAt, report.ReceivedAt)
+		webReportMeta(w, name, via, role == RoleSite, report.ObservedAt, report.ReceivedAt)
 		threshold := time.Duration(max(10, s.Config().PollSeconds*4)) * time.Second
 		stale := role != RoleSite && (modemTimeStale(report.ObservedAt, now, threshold) || modemTimeStale(report.ReceivedAt, now, threshold))
 		if role == RoleSystem {
@@ -105,14 +105,14 @@ func (s *Service) webModemReports(w io.Writer, now time.Time) {
 			}
 		}
 		rows := modemRows(report, zone)
-		fmt.Fprint(w, `<div class=table-wrap tabindex=0 aria-label="Per-modem TX and RX observations"><table class="record-table modem-table"><thead><tr><th scope=col>Modem / channel</th><th scope=col>TX / RX frequency (MHz)</th><th scope=col>TX</th><th scope=col>RX</th><th scope=col>Last received-call BER</th><th scope=col>FEC / decode errors</th><th scope=col>Observed</th></tr></thead><tbody>`)
+		fmt.Fprint(w, `<div class=table-wrap tabindex=0 aria-label="Per-modem TX and RX observations"><table class=record-table><thead><tr><th scope=col>Modem / channel</th><th scope=col>TX indication</th><th scope=col>Receive decoder</th><th scope=col>Last call bit error rate</th></tr></thead><tbody>`)
 		for rowIndex, row := range rows {
 			id := fmt.Sprintf("modem-chart-%d-%d", index, rowIndex)
-			txFrequency, rxFrequency := "Unavailable", "Unavailable"
-			if row.Programming != "Unassigned" && row.FrequenciesKnown {
-				txFrequency, rxFrequency = webUnitText("tx_frequency_hz", row.TXHz), webUnitText("rx_frequency_hz", row.RXHz)
+			fmt.Fprintf(w, `<tr><td><a href="#%s">%s</a><span class=channel-sub>%s</span>`, id, esc(row.Name), esc(row.ChannelName))
+			if row.Error != "" {
+				fmt.Fprint(w, `<span class=channel-sub>`, esc(row.Error), `</span>`)
 			}
-			fmt.Fprintf(w, `<tr><td><a href="#%s">%s</a><br><span class=muted>%s · %s</span><br>%s</td><td><span class=nowrap>TX %s</span><br><span class=nowrap>RX %s</span><br><span class=muted>%s</span></td>`, id, esc(row.Name), esc(row.ID), esc(row.Role), esc(row.ChannelName), esc(txFrequency), esc(rxFrequency), esc(row.Programming))
+			fmt.Fprint(w, `</td>`)
 			var sample radio.ModemSample
 			if len(row.Telemetry.Samples) > 0 {
 				sample = row.Telemetry.Samples[len(row.Telemetry.Samples)-1]
@@ -134,27 +134,34 @@ func (s *Service) webModemReports(w io.Writer, now time.Time) {
 			fmt.Fprintf(w, `<td data-modem-live-state>%s</td><td data-modem-live-state>%s</td>`, esc(tx), esc(rx))
 			if count := len(row.Telemetry.Receive); count > 0 {
 				last := row.Telemetry.Receive[count-1]
-				fmt.Fprintf(w, `<td>%s%%<br><span class=muted>%s</span></td><td>%d reported bit errors<br>%d undecodable LC<br><span class=muted>%d frames · %d protected bits</span></td>`, esc(fmt.Sprintf("%.4f", last.BERPercent)), webTime(last.At), last.Errors, last.UndecodableLC, last.Frames, last.ProtectedBits)
+				fmt.Fprintf(w, `<td>%s%%<br><span class=muted>%s</span></td>`, esc(fmt.Sprintf("%.4f", last.BERPercent)), webTime(last.At))
 			} else {
-				fmt.Fprint(w, `<td>Unavailable · no completed RX report</td><td>Unavailable · no completed RX report</td>`)
+				fmt.Fprint(w, `<td>No received-call report</td>`)
 			}
-			fmt.Fprintf(w, `<td>%s<br><span class=muted>%s</span>`, webTime(sample.At), esc(row.State))
-			if row.Error != "" {
-				fmt.Fprintf(w, `<br>%s`, esc(row.Error))
-			}
-			fmt.Fprint(w, `</td></tr>`)
+			fmt.Fprint(w, `</tr>`)
 		}
 		if len(rows) == 0 {
-			fmt.Fprint(w, `<tr><td colspan=7>No modem observations available.</td></tr>`)
+			fmt.Fprint(w, `<tr><td colspan=4>No modem observations available.</td></tr>`)
 		}
 		fmt.Fprint(w, `</tbody></table></div><div class=modem-charts>`)
 		for rowIndex, row := range rows {
 			fmt.Fprintf(w, `<section class=modem-chart-card id="modem-chart-%d-%d"><h4>%s · %s</h4>`, index, rowIndex, esc(row.Name), esc(row.ChannelName))
+			txFrequency, rxFrequency := "Unavailable", "Unavailable"
+			if row.Programming != "Unassigned" && row.FrequenciesKnown {
+				txFrequency, rxFrequency = webUnitText("tx_frequency_hz", row.TXHz), webUnitText("rx_frequency_hz", row.RXHz)
+			}
+			var observed time.Time
+			if len(row.Telemetry.Samples) > 0 {
+				observed = row.Telemetry.Samples[len(row.Telemetry.Samples)-1].At
+			}
+			fmt.Fprintf(w, `<div class=frequency-stack><span>TX <span class=ts-numeric>%s</span> MHz</span><span>RX <span class=ts-numeric>%s</span> MHz</span></div><p class=ts-caption>%s · %s</p><p class=ts-caption>Last observation %s · Native state: %s</p>`, esc(txFrequency), esc(rxFrequency), esc(row.Programming), esc(row.Role), webTime(observed), esc(row.State))
 			webModemActivityChart(w, row.Telemetry.Samples)
 			webModemReceiveChart(w, row.Telemetry.Receive, true)
 			webModemReceiveChart(w, row.Telemetry.Receive, false)
 			if len(row.Telemetry.Receive) > 0 {
-				fmt.Fprint(w, `<details class=modem-receive-history><summary>Received-call reports</summary><div class=table-wrap tabindex=0 aria-label="Received-call decoder reports"><table class=record-table><thead><tr><th>Site observed</th><th>BER estimate (%)</th><th>Reported bit errors</th><th>Undecodable LC</th><th>Frames / protected bits</th></tr></thead><tbody>`)
+				last := row.Telemetry.Receive[len(row.Telemetry.Receive)-1]
+				fmt.Fprintf(w, `<p class=ts-caption>%d reported bit errors · %d undecodable link-control messages</p>`, last.Errors, last.UndecodableLC)
+				fmt.Fprint(w, `<details class=modem-receive-history><summary>Received-call reports</summary><div class=table-wrap tabindex=0 aria-label="Received-call decoder reports"><table class=record-table><thead><tr><th>Site observed</th><th>BER estimate (%)</th><th>Reported bit errors</th><th>Undecodable link-control messages</th><th>Frames / protected bits</th></tr></thead><tbody>`)
 				for _, stats := range row.Telemetry.Receive {
 					fmt.Fprintf(w, `<tr><td>%s</td><td>%.4f</td><td>%d</td><td>%d</td><td>%d / %d</td></tr>`, webTime(stats.At), stats.BERPercent, stats.Errors, stats.UndecodableLC, stats.Frames, stats.ProtectedBits)
 				}
@@ -197,16 +204,16 @@ func modemRows(report SiteReport, zones ...*ZoneConfig) []modemRow {
 				continue
 			}
 			if name == "" {
-				name = id
+				name = "USB modem"
 			}
 			rows = append(rows, modemRow{ID: id, Name: name, ChannelName: ch.Name, Role: ch.Role, Programming: "Operating programming", FrequenciesKnown: true, TXHz: ch.TXHz, RXHz: ch.RXHz, ChannelStatus: ch})
-			bound[id+"\x00"+ch.ID] = true
+			bound[id+"\x00"+ch.ID+"\x00"+ch.Device] = true
 		}
 	}
 	for _, modem := range report.Config.Modems {
 		name := modem.Name
 		if name == "" {
-			name = modem.ID
+			name = "USB modem"
 		}
 		assigned := false
 		for _, ch := range report.Config.Channels {
@@ -214,9 +221,9 @@ func modemRows(report SiteReport, zones ...*ZoneConfig) []modemRow {
 				continue
 			}
 			assigned = true
-			if !bound[modem.ID+"\x00"+ch.ID] {
+			if !bound[modem.ID+"\x00"+ch.ID+"\x00"+modem.Device] {
 				tx, rx, known := bandPlanFrequencies(zone, ch.Identifier, ch.ChannelNo)
-				rows = append(rows, modemRow{ID: modem.ID, Name: name, ChannelName: ch.Name, Role: ch.Role, Programming: "Saved programming", FrequenciesKnown: known, TXHz: tx, RXHz: rx, ChannelStatus: radio.ChannelStatus{ID: ch.ID, State: "No operating observation"}})
+				rows = append(rows, modemRow{ID: modem.ID, Name: name, ChannelName: ch.Name, Programming: "Saved programming", FrequenciesKnown: known, TXHz: tx, RXHz: rx, ChannelStatus: radio.ChannelStatus{ID: ch.ID, Device: modem.Device, State: "No operating observation"}})
 			}
 		}
 		if !assigned {
@@ -225,7 +232,7 @@ func modemRows(report SiteReport, zones ...*ZoneConfig) []modemRow {
 				active = active || row.ID == modem.ID
 			}
 			if !active {
-				rows = append(rows, modemRow{ID: modem.ID, Name: name, ChannelName: "Unassigned", Programming: "Unassigned", ChannelStatus: radio.ChannelStatus{State: "No operating observation"}})
+				rows = append(rows, modemRow{ID: modem.ID, Name: name, ChannelName: "Unassigned", Programming: "Unassigned", ChannelStatus: radio.ChannelStatus{Device: modem.Device, State: "No operating observation"}})
 			}
 		}
 	}

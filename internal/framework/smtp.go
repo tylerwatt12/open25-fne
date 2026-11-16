@@ -356,14 +356,11 @@ func smtpSend(ctx context.Context, p smtpProfile, d smtpDelivery) error {
 	return nil
 }
 
-// Delivery history follows the service's already configured event retention.
+// Delivery history follows the latest accepted System archive retention policy.
 // Queued and uncertain/in-progress deliveries are never removed by retention.
 func (s *Service) pruneSMTP(ctx context.Context) {
-	if s.activity == nil {
-		return
-	}
-	retention, err := s.activity.Retention(ctx)
-	if err != nil {
+	retention := s.historyRetentionPolicy()
+	if retention == nil {
 		return
 	}
 	s.smtpMu.Lock()

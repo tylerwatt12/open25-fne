@@ -1,8 +1,8 @@
 package rtpvoice
 
 import (
-	"time"
 	"open25.local/open25-fne/internal/p25rtp"
+	"time"
 )
 
 // BACA-B Annex B Table58 PDF428-430 (printed404-406); B-2 keeps the

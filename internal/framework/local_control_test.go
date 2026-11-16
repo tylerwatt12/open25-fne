@@ -188,7 +188,7 @@ func TestLocalRadioHandlerRejectsInvalidCommands(t *testing.T) {
 	for _, tc := range []struct {
 		method, path, body string
 		status             int
-	}{{"GET", "/start", "", 405}, {"POST", "/status", "{}", 405}, {"POST", "/anything", "{}", 404}, {"POST", "/start", `{"frequency":444.45}`, 400}, {"POST", "/start", `{} {}`, 400}, {"POST", "/start", strings.Repeat(" ", 2048), 400}} {
+	}{{"GET", "/start", "", 405}, {"POST", "/status", "{}", 405}, {"POST", "/anything", "{}", 404}, {"POST", "/start", `{"frequency":434.45}`, 400}, {"POST", "/start", `{} {}`, 400}, {"POST", "/start", strings.Repeat(" ", 2048), 400}} {
 		w := httptest.NewRecorder()
 		s.localRadioHandler().ServeHTTP(w, httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body)))
 		if w.Code != tc.status {

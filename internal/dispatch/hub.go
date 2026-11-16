@@ -728,8 +728,9 @@ func (h *Hub) PublishUnavailable(frame Frame, reason string) {
 	}
 }
 
-func (h *Hub) InvalidateSession(key string) {
-	digest := sha256.Sum256([]byte(key))
+func (h *Hub) InvalidateSession(key string) { h.InvalidateSessionDigest(sha256.Sum256([]byte(key))) }
+
+func (h *Hub) InvalidateSessionDigest(digest [32]byte) {
 	h.mu.Lock()
 	clients := []*client{}
 	for _, c := range h.clients {

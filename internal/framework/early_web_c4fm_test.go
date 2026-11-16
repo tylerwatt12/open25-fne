@@ -102,12 +102,12 @@ func TestC4FMTestAPIBelongsToSiteAdministrator(t *testing.T) {
 func TestC4FMTestAPIReportsAdapterStatusAndActualFailures(t *testing.T) {
 	s, runtime := webC4FMService(t)
 	runtime.mu.Lock()
-	runtime.testStatus = radio.C4FMTestStatus{State: "stopped", ChannelID: "channel-voice", TXHz: 443450001, TXObserved: true, StopConfirmed: true, FinishedAt: time.Date(2026, 11, 4, 20, 0, 0, 0, time.UTC)}
+	runtime.testStatus = radio.C4FMTestStatus{State: "stopped", ChannelID: "channel-voice", TXHz: 433450001, TXObserved: true, StopConfirmed: true, FinishedAt: time.Date(2026, 11, 4, 20, 0, 0, 0, time.UTC)}
 	runtime.testError = errors.New("selected modem is unavailable")
 	runtime.mu.Unlock()
 	response := webC4FMAPI(t, s, http.MethodGet, "/api/radio/c4fm-test", "", Session{})
 	var status radio.C4FMTestStatus
-	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &status) != nil || status.State != "stopped" || !status.TXObserved || !status.StopConfirmed || status.TXHz != 443450001 {
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &status) != nil || status.State != "stopped" || !status.TXObserved || !status.StopConfirmed || status.TXHz != 433450001 {
 		t.Fatalf("actual adapter observation lost: HTTP %d %s", response.Code, response.Body.String())
 	}
 	for _, action := range []struct{ path, body string }{
@@ -188,8 +188,8 @@ func TestC4FMTestPageReadsWithoutSavingOrStartingRadio(t *testing.T) {
 		t.Fatal(err)
 	}
 	site.Channels = []Channel{
-		{ID: "control-one", Name: "Control <&>", Role: "control", ModemID: "control-modem", Enabled: true},
-		{ID: "disabled-voice", Name: "Disabled voice", Role: "voice", ModemID: "voice-modem", Enabled: false},
+		{ID: "control-one", Name: "Control <&>", ModemID: "control-modem", Enabled: true},
+		{ID: "disabled-voice", Name: "Disabled voice", ModemID: "voice-modem", Enabled: false},
 	}
 	if err := s.Store.SaveConfig(storeDoc(t, site)); err != nil {
 		t.Fatal(err)

@@ -1,0 +1,86 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+const [fixtureFile, outputArg] = process.argv.slice(2);
+const fixture = JSON.parse(await fs.readFile(fixtureFile,'utf8'));
+const output = path.resolve(outputArg); await fs.mkdir(output,{recursive:true});
+const {chromium} = await import(process.env.TRUNKSYSTEM_PLAYWRIGHT || 'playwright');
+const browser = await chromium.launch({headless:true,channel:'chrome'});
+const report = {scope:'Disposable loopback production Go renderers and live endpoint with synthetic inventory/telemetry; no production or radio operations.',checks:[],errors:[]};
+try {
+  let shared;
+  for (const role of ['system','zone','site','other_site']) {
+    const origin = fixture[role]; assert.equal(new URL(origin).hostname,'127.0.0.1');
+    const context = await browser.newContext({viewport:{width:1024,height:1000}}), page = await context.newPage();
+    page.on('pageerror',error=>report.errors.push({role,error:String(error)}));
+    await page.goto(origin+'/login');
+    await page.getByLabel('Username',{exact:true}).fill(fixture.username);
+    await page.getByLabel('Password',{exact:true}).fill(fixture.password);
+    await Promise.all([page.waitForURL(url=>url.pathname==='/'),page.getByRole('button',{name:'Sign in',exact:true}).click()]);
+    const isSite = role==='site'||role==='other_site';
+    await page.goto(origin+(isSite?'/hardware':'/'+role));
+    const tokens = await page.evaluate(()=>({body:getComputedStyle(document.querySelector('.ts-admin')).fontSize,nav:getComputedStyle(document.querySelector('.ts-sidebar a')).fontSize,heading:getComputedStyle(document.querySelector('h1')).fontSize,button:getComputedStyle(document.querySelector('[data-admin-theme]')).minHeight}));
+    shared ??= tokens; assert.deepEqual(tokens,shared,'shared System/Zone/Site typography and controls');
+    if (!isSite) { await context.close(); continue; }
+    const requests=[];page.on('request',request=>requests.push({url:request.url(),method:request.method()}));
+    assert.equal(await page.getByRole('heading',{level:1,name:'Hardware & activity',exact:true}).count(),1);
+    assert.equal(await page.locator('.ts-sidebar a[href="/hardware"]').count(),1);
+    assert.equal(await page.locator('.ts-sidebar a[href="/modem-status"]').count(),0);
+    assert.deepEqual(await page.locator('.hardware-table>thead th').allTextContents(),['Device / modem','Serial device path','Hardware status','Use','Activity']);
+    assert.equal(await page.locator('.hardware-device').count(),7);
+    assert.ok((await page.locator('.hardware-device:has([data-hardware-toggle])').first().innerText()).includes('Active (control)'),role+' local control status');
+    assert.equal(await page.locator('.hardware-detail').count(),0);
+    const row = page.locator('.hardware-device').filter({has:page.locator('[data-hardware-name]',{hasText:'Voice modem 1'})}).filter({has:page.locator('[data-hardware-toggle]')});
+    await row.getByRole('button').click();
+    await page.locator('.hardware-detail').waitFor();
+    assert.ok((await row.innerText()).includes('Active (voice, idle)'));
+    assert.ok((await page.locator('.hardware-detail').innerText()).includes('0.1585%'));
+    assert.equal(await page.locator('.hardware-plot circle').count(),0,'closed chart has no sample marks');
+    await page.locator('[data-hardware-section=charts]>summary').click();
+    await page.locator('.hardware-plot circle').first().waitFor();
+    await page.locator('[data-hardware-chart]').selectOption('ber');
+    await page.getByRole('img',{name:'Bit error rate of recent received calls',exact:true}).waitFor();
+    await page.locator('[data-hardware-section=diagnostics]>summary').click();
+    await page.locator('[data-hardware-chart]').focus();
+    await page.waitForResponse(response=>new URL(response.url()).searchParams.get('fragment')==='activity');
+    await page.waitForFunction(()=>document.activeElement.matches('[data-hardware-chart]'));
+    assert.equal(await page.locator('[data-hardware-chart]').inputValue(),'ber');
+    const invBefore=requests.filter(r=>new URL(r.url).searchParams.get('fragment')==='inventory').length;
+    assert.equal(invBefore,0,'live polling does not scan USB hardware');
+    await page.getByRole('link',{name:'Refresh hardware',exact:true}).click();
+    await page.getByText('Hardware refreshed just now',{exact:true}).waitFor();
+    await page.locator('.hardware-detail').waitFor();
+    assert.equal(await page.locator('[data-hardware-section=charts]').getAttribute('open'),'');
+    assert.equal(await page.locator('[data-hardware-section=diagnostics]').getAttribute('open'),'');
+    assert.equal(await page.locator('[data-hardware-chart]').inputValue(),'ber');
+    await page.getByRole('button',{name:'Pause activity',exact:true}).click();
+    assert.ok((await page.locator('.hardware-receiver').innerText()).includes('Unavailable'));
+    const pausedCount=requests.length; await page.waitForTimeout(2300);assert.equal(requests.length,pausedCount,'pause stops requests');
+    assert.ok((await page.locator('.hardware-history').innerText()).includes('0.1585%'));
+    await page.getByRole('button',{name:'Resume activity',exact:true}).click();
+    await page.waitForFunction(()=>document.querySelector('[data-hardware-update]').textContent==='Activity updated just now');
+    await page.route('**/hardware?fragment=activity*',route=>route.abort());
+    await page.getByText('Activity updates unavailable · previous reports retained',{exact:true}).waitFor();
+    assert.ok((await page.locator('.hardware-history').innerText()).includes('0.1585%'));
+    assert.ok((await row.innerText()).includes('Status unavailable'));
+    await page.unroute('**/hardware?fragment=activity*');
+    await page.waitForFunction(()=>document.querySelector('[data-hardware-update]').textContent==='Activity updated just now');
+    for(const width of [1440,1024,736,320]) for(const theme of ['light','dark']) {
+      await page.setViewportSize({width,height:1000});
+      if(await page.locator('body').getAttribute('data-theme')!==theme)await page.locator('[data-admin-theme]').click();
+      const size=await page.evaluate(()=>({width:document.documentElement.clientWidth,scroll:document.documentElement.scrollWidth,plot:getComputedStyle(document.querySelector('.hardware-plot text')).fontSize}));
+      assert.ok(size.scroll<=size.width+1,JSON.stringify({role,width,theme,size}));assert.equal(size.plot,'13px');
+      report.checks.push({role,width,theme,...size});
+      if(width===1024)await page.screenshot({path:path.join(output,role+'-expanded-'+theme+'.png'),fullPage:true});
+    }
+    await page.setViewportSize({width:1440,height:1000});await page.evaluate(()=>{document.documentElement.style.zoom='2';});
+    assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth+1),'200% enlarged layout');
+    await page.evaluate(()=>{document.documentElement.style.zoom='';});
+    await row.getByRole('button').click();assert.equal(await page.locator('.hardware-detail-row:not([hidden])').count(),0);
+    await page.screenshot({path:path.join(output,role+'-list.png'),fullPage:true});
+    assert.ok(requests.every(request=>request.method==='GET'&&new URL(request.url).origin===origin),'same-service reads only');
+    await page.goto(origin+'/modem-status');assert.equal(new URL(page.url()).pathname,'/hardware');
+    await context.close();
+  }
+  assert.deepEqual(report.errors,[]);report.passed=true;
+} finally { await browser.close();await fs.writeFile(path.join(output,'hardware-browser.json'),JSON.stringify(report,null,2)+'\n'); }

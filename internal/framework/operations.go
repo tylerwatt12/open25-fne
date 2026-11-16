@@ -28,7 +28,6 @@ type directorySnapshot struct {
 	Users       map[string]userRecord
 	Automations map[string]automationRecord
 	Reports     []SiteReport
-	Presence    []activity.Radio
 }
 type atomicDirectory struct {
 	value atomic.Pointer[directorySnapshot]
@@ -43,6 +42,7 @@ type radioRuntime interface {
 	SourceState() radio.SourceState
 	SourceAllowed(int, int, time.Time) bool
 	SetZoneConnected(bool)
+	ApplyNeighborSites(context.Context, []radio.NeighborSite) error
 	ApplyPolicy(context.Context, radio.Profile) error
 	ApplyInhibitionPolicy(context.Context, []int) error
 	Network() radio.Network
@@ -96,23 +96,12 @@ func (s *Service) refreshDirectory() {
 		automations[record.Automation.ID] = record
 	}
 	reports := s.siteReports()
-	presence := []activity.Radio{}
-	if s.activity != nil {
-		rows, _ := s.activity.Presence()
-		allowed := map[string]bool{}
-		if zone != nil {
-			for _, site := range zone.Sites {
-				allowed[site.ID] = true
-			}
-		}
-		for _, row := range rows {
-			if allowed[row.SiteID] && row.Kind == "rf" {
-				presence = append(presence, row)
-			}
-		}
-	}
-	next := &directorySnapshot{System: system, Zone: zone, Users: users, Automations: automations, Reports: reports, Presence: presence}
-	old := s.directory.value.Swap(next)
+	next := &directorySnapshot{System: system, Zone: zone, Users: users, Automations: automations, Reports: reports}
+	s.directoryMu.Lock()
+	old := s.directory.value.Load()
+	s.directory.value.Store(next)
+	s.directoryMu.Unlock()
+
 	if role := s.Config().Role; role == RoleZone || role == RoleSite {
 		_ = s.currentRadioInhibition()
 		if role == RoleSite {
@@ -156,11 +145,13 @@ func (s *Service) openOperations() error {
 	if c.Role == RoleSystem {
 		s.activity, err = activity.OpenArchive(filepath.Join(c.StateDir, "activity.db"))
 	} else {
-		s.activity, err = activity.Open(filepath.Join(c.StateDir, "activity.db"))
+		s.activity, err = activity.Open(filepath.Join(c.StateDir, "event-outbox.db"))
 	}
 	if err != nil {
 		return err
 	}
+	// The Store's existing worker owns asynchronous initialization and its
+	// availability diagnostics. Controller/RF setup never waits for history I/O.
 	s.refreshDirectory()
 	if c.Role == RoleZone {
 		s.rfAuthority, s.rfAuthorityError = openRFSourceAuthority(filepath.Join(c.StateDir, "rf-source-authority.json"), c.InstanceID)
@@ -301,13 +292,20 @@ func (s *Service) operationLoop() {
 	}
 }
 func (s *Service) emit(e activity.Event) {
+	if s.activity == nil {
+		return
+	}
+	if errors.Is(s.activity.InitializationError(), activity.ErrUnavailable) {
+		// The history owner counts rejected observations without needing their
+		// metadata or a controller/configuration lock.
+		_ = s.activity.Enqueue(e)
+		return
+	}
 	e.Origin = s.Config().InstanceID
 	if e.SiteID == "" && s.Config().Role == RoleSite {
 		e.SiteID = s.Config().InstanceID
 	}
-	if s.activity != nil {
-		_ = s.activity.Enqueue(e)
-	}
+	_ = s.activity.Enqueue(e)
 }
 func (s *Service) radioEvent(e radio.Event) {
 	s.observeRadioCommand(e)
@@ -786,7 +784,7 @@ func (s *Service) ensureCodecLocked(ctx context.Context, p radio.Profile) error 
 		Network                   radio.Network
 		WACN, SystemID, VoiceMFID int
 		Callsign                  string
-	}{network, p.System.WACN, p.System.SystemID, p.System.VoiceMFID, p.System.Callsign})
+	}{network, p.System.WACN, p.System.SystemID, p.System.VoiceMFID, p.Site.Identification.Callsign})
 	if signature == s.codecSignature && s.codec != nil && s.rfRouter.Load() != nil {
 		return nil
 	}
@@ -799,7 +797,7 @@ func (s *Service) ensureCodecLocked(ctx context.Context, p radio.Profile) error 
 	s.broker.mu.Lock()
 	codecEpoch := s.broker.epoch
 	s.broker.mu.Unlock()
-	codec, err := dispatch.NewCodec(dispatch.CodecOptions{Opaque: true, Binary: s.Config().Radio.Bridge, StateDir: filepath.Join(s.Config().StateDir, "codec"), Identity: p.System.Callsign, MasterAddress: network.Address, MasterPort: network.Port, MasterPassword: network.Secret, PeerIDs: network.ConsolePeerIDs, RadioID: 0xFFFFFB, WACN: p.System.WACN, SystemID: p.System.SystemID, VoiceMFID: p.System.VoiceMFID, OnFrame: func(f dispatch.Frame) { s.codecFrameAtEpoch(f, codecEpoch) }, OnReceiveActivity: func(a dispatch.CodecReceiveActivity) { s.codecReceiveActivityAtEpoch(a, codecEpoch) }, OnEvent: func(e dispatch.CodecEvent) {
+	codec, err := dispatch.NewCodec(dispatch.CodecOptions{Opaque: true, Binary: s.Config().Radio.Bridge, StateDir: filepath.Join(s.Config().StateDir, "codec"), Identity: p.Site.Identification.Callsign, MasterAddress: network.Address, MasterPort: network.Port, MasterPassword: network.Secret, PeerIDs: network.ConsolePeerIDs, RadioID: 0xFFFFFB, WACN: p.System.WACN, SystemID: p.System.SystemID, VoiceMFID: p.System.VoiceMFID, OnFrame: func(f dispatch.Frame) { s.codecFrameAtEpoch(f, codecEpoch) }, OnReceiveActivity: func(a dispatch.CodecReceiveActivity) { s.codecReceiveActivityAtEpoch(a, codecEpoch) }, OnEvent: func(e dispatch.CodecEvent) {
 		s.emit(activity.Event{At: e.At, TalkgroupID: e.TalkgroupID, Type: "audio_bridge", Message: e.Message, Audience: "operator", Outcome: e.State})
 	}})
 	if err != nil {
@@ -830,10 +828,37 @@ func (s *Service) ensureCodecLocked(ctx context.Context, p radio.Profile) error 
 		}
 		return errors.Join(err, cleanupErr)
 	}
-	s.rfRouter.Store(siteaudio.New(siteaudio.Options{Control: func() (radio.Native, error) { return owner, nil }, Codec: codec, HasRFInterest: s.hasRFInterest, AllowTX: s.allowedRadioGroup, Event: func(e siteaudio.Event) {
-		s.emit(activity.Event{At: e.At, RadioID: e.RadioID, TalkgroupID: e.TalkgroupID, CallID: e.CallID, Type: e.Kind, Message: e.Message, Audience: "operator", Outcome: e.Outcome, SourceKind: "application", Details: map[string]any{"allocation_id": e.AllocationID}})
-	}}))
+	s.rfRouter.Store(siteaudio.New(siteaudio.Options{Control: func() (radio.Native, error) {
+		control, err := s.radio.ControlClient()
+		if current := s.radio.Status(); current.State != "running" || !current.StartedAt.Equal(status.StartedAt) {
+			return nil, context.Canceled
+		}
+		return control, err
+	}, Codec: codec, HasRFInterest: s.hasRFInterest, AllowTX: s.allowedRadioGroup, Event: s.siteAudioObservation}))
 	return nil
+}
+
+// The native router owns these timing facts. The existing diagnostic ring gives
+// administrators a current, bounded view even while canonical delivery lags.
+func (s *Service) siteAudioObservation(e siteaudio.Event) {
+	if e.Kind == "rf.grant" && !e.RequestStartedAt.IsZero() {
+		var message string
+		switch e.Outcome {
+		case "granted":
+			message = fmt.Sprintf("Native voice grant acknowledged in %.3f ms.", e.DurationMS)
+		case "failed":
+			message = fmt.Sprintf("Native voice grant failed after %.3f ms.", e.DurationMS)
+		}
+		if message != "" {
+			_ = s.Store.AddEvent(e.Kind, message)
+		}
+	}
+	details := map[string]any{"allocation_id": e.AllocationID}
+	if !e.RequestStartedAt.IsZero() {
+		details["request_started_at"] = e.RequestStartedAt
+		details["native_ack_duration_ms"] = e.DurationMS
+	}
+	s.emit(activity.Event{At: e.At, RadioID: e.RadioID, TalkgroupID: e.TalkgroupID, CallID: e.CallID, Type: e.Kind, Message: e.Message, Audience: "operator", Outcome: e.Outcome, SourceKind: "application", Details: details})
 }
 
 func (s *Service) closeRFMediaLocked(ctx context.Context) error {
@@ -860,6 +885,10 @@ func (s *Service) closeRFMediaLocked(ctx context.Context) error {
 }
 func (s *Service) stopRadio(ctx context.Context, channel string) error {
 	s.operationMu.Lock()
+	if s.radioStartupCancel != nil {
+		s.radioStartupCancel()
+		s.radioStartupError = ""
+	}
 	retiring := []<-chan struct{}{}
 	for _, admission := range s.radioStarts {
 		if channel == "" || admission.channel == "" || admission.channel == channel {
@@ -979,6 +1008,10 @@ func (s *Service) principal(session Session) (dispatch.Principal, error) {
 }
 func (s *Service) operationsHTTP(w http.ResponseWriter, r *http.Request, session Session) bool {
 	path := r.URL.Path
+	if path == "/api/site/disconnect-parent" || path == "/api/site/reconnect-parent" {
+		s.parentLinkHTTP(w, r, session)
+		return true
+	}
 	if path == "/api/radio/c4fm-test" || strings.HasPrefix(path, "/api/radio/c4fm-test/") {
 		s.c4fmTestHTTP(w, r, session)
 		return true
@@ -1139,69 +1172,33 @@ func (s *Service) activityHTTP(w http.ResponseWriter, r *http.Request, session S
 		w.WriteHeader(405)
 		return
 	}
-	q := activity.Query{Limit: 200, SiteID: r.URL.Query().Get("site_id"), Audience: r.URL.Query().Get("audience")}
-	if s.Config().Role == RoleSite {
-		q.SiteID = s.Config().InstanceID
-	}
+	groups := []int(nil)
 	if session.UserID != "" {
-		u, ok := s.view().Users[session.UserID]
+		user, ok := s.view().Users[session.UserID]
 		if !ok {
 			fail(w, 403, dispatch.ErrPermission)
 			return
 		}
-		q.Restricted = true
-		effective, _, err := resolveUserPosition(u.User, s.view().System, session.PositionID)
+		effective, _, err := resolveUserPosition(user.User, s.view().System, session.PositionID)
 		if err != nil {
 			fail(w, 403, dispatch.ErrPermission)
 			return
 		}
-		q.Groups = effective.Talkgroups
-		q.Audience = ""
-		if !slices.Contains(effective.Permissions, "location_view") {
-			q.LocationRadioID = effective.RadioID
-		}
+		groups = effective.Talkgroups
 	}
-	events, err := s.activity.Events(q)
-	if err != nil {
-		fail(w, 500, err)
-		return
+	rows := s.currentRadioPresence()
+	site := r.URL.Query().Get("site_id")
+	if s.Config().Role == RoleSite {
+		site = s.Config().InstanceID
 	}
-	radios, _ := s.activity.Presence()
-	callPage, _ := s.activity.CallHistory(q)
-	calls := callPage.Calls
-	if q.SiteID != "" {
-		radios = slices.DeleteFunc(radios, func(v activity.Radio) bool { return v.SiteID != q.SiteID })
-	}
-	if session.UserID != "" {
-		groups := q.Groups
-		radios = slices.DeleteFunc(radios, func(v activity.Radio) bool { return !slices.Contains(groups, v.AffiliatedTalkgroup) })
-	}
-	observed := map[int]bool{}
-	for _, event := range events {
-		observed[event.RadioID] = true
-	}
-	for _, call := range calls {
-		observed[call.RadioID] = true
-	}
-	for _, radio := range radios {
-		observed[radio.RID] = true
-	}
+	rows = slices.DeleteFunc(rows, func(row currentRadio) bool {
+		return (site != "" && row.SiteID != site) || (session.UserID != "" && !slices.Contains(groups, row.AffiliatedTalkgroup))
+	})
 	aliases := map[int]string{}
-	directory := s.view().System.Radios
-	for _, known := range directory {
-		if observed[known.RID] {
-			aliases[known.RID] = known.Alias
-		}
+	for _, row := range rows {
+		aliases[row.RID] = row.Alias
 	}
-	for i := range radios {
-		for _, known := range directory {
-			if known.RID == radios[i].RID {
-				radios[i].Alias = known.Alias
-				radios[i].Kind = known.Kind
-			}
-		}
-	}
-	respond(w, 200, map[string]any{"events": events, "radios": radios, "calls": calls, "radio_aliases": aliases})
+	respond(w, 200, map[string]any{"radios": rows, "radio_aliases": aliases})
 }
 func (s *Service) runtimeError(err error) {
 	if err != nil {

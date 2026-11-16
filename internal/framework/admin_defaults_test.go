@@ -19,17 +19,17 @@ func TestAdminNewEntryFormsUseApprovedDefaultsWithoutSaving(t *testing.T) {
 	}{
 		{c.system, "/radios/edit", "rid", map[string]string{"kind": "subscriber", "enabled": "true", "rid": "", "rid__hex": "", "alias": ""}, nil},
 		{c.system, "/talkgroups/edit", "tgid", map[string]string{"enabled": "true", "affiliation_access": "all", "transmit_access": "all", "site_access": "all", "start_policy": "fast_start", "priority": "10", "admission_mode": "clear", "transmit_mode": "clear", "tgid": "", "tgid__hex": "", "alias": "", "algorithm_id": "", "key_id": "", "key_id__hex": "", "affiliation_radio_ids": "", "transmit_radio_ids": "", "site_ids": ""}, nil},
-		{c.system, "/positions/edit", "id", map[string]string{"enabled": "true", "id": "", "name": "", "radio_id": "", "talkgroups": ""}, nil},
+		{c.system, "/positions/edit", "id", map[string]string{"enabled": "true", "id": "", "name": "Console position", "radio_id": "", "talkgroups": ""}, nil},
 		{c.system, "/users/edit", "username", map[string]string{"role": "operator", "enabled": "true", "id": "", "username": "", "password": "", "radio_id": "", "position_ids": "", "talkgroups": "", "permissions": ""}, nil},
-		{c.system, "/automations/edit", "id", map[string]string{"enabled": "true", "id": "", "name": "", "radio_id": "", "talkgroups": "", "actions": ""}, nil},
+		{c.system, "/automations/edit", "id", map[string]string{"enabled": "true", "id": "", "name": "Automation client", "radio_id": "", "talkgroups": "", "actions": ""}, nil},
 		{c.system, "/keys/edit", "key_id", map[string]string{"algorithm_id": "", "key_id": "", "key_id__hex": "", "name": "", "material": ""}, []string{"enabled"}},
 		{c.system, "/recipients/edit", "recipient", map[string]string{"recipient": "", "public_key": ""}, nil},
 		{c.system, "/status-labels/edit", "id", map[string]string{"id": "", "label": ""}, nil},
 		{c.system, "/message-labels/edit", "id", map[string]string{"id": "", "label": ""}, nil},
 		{c.zone, "/identifiers/edit", "identifier", map[string]string{"identifier": "", "identifier__hex": "", "base_frequency_hz": "", "channel_spacing_hz": "12.5", "uplink_offset_hz": "", "bandwidth_hz": "12.5"}, nil},
-		{c.zone, "/sites/edit", "id", map[string]string{"id": "", "name": "", "site_id": "", "nac": "", "endpoint": "", "admin_url": ""}, nil},
-		{c.site, "/modems/edit", "id", map[string]string{"baud": "115200", "calibration.rx_offset_hz": "0", "calibration.tx_offset_hz": "0", "calibration.rx_dc_offset": "0", "calibration.tx_dc_offset": "0", "calibration.rx_level": "", "calibration.tx_level": "", "id": "", "name": "", "device": ""}, []string{"calibration.rx_invert", "calibration.tx_invert", "calibration.ptt_invert"}},
-		{c.site, "/channels/edit", "id", map[string]string{"role": "voice", "id": "", "name": "", "identifier": "", "channel_no": "", "power_percent": "", "modem_id": ""}, []string{"enabled"}},
+		{c.zone, "/sites/edit", "id", map[string]string{"id": "", "name": "", "site_id": "", "endpoint": "", "admin_url": ""}, nil},
+		{c.site, "/modems/edit", "id", map[string]string{"baud": "115200", "calibration.rx_offset_hz": "0", "calibration.tx_offset_hz": "0", "calibration.rx_dc_offset": "0", "calibration.tx_dc_offset": "0", "calibration.rx_level": "50", "calibration.tx_level": "50", "id": "", "name": "USB modem 2", "device": ""}, []string{"calibration.rx_invert", "calibration.tx_invert", "calibration.ptt_invert"}},
+		{c.site, "/channels/edit", "id", map[string]string{"id": "", "name": "RF channel 2", "identifier": "", "channel_no": "", "power_percent": "95", "modem_id": ""}, []string{"enabled"}},
 	}
 	for _, test := range cases {
 		t.Run(test.path, func(t *testing.T) {
@@ -41,6 +41,12 @@ func TestAdminNewEntryFormsUseApprovedDefaultsWithoutSaving(t *testing.T) {
 			body := earlyWebGet(t, client, test.pair.web.URL+test.path, http.StatusOK)
 			values := earlyWebForm(t, body, test.anchor)
 			for name, want := range test.want {
+				if name == "id" && adminInternalRecord(strings.Split(strings.TrimPrefix(test.path, "/"), "/")[0]) {
+					if values.Get(name) == "" {
+						t.Error("missing generated internal ID")
+					}
+					continue
+				}
 				if !values.Has(name) || values.Get(name) != want {
 					t.Errorf("Add field %s = %q (present %v), want %q", name, values.Get(name), values.Has(name), want)
 				}
@@ -79,7 +85,7 @@ func TestAdminNewEntryDefaultsDoNotReplaceExistingZeroFalseOrBlank(t *testing.T)
 	}
 	client := earlyWebLogin(t, c.system)
 	form := earlyWebForm(t, earlyWebGet(t, client, c.system.web.URL+"/talkgroups/edit?row=0", http.StatusOK), "tgid")
-	for field, want := range map[string]string{"tgid": "1001", "priority": "0", "affiliation_access": "", "transmit_access": "", "site_access": "", "start_policy": "", "admission_mode": "", "transmit_mode": "", "algorithm_id": "0", "key_id": "0"} {
+	for field, want := range map[string]string{"tgid": "01001", "priority": "0", "affiliation_access": "", "transmit_access": "", "site_access": "", "start_policy": "", "admission_mode": "", "transmit_mode": "", "algorithm_id": "0", "key_id": "0"} {
 		if form.Get(field) != want {
 			t.Errorf("existing %s became %q, want %q", field, form.Get(field), want)
 		}
@@ -91,7 +97,7 @@ func TestAdminNewEntryDefaultsDoNotReplaceExistingZeroFalseOrBlank(t *testing.T)
 		t.Fatal(err)
 	}
 	form = earlyWebForm(t, earlyWebGet(t, client, c.system.web.URL+"/users/edit?row=0", http.StatusOK), "username")
-	if form.Get("role") != "" || form.Has("enabled") || form.Get("radio_id") != "0" {
+	if form.Get("role") != "" || form.Has("enabled") || form.Get("radio_id") != "00000000" {
 		t.Fatal("existing user was given new-entry defaults", form)
 	}
 }
@@ -197,7 +203,7 @@ func TestAdminNewEntryDirectoryFailureKeepsSubmittedValues(t *testing.T) {
 	}
 	failed.Set("radio_id__hex", "000000")
 	earlyWebPost(t, client, c.system.web.URL+"/users/edit", failed, c.system.web.URL, http.StatusSeeOther)
-	user, _, err := c.system.service.Store.User("submitted-user")
+	user, _, err := c.system.service.Store.User(failed.Get("id"))
 	if err != nil || user.Enabled || user.Role != "" || user.RadioID != 0 || len(user.Permissions) != 1 || user.Permissions[0] != "future_permission" {
 		t.Fatal("corrected user submission was defaulted or filtered", user, err)
 	}

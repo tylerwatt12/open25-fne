@@ -9,13 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"open25.local/open25-fne/internal/p25crypto"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
-	"open25.local/open25-fne/internal/p25crypto"
 )
 
 const packetHeaderSize = 64

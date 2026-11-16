@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"open25.local/open25-fne/internal/radio"
@@ -13,13 +12,6 @@ import (
 
 func webSourceTag(w io.Writer, label string) {
 	fmt.Fprintf(w, "<span class=source-tag>%s</span>", esc(label))
-}
-
-func webReportTime(value time.Time) string {
-	if value.IsZero() {
-		return "—"
-	}
-	return value.Format("2006-01-02 15:04:05 MST")
 }
 
 // Configured addresses remain editable; only ordinary web addresses become links.
@@ -67,11 +59,23 @@ func webRadioObservations(w io.Writer, status *radio.Status) {
 	webProperties(w, map[string]any{"state": status.State, "mode": status.Mode, "zone_connected": status.ZoneConnected, "fne_ready": status.FNEReady, "started_at": status.StartedAt, "error": status.Error}, []webColumn{{"state", "Radio state"}, {"mode", "Operating mode"}, {"zone_connected", "Zone connected"}, {"fne_ready", "Fixed network ready"}, {"started_at", "Started"}, {"error", "Last error"}})
 	webControlObservations(w, *status)
 	fmt.Fprint(w, "<h3>Channel observations</h3>")
+	fmt.Fprint(w, `<div class=table-wrap tabindex=0 aria-label="Channel observations"><table class=record-table><thead><tr><th>Channel</th><th>Channel status</th><th>Current traffic / issue</th></tr></thead><tbody>`)
+	now := time.Now()
 	channels := make([]map[string]any, 0, len(status.Channels))
 	for _, channel := range status.Channels {
-		channels = append(channels, map[string]any{"channel": channel.Name, "record_id": channel.ID, "role": channel.Role, "host_state": channel.State, "ready": channel.Ready, "busy": channel.Busy, "radio_id": channel.RID, "talkgroup_id": channel.TGID, "error": channel.Error})
+		fmt.Fprintf(w, `<tr><td>%s</td><td>`, esc(channel.Name))
+		webChannelStatus(w, *status, channel, now)
+		fmt.Fprint(w, `</td><td>`)
+		webSiteChannelTraffic(w, *status, channel, now)
+		fmt.Fprint(w, `</td></tr>`)
+		channels = append(channels, map[string]any{"channel": channel.Name, "role": channel.Role, "host_state": channel.State, "ready": channel.Ready, "busy": channel.Busy, "radio_id": channel.RID, "talkgroup_id": channel.TGID, "error": channel.Error})
 	}
-	webTable(w, []webColumn{{"channel", "Channel"}, {"role", "Role"}, {"host_state", "State"}, {"ready", "Ready"}, {"busy", "Busy"}, {"radio_id", "Radio ID"}, {"talkgroup_id", "Talkgroup ID"}, {"error", "Last error"}}, channels)
+	if len(channels) == 0 {
+		fmt.Fprint(w, `<tr><td colspan=3>No channel observations.</td></tr>`)
+	}
+	fmt.Fprint(w, `</tbody></table></div><details class=ts-advanced><summary>`, adminIcon("chevron-down"), `Technical observations</summary>`)
+	webTable(w, []webColumn{{"channel", "Channel"}, {"role", "Role"}, {"host_state", "Native state"}, {"ready", "Ready"}, {"busy", "Busy"}, {"radio_id", "Radio ID"}, {"talkgroup_id", "Talkgroup ID"}, {"error", "Last error"}}, channels)
+	fmt.Fprint(w, `</details>`)
 	fmt.Fprint(w, "<h3>Registration</h3>")
 	registrations := make([]map[string]any, 0, len(status.Registrations))
 	for _, registration := range status.Registrations {
@@ -105,9 +109,9 @@ func (s *Service) webInterfaces(w io.Writer) {
 func (s *Service) webLocalStatus(w http.ResponseWriter, r *http.Request, session Session, live bool) {
 	s.webHeader(w, r, "Local Status", session, live)
 	defer webFooter(w)
-	webReportMeta(w, s.Config().InstanceID, "", true, time.Time{}, time.Time{})
+	webReportMeta(w, adminName(s.adminNames(), "instances", s.Config().InstanceID), "", true, time.Time{}, time.Time{})
 	fmt.Fprint(w, "<p><a class=button href=\"\">Refresh</a></p><h3>Connections</h3>")
-	webTable(w, []webColumn{{"connection", "Connection"}, {"reported_state", "Reported state"}, {"freshness", "Report"}, {"last_success", "Last contact"}, {"error", "Last error"}}, s.webConnectionRows())
+	s.webTable(w, []webColumn{{"connection", "Connection"}, {"reported_state", "Reported state"}, {"freshness", "Report"}, {"last_success", "Last contact"}, {"error", "Last error"}}, s.webConnectionRows())
 	if s.Config().Role == RoleSite {
 		fmt.Fprint(w, "<h3>Local radio observations</h3>")
 		status := s.radioStatus()
@@ -142,7 +146,7 @@ func (s *Service) webSiteReports(w http.ResponseWriter, r *http.Request, session
 	for _, identity := range identities {
 		name := identity.Name
 		if name == "" {
-			name = identity.ID
+			name = "Unnamed Site"
 		}
 		state := "No report"
 		address := identity.AdminURL
@@ -167,7 +171,7 @@ func (s *Service) webSiteReports(w http.ResponseWriter, r *http.Request, session
 	}
 	fmt.Fprint(w, "</tbody></table></div>")
 	if selected != "" {
-		fmt.Fprintf(w, "<section class=record-detail><h3>Site status · %s</h3>", esc(selected))
+		fmt.Fprintf(w, "<section class=record-detail><h3>Site status · %s</h3>", esc(adminName(s.adminNames(), "sites", selected)))
 		var report *SiteReport
 		for i := range reports {
 			if reports[i].ID == selected {
@@ -175,17 +179,17 @@ func (s *Service) webSiteReports(w http.ResponseWriter, r *http.Request, session
 			}
 		}
 		if report == nil {
-			webReportMeta(w, selected, "", false, time.Time{}, time.Time{})
+			webReportMeta(w, adminName(s.adminNames(), "sites", selected), "", false, time.Time{}, time.Time{})
 			fmt.Fprint(w, "<p class=muted>No report.</p>")
 		} else {
 			via := ""
 			if s.Config().Role == RoleSystem && zone != nil {
 				via = zone.Name
 				if via == "" {
-					via = zone.ID
+					via = "Zone"
 				}
 			}
-			webReportMeta(w, report.ID, via, s.Config().Role == RoleSite, report.ObservedAt, report.ReceivedAt)
+			webReportMeta(w, adminName(s.adminNames(), "sites", report.ID), via, s.Config().Role == RoleSite, report.ObservedAt, report.ReceivedAt)
 			if s.Config().Role == RoleSystem {
 				var relay zoneReport
 				if s.readCache("zone_report", &relay) {
@@ -212,7 +216,7 @@ func (s *Service) webZoneStatus(w http.ResponseWriter, r *http.Request, session 
 		fmt.Fprint(w, "<p class=muted>No report.</p>")
 		return
 	}
-	webReportMeta(w, report.ID, "", false, report.ObservedAt, report.ReceivedAt)
+	webReportMeta(w, adminName(s.adminNames(), "zones", report.ID), "", false, report.ObservedAt, report.ReceivedAt)
 	if report.ReceivedAt.IsZero() || time.Since(report.ReceivedAt) > time.Duration(max(10, s.Config().PollSeconds*4))*time.Second {
 		webSourceTag(w, "Stale")
 	}
@@ -228,7 +232,7 @@ func (s *Service) webReference(w http.ResponseWriter, r *http.Request, session S
 		if zone != nil {
 			owner = zone.Name
 			if owner == "" {
-				owner = zone.ID
+				owner = "Zone"
 			}
 		}
 	}
@@ -247,7 +251,7 @@ func (s *Service) webReference(w http.ResponseWriter, r *http.Request, session S
 			return
 		}
 		fmt.Fprint(w, "<h3>Band Plan</h3>")
-		webTable(w, []webColumn{{"identifier", "Channel Identifier"}, {"base_frequency_hz", "Base (MHz)"}, {"channel_spacing_hz", "Spacing (kHz)"}, {"uplink_offset_hz", "Offset (MHz)"}, {"bandwidth_hz", "Bandwidth (kHz)"}}, zone.ChannelIdentifiers)
+		s.webTable(w, []webColumn{{"identifier", "Channel Identifier"}, {"base_frequency_hz", "Base (MHz)"}, {"channel_spacing_hz", "Spacing (kHz)"}, {"uplink_offset_hz", "Offset (MHz)"}, {"bandwidth_hz", "Bandwidth (kHz)"}}, zone.ChannelIdentifiers)
 		tree := s.adminTopology(zone)
 		s.webAdminAddress(w, tree.ZoneURL, "Open Zone Administration")
 		return
@@ -258,13 +262,13 @@ func (s *Service) webReference(w http.ResponseWriter, r *http.Request, session S
 		return
 	}
 	fmt.Fprint(w, "<h3>Radio directory</h3>")
-	webTable(w, []webColumn{{"rid", "Radio ID"}, {"alias", "Name"}, {"kind", "Radio type"}, {"enabled", "Enabled"}}, system.Radios)
+	s.webTable(w, []webColumn{{"rid", "Radio ID"}, {"alias", "Name"}, {"kind", "Radio type"}, {"enabled", "Enabled"}}, system.Radios)
 	fmt.Fprint(w, "<h3>Talkgroups</h3>")
 	groups := make([]map[string]any, 0, len(system.Talkgroups))
 	for _, group := range system.Talkgroups {
 		groups = append(groups, map[string]any{"talkgroup_id": group.TGID, "name": group.Alias})
 	}
-	webTable(w, []webColumn{{"talkgroup_id", "Talkgroup ID"}, {"name", "Name"}}, groups)
+	s.webTable(w, []webColumn{{"talkgroup_id", "Talkgroup ID"}, {"name", "Name"}}, groups)
 	tree := s.adminTopology(s.webKnownZone())
 	s.webAdminAddress(w, tree.SystemURL, "Open System Administration")
 }
@@ -287,80 +291,37 @@ func webObservationRows(value any, keys []string) []map[string]any {
 }
 
 func (s *Service) webActivityStatus(w http.ResponseWriter, r *http.Request, session Session) {
-	s.webHeader(w, r, "Activity Status", session, r.URL.Query().Get("live") == "1")
+	s.webHeader(w, r, "History delivery", session, false)
 	defer webFooter(w)
-
-	fmt.Fprint(w, "<p><a class=button href=\"\">Refresh</a> <a class=button href=/activity-status?live=1>Auto-refresh</a></p>")
-	result := s.webAPI(r, session, "/api/activity", "GET", nil)
-	if result.code >= 300 {
-		webJSONResult(w, result)
-		return
-	}
-	activity, err := webConfig(result.Bytes())
-	if err != nil {
-		webError(w, err)
-		return
-	}
-	fmt.Fprint(w, "<h3>Presence</h3>")
-	webTable(w, []webColumn{{"rid", "Radio ID"}, {"alias", "Name"}, {"registered", "Registered"}, {"affiliated_talkgroup", "Affiliated talkgroup"}, {"site_id", "Site"}, {"last_seen", "Last seen"}}, webObservationRows(activity["radios"], []string{"rid", "alias", "registered", "affiliated_talkgroup", "site_id", "last_seen"}))
-	fmt.Fprint(w, "<h3>Calls</h3>")
-	calls := webObservationRows(activity["calls"], []string{"id", "radio_id", "started_at", "ended_at", "source_kind", "lifetime_ms", "speech_ms"})
-	webActivityList(w, "calls", calls, []webColumn{{"started_at", "Started"}, {"radio_id", "Radio ID"}, {"source_kind", "Source"}, {"lifetime_ms", "Call lifetime (seconds)"}, {"speech_ms", "Speech (seconds)"}})
-	fmt.Fprint(w, "<h3>Events</h3>")
-	events := webObservationRows(activity["events"], []string{"id", "at", "received_at", "origin", "site_id", "channel_id", "radio_id", "talkgroup_id", "call_id", "type", "label", "message", "outcome", "source_kind", "severity"})
-	webActivityList(w, "events", events, []webColumn{{"at", "Time"}, {"label", "Event"}, {"radio_id", "Radio ID"}, {"site_id", "Site"}, {"outcome", "Result"}, {"message", "Message"}})
-	selected, kind := r.URL.Query().Get("id"), r.URL.Query().Get("kind")
-	if selected == "" || (kind != "calls" && kind != "events") {
-		return
-	}
-	rows, columns := events, []webColumn{{"id", "Event ID"}, {"at", "Observed"}, {"received_at", "Received"}, {"origin", "Source service"}, {"site_id", "Site"}, {"channel_id", "Channel"}, {"radio_id", "Radio ID"}, {"talkgroup_id", "Talkgroup ID"}, {"call_id", "Call ID"}, {"type", "Event type"}, {"label", "Event"}, {"message", "Message"}, {"outcome", "Result"}, {"source_kind", "Source"}, {"severity", "Severity"}}
-	if kind == "calls" {
-		rows = calls
-		columns = []webColumn{{"id", "Call ID"}, {"radio_id", "Radio ID"}, {"started_at", "Started"}, {"ended_at", "Ended"}, {"source_kind", "Source"}, {"lifetime_ms", "Call lifetime (seconds)"}, {"speech_ms", "Speech (seconds)"}}
-	}
-	fmt.Fprint(w, "<section class=record-detail><h3>Selected record</h3>")
-	defer fmt.Fprint(w, "</section>")
-	for _, row := range rows {
-		if webText(row["id"]) != selected {
-			continue
-		}
-		webProperties(w, row, columns)
-		if kind == "calls" {
-			for _, raw := range webObservationRows(activity["calls"], []string{"id", "destinations"}) {
-				if webText(raw["id"]) == selected {
-					fmt.Fprint(w, "<h4>Destinations</h4>")
-					webTable(w, []webColumn{{"site_id", "Site"}, {"talkgroup_id", "Talkgroup ID"}, {"channel_id", "Channel"}, {"outcome", "Result"}, {"allocated_ms", "Allocated (seconds)"}, {"speech_ms", "Speech (seconds)"}}, webObservationRows(raw["destinations"], []string{"site_id", "talkgroup_id", "channel_id", "outcome", "allocated_ms", "speech_ms"}))
-				}
-			}
-		}
-		return
-	}
-	fmt.Fprint(w, "<p class=muted>Record unavailable.</p>")
+	fmt.Fprint(w, `<p><a class=ts-button href="">Refresh</a></p>`)
+	s.webHistoryDelivery(w)
 }
 
-func webActivityList(w io.Writer, kind string, rows []map[string]any, columns []webColumn) {
-	fmt.Fprint(w, "<div class=table-wrap tabindex=0 aria-label=\"Scrollable records\"><table class=record-table><thead><tr>")
-	for _, column := range columns {
-		fmt.Fprintf(w, "<th>%s</th>", esc(column.Label))
+func (s *Service) webHistoryDelivery(w io.Writer) {
+	health := s.activity.IngestionHealth()
+	state := "Up to date"
+	switch {
+	case health.StorageInitializing:
+		state = "Initializing"
+	case health.StorageUnavailable:
+		state = "Unavailable"
+	case health.Degraded:
+		state = "Delivery degraded"
+	case health.OutboxPending > 0 || health.QueueDepth > 0:
+		state = "Delivery pending"
 	}
-	fmt.Fprint(w, "<th>Details</th></tr></thead><tbody>")
-	for _, row := range rows {
-		fmt.Fprint(w, "<tr>")
-		for _, column := range columns {
-			class := "cell-text"
-			if strings.HasSuffix(column.Key, "_at") || column.Key == "at" {
-				class = "time"
-			} else if strings.HasSuffix(column.Key, "_id") || column.Key == "rid" {
-				class = "identity"
-			}
-			fmt.Fprintf(w, "<td class=%s>", class)
-			webDataField(w, column.Key, row[column.Key])
-			fmt.Fprint(w, "</td>")
-		}
-		fmt.Fprintf(w, "<td><a href=\"/activity-status?kind=%s&amp;id=%s\">Details</a></td></tr>", esc(kind), esc(url.QueryEscape(webText(row["id"]))))
+	fmt.Fprint(w, `<section class=ts-panel><div class=ts-panelhead><h2>History delivery</h2></div>`)
+	fields := webObject(health)
+	fields["status"] = state
+	webProperties(w, fields, []webColumn{{"status", "Status"}, {"outbox_pending", "Awaiting acknowledgment"}, {"outbox_capacity", "Outbox limit"}, {"oldest_pending_at", "Oldest pending"}})
+	fmt.Fprint(w, `<details class=ts-advanced><summary>`, adminIcon("chevron-down"), `Capture status</summary>`)
+	webProperties(w, fields, []webColumn{{"queue_depth", "Waiting to persist"}, {"queue_dropped", "Capture queue drops"}, {"outbox_dropped", "Outbox limit drops"}, {"write_failures", "Write failures"}, {"maintenance_failures", "Storage failures"}, {"last_write_success_at", "Last successful write"}, {"error", "Error"}})
+	fmt.Fprint(w, `</details><div class=ts-actions>`)
+	tree := s.adminTopology(s.webKnownZone())
+	if address := adminURL(tree.SystemURL); address != "" {
+		s.webAdminAddress(w, address+"history", "System history")
+	} else {
+		fmt.Fprint(w, `<span class=ts-muted>System history address unavailable</span>`)
 	}
-	if len(rows) == 0 {
-		fmt.Fprintf(w, "<tr><td class=empty colspan=%d>No records.</td></tr>", len(columns)+1)
-	}
-	fmt.Fprint(w, "</tbody></table></div>")
+	fmt.Fprint(w, `</div></section>`)
 }

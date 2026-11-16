@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"open25.local/open25-fne/internal/p25rtp"
 	"testing"
 	"time"
-	"open25.local/open25-fne/internal/p25rtp"
 )
 
 func TestPacedEighteenWordsDoNotAcquireFortyMillisecondCadence(t *testing.T) {

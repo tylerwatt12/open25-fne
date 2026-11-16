@@ -61,36 +61,35 @@ func findModem(p Profile, id string) (Modem, bool) {
 	}
 	return Modem{}, false
 }
+
+// validateOperatingWACN owns the startup policy for both rendered profiles and
+// controller entry points. Administrator Save preserves the entered identity.
+func validateOperatingWACN(wacn int) error {
+	if wacn >= 0xBEE00 && wacn <= 0xBEEFF {
+		return fmt.Errorf("WACN %05X is blocked for operation: BEE00-BEEFF is restricted to reduce unintended subscriber roaming risk", wacn)
+	}
+	return nil
+}
+
 func Validate(p Profile) error {
 	identity, err := siteIdentity(p)
 	if err != nil {
 		return err
 	}
-	if p.System.ID == "" || p.Zone.SystemID != p.System.ID || p.Zone.RFSSID < 1 || p.Zone.RFSSID > 254 || identity.SiteID < 1 || identity.SiteID > 254 || identity.NAC < 0 || identity.NAC > 0xFFF || identity.NAC == 0xF7E || identity.NAC == 0xF7F {
+	if p.System.ID == "" || p.Zone.SystemID != p.System.ID || p.Zone.RFSSID < 1 || p.Zone.RFSSID > 254 || identity.SiteID < 1 || identity.SiteID > 254 || p.Site.NAC < 0 || p.Site.NAC > 0xFFF || p.Site.NAC == 0xF7E || p.Site.NAC == 0xF7F {
 		return errors.New("system, RFSS, Site or NAC identity is invalid")
 	}
 	if p.System.VoiceMFID != 0 && p.System.VoiceMFID != 1 {
 		return errors.New("standard voice MFID must be 00 or 01")
 	}
-	if p.System.BSIProfile != "" && p.System.BSIProfile != "motorola" {
+	if p.Site.Identification.BSIProfile != "" && p.Site.Identification.BSIProfile != "motorola" {
 		return errors.New("only the Motorola P25 BSI profile is implemented")
 	}
-	if p.System.WACN < 1 || p.System.WACN > 0xFFFFE || p.System.SystemID < 1 || p.System.SystemID > 0xFFE || strings.TrimSpace(p.System.Callsign) == "" || strings.ContainsAny(p.System.Callsign, "\r\n\x00") {
-		return errors.New("valid home WACN, System ID and callsign are required")
+	if p.System.WACN < 1 || p.System.WACN > 0xFFFFE || p.System.SystemID < 1 || p.System.SystemID > 0xFFE || strings.TrimSpace(p.Site.Identification.Callsign) == "" || strings.ContainsAny(p.Site.Identification.Callsign, "\r\n\x00") {
+		return errors.New("valid home WACN, System ID and Site callsign are required")
 	}
-	// Match the native startup policy for direct DVM callers. This checks an
-	// operating profile only; administrator Save preserves the entered identity.
-	if p.System.WACN >= 0xBEE00 && p.System.WACN <= 0xBEEFF {
-		return fmt.Errorf("WACN %05X is blocked for operation: BEE00-BEEFF is restricted to reduce unintended subscriber roaming risk", p.System.WACN)
-	}
-	if p.Site.Identification.Mode != "ham" && p.Site.Identification.Mode != "bsi" {
-		return errors.New("choose Ham CWID or Commercial BSI")
-	}
-	if p.Site.Identification.WPM != 20 {
-		return errors.New("Ham CWID requires 20 WPM")
-	}
-	if p.Site.Identification.QuietSeconds < 1 || p.Site.Identification.QuietSeconds > 60 {
-		return errors.New("identification quiet period must be 1-60 seconds")
+	if err := validateOperatingWACN(p.System.WACN); err != nil {
+		return err
 	}
 	radios := map[int]bool{}
 	for _, r := range p.System.Radios {
@@ -228,7 +227,7 @@ func RenderLookups(p Profile) map[string]string {
 		if g.Alias == "" {
 			g.Alias = fmt.Sprintf("TG%d", g.TGID)
 		}
-		fmt.Fprintf(&tg, "  - name: %s\n    alias: %s\n    config:\n      active: %t\n      system_valid: %t\n      affiliated: false\n      rid_permitted: []\n      subscriber_access:\n", quoted(g.Alias), quoted(g.Alias), g.Enabled && groupAllowedAtSite(g, p.Site.ID), g.Enabled)
+		fmt.Fprintf(&tg, "  - name: %s\n    alias: %s\n    config:\n      active: %t\n      system_valid: %t\n      requested: %t\n      affiliated: false\n      rid_permitted: []\n      subscriber_access:\n", quoted(g.Alias), quoted(g.Alias), g.Enabled && groupAllowedAtSite(g, p.Site.ID), g.Enabled, slices.Contains(g.RequestedSiteIDs, p.Site.ID))
 		for _, rule := range []struct {
 			name, mode string
 			ids        []int
@@ -286,37 +285,29 @@ func RenderChannel(p Profile, ch Channel, n Network, rpcPort, restPort int, mode
 	}
 	control := ch.Role == "control"
 	rpcSecret := n.RPCSecret
-	peerID := n.ControlPeerID
-	if !control {
-		peerID = n.VoicePeerIDs[ch.ID]
-	}
+	peerID := n.ChannelPeerIDs[ch.ID]
 	if peerID < 1 {
 		return nil, errors.New("native peer identity is missing")
 	}
 	channels := orderedChannels(p)
-	ccRPC := rpcPort
-	for i, x := range channels {
-		if x.Role == "control" {
-			ccRPC = rpcPort - 2*indexChannel(channels, ch.ID) + 2*i
-			break
-		}
-	}
+	base := rpcPort - 2*(peerID-n.PeerBase)
+	ccRPC := base
 	var voice strings.Builder
-	if control {
-		for i, v := range channels {
-			if v.Role == "voice" {
-				fmt.Fprintf(&voice, "            - channelId: %d\n              channelNo: %s\n              rpcAddress: 127.0.0.1\n              rpcPort: %d\n              rpcPassword: %s\n", v.Identifier, quoted(fmt.Sprintf("%X", v.ChannelNo)), rpcPort-2*indexChannel(channels, ch.ID)+2*i, quoted(rpcSecret))
-			}
+	for _, channel := range channels {
+		port := base + 2*(n.ChannelPeerIDs[channel.ID]-n.PeerBase)
+		if channel.Role == "control" {
+			ccRPC = port
 		}
-	} else {
-		fmt.Fprintf(&voice, "            - channelId: %d\n              channelNo: %s\n              rpcAddress: 127.0.0.1\n              rpcPort: %d\n              rpcPassword: %s\n", ch.Identifier, quoted(fmt.Sprintf("%X", ch.ChannelNo)), rpcPort, quoted(rpcSecret))
+		if channel.ID != ch.ID {
+			fmt.Fprintf(&voice, "            - channelId: %d\n              channelNo: %s\n              rpcAddress: 127.0.0.1\n              rpcPort: %d\n              rpcPassword: %s\n", channel.Identifier, quoted(fmt.Sprintf("%X", channel.ChannelNo)), port, quoted(rpcSecret))
+		}
 	}
 	voiceText := "        voiceChNo: []\n"
 	if voice.Len() > 0 {
 		voiceText = "        voiceChNo:\n" + voice.String()
 	}
 	controlRef := ""
-	if control {
+	{
 		controlRef = "        backupControlChannels: []\n"
 		var backup strings.Builder
 		for _, candidate := range controlCandidates(p) {
@@ -328,9 +319,7 @@ func RenderChannel(p Profile, ch Channel, n Network, rpcPort, restPort int, mode
 			controlRef = "        backupControlChannels:\n" + backup.String()
 		}
 	}
-	if !control {
-		controlRef = fmt.Sprintf("        controlCh:\n            rpcAddress: 127.0.0.1\n            rpcPort: %d\n            rpcPassword: %s\n            notifyEnable: true\n            presence: 5\n", ccRPC, quoted(rpcSecret))
-	}
+	controlRef += fmt.Sprintf("        controlCh:\n            rpcAddress: 127.0.0.1\n            rpcPort: %d\n            rpcPassword: %s\n            notifyEnable: %t\n            presence: 5\n", ccRPC, quoted(rpcSecret), !control)
 	transport := "            type: \"null\"\n"
 	if mode == "hardware" {
 		transport = fmt.Sprintf("            type: uart\n            uart:\n                port: %s\n                speed: 115200\n", quoted(m.Device))
@@ -373,7 +362,7 @@ func RenderChannel(p Profile, ch Channel, n Network, rpcPort, restPort int, mode
 	if security.Len() > 0 {
 		subscribers += "        rfTalkgroupSecurity:\n" + security.String()
 	}
-	bsiProfile := p.System.BSIProfile
+	bsiProfile := p.Site.Identification.BSIProfile
 	if bsiProfile == "" {
 		bsiProfile = "motorola"
 	}
@@ -413,6 +402,7 @@ protocols:
     p25:
         enable: true
         managedSite: true
+        controlAuthority: %s
         convNetGrantDemand: %t
         dispatchEnable: %t
 %s        inhibitUnauthorized: false
@@ -455,13 +445,6 @@ system:
         siteId: %s
         lra: %d
         nac: %s
-    cwId:
-        enable: %t
-        mode: %s
-        time: 10
-        quietSeconds: %d
-        drainSeconds: 540
-        callsign: %s
     bsi:
         enable: %t
         profile: %s
@@ -479,16 +462,8 @@ system:
             txTuning: %d
         protocol:
 %s            mode: air
-`, peerID, quoted(n.Address), n.Port, quoted(n.Secret), rpcPort, quoted(rpcSecret), restPort, quoted(rpcSecret), !control, control, subscribers, control, control, control, control, control, control && p.Site.BroadcastBandPlan, quoted(p.System.Callsign), p.System.VoiceMFID, control, control && hasVoice(channels), ch.Identifier, quoted(fmt.Sprintf("%X", ch.ChannelNo)), voiceText, controlRef, quoted(fmt.Sprintf("%05X", p.System.WACN)), quoted(fmt.Sprintf("%03X", p.System.SystemID)), quoted(fmt.Sprintf("%X", p.Zone.RFSSID)), quoted(fmt.Sprintf("%X", identity.SiteID)), identity.LRA, quoted(fmt.Sprintf("%03X", identity.NAC)), p.Site.Identification.Enabled && p.Site.Identification.Mode == "ham" && mode == "hardware", quoted(p.Site.Identification.Mode), p.Site.Identification.QuietSeconds, quoted(p.System.Callsign), p.Site.Identification.Enabled && p.Site.Identification.Mode == "bsi" && control && mode == "hardware", quoted(bsiProfile), cal.RXLevel, cal.TXLevel, cal.RXDCOffset, cal.TXDCOffset, cal.RXInvert, cal.TXInvert, cal.PTTInvert, ch.PowerPercent, cal.RXOffsetHz, cal.TXOffsetHz, transport)
+`, peerID, quoted(n.Address), n.Port, quoted(n.Secret), rpcPort, quoted(rpcSecret), restPort, quoted(rpcSecret), quoted(n.ControlAuthority), !control, true, subscribers, control, control, control, control, control, p.Site.BroadcastBandPlan, quoted(p.Site.Identification.Callsign), p.System.VoiceMFID, control, hasVoice(channels), ch.Identifier, quoted(fmt.Sprintf("%X", ch.ChannelNo)), voiceText, controlRef, quoted(fmt.Sprintf("%05X", p.System.WACN)), quoted(fmt.Sprintf("%03X", p.System.SystemID)), quoted(fmt.Sprintf("%X", p.Zone.RFSSID)), quoted(fmt.Sprintf("%X", identity.SiteID)), identity.LRA, quoted(fmt.Sprintf("%03X", p.Site.NAC)), p.Site.Identification.Enabled && mode == "hardware", quoted(bsiProfile), cal.RXLevel, cal.TXLevel, cal.RXDCOffset, cal.TXDCOffset, cal.RXInvert, cal.TXInvert, cal.PTTInvert, ch.PowerPercent, cal.RXOffsetHz, cal.TXOffsetHz, transport)
 	return files, nil
-}
-func indexChannel(channels []Channel, id string) int {
-	for i, ch := range channels {
-		if ch.ID == id {
-			return i
-		}
-	}
-	return 0
 }
 func hasVoice(channels []Channel) bool {
 	for _, ch := range channels {
@@ -503,14 +478,20 @@ func RenderFNE(p Profile, n Network) (map[string]string, error) {
 	if err := Validate(p); err != nil {
 		return nil, err
 	}
-	if !validSecret(n.Secret) {
+	if !validSecret(n.Secret) || !validSecret(n.RPCSecret) || n.RPCSecret == n.Secret {
 		return nil, errors.New("private media credential is invalid")
 	}
 	files := RenderLookups(p)
 	delete(files, "iden_table.dat")
 	voiceIDs := []int{}
-	for _, id := range n.VoicePeerIDs {
-		voiceIDs = append(voiceIDs, id)
+	controlPeer := 0
+	for _, channel := range orderedChannels(p) {
+		id := n.ChannelPeerIDs[channel.ID]
+		if channel.Role == "control" {
+			controlPeer = id
+		} else {
+			voiceIDs = append(voiceIDs, id)
+		}
 	}
 	sort.Ints(voiceIDs)
 	consoleIDs := []int{}
@@ -545,7 +526,10 @@ log:
     fileRoot: SiteMedia
 system:
     identity: %s
-    restEnable: false
+    restEnable: true
+    restAddress: %s
+    restPort: %d
+    restPassword: %s
     pingTime: 5
     maxMissedPings: 5
     sendTalkgroups: false
@@ -583,7 +567,7 @@ master:
 peers: []
 vtun:
     enable: false
-`, quoted(p.System.Callsign), 900000000+p.System.SystemID, quoted(n.Address), n.Port, quoted(n.Secret), p.System.WACN, p.System.SystemID, n.ControlPeerID, list("voicePeerIds", voiceIDs), list("consolePeerIds", consoleIDs), list("talkgroups", groupIDs))
+`, quoted(p.Site.Identification.Callsign), quoted(n.Address), n.Port, quoted(n.RPCSecret), 900000000+p.System.SystemID, quoted(n.Address), n.Port, quoted(n.Secret), p.System.WACN, p.System.SystemID, controlPeer, list("voicePeerIds", voiceIDs), list("consolePeerIds", consoleIDs), list("talkgroups", groupIDs))
 	return files, nil
 }
 

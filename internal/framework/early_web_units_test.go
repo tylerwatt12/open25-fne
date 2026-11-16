@@ -15,11 +15,11 @@ func TestWebScaleDecimalPreservesRadioAndTimePrecision(t *testing.T) {
 		exponent int
 		want     string
 	}{
-		{"443450000", -6, "443.45"}, {"443437500", -6, "443.4375"}, {"1", -6, "0.000001"},
+		{"433450000", -6, "433.45"}, {"433437500", -6, "433.4375"}, {"1", -6, "0.000001"},
 		{"-5000000", -6, "-5"}, {"12500", -3, "12.5"}, {"6250", -3, "6.25"}, {"1", -3, "0.001"},
 		{"9223372036854775807", -6, "9223372036854.775807"}, {"-9223372036854775808", -6, "-9223372036854.775808"},
-		{"443.450001", 6, "443450001"}, {"443.4500001", 6, "443450000.1"}, {"0.000001", 6, "1"}, {"-5", 6, "-5000000"},
-		{"4.4345e2", 6, "443450000"}, {".5", 6, "500000"}, {"+0001.250", 3, "1250"},
+		{"433.450001", 6, "433450001"}, {"433.4500001", 6, "433450000.1"}, {"0.000001", 6, "1"}, {"-5", 6, "-5000000"},
+		{"4.3345e2", 6, "433450000"}, {".5", 6, "500000"}, {"+0001.250", 3, "1250"},
 		{"900", -3, "0.9"}, {"-1", -3, "-0.001"}, {"0.753", 2, "75.3"}, {"75.3", -2, "0.753"},
 		{"1e1000000", -6, "1e999994"}, {"1e-1000000", 6, "1e-999994"}, {"0", -6, "0"},
 	} {
@@ -59,16 +59,16 @@ func TestWebUnitsRenderAndReadOnlyKnownMeasurements(t *testing.T) {
 	if got := webDisplay(fields[0], record["tx_frequency_hz"]); got != "9223372036854.775807" {
 		t.Fatal("collection and editor units disagree", got)
 	}
-	form.Set("tx_frequency_hz", "443.4500001")
+	form.Set("tx_frequency_hz", "433.4500001")
 	r = httptest.NewRequest("POST", "/channels", strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if err := webReadFields(r, fields, record); err != nil || webText(record["tx_frequency_hz"]) != "443450000.1" {
+	if err := webReadFields(r, fields, record); err != nil || webText(record["tx_frequency_hz"]) != "433450000.1" {
 		t.Fatal("sub-Hz input was rounded or given a new representability restriction", err)
 	}
 }
 
 func TestWebUnitsReadOnlyTablesPreserveNumbersNullsAndUnits(t *testing.T) {
-	record := map[string]any{"tx_frequency_hz": json.Number("9223372036854775807"), "channel_spacing_hz": json.Number("12500"), "uplink_offset_hz": json.Number("-5000000"), "radio_id": json.Number("443450000"), "lifetime_ms": json.Number("1234"), "speech_ms": nil, "last_frame_age_ms": json.Number("250"), "latitude": json.Number("41.50000001"), "accuracy": json.Number("5.25"), "volume": json.Number("0.753"), "nested": []any{map[string]any{"rx_frequency_hz": json.Number("448450001")}}}
+	record := map[string]any{"tx_frequency_hz": json.Number("9223372036854775807"), "channel_spacing_hz": json.Number("12500"), "uplink_offset_hz": json.Number("-5000000"), "radio_id": json.Number("433450000"), "lifetime_ms": json.Number("1234"), "speech_ms": nil, "last_frame_age_ms": json.Number("250"), "latitude": json.Number("41.50000001"), "accuracy": json.Number("5.25"), "volume": json.Number("0.753"), "nested": []any{map[string]any{"rx_frequency_hz": json.Number("438450001")}}}
 	before, _ := json.Marshal(record)
 	var output bytes.Buffer
 	columns := []webColumn{}
@@ -77,7 +77,7 @@ func TestWebUnitsReadOnlyTablesPreserveNumbersNullsAndUnits(t *testing.T) {
 	}
 	webProperties(&output, record, columns)
 	webTable(&output, []webColumn{{"rx_frequency_hz", "RX frequency (MHz)"}}, record["nested"])
-	for _, want := range []string{"TX Frequency (MHz)", "9223372036854.775807", "Channel Spacing (kHz)", "12.5", "Uplink Offset (MHz)", ">-5<", "Radio ID", "443450000 / 1A6E8290 hex", "Lifetime (s)", ">1.234<", "Speech (s)", "—", "Last Frame Age (ms)", ">250<", "Latitude (°)", ">41.50000001<", "Accuracy (m)", ">5.25<", "Volume (%)", ">75.3<", ">448.450001<"} {
+	for _, want := range []string{"TX Frequency (MHz)", "9223372036854.775807", "Channel Spacing (kHz)", "12.5", "Uplink Offset (MHz)", ">-5.000000<", "Radio ID", "433450000 / 19D5EC10 hex", "Lifetime (s)", ">1.234<", "Speech (s)", "—", "Last Frame Age (ms)", ">250<", "Latitude (°)", ">41.50000001<", "Accuracy (m)", ">5.25<", "Volume (%)", ">75.3<", ">438.450001<"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatal("read-only units/value missing", want, output.String())
 		}

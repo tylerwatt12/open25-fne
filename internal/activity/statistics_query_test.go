@@ -38,7 +38,7 @@ func TestStatisticsAggregateMatchesScopedAllocationHistory(t *testing.T) {
 					e.Details["speech_ms"] = record.speech
 				}
 			}
-			if err := s.Append(e); err != nil {
+			if err := s.Append(context.Background(), e); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -91,7 +91,7 @@ func TestStatisticsAggregateMatchesScopedAllocationHistory(t *testing.T) {
 
 func TestStatisticsCancellationDoesNotWaitForOccupiedDatabase(t *testing.T) {
 	s := activityOpen(t)
-	connection, err := s.db.Conn(context.Background())
+	connection, err := s.readDB.Conn(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

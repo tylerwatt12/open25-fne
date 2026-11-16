@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -25,6 +27,7 @@ type controlSwitchAttempt struct {
 	retired              bool
 	quiesced             map[*child]bool
 	outage               atomic.Bool
+	handoff              bool
 }
 
 func promotedProfile(p Profile, controlID string) Profile {
@@ -41,20 +44,80 @@ func promotedProfile(p Profile, controlID string) Profile {
 	return p
 }
 
+// Candidates are a set. Storage order and channel names never imply priority.
 func controlCandidates(p Profile) []Channel {
+	ids := slices.Clone(p.Site.ControlPolicy.CandidateIDs)
+	if p.Site.ControlPolicy.Mode == "static" {
+		ids = append(ids, p.Site.ControlPolicy.ChannelID)
+	}
 	channels := []Channel{}
-	for _, channel := range p.Site.Channels {
-		if channel.Enabled && channel.ControlEligible {
-			channels = append(channels, channel)
+	for _, ch := range p.Site.Channels {
+		if ch.Enabled && slices.Contains(ids, ch.ID) {
+			channels = append(channels, ch)
 		}
 	}
-	sort.Slice(channels, func(i, j int) bool {
-		if channels[i].ControlPriority != channels[j].ControlPriority {
-			return channels[i].ControlPriority < channels[j].ControlPriority
-		}
-		return channels[i].ID < channels[j].ID
-	})
 	return channels
+}
+
+// The Site's ready workers are the source for both traffic allocation and
+// backup advertisements. The last accepted snapshot belongs to this worker.
+func (c *Controller) synchronizeControlResources(ctx context.Context) error {
+	c.mu.Lock()
+	owner := c.children[c.status.ActiveControlChannelID]
+	if owner == nil || !owner.acceptsObservations() || !owner.validDevice() {
+		c.mu.Unlock()
+		return nil
+	}
+	ready := make([]int, 0, len(c.status.Channels))
+	for _, row := range c.status.Channels {
+		worker := c.children[row.ID]
+		if row.Role != "voice" || !row.Ready || worker == nil || !worker.acceptsObservations() || !worker.validDevice() {
+			continue
+		}
+		for _, channel := range c.profile.Site.Channels {
+			if channel.ID == row.ID {
+				ready = append(ready, channel.Identifier<<12|channel.ChannelNo)
+				break
+			}
+		}
+	}
+	if owner.controlResources != nil && slices.Equal(ready, owner.controlResources) {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+	if _, err := owner.client.Put(ctx, "/p25/control-resources", map[string][]int{"ready": ready}); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	owner.controlResources = ready
+	c.mu.Unlock()
+	return nil
+}
+
+// Called under c.mu. Only actual selections consume a turn. Unavailable
+// candidates are skipped and can rejoin an available round; the pool is bounded by
+// this Site's enabled channels and is never persisted as configuration.
+func (c *Controller) chooseControlLocked(p Profile, usable []string, active string) string {
+	if len(usable) == 0 {
+		return ""
+	}
+	c.controlTurns = slices.DeleteFunc(c.controlTurns, func(id string) bool {
+		return !slices.ContainsFunc(controlCandidates(p), func(ch Channel) bool { return ch.ID == id })
+	})
+	for pass := 0; pass < 2; pass++ {
+		for i, id := range c.controlTurns {
+			if id != active && slices.Contains(usable, id) {
+				c.controlTurns = append(c.controlTurns[:i], c.controlTurns[i+1:]...)
+				return id
+			}
+		}
+		// Complete rounds of currently available resources even when a missing
+		// candidate retains an unconsumed turn. Do not let it block rotation.
+		c.controlTurns = slices.Clone(usable)
+		rand.Shuffle(len(c.controlTurns), func(i, j int) { c.controlTurns[i], c.controlTurns[j] = c.controlTurns[j], c.controlTurns[i] })
+	}
+	return ""
 }
 
 func rotationInterval(policy ControlPolicy) (time.Duration, error) {
@@ -71,7 +134,7 @@ func rotationInterval(policy ControlPolicy) (time.Duration, error) {
 
 func (c *Controller) updateNextRotationLocked() {
 	c.status.NextControlRotation = time.Time{}
-	if !c.profile.Site.ControlPolicy.RotationEnabled || c.status.ControlChangedAt.IsZero() {
+	if c.profile.Site.ControlPolicy.Mode != "random" || c.profile.Site.ControlPolicy.RotationHours == 0 || c.status.ControlChangedAt.IsZero() {
 		return
 	}
 	interval, err := rotationInterval(c.profile.Site.ControlPolicy)
@@ -134,7 +197,10 @@ func (c *Controller) queueControlSwitchLocked(target, reason string) {
 	attempt.outage.Store(reason == "failover")
 	c.status.ControlSwitchTarget, c.status.ControlSwitchReason = target, reason
 	c.status.ControlSwitchError = "Waiting for the Site to become idle."
-	c.emitLocked(Event{Kind: "control_switch_pending", ChannelID: target, Message: "Control-channel " + reason + " requested; waiting for all Site calls to finish."})
+	if reason == "failover" {
+		c.status.ControlSwitchError = "Waiting for an idle control-eligible channel."
+	}
+	c.emitLocked(Event{Kind: "control_switch_pending", ChannelID: target, Message: "Control-channel " + reason + " requested. " + c.status.ControlSwitchError})
 	go c.runControlSwitch(attempt)
 }
 
@@ -153,26 +219,21 @@ func (c *Controller) scheduleControlRotation(now time.Time) {
 		c.status.ControlSwitchError = "Control rotation is waiting for an eligible channel."
 		return
 	}
-	start := -1
-	for i, ch := range channels {
+	usable := []string{}
+	for _, ch := range channels {
 		if ch.ID == c.status.ActiveControlChannelID {
-			start = i
-			break
+			continue
+		}
+		if recovery := c.recovery[ch.ID]; recovery != nil && !recovery.wanted {
+			continue
+		}
+		process := c.children[ch.ID]
+		if process != nil && process.alive() && process.readyNow() && process.validDevice() {
+			usable = append(usable, ch.ID)
 		}
 	}
-	for offset := 1; offset <= len(channels); offset++ {
-		channel := channels[(start+offset)%len(channels)]
-		if channel.ID == c.status.ActiveControlChannelID {
-			continue
-		}
-		if recovery := c.recovery[channel.ID]; recovery != nil && !recovery.wanted {
-			continue
-		}
-		process := c.children[channel.ID]
-		if process == nil || !process.alive() || !process.readyNow() || !process.validDevice() {
-			continue
-		}
-		c.queueControlSwitchLocked(channel.ID, "rotation")
+	if target := c.chooseControlLocked(c.configuredProfile, usable, c.status.ActiveControlChannelID); target != "" {
+		c.queueControlSwitchLocked(target, "rotation")
 		return
 	}
 	c.status.ControlSwitchError = "Control rotation is waiting for another wanted eligible channel."
@@ -180,10 +241,19 @@ func (c *Controller) scheduleControlRotation(now time.Time) {
 
 // A dynamic control outage keeps healthy voice workers alive until their
 // actual native call/permit state is idle. It never preempts them to promote.
-func (c *Controller) dynamicControlFailed(process *child) bool {
+func (c *Controller) controlFailedWithFallback(process *child) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.profile.Site.ControlPolicy.Mode != "dynamic" || c.children[process.id] != process || c.status.State != "running" || !c.siteWanted || c.closing || c.stopRequests != 0 {
+	if c.children[process.id] != process || c.status.ActiveControlChannelID != process.id || c.status.State != "running" || !c.siteWanted || c.closing || c.stopRequests != 0 {
+		return false
+	}
+	alternate := false
+	for _, ch := range controlCandidates(c.configuredProfile) {
+		if ch.ID != process.id {
+			alternate = true
+		}
+	}
+	if !alternate {
 		return false
 	}
 	if c.c4fm != nil {
@@ -201,6 +271,11 @@ func (c *Controller) dynamicControlFailed(process *child) bool {
 			c.status.Channels[i].Error = c.status.Error
 		}
 	}
+	for _, voice := range c.recovery {
+		if voice.attempt != nil {
+			voice.attempt.cancel()
+		}
+	}
 	if c.controlSwitch != nil {
 		c.controlSwitch.outage.Store(true)
 		c.status.ControlSwitchReason = "failover"
@@ -211,15 +286,19 @@ func (c *Controller) dynamicControlFailed(process *child) bool {
 }
 
 func (c *Controller) switchTargetLocked(attempt *controlSwitchAttempt) string {
-	if attempt.target != "" && attempt.reason == "manual" {
+	if attempt.target != "" {
 		// An ordinary manual request stays pinned to its explicit target.
 		// After a dynamic outage, an unavailable/failed target must not prevent
 		// another eligible resource from restoring control.
-		if !attempt.outage.Load() {
-			return attempt.target
+		if !attempt.outage.Load() && attempt.lastFailed != attempt.target {
+			process := c.children[attempt.target]
+			if attempt.retired || process != nil && process.readyNow() && process.acceptsObservations() && process.validDevice() {
+				return attempt.target
+			}
+			return ""
 		}
 		usable := attempt.lastFailed != attempt.target
-		if !attempt.retired {
+		if attempt.outage.Load() && !attempt.retired {
 			process := c.children[attempt.target]
 			usable = usable && process != nil && process.alive() && process.readyNow() && process.validDevice()
 		}
@@ -237,20 +316,8 @@ func (c *Controller) switchTargetLocked(attempt *controlSwitchAttempt) string {
 		}
 	}
 	channels := controlCandidates(attempt.profile)
-	start := 0
-	after := attempt.lastFailed
-	if after == "" && attempt.reason == "rotation" {
-		after = attempt.previous
-	}
-	for i, channel := range channels {
-		if channel.ID == after {
-			start = (i + 1) % len(channels)
-			break
-		}
-	}
-	if len(channels) > 0 {
-		channels = append(append([]Channel{}, channels[start:]...), channels[:start]...)
-	}
+	usableIDs := []string{}
+
 	for _, channel := range channels {
 		if channel.ID == attempt.previous {
 			continue
@@ -270,7 +337,13 @@ func (c *Controller) switchTargetLocked(attempt *controlSwitchAttempt) string {
 				continue
 			}
 		}
-		return channel.ID
+		if channel.ID != attempt.lastFailed {
+			usableIDs = append(usableIDs, channel.ID)
+		}
+	}
+	if selected := c.chooseControlLocked(attempt.profile, usableIDs, attempt.previous); selected != "" {
+		attempt.target = selected
+		return selected
 	}
 	// If no alternate can operate, ordinary same-device recovery remains
 	// possible. A successful replacement is never automatically returned.
@@ -350,7 +423,7 @@ func (c *Controller) runControlSwitch(attempt *controlSwitchAttempt) {
 		if err == nil && !idle {
 			c.mu.Lock()
 			if c.currentControlSwitchLocked(attempt) {
-				c.status.ControlSwitchError = "Waiting for all Site calls, permits and identification to finish."
+				c.status.ControlSwitchError = "Waiting for all Site calls, permits to finish."
 			}
 			c.mu.Unlock()
 			unlock()

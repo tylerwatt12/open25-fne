@@ -323,8 +323,8 @@ func TestSIPRTPServiceSourcePermissionAndRevocation(t *testing.T) {
 	}
 }
 func TestGeneratedHeaderUsesSiteNACWithoutChangingObservedRF(t *testing.T) {
-	s := &Service{config: FileConfig{Role: RoleSite, InstanceID: "site-1"}}
-	s.directory.value.Store(&directorySnapshot{Zone: &ZoneConfig{Sites: []SiteIdentity{{ID: "site-1", NAC: 0x293}}}})
+	s := &Service{config: FileConfig{Role: RoleSite, InstanceID: "site-1"}, radio: &operationRadio{status: radio.Status{State: "running", NAC: 0x293}}}
+	s.directory.value.Store(&directorySnapshot{Zone: &ZoneConfig{Sites: []SiteIdentity{{ID: "site-1"}}}})
 	f := sipTestFrame("generated", 10002, 1001, 1, 0)
 	f.SourceKind = "application"
 	f.P25.Header.NID = 0

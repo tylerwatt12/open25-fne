@@ -103,6 +103,9 @@ func startIntegrationService(t *testing.T, dir string, role Role, id string, con
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Standard fixtures explicitly wait for their disposable history store.
+	// Production OpenService deliberately never waits for this background I/O.
+	waitHistoryInitialization(t, s.activity)
 	pair := &integrationService{service: s, configPath: configPath}
 	pair.server = httptest.NewServer(s.InternalHandler())
 	pair.web = httptest.NewServer(s.Handler())
@@ -118,32 +121,66 @@ func startIntegrationService(t *testing.T, dir string, role Role, id string, con
 
 func integrationNewCluster(t *testing.T) *integrationCluster {
 	t.Helper()
+	return integrationNewZoneCluster(t, "zone-1", 1, nil)
+}
+
+// Fixture only: independent Zone/Site state and listeners, optionally one System.
+// This deliberately leaves the production singular Zone report cache unchanged.
+func integrationNewZoneCluster(t *testing.T, zoneID string, rfss int, sharedSystem *integrationService) *integrationCluster {
+	t.Helper()
+	firstID, secondID := "site-1", "site-2"
+	if zoneID != "zone-1" {
+		firstID, secondID = zoneID+"-site-1", zoneID+"-site-2"
+	}
 	dir := t.TempDir()
 	system := storeFixtureSystem()
 	system.Talkgroups = []Talkgroup{
 		{TGID: 1001, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Every Site", Enabled: true, SiteAccess: "all", SiteIDs: []string{}},
-		{TGID: 1002, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Main Site only", Enabled: true, SiteAccess: "selected", SiteIDs: []string{"site-1"}},
-		{TGID: 1003, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Other Site only", Enabled: true, SiteAccess: "selected", SiteIDs: []string{"site-2"}},
+		{TGID: 1002, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Main Site only", Enabled: true, SiteAccess: "selected", SiteIDs: []string{firstID}},
+		{TGID: 1003, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Other Site only", Enabled: true, SiteAccess: "selected", SiteIDs: []string{secondID}},
 		{TGID: 1099, AdmissionMode: "clear", TransmitMode: "clear", Alias: "Denied", Enabled: false, SiteAccess: "all", SiteIDs: []string{}},
 	}
 	zone := storeFixtureZone()
-	zone.Sites = append(zone.Sites, SiteIdentity{ID: "site-2", Name: "Other Site", SiteID: 2, NAC: 0x294})
+	zone.ID, zone.RFSSID = zoneID, rfss
+	zone.Sites[0].ID = firstID
+	zone.Sites = append(zone.Sites, SiteIdentity{ID: secondID, Name: "Other Site", SiteID: 2})
 	zoneToken := strings.Repeat("z", 64)
 	siteToken := strings.Repeat("s", 64)
 	otherToken := strings.Repeat("o", 64)
 	dispatchToken := strings.Repeat("d", 64)
+	if zoneID != "zone-1" {
+		var err error
+		zoneToken, err = randomToken()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	c := &integrationCluster{}
-	c.system = startIntegrationService(t, dir, RoleSystem, "system-1", system, ServiceCredentials{Peers: map[string]PeerCredential{"zone-1": {Role: RoleZone, InstanceID: "zone-1", Token: zoneToken}}}, system, zone)
-	c.zone = startIntegrationService(t, dir, RoleZone, "zone-1", zone, ServiceCredentials{OutboundID: "zone-1", OutboundToken: zoneToken, Peers: map[string]PeerCredential{"site-1": {Role: RoleSite, InstanceID: "site-1", Token: siteToken}, "site-2": {Role: RoleSite, InstanceID: "site-2", Token: otherToken}, "application-1": {Role: RoleApplication, InstanceID: "application-1", Token: dispatchToken}}}, system, zone)
+	if sharedSystem == nil {
+		c.system = startIntegrationService(t, dir, RoleSystem, "system-1", system, ServiceCredentials{Peers: map[string]PeerCredential{zoneID: {Role: RoleZone, InstanceID: zoneID, Token: zoneToken}}}, system, zone)
+	} else {
+		c.system = sharedSystem
+		creds, err := readCredentials(sharedSystem.service.Config().CredentialFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		creds.Peers[zoneID] = PeerCredential{Role: RoleZone, InstanceID: zoneID, Token: zoneToken}
+		if err := WritePrivateJSON(sharedSystem.service.Config().CredentialFile, creds); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.zone = startIntegrationService(t, dir, RoleZone, zoneID, zone, ServiceCredentials{OutboundID: zoneID, OutboundToken: zoneToken, Peers: map[string]PeerCredential{firstID: {Role: RoleSite, InstanceID: firstID, Token: siteToken}, secondID: {Role: RoleSite, InstanceID: secondID, Token: otherToken}, "application-1": {Role: RoleApplication, InstanceID: "application-1", Token: dispatchToken}}}, system, zone)
 	settings := c.zone.service.Config().Settings()
 	settings.UpstreamURL = c.system.server.URL
 	if err := c.zone.service.SaveSettings(settings); err != nil {
 		t.Fatal(err)
 	}
-	c.site = startIntegrationService(t, dir, RoleSite, "site-1", storeFixtureSite(), ServiceCredentials{OutboundID: "site-1", OutboundToken: siteToken, Peers: map[string]PeerCredential{"application-1": {Role: RoleApplication, InstanceID: "application-1", Token: dispatchToken}}}, system, zone)
+	firstSite := storeFixtureSite()
+	firstSite.ID = firstID
+	c.site = startIntegrationService(t, dir, RoleSite, firstID, firstSite, ServiceCredentials{OutboundID: firstID, OutboundToken: siteToken, Peers: map[string]PeerCredential{"application-1": {Role: RoleApplication, InstanceID: "application-1", Token: dispatchToken}}}, system, zone)
 	otherSite := storeFixtureSite()
-	otherSite.ID = "site-2"
-	c.otherSite = startIntegrationService(t, dir, RoleSite, "site-2", otherSite, ServiceCredentials{OutboundID: "site-2", OutboundToken: otherToken, Peers: map[string]PeerCredential{}}, system, zone)
+	otherSite.ID = secondID
+	c.otherSite = startIntegrationService(t, dir, RoleSite, secondID, otherSite, ServiceCredentials{OutboundID: secondID, OutboundToken: otherToken, Peers: map[string]PeerCredential{}}, system, zone)
 	for _, site := range []*integrationService{c.site, c.otherSite} {
 		settings = site.service.Config().Settings()
 		settings.UpstreamURL = c.zone.server.URL

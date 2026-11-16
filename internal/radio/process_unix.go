@@ -17,6 +17,10 @@ import (
 )
 
 type child struct {
+	// Read and written under the Controller mutex, for this native process only.
+	adjacentSite          *AdjacentSite
+	controlResources      []int
+	controlSince          time.Time
 	cmd                   *exec.Cmd
 	done                  chan struct{}
 	ready                 chan struct{}
@@ -146,7 +150,7 @@ func (c *child) waitReady(ctx context.Context) error {
 		return nil
 	}
 }
-func (c *child) stop(ctx context.Context, identification bool) error {
+func (c *child) stop(ctx context.Context) error {
 	c.stopMu.Lock()
 	defer c.stopMu.Unlock()
 	c.mu.Lock()
@@ -157,18 +161,11 @@ func (c *child) stop(ctx context.Context, identification bool) error {
 	}
 	var deadline time.Time
 	if c.alive() {
-		// SIGINT permits bounded final station identification; SIGTERM is the
-		// fail-closed path for failed startup or a revoked policy.
-		signal := syscall.SIGTERM
 		grace := 2 * time.Second
 		if c.stopGrace > 0 {
 			grace = c.stopGrace
 		}
-		if identification {
-			signal = syscall.SIGINT
-			grace = 9 * time.Second
-		}
-		_ = syscall.Kill(-c.cmd.Process.Pid, signal)
+		_ = syscall.Kill(-c.cmd.Process.Pid, syscall.SIGTERM)
 		timer := time.NewTimer(grace)
 		defer timer.Stop()
 		select {

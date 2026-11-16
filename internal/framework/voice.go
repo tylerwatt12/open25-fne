@@ -167,7 +167,7 @@ func voiceRoles(local, peer Role) bool {
 }
 func (s *Service) voiceDiscovery(w http.ResponseWriter, r *http.Request, p PeerCredential) {
 	v := s.voice.Load()
-	if v == nil || !voiceRoles(s.Config().Role, p.Role) {
+	if v == nil || !voiceRoles(s.Config().Role, p.Role) || (s.parentIsolated.Load() && p.Role == RoleZone) {
 		fail(w, 403, dispatch.ErrPermission)
 		return
 	}
@@ -229,6 +229,9 @@ func (v *voiceRuntime) authenticate(ctx context.Context, a sipvoice.AuthRequest)
 	if !ok || subtle.ConstantTimeCompare([]byte(p.Token), []byte(a.BearerToken)) != 1 || !voiceRoles(v.s.Config().Role, p.Role) {
 		return dispatch.ErrPermission
 	}
+	if a.Method == "INVITE" && v.s.parentIsolated.Load() && p.Role == RoleZone {
+		return dispatch.ErrUnavailable
+	}
 	if a.Method != "INVITE" {
 		return nil
 	} // Cleanup remains possible after policy revocation.
@@ -247,6 +250,9 @@ func (v *voiceRuntime) authenticate(ctx context.Context, a sipvoice.AuthRequest)
 	return v.validate(a.PeerID, p, a.Call, e)
 }
 func (v *voiceRuntime) validate(peerID string, p PeerCredential, c sipvoice.Call, e voiceEnvelope) error {
+	if v.s.parentIsolated.Load() && p.Role == RoleZone {
+		return dispatch.ErrUnavailable
+	}
 	q := e.Request
 	if q.ID != c.ID || len(q.Talkgroups) == 0 || q.Talkgroups[0] != int(c.GroupID) || q.RadioID < 1 || q.RadioID > 0xfffffb {
 		return dispatch.ErrPermission
@@ -387,11 +393,16 @@ func (v *voiceRuntime) invite(ctx context.Context, s *sipvoice.Session) (sipvoic
 			return sipvoice.Answer{}, err
 		}
 		if q.SourceKind == "rf" && v.s.Config().Role == RoleZone {
-			if err = v.s.acceptRFObservation(ctx, q); err != nil {
+			stage := v.s.admissionClock()
+			err = v.s.acceptRFObservation(ctx, q)
+			v.s.admissionElapsed(stage, "rf_source_authority", q.ID, err == nil)
+			if err != nil {
 				return sipvoice.Answer{}, err
 			}
 		}
+		stage := v.s.admissionClock()
 		g, err = v.s.broker.Begin(ctx, s.PeerID(), q)
+		v.s.admissionElapsed(stage, "voice_broker_admission", q.ID, err == nil)
 		if err != nil {
 			return sipvoice.Answer{}, err
 		}
@@ -565,18 +576,13 @@ func (s *Service) stampGeneratedVoiceHeader(frame *dispatch.Frame) error {
 	if frame.SourceKind != "application" && frame.SourceKind != "automation" {
 		return dispatch.ErrP25MetadataNotSupported
 	}
-	zone := s.view().Zone
-	if zone == nil {
-		return dispatch.ErrP25MetadataNotSupported
+	status := s.radioStatus()
+	if status.State != "running" {
+		return dispatch.ErrUnavailable
 	}
-	for _, site := range zone.Sites {
-		if site.ID == s.Config().InstanceID {
-			frame.P25 = frame.P25.Clone()
-			frame.P25.Header.NID = uint16(site.NAC << 4)
-			return nil
-		}
-	}
-	return dispatch.ErrP25MetadataNotSupported
+	frame.P25 = frame.P25.Clone()
+	frame.P25.Header.NID = uint16(status.NAC << 4)
+	return nil
 }
 
 func (v *voiceRuntime) renew(ctx context.Context, session *sipvoice.Session) error {

@@ -18,7 +18,7 @@ func TestIngestionReportsLossWithoutWaitingForBlockedStorage(t *testing.T) {
 	defer connection.Close()
 	result := make(chan IngestionHealth, 1)
 	go func() {
-		for n := 0; n < cap(s.queue)+20; n++ {
+		for n := 0; n < cap(s.queue)+128; n++ {
 			s.Enqueue(event(NewID(), "status", "site-1", time.Now()))
 		}
 		result <- s.IngestionHealth()
@@ -35,7 +35,8 @@ func TestIngestionReportsLossWithoutWaitingForBlockedStorage(t *testing.T) {
 	if err := connection.Close(); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Allow the full bounded queue to drain through paced 32-record turns.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := s.Flush(ctx); err != nil {
 		t.Fatal(err)
@@ -48,7 +49,7 @@ func TestIngestionReportsLossWithoutWaitingForBlockedStorage(t *testing.T) {
 
 func TestIngestionSeparatesRejectedRecordsFailedWritesAndRecovery(t *testing.T) {
 	s := activityOpen(t)
-	if err := s.Append(Event{Type: "status"}); err == nil {
+	if err := s.Append(context.Background(), Event{Type: "status"}); err == nil {
 		t.Fatal("invalid observation was accepted")
 	}
 	if _, err := s.db.Exec(`CREATE TRIGGER reject_activity BEFORE INSERT ON radio_events BEGIN SELECT RAISE(ABORT,'private database detail'); END`); err != nil {
@@ -73,7 +74,7 @@ func TestIngestionSeparatesRejectedRecordsFailedWritesAndRecovery(t *testing.T) 
 	if _, err := s.db.Exec("DROP TRIGGER reject_activity"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(event("recovered", "status", "site-1", time.Now())); err != nil {
+	if err := s.Append(context.Background(), event("recovered", "status", "site-1", time.Now())); err != nil {
 		t.Fatal(err)
 	}
 	after := s.IngestionHealth()
@@ -87,11 +88,15 @@ func TestIngestionMaintenanceFailureDoesNotClaimCommittedEventWasLost(t *testing
 	if _, err := s.db.Exec(`CREATE TRIGGER reject_pruning BEFORE DELETE ON radio_events BEGIN SELECT RAISE(ABORT,'pruning denied'); END`); err != nil {
 		t.Fatal(err)
 	}
-	s.pruneMu.Lock()
-	s.appends = 255
-	s.pruneMu.Unlock()
-	if err := s.Append(event("committed-old-record", "status", "site-1", time.Now().Add(-90*24*time.Hour))); err == nil {
-		t.Fatal("expected failed automatic retention cleanup")
+	if err := s.Append(context.Background(), event("committed-old-record", "status", "site-1", time.Now().Add(-90*24*time.Hour))); err != nil {
+		t.Fatal("committed event inherited a cleanup failure", err)
+	}
+	if err := s.RequestCleanup(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for s.IngestionHealth().MaintenanceFailures == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
 	rows, err := s.Events(Query{ID: "committed-old-record"})
 	if err != nil || len(rows) != 1 {
@@ -105,23 +110,25 @@ func TestIngestionMaintenanceFailureDoesNotClaimCommittedEventWasLost(t *testing
 
 func TestIngestionCountersDescribeOnlyCurrentServiceLifetime(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "activity.db")
-	s, err := Open(path)
+	s, err := OpenArchive(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = s.Append(Event{Type: "invalid"})
-	if err := s.Append(event("retained", "status", "site-1", time.Now())); err != nil {
+	waitActivityReady(t, s)
+	_ = s.Append(context.Background(), Event{Type: "invalid"})
+	if err := s.Append(context.Background(), event("retained", "status", "site-1", time.Now())); err != nil {
 		t.Fatal(err)
 	}
 	first := s.IngestionHealth()
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err = Open(path)
+	s, err = OpenArchive(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	waitActivityReady(t, s)
 	health := s.IngestionHealth()
 	rows, err := s.Events(Query{})
 	if err != nil || len(rows) != 1 || !health.StartedAt.After(first.StartedAt) || health.RejectedObservations != 0 || health.LastWriteSuccessAt != nil || health.Degraded {

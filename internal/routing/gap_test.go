@@ -3,8 +3,8 @@ package routing
 import (
 	"context"
 	"errors"
-	"testing"
 	"open25.local/open25-fne/internal/dispatch"
+	"testing"
 )
 
 type gapTarget struct {

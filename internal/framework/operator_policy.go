@@ -1,6 +1,7 @@
 package framework
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -94,6 +95,19 @@ func (s *Store) acceptOperatorSnapshots(local *OperatorSnapshot, upstream Operat
 		if len(doc.raw) > maxConfigurationBytes {
 			return errors.New("operator state exceeds the supported cache size")
 		}
+	}
+	// The caller serializes operator acceptance with featureMu. An identical
+	// committed pair needs neither the configuration writer nor a transaction.
+	unchanged := true
+	for _, doc := range documents {
+		previous, _, readErr := s.ReadCache(doc.name)
+		if readErr != nil || !bytes.Equal(previous, doc.raw) {
+			unchanged = false
+			break
+		}
+	}
+	if unchanged {
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

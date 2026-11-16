@@ -9,7 +9,7 @@ import (
 )
 
 func TestLocationRegistrationAreaReachesEveryNativeChannel(t *testing.T) {
-	network := Network{Address: "127.0.0.1", Port: 62031, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), ControlPeerID: 100, VoicePeerIDs: map[string]int{"voice-1": 101}}
+	network := Network{Address: "127.0.0.1", Port: 62031, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), PeerBase: 100, ChannelPeerIDs: map[string]int{"control-1": 100, "voice-1": 101}}
 	for _, lra := range []int{0, 1, 165, 255} {
 		t.Run(fmt.Sprint(lra), func(t *testing.T) {
 			profile := fixtureProfile()
@@ -41,7 +41,7 @@ func TestLocationRegistrationAreaReachesEveryNativeChannel(t *testing.T) {
 }
 
 func TestLocationRegistrationAreaUnrepresentableOperationProducesNoNativeFiles(t *testing.T) {
-	network := Network{Address: "127.0.0.1", Port: 62031, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), ControlPeerID: 100, VoicePeerIDs: map[string]int{"voice-1": 101}}
+	network := Network{Address: "127.0.0.1", Port: 62031, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), PeerBase: 100, ChannelPeerIDs: map[string]int{"control-1": 100, "voice-1": 101}}
 	for _, lra := range []int{-1, 256, 257, 1 << 32} {
 		t.Run(fmt.Sprint(lra), func(t *testing.T) {
 			profile := fixtureProfile()

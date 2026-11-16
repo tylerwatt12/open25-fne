@@ -275,6 +275,12 @@ func (b *callBroker) targets(q routing.Request) routing.Selection {
 				continue
 			}
 			interest := false
+			for _, group := range v.System.Talkgroups {
+				if group.TGID == tg && slices.Contains(group.RequestedSiteIDs, identity.ID) {
+					interest = true
+					break
+				}
+			}
 			matching, ownerMismatch, inhibited, denied := 0, 0, 0, 0
 			for rid, owner := range authority.owners {
 				if owner.TGID != tg || owner.SiteID != identity.ID {
@@ -458,11 +464,15 @@ type siteLeg struct {
 func (l *siteLeg) Begin(ctx context.Context, q dispatch.CallRequest) (dispatch.Grant, error) {
 	r := l.request
 	r.CallRequest = q
+	stage := l.s.admissionClock()
 	endpoint, err := l.s.voice.Load().discover(ctx, l.address, &l.peer)
+	l.s.admissionElapsed(stage, "site_discovery", q.ID, err == nil)
 	if err != nil {
 		return dispatch.Grant{}, err
 	}
+	stage = l.s.admissionClock()
 	call, err := l.s.voice.Load().begin(ctx, endpoint, r, false)
+	l.s.admissionElapsed(stage, "site_sip_admission", q.ID, err == nil)
 	if err != nil {
 		return dispatch.Grant{}, err
 	}
@@ -815,7 +825,9 @@ func (s *Service) beginRFStream(stream *rfStream) {
 		s.endRFStream(stream)
 		return
 	}
+	stage := s.admissionClock()
 	local, err := b.Begin(ctx, owner, q)
+	s.admissionElapsed(stage, "rf_fast_local_admission", q.ID, err == nil)
 	if err != nil {
 		s.endRFStream(stream)
 		s.runtimeError(err)
@@ -828,7 +840,9 @@ func (s *Service) beginRFStream(stream *rfStream) {
 		address, generation = s.mediaClient.Link()
 		if address != "" {
 			if endpoint, e := s.mediaClient.endpointAt(generation); e == nil {
-				call, _ = s.voice.Load().begin(ctx, endpoint, q, false)
+				stage = s.admissionClock()
+				call, err = s.voice.Load().begin(ctx, endpoint, q, false)
+				s.admissionElapsed(stage, "rf_fast_zone_admission", q.ID, err == nil)
 			}
 		}
 	}

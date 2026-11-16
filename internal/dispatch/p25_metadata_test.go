@@ -6,9 +6,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"open25.local/open25-fne/internal/p25rtp"
 	"reflect"
 	"testing"
-	"open25.local/open25-fne/internal/p25rtp"
 )
 
 // Synthetic metadata for software fixtures, never a receiver observation.

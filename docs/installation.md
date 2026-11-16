@@ -5,7 +5,7 @@ JSON file with the following documents.
 
 | Field | Purpose |
 | --- | --- |
-| `system` | WACN, System ID, station callsign, radio directory, and talkgroups |
+| `system` | WACN, System ID, radio directory, and talkgroups |
 | `zone` | RFSS ID, channel identifiers, and site registry |
 | `sites` | Initial site's modem, channel, and station-identification settings |
 | `application` | Application Server name and upstream connection |
@@ -33,6 +33,17 @@ The web listeners default to loopback ports 5000–5003. Run
 Use HTTPS for web access across a network and keep the internal HTTP, SIP and
 RTP connections on the private service network. Set the Site's native runtime
 paths and provision its modem and channel assignments before starting RF.
+
+Each Site owns its NAC, station callsign, digital BSI settings, modem assignments
+and control-channel selection policy. Station identification is digital BSI;
+the former CWID/Morse controls are removed. The Site's optional automatic-start
+setting defaults off. Saving programming never starts RF; an enabled automatic
+start applies only when that Site service starts.
+
+System owns the shared history archive and retention policy. Other services
+keep durable delivery outboxes and forward accepted events to System. Their
+administration pages link to System for historical views; live observations
+remain with their existing service owners.
 
 Open25 blocks operation with a home WACN in `BEE00`–`BEEFF` to reduce the risk
 of unintended subscriber roaming. Start Site reports the configured WACN and

@@ -319,6 +319,7 @@ func (m *rfAdmissionManager) reject(entry *admittedRF) {
 	_, _ = native.Put(ctx, "/p25/rf-admission/decision", map[string]any{"id": id, "epoch": epoch, "approved": false})
 }
 func (m *rfAdmissionManager) reserve(ctx context.Context, entry *admittedRF) {
+	started := m.s.admissionClock()
 	m.mu.Lock()
 	record := entry.request
 	native := entry.native
@@ -337,6 +338,7 @@ func (m *rfAdmissionManager) reserve(ctx context.Context, entry *admittedRF) {
 	var remote, local dispatch.Grant
 	var remoteCall *voiceCall
 	installed := false
+	defer func() { m.s.admissionElapsed(started, "rf_reserve", id, installed) }()
 	defer func() {
 		if installed {
 			return
@@ -367,11 +369,17 @@ func (m *rfAdmissionManager) reserve(ctx context.Context, entry *admittedRF) {
 	if e != nil {
 		return
 	}
-	if remoteCall, err = m.s.voice.Load().begin(ctx, endpoint, q, false); err != nil {
+	stage := m.s.admissionClock()
+	remoteCall, err = m.s.voice.Load().begin(ctx, endpoint, q, false)
+	m.s.admissionElapsed(stage, "rf_zone_admission", id, err == nil)
+	if err != nil {
 		return
 	}
 	remote = remoteCall.grant
-	if local, err = m.s.broker.Begin(ctx, "rf:"+m.s.Config().InstanceID, q); err != nil {
+	stage = m.s.admissionClock()
+	local, err = m.s.broker.Begin(ctx, "rf:"+m.s.Config().InstanceID, q)
+	m.s.admissionElapsed(stage, "rf_local_admission", id, err == nil)
+	if err != nil {
 		return
 	}
 	m.mu.Lock()
@@ -393,7 +401,9 @@ func (m *rfAdmissionManager) reserve(ctx context.Context, entry *admittedRF) {
 	if m.s.radioServiceInhibited(record.Source) {
 		return
 	}
+	stage = m.s.admissionClock()
 	raw, err := native.Put(ctx, "/p25/rf-admission/decision", map[string]any{"id": record.ID, "epoch": record.Epoch, "approved": true})
+	m.s.admissionElapsed(stage, "rf_native_approval_http", id, err == nil)
 	if err != nil {
 		return
 	}

@@ -20,6 +20,7 @@ func TestMediaDiagnosticIsBoundedAndContainsNoMediaOrCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitHistoryInitialization(t, events)
 	defer events.Close()
 	s := &Service{config: FileConfig{Role: RoleZone, InstanceID: "zone-1"}, activity: events}
 	d := &mediaLinkDiagnostic{s: s, peer: "application-1", generation: 4}
@@ -37,12 +38,12 @@ func TestMediaDiagnosticIsBoundedAndContainsNoMediaOrCredentials(t *testing.T) {
 	if err = events.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := events.Events(activity.Query{Audience: "diagnostic"})
+	rows, err := events.Pending(context.Background(), activity.EventBatchLimit)
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("disconnect produced more than one observation: %d %v", len(rows), err)
 	}
 	row := rows[0]
-	if row.Type != "media_link" || row.CallID != "diagnostic-call" || row.RadioID != 10020 || row.Details["stage"] != "route_write" || row.Details["maximum_processing_ms"] != float64(141) || row.Details["last_frame_age_ms"] != float64(325) {
+	if row.Audience != "diagnostic" || row.Type != "media_link" || row.CallID != "diagnostic-call" || row.RadioID != 10020 || row.Details["stage"] != "route_write" || row.Details["maximum_processing_ms"] != float64(141) || row.Details["last_frame_age_ms"] != float64(325) {
 		t.Fatalf("missing diagnostic cause/timing: %#v", row)
 	}
 	raw, _ := json.Marshal(row)
@@ -61,6 +62,7 @@ func TestMediaDiagnosticDoesNotWarnForIntentionalCloseOrShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitHistoryInitialization(t, events)
 	defer events.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Service{config: FileConfig{Role: RoleApplication, InstanceID: "application-1"}, activity: events, operationCtx: ctx}
@@ -75,8 +77,8 @@ func TestMediaDiagnosticDoesNotWarnForIntentionalCloseOrShutdown(t *testing.T) {
 	if err = events.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := events.Events(activity.Query{Audience: "diagnostic"})
-	if err != nil || len(rows) != 1 || rows[0].Severity != "info" || rows[0].Details["stage"] != "read" {
+	rows, err := events.Pending(context.Background(), activity.EventBatchLimit)
+	if err != nil || len(rows) != 1 || rows[0].Audience != "diagnostic" || rows[0].Severity != "info" || rows[0].Details["stage"] != "read" {
 		t.Fatalf("normal close/shutdown generated warning noise: %#v %v", rows, err)
 	}
 }

@@ -1,14 +1,14 @@
 package framework
 
-// Starting choices for a new control-selection policy.
+// Starting choices approved with the control-selection policy on 2026-11-04.
 // This map is used only when opening a policy that has never been configured.
 func webNewControlPolicy() map[string]any {
-	return map[string]any{"mode": "static", "rotation_enabled": false, "rotation_hours": 24}
+	return map[string]any{"mode": "static", "channel_id": "", "candidate_ids": []string{}, "rotation_hours": 0}
 }
 
-// Starting values for an Add form. Never apply them to a saved
+// User-approved starting values for an Add form. Never apply them to a saved
 // record or submitted form; every choice remains editable.
-func webNewRecord(kind string) map[string]any {
+func webRecordDefaults(kind string) map[string]any {
 	switch kind {
 	case "radios":
 		return map[string]any{"kind": "subscriber", "enabled": true}
@@ -19,13 +19,15 @@ func webNewRecord(kind string) map[string]any {
 		}
 	case "users":
 		return map[string]any{"role": "operator", "enabled": true}
-	case "positions", "automations":
-		return map[string]any{"enabled": true}
+	case "positions":
+		return map[string]any{"enabled": true, "name": "Console position"}
+	case "automations":
+		return map[string]any{"enabled": true, "name": "Automation client"}
 	case "channels":
-		return map[string]any{"role": "voice", "enabled": false}
+		return map[string]any{"enabled": false, "name": "RF channel", "power_percent": 95}
 	case "modems":
-		return map[string]any{"baud": 115200, "calibration": map[string]any{
-			"rx_offset_hz": 0, "tx_offset_hz": 0, "rx_dc_offset": 0, "tx_dc_offset": 0,
+		return map[string]any{"name": "USB modem", "baud": 115200, "calibration": map[string]any{
+			"rx_offset_hz": 0, "tx_offset_hz": 0, "rx_level": 50, "tx_level": 50, "rx_dc_offset": 0, "tx_dc_offset": 0,
 			"rx_invert": false, "tx_invert": false, "ptt_invert": false,
 		}}
 	case "identifiers":

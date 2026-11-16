@@ -29,7 +29,7 @@ func TestReviewMatchingACKResolvesAnUnconfirmedSendWithinItsWindow(t *testing.T)
 	}
 }
 
-func TestReviewCommandTimeoutIsRetainedInCentralActivityOnce(t *testing.T) {
+func TestReviewCommandTimeoutIsRetainedInSourceOutboxOnce(t *testing.T) {
 	s, _, client := commandSiteFixture(t)
 	status, _ := client.request(t, "POST", "/api/radio/command", radioCommandInput{ID: "review-timeout", Action: "page", RadioID: 10001})
 	if status != 202 {
@@ -51,7 +51,7 @@ func TestReviewCommandTimeoutIsRetainedInCentralActivityOnce(t *testing.T) {
 	if err := s.activity.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := s.activity.Events(activity.Query{Type: "radio_command"})
+	rows, err := s.activity.Pending(ctx, activity.EventBatchLimit)
 	if err != nil {
 		t.Fatal(err)
 	}

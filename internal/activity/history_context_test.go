@@ -32,7 +32,8 @@ func TestHistoryReadsCancelWhileTheOnlyConnectionIsOccupied(t *testing.T) {
 	for _, name := range []string{"events", "calls", "call_destinations", "locations"} {
 		t.Run(name, func(t *testing.T) {
 			s := activityOpen(t)
-			connection, err := s.db.Conn(context.Background())
+			db := s.readDB
+			connection, err := db.Conn(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -40,10 +41,10 @@ func TestHistoryReadsCancelWhileTheOnlyConnectionIsOccupied(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := make(chan error, 1)
-			waits := s.db.Stats().WaitCount
+			waits := db.Stats().WaitCount
 			go func() { done <- historyContextRead(s, name, ctx) }()
 			deadline := time.Now().Add(time.Second)
-			for s.db.Stats().WaitCount == waits && time.Now().Before(deadline) {
+			for db.Stats().WaitCount == waits && time.Now().Before(deadline) {
 				time.Sleep(time.Millisecond)
 			}
 			cancel()
@@ -77,6 +78,7 @@ func TestHistoryCancellationInterruptsActiveSQLAndReleasesItsReader(t *testing.T
 	} {
 		t.Run(reader.name, func(t *testing.T) {
 			s := activityOpen(t)
+			db := s.readDB
 			at := time.Now().UTC()
 			for _, kind := range []string{"call_start", "location"} {
 				e := event(kind, kind, "site-1", at)
@@ -84,7 +86,7 @@ func TestHistoryCancellationInterruptsActiveSQLAndReleasesItsReader(t *testing.T
 				if kind == "location" {
 					e.Details = map[string]any{"latitude": 41.5, "longitude": -81.7, "accuracy": 5, "fix_at": at}
 				}
-				if err := s.Append(e); err != nil {
+				if err := s.Append(context.Background(), e); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -101,7 +103,7 @@ SELECT saved_history.* FROM saved_history CROSS JOIN n WHERE n.x=5000000`, reade
 			done := make(chan error, 1)
 			go func() { done <- historyContextRead(s, reader.name, ctx) }()
 			deadline := time.Now().Add(time.Second)
-			for s.db.Stats().InUse == 0 && time.Now().Before(deadline) {
+			for db.Stats().InUse == 0 && time.Now().Before(deadline) {
 				time.Sleep(time.Millisecond)
 			}
 			// Location first reads retention settings; allow that small query to
@@ -120,10 +122,10 @@ SELECT saved_history.* FROM saved_history CROSS JOIN n WHERE n.x=5000000`, reade
 			probe, stop := context.WithTimeout(context.Background(), time.Second)
 			defer stop()
 			var count int
-			if err := s.db.QueryRowContext(probe, "SELECT COUNT(*) FROM saved_history").Scan(&count); err != nil || count == 0 {
+			if err := db.QueryRowContext(probe, "SELECT COUNT(*) FROM saved_history").Scan(&count); err != nil || count == 0 {
 				t.Fatal("cancellation did not release the shared SQL reader", count, err)
 			}
-			if s.db.Stats().InUse != 0 {
+			if db.Stats().InUse != 0 {
 				t.Fatal("history reader retained the only database connection")
 			}
 		})

@@ -68,11 +68,11 @@ func TestEarlyWebUserPasswordHasNoAdministratorMinimumLength(t *testing.T) {
 	client := earlyWebLogin(t, c.system)
 	address := c.system.web.URL + "/users/edit"
 	form := earlyWebForm(t, earlyWebGet(t, client, address, http.StatusOK), "username")
-	form.Set("id", "entered-password")
+	generatedID := form.Get("id")
 	form.Set("username", "entered-password-user")
 	form.Set("password", "x")
 	adminFormResponse(t, client, address, c.system.web.URL, form, http.StatusSeeOther)
-	_, verifier, err := c.system.service.Store.User("entered-password")
+	_, verifier, err := c.system.service.Store.User(generatedID)
 	if err != nil || bcrypt.CompareHashAndPassword(verifier, []byte("x")) != nil {
 		t.Fatal("the entered password was refused or changed", err)
 	}
@@ -131,8 +131,8 @@ func TestEarlyWebLargeEncodedSnapshotPreservesUnknownField(t *testing.T) {
 		t.Fatal(err)
 	}
 	address := c.system.web.URL + "/system"
-	form := earlyWebForm(t, earlyWebGet(t, client, address, http.StatusOK), "callsign")
-	form.Set("callsign", "Submitted large configuration")
+	form := earlyWebForm(t, earlyWebGet(t, client, address, http.StatusOK), "name")
+	form.Set("name", "Submitted large configuration")
 	if len(form.Encode()) > 32<<10 {
 		t.Fatal("the settings form embedded unrelated configuration")
 	}
@@ -142,7 +142,7 @@ func TestEarlyWebLargeEncodedSnapshotPreservesUnknownField(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved, err := webConfig(raw)
-	if err != nil || saved["future_large_setting"] != large || saved["callsign"] != "Submitted large configuration" {
+	if err != nil || saved["future_large_setting"] != large || saved["name"] != "Submitted large configuration" {
 		t.Fatal("the large form save failed or changed the unknown field", err)
 	}
 }
@@ -152,13 +152,13 @@ func TestEarlyWebNullEditableSnapshotsSaveWithoutPanic(t *testing.T) {
 		c := integrationNewCluster(t)
 		client := earlyWebLogin(t, c.system)
 		address := c.system.web.URL + "/system"
-		form := earlyWebForm(t, earlyWebGet(t, client, address, http.StatusOK), "callsign")
+		form := earlyWebForm(t, earlyWebGet(t, client, address, http.StatusOK), "name")
 		form.Set("record", "null")
-		form.Set("callsign", "Submitted null snapshot")
+		form.Set("name", "Submitted null snapshot")
 		adminFormResponse(t, client, address, c.system.web.URL, form, http.StatusSeeOther)
 		raw, _ := c.system.service.Store.Config()
 		saved, err := webConfig(raw)
-		if err != nil || saved["callsign"] != "Submitted null snapshot" {
+		if err != nil || saved["name"] != "Submitted null snapshot" {
 			t.Fatal("null configuration was not editable", err)
 		}
 	})
@@ -172,7 +172,11 @@ func TestEarlyWebNullEditableSnapshotsSaveWithoutPanic(t *testing.T) {
 		form.Set("username", "null-record-user")
 		form.Set("password", "null-record-password")
 		adminFormResponse(t, client, address, c.system.web.URL, form, http.StatusSeeOther)
-		saved, _, err := c.system.service.Store.User("from-null")
+		users, err := c.system.service.Store.Users()
+		var saved User
+		if len(users) > 0 {
+			saved = users[0]
+		}
 		if err != nil || saved.Username != "null-record-user" {
 			t.Fatal("null directory record was not editable", err)
 		}

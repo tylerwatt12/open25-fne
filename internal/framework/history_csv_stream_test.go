@@ -17,16 +17,12 @@ import (
 	"open25.local/open25-fne/internal/activity"
 )
 
-func TestHistoryCSVBytesScopeAndContinuation(t *testing.T) {
+func TestSystemHistoryCSVBytesFiltersAndContinuation(t *testing.T) {
 	at := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
 	fix := time.Now().UTC().Add(time.Hour)
 	for _, kind := range []string{"events", "calls", "locations"} {
 		t.Run(kind, func(t *testing.T) {
-			s, user := historyFixture(t)
-			user.Permissions = append(user.Permissions, "location_view")
-			record := s.view().Users[user.ID]
-			record.User = user
-			s.view().Users[user.ID] = record
+			s, _ := historyFixture(t)
 			for i, name := range []string{"new", "old", "forbidden"} {
 				tg := 1001
 				if name == "forbidden" {
@@ -39,23 +35,23 @@ func TestHistoryCSVBytesScopeAndContinuation(t *testing.T) {
 				case "locations":
 					e.Type, e.Details = "location", map[string]any{"latitude": 41.5, "longitude": -81.7, "accuracy": 5, "fix_at": fix.Add(-time.Duration(i) * time.Minute), "scope_id": "=scope"}
 				}
-				if err := s.activity.Append(e); err != nil {
+				if err := s.activity.Append(context.Background(), e); err != nil {
 					t.Fatal(err)
 				}
 				if kind == "calls" {
 					e.ID += "-end"
 					e.Type, e.At = "call_end", e.At.Add(time.Second)
 					e.Details = map[string]any{"allocated_ms": 900, "speech_ms": 500}
-					if err := s.activity.Append(e); err != nil {
+					if err := s.activity.Append(context.Background(), e); err != nil {
 						t.Fatal(err)
 					}
 				}
 			}
 			cursor := ""
 			for i, name := range []string{"new", "old"} {
-				query := url.Values{"limit": {"1"}, "cursor": {cursor}}
+				query := url.Values{"limit": {"1"}, "cursor": {cursor}, "talkgroup_id": {"1001"}}
 				path := "/api/history/" + kind + "?" + query.Encode()
-				page := historyGet(s, path, Session{UserID: user.ID})
+				page := historyGet(s, path, Session{})
 				var metadata struct {
 					NextCursor string              `json:"next_cursor"`
 					Locations  []activity.Location `json:"locations"`
@@ -63,7 +59,7 @@ func TestHistoryCSVBytesScopeAndContinuation(t *testing.T) {
 				if page.Code != 200 || json.Unmarshal(page.Body.Bytes(), &metadata) != nil {
 					t.Fatalf("page: HTTP%d %s", page.Code, page.Body)
 				}
-				got := historyGet(s, path+"&format=csv", Session{UserID: user.ID})
+				got := historyGet(s, path+"&format=csv", Session{})
 				start := at.Add(-time.Duration(i) * time.Minute).Format(time.RFC3339Nano)
 				var rows [][]string
 				switch kind {
@@ -81,7 +77,7 @@ func TestHistoryCSVBytesScopeAndContinuation(t *testing.T) {
 				if got.Code != 200 || got.Body.String() != expected.String() {
 					t.Fatalf("%s page%d CSV differs:\n%s\nwant:\n%s", kind, i, got.Body, &expected)
 				}
-				if got.Header().Get("Content-Type") != "text/csv; charset=utf-8" || got.Header().Get("Content-Disposition") != `attachment; filename="`+kind+`.csv"` || got.Header().Get("Cache-Control") != "no-store" || got.Header().Get("X-History-Scope-Role") != "zone" || got.Header().Get("X-History-Scope-ID") != "zone-1" || got.Header().Get("X-Next-Cursor") != metadata.NextCursor {
+				if got.Header().Get("Content-Type") != "text/csv; charset=utf-8" || got.Header().Get("Content-Disposition") != `attachment; filename="`+kind+`.csv"` || got.Header().Get("Cache-Control") != "no-store" || got.Header().Get("X-History-Scope-Role") != "system" || got.Header().Get("X-History-Scope-ID") != "system-1" || got.Header().Get("X-Next-Cursor") != metadata.NextCursor {
 					t.Fatal("CSV response metadata changed", got.Header())
 				}
 				if i == 0 && metadata.NextCursor == "" || i == 1 && kind != "events" && metadata.NextCursor != "" {
@@ -90,7 +86,7 @@ func TestHistoryCSVBytesScopeAndContinuation(t *testing.T) {
 				cursor = metadata.NextCursor
 			}
 			if kind == "events" {
-				last := historyGet(s, "/api/history/events?format=csv&limit=1&cursor="+url.QueryEscape(cursor), Session{UserID: user.ID})
+				last := historyGet(s, "/api/history/events?format=csv&limit=1&talkgroup_id=1001&cursor="+url.QueryEscape(cursor), Session{})
 				rows, err := csv.NewReader(strings.NewReader(last.Body.String())).ReadAll()
 				if last.Code != 200 || err != nil || len(rows) != 1 || last.Header().Get("X-Next-Cursor") != "" {
 					t.Fatal("end-of-page cursor leaked the forbidden group", last.Body, err)
@@ -101,27 +97,27 @@ func TestHistoryCSVBytesScopeAndContinuation(t *testing.T) {
 }
 
 func TestHistoryCSVSecondsAreExactAndJSONStaysMilliseconds(t *testing.T) {
-	s, user := historyFixture(t)
+	s, _ := historyFixture(t)
 	at := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
 	for _, id := range []string{"completed", "open"} {
 		event := activity.Event{ID: id + "-start", CallID: id, At: at, Origin: "site-1", SiteID: "site-1", ChannelID: "voice-1", RadioID: 10001, TalkgroupID: 1001, Type: "call_start", Audience: "dispatcher", SourceKind: "rf"}
-		if err := s.activity.Append(event); err != nil {
+		if err := s.activity.Append(context.Background(), event); err != nil {
 			t.Fatal(err)
 		}
 		if id == "completed" {
 			event.ID, event.Type, event.At = id+"-end", "call_end", at.Add(1501*time.Millisecond)
 			event.Details = map[string]any{"allocated_ms": 1200, "speech_ms": 1}
-			if err := s.activity.Append(event); err != nil {
+			if err := s.activity.Append(context.Background(), event); err != nil {
 				t.Fatal(err)
 			}
 		}
 		path := "/api/history/calls?call_id=" + id
-		before := historyGet(s, path, Session{UserID: user.ID})
+		before := historyGet(s, path, Session{})
 		var page activity.CallPage
 		if before.Code != 200 || json.Unmarshal(before.Body.Bytes(), &page) != nil || len(page.Calls) != 1 {
 			t.Fatalf("JSON call page: HTTP%d %s", before.Code, before.Body)
 		}
-		csvPage := historyGet(s, path+"&format=csv", Session{UserID: user.ID})
+		csvPage := historyGet(s, path+"&format=csv", Session{})
 		rows, err := csv.NewReader(strings.NewReader(csvPage.Body.String())).ReadAll()
 		if csvPage.Code != 200 || err != nil || len(rows) != 2 {
 			t.Fatalf("CSV call page: HTTP%d %v %s", csvPage.Code, err, csvPage.Body)
@@ -137,7 +133,7 @@ func TestHistoryCSVSecondsAreExactAndJSONStaysMilliseconds(t *testing.T) {
 		} else if call.LifetimeMS != nil || call.Destinations[0].AllocatedMS != nil || call.Destinations[0].SpeechMS != nil || strings.Join(values, ",") != ",," {
 			t.Fatal("unknown measurements became zero", call, values)
 		}
-		after := historyGet(s, path, Session{UserID: user.ID})
+		after := historyGet(s, path, Session{})
 		if after.Code != before.Code || !bytes.Equal(after.Body.Bytes(), before.Body.Bytes()) {
 			t.Fatal("CSV presentation changed JSON or stored call measurements", before.Body, after.Body)
 		}
@@ -164,7 +160,7 @@ func expandedCSVFixture(t *testing.T) *Service {
 	at := time.Now().UTC().Add(-time.Minute)
 	for i := range 256 {
 		e := activity.Event{ID: fmt.Sprintf("expanded-%d", i), At: at, Origin: "site-1", SiteID: fmt.Sprintf("site-%03d", i), ChannelID: "voice-1", RadioID: 10001, TalkgroupID: 1001, CallID: "one-expanded-call", Type: "call_start", Audience: "dispatcher", SourceKind: "rf"}
-		if err := s.activity.Append(e); err != nil {
+		if err := s.activity.Append(context.Background(), e); err != nil {
 			t.Fatal(err)
 		}
 	}

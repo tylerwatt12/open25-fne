@@ -294,7 +294,7 @@ func TestNativeOpaqueP25ThroughPrivateFNE(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer receiver.Close()
-	sendOptions := options(network.VoicePeerIDs["voice"], "opaque-send")
+	sendOptions := options(network.ChannelPeerIDs["voice"], "opaque-send")
 	sendOptions.RadioID = 10001 // Physical voice ingress uses the subscriber population.
 	sender, err := NewCodec(sendOptions)
 	if err != nil {
@@ -470,7 +470,7 @@ collect:
 }
 
 // AAAD-B B.4, PDF46/printed36, public three-key key bundle. Exact document
-// citations and transcription are in the p25crypto test fixtures.
+// ID/path and vector transcription are in phase1-tdea-published-vectors.json.
 const publishedTDEAKey = "0123456789ABCDEF23456789ABCDEF01456789ABCDEF0123"
 
 // Public test-only alternate: the B.4 key components in K3/K2/K1 order.

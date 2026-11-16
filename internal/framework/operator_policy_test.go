@@ -26,15 +26,77 @@ func TestOperatorSnapshotsUnchangedWritesSkipUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, retainedLocal := range []*OperatorSnapshot{&local, nil} {
-		if err := s.acceptOperatorSnapshots(retainedLocal, upstream); err != nil {
-			t.Fatal("unchanged operator state attempted an UPDATE:", err)
-		}
+		withOccupiedConfigurationWriter(t, s, func() error { return s.acceptOperatorSnapshots(retainedLocal, upstream) })
 	}
 	afterLocal, afterLocalAt, localErr := s.ReadCache("operator-local")
 	afterUpstream, afterUpstreamAt, upstreamErr := s.ReadCache("operator-upstream")
 	if localErr != nil || upstreamErr != nil || !bytes.Equal(beforeLocal, afterLocal) || !localAt.Equal(afterLocalAt) ||
 		!bytes.Equal(beforeUpstream, afterUpstream) || !upstreamAt.Equal(afterUpstreamAt) {
 		t.Fatal("unchanged operator state changed its saved documents or timestamps")
+	}
+}
+
+func TestOperatorCallDeliveryChangesNeverRewriteDurableSnapshot(t *testing.T) {
+	s := &Service{Store: storeOpen(t, RoleApplication), config: FileConfig{Role: RoleApplication, InstanceID: "application-1"}}
+	now := time.Now().UTC()
+	value := OperatorSnapshot{
+		Emergencies:  []EmergencyIncident{{ID: "incident-1", RadioID: 10001, TalkgroupID: 1001, ScopeID: "zone-1", At: now, LastSeen: now}},
+		Locations:    []RadioLocation{{RadioID: 10001, TalkgroupID: 1001, Latitude: 41.5, Longitude: -81.7, FixAt: now, ReceivedAt: now, ScopeID: "zone-1"}},
+		Patches:      []RuntimePatch{{ID: "patch-1", Name: "Durable patch", Talkgroups: []int{1001, 1002}, At: now, Active: true, ScopeID: "zone-1", State: "active"}},
+		Commands:     []radioCommandReceipt{{ID: "command-1", Action: "radio_check", RadioID: 10001, SiteID: "site-1", State: "acknowledged", Sent: true, CreatedAt: now, ResponseAt: now}},
+		CommandSites: []commandSiteStatus{{SiteID: "site-1", State: "connected"}},
+		CallDelivery: []CallDelivery{{CallID: "first-transient-call", RadioID: 10001, Talkgroups: []int{1001}}},
+	}
+	if err := s.acceptOperatorSnapshot(value); err != nil {
+		t.Fatal(err)
+	}
+	before, at, err := s.Store.ReadCache("operator-upstream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := value
+	want.CallDelivery = nil
+	if !bytes.Equal(before, storeDoc(t, want)) {
+		t.Fatalf("persisted snapshot lost a semantic field or retained delivery: %s", before)
+	}
+	value.CallDelivery = []CallDelivery{{CallID: "second-transient-call", RadioID: 10002, Talkgroups: []int{1002}}}
+	withOccupiedConfigurationWriter(t, s.Store, func() error { return s.acceptOperatorSnapshot(value) })
+	after, afterAt, err := s.Store.ReadCache("operator-upstream")
+	if err != nil || !bytes.Equal(before, after) || !at.Equal(afterAt) {
+		t.Fatalf("changing only live delivery rewrote persistent state: %s %v", after, err)
+	}
+	value.Emergencies[0].ClearedAt = now.Add(time.Second)
+	value.Commands[0].State = "timed_out"
+	if err = s.acceptOperatorSnapshot(value); err != nil {
+		t.Fatal(err)
+	}
+	changed, _, err := s.Store.ReadCache("operator-upstream")
+	want = value
+	want.CallDelivery = nil
+	if err != nil || !bytes.Equal(changed, storeDoc(t, want)) {
+		t.Fatalf("a real semantic change was not durably accepted: %s %v", changed, err)
+	}
+}
+
+func TestOperatorSnapshotStillBuildsLiveCallDelivery(t *testing.T) {
+	s, desk, _ := operatorFixture(t, RoleZone)
+	s.peers = newMediaPeers(s)
+	s.broker = newCallBroker(s)
+	defer s.broker.Close()
+	defer s.peers.Close()
+	grant, err := s.broker.Begin(context.Background(), "application-1", routing.Request{CallRequest: dispatch.CallRequest{ID: "live-delivery", SessionID: "live-delivery-session", UserID: desk.actor.UserID, RadioID: desk.actor.RadioID, Talkgroups: []int{1001}}, SourceKind: "application", Proof: desk.actor.Proof})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := s.operatorSnapshot().CallDelivery
+	if len(current) != 1 || current[0].CallID != "live-delivery" || current[0].RadioID != desk.actor.RadioID || !slices.Equal(current[0].Talkgroups, []int{1001}) {
+		t.Fatalf("live grant delivery was not generated: %+v", current)
+	}
+	if err = s.broker.End(context.Background(), "application-1", grant); err != nil {
+		t.Fatal(err)
+	}
+	if current = s.operatorSnapshot().CallDelivery; len(current) != 0 {
+		t.Fatalf("ended call remained in live delivery: %+v", current)
 	}
 }
 

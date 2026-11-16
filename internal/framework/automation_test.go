@@ -219,7 +219,11 @@ func TestAutomationWAVUsesRealServiceRoutingWithoutCreatingRFInterest(t *testing
 	if err := c.zone.service.activity.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	events, _ := c.zone.service.activity.Events(activity.Query{RadioID: a.RadioID})
+	c.zone.service.uploadActivity(context.Background())
+	events, err := c.system.service.activity.Events(activity.Query{RadioID: a.RadioID})
+	if err != nil {
+		t.Fatal(err)
+	}
 	found := false
 	for _, event := range events {
 		if event.Type == "call_start" && event.SourceKind == "automation" {
@@ -360,7 +364,7 @@ func TestAutomationTTSJobUsesSameRoutingAndDoesNotRetainText(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.dispatch.service.uploadActivity(context.Background())
-	events, err := c.zone.service.activity.Events(activity.Query{RadioID: job.RadioID})
+	events, err := c.system.service.activity.Events(activity.Query{RadioID: job.RadioID})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -40,7 +40,7 @@ func TestAffiliationDirectoryKeepsGlobalValidityAndSiteAdmissionSeparate(t *test
 	if controller.HasRFInterest(1002) {
 		t.Fatal("global-only group created local listener demand")
 	}
-	network := Network{Address: "127.0.0.1", Port: 62031, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), ControlPeerID: 100, VoicePeerIDs: map[string]int{"voice-1": 101}}
+	network := Network{Address: "127.0.0.1", Port: 62031, Secret: strings.Repeat("a", 64), RPCSecret: strings.Repeat("b", 64), PeerBase: 100, ChannelPeerIDs: map[string]int{"control-1": 100, "voice-1": 101}}
 	files, err := RenderChannel(profile, profile.Site.Channels[0], network, 25100, 25101, "null")
 	if err != nil {
 		t.Fatal(err)

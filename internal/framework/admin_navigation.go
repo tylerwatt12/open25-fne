@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"slices"
 	"sort"
 	"strings"
 
@@ -34,6 +33,13 @@ func adminTier(role Role) string {
 }
 func adminRoleName(role Role) string {
 	return map[Role]string{RoleSystem: "Open25 System Administration", RoleZone: "Open25 Zone Administration", RoleSite: "Open25 Site Administration", RoleApplication: "Open25 Application Server Administration"}[role]
+}
+func adminInstanceLabel(n adminInstance) string {
+	label := adminTier(n.Role)
+	if n.Name != "" && n.Name != label {
+		label += ": " + n.Name
+	}
+	return label
 }
 func adminURL(address string) string {
 	u, err := url.Parse(address)
@@ -68,7 +74,7 @@ func (s *Service) adminInstances() []adminInstance {
 	if zone != nil {
 		zoneName, zoneID = zone.Name, zone.ID
 		if zoneName == "" {
-			zoneName = zoneID
+			zoneName = "Zone"
 		}
 	}
 	nodes := []adminInstance{{ID: systemID, Name: systemName, URL: tree.SystemURL, Icon: "network", Role: RoleSystem}, {ID: zoneID, Name: zoneName, URL: tree.ZoneURL, Icon: "git-branch", Role: RoleZone, Level: 1}}
@@ -93,7 +99,7 @@ func (s *Service) adminInstances() []adminInstance {
 	}
 	sort.Strings(ordered)
 	for _, id := range ordered {
-		name := id
+		name := "Unnamed Site"
 		if names[id] != "" {
 			name = names[id]
 		}
@@ -122,12 +128,15 @@ func (s *Service) adminInstances() []adminInstance {
 var adminPrimaryPages = map[Role][]string{
 	RoleSystem:      {"system", "talkgroups", "radios", "users", "profiles", "keys"},
 	RoleZone:        {"zone", "sites", "identifiers"},
-	RoleSite:        {"channels", "modems", "site-identity"},
+	RoleSite:        {"channels", "modems", "control-policy"},
 	RoleApplication: {"application-settings"},
 }
 
 func adminConfiguration(role Role) []adminCategory {
-	service := adminCategory{"Service", []adminLink{{"networking", "Connections"}, {"history-settings", "History storage"}, {"account", "Administrator password"}}}
+	service := adminCategory{"Service", []adminLink{{"networking", "Connections"}, {"account", "Administrator password"}}}
+	if role == RoleSystem {
+		service.Links = append(service.Links, adminLink{"history-settings", "History storage"})
+	}
 	switch role {
 	case RoleSystem:
 		return []adminCategory{
@@ -139,48 +148,63 @@ func adminConfiguration(role Role) []adminCategory {
 	case RoleZone:
 		return []adminCategory{{"Site programming", []adminLink{{"zone", "Zone identity"}, {"identifiers", "Band Plan"}, {"sites", "Site registry"}}}, service}
 	case RoleSite:
-		return []adminCategory{{"Radio setup", []adminLink{{"modems", "USB modems"}, {"channels", "RF channels"}, {"control-policy", "Control channel behavior"}, {"identification", "Station identification"}, {"site-identity", "Local Site identity"}}}, service}
+		return []adminCategory{{"Radio setup", []adminLink{{"channels", "RF channels"}, {"modems", "Modem setup"}, {"control-policy", "Control channel behavior"}, {"neighbor-announcements", "Neighbor announcements"}, {"site-identity", "RF identity"}, {"identification", "Station identification"}}}, service}
 	default:
 		return []adminCategory{{"Application", []adminLink{{"application-settings", "Application Server"}}}, service}
 	}
 }
 func adminCategories(role Role, group string) []adminCategory {
+	if role == RoleSite {
+		switch group {
+		case "status":
+			return []adminCategory{{"Status & troubleshooting", []adminLink{{"live-status", "Site status"}, {"hardware", "Hardware & activity"}, {"activity-status", "History delivery"}, {"history", "System history"}}}}
+		case "notifications":
+			return []adminCategory{{"Email", []adminLink{{"smtp-settings", "SMTP settings"}, {"notification-delivery", "Delivery records"}, {"notification-actions", "Email test and retry"}}}}
+		case "operations":
+			return []adminCategory{{"Operations", []adminLink{{"radio-operation", "Channel operation"}, {"radio-commands", "Radio commands"}, {"command-results", "Command results"}, {"parent-zone", "Parent Zone connection"}, {"c4fm-test", "C4FM transmitter test"}}}}
+		case "reference":
+			return []adminCategory{{"Reference", []adminLink{{"reference-system", "System programming"}, {"reference-zone", "Zone programming"}, {"installation", "Host installation"}, {"planned", "Planned features"}}}}
+		}
+	}
 	switch group {
 	case "configuration":
 		return adminConfiguration(role)
 	case "status":
-		links := []adminLink{{"alarms", "Alarms"}, {"connections", "Service connections"}}
+		links := []adminLink{{"connections", "Service connections"}}
 		if role == RoleSite || role == RoleZone {
 			links = append(links, adminLink{"live-status", "Radio status"})
 		}
 		if role == RoleSystem || role == RoleZone {
-			links = append(links, adminLink{"reports", "Reported Sites"}, adminLink{"modem-status", "Modem observations"})
+			links = append(links, adminLink{"reports", "Reported Sites"}, adminLink{"modem-status", "Modem activity"})
 		}
 		if role == RoleSystem {
 			links = append(links, adminLink{"zone-status", "Reported Zone"})
 		}
 		if role == RoleSite {
-			links = append(links, adminLink{"modem-status", "Modem observations"}, adminLink{"hardware", "Hardware observations"})
+			links = append(links, adminLink{"hardware", "Hardware & activity"})
 		}
 		if role == RoleSystem || role == RoleApplication {
 			links = append(links, adminLink{"enrollment-status", "Key enrollment status"})
 		}
-		links = append(links, adminLink{"alarm-history", "Alarm history"}, adminLink{"notification-delivery", "Notification delivery"}, adminLink{"activity-status", "Recent activity"}, adminLink{"history", "History"})
+		if role == RoleSystem {
+			links = append(links, adminLink{"history", "History"})
+		} else {
+			links = append(links, adminLink{"activity-status", "History delivery"}, adminLink{"history", "System history"})
+		}
 		return []adminCategory{{"Status & records", links}}
 	case "notifications":
-		return []adminCategory{{"Notifications", []adminLink{{"alarm-settings", "Alarm settings"}, {"notification-rules", "Notification rules"}, {"smtp-settings", "SMTP settings"}}}}
+		return []adminCategory{{"Email", []adminLink{{"smtp-settings", "SMTP settings"}, {"notification-delivery", "Delivery records"}, {"notification-actions", "Email test and retry"}}}}
 	case "operations":
 		links := []adminLink{}
 		if role == RoleSite || role == RoleZone {
 			links = append(links, adminLink{"radio-commands", "Radio commands"})
 		}
 		if role == RoleSite {
-			links = append(links, adminLink{"radio-operation", "Channel operation"}, adminLink{"c4fm-test", "C4FM transmitter test"})
+			links = append(links, adminLink{"radio-operation", "Channel operation"}, adminLink{"parent-zone", "Parent Zone connection"}, adminLink{"c4fm-test", "C4FM transmitter test"})
 		}
 		if role == RoleZone || role == RoleSite {
 			links = append(links, adminLink{"command-results", "Command results"})
 		}
-		links = append(links, adminLink{"alarm-actions", "Alarm acknowledgment"}, adminLink{"notification-actions", "Email test and retry"})
 		if role == RoleApplication {
 			links = append(links, adminLink{"dispatch-test", "Open25 Dispatch"}, adminLink{"ptt-test", "Open25 PTT"})
 		}
@@ -193,21 +217,21 @@ func adminCategories(role Role, group string) []adminCategory {
 		if role == RoleSite || role == RoleApplication {
 			links = append(links, adminLink{"reference-zone", "Zone programming"})
 		}
-		links = append(links, adminLink{"installation", "Host installation"}, adminLink{"planned", "Feature coverage"})
+		links = append(links, adminLink{"installation", "Host installation"}, adminLink{"planned", "Planned features"})
 		return []adminCategory{{"Reference", links}}
 	}
 	return nil
 }
 func adminPageGroup(path string) string {
 	path = strings.TrimSuffix(path, "/edit")
+	if path == "alarms" || path == "alarm-history" || path == "alarm-settings" || path == "notification-rules" || path == "alarm-actions" {
+		return "reference"
+	}
 	for _, role := range []Role{RoleSystem, RoleZone, RoleSite, RoleApplication} {
 		for _, group := range []string{"status", "operations", "notifications", "reference"} {
 			for _, category := range adminCategories(role, group) {
 				for _, link := range category.Links {
 					if path == link.Path {
-						if path == "command-results" {
-							return "status"
-						}
 						return group
 					}
 				}
@@ -220,7 +244,7 @@ func adminPageGroup(path string) string {
 	return "configuration"
 }
 
-var adminIcons = map[string]string{"radios": "radio", "talkgroups": "users-round", "users": "user-round", "profiles": "sliders-horizontal", "positions": "headphones", "automations": "workflow", "keys": "key-round", "recipients": "fingerprint", "sites": "radio-tower", "identifiers": "list-ordered", "modems": "usb", "channels": "radio", "control-policy": "repeat-2", "identification": "badge-info", "system": "network", "zone": "git-branch", "site-identity": "map-pin", "application-settings": "headphones", "networking": "plug", "history-settings": "database", "account": "lock-keyhole", "radio-commands": "send", "radio-operation": "power", "c4fm-test": "audio-lines", "zone-status": "git-branch", "reference-system": "network", "reference-zone": "git-branch", "history": "history", "status-labels": "list", "message-labels": "message-square", "alarms": "bell", "alarm-settings": "bell-ring", "notification-rules": "list-filter", "smtp-settings": "mail", "notification-delivery": "mail", "alarm-history": "history", "alarm-actions": "check-check", "notification-actions": "mail-check", "connections": "plug", "reports": "radio-tower", "modem-status": "usb", "hardware": "usb", "enrollment-status": "fingerprint", "activity-status": "list", "live-status": "radio", "installation": "server", "planned": "list-checks"}
+var adminIcons = map[string]string{"radios": "radio", "talkgroups": "users-round", "users": "user-round", "profiles": "sliders-horizontal", "positions": "headphones", "automations": "workflow", "keys": "key-round", "recipients": "fingerprint", "sites": "radio-tower", "identifiers": "list-ordered", "modems": "usb", "channels": "radio", "control-policy": "repeat-2", "neighbor-announcements": "radio-tower", "identification": "badge-info", "system": "network", "zone": "git-branch", "site-identity": "map-pin", "application-settings": "headphones", "networking": "plug", "history-settings": "database", "account": "lock-keyhole", "radio-commands": "send", "radio-operation": "power", "c4fm-test": "audio-lines", "zone-status": "git-branch", "reference-system": "network", "reference-zone": "git-branch", "history": "history", "status-labels": "list", "message-labels": "message-square", "alarms": "bell", "alarm-settings": "bell-ring", "notification-rules": "list-filter", "smtp-settings": "mail", "notification-delivery": "mail", "alarm-history": "history", "alarm-actions": "check-check", "notification-actions": "mail-check", "connections": "plug", "reports": "radio-tower", "modem-status": "usb", "hardware": "usb", "enrollment-status": "fingerprint", "activity-status": "list", "live-status": "radio", "installation": "server", "planned": "list-checks"}
 
 func adminLabel(role Role, path, fallback string) string {
 	for _, group := range []string{"configuration", "notifications", "status", "operations", "reference"} {
@@ -242,13 +266,19 @@ func (s *Service) webHeader(w http.ResponseWriter, r *http.Request, title string
 	base := strings.TrimSuffix(strings.TrimSuffix(path, "/edit"), "/bulk")
 	editing := strings.HasSuffix(path, "/edit") || strings.HasSuffix(path, "/bulk")
 	group := adminPageGroup(base)
-	if !editing {
+	if c.Role == RoleSite && base == "command-results" {
+		group = "operations"
+	}
+	if c.Role == RoleSite && (base == "connections" || base == "activity-status") {
+		group = "status"
+	}
+	if !editing && !(c.Role == RoleSite && base == "live-status" && r.URL.Query().Get("channel") != "") {
 		title = adminLabel(c.Role, base, title)
 	}
 	if group == "dashboard" {
 		title = "Overview"
 	}
-	fmt.Fprintf(w, `<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>%s — %s</title><link rel=stylesheet href=/admin.css><script src=/forms.js defer></script><script src=/admin.js defer></script><script src=/admin-chooser.js defer></script>`, esc(adminRoleName(c.Role)), esc(title))
+	fmt.Fprintf(w, `<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>%s — %s</title><link rel=stylesheet href=/admin.css><script src=/forms.js defer></script><script src=/timestamps.js defer></script><script src=/admin.js defer></script><script src=/admin-chooser.js defer></script>`, esc(adminRoleName(c.Role)), esc(title))
 	if live {
 		fmt.Fprint(w, `<meta http-equiv=refresh content=5>`)
 	}
@@ -259,6 +289,7 @@ func (s *Service) webHeader(w http.ResponseWriter, r *http.Request, title string
 		fmt.Fprint(w, `<button>Sign out</button></form></div>`)
 	}
 	fmt.Fprint(w, `</header>`)
+	s.webParentIsolationNotice(w)
 	if session.Username == "" {
 		fmt.Fprintf(w, `<div class="ts-layout ts-login-layout"><main id=admin-content class=ts-main><section class=ts-page><div class=ts-heading><h1>%s</h1></div>`, esc(title))
 		return
@@ -270,8 +301,8 @@ func (s *Service) webHeader(w http.ResponseWriter, r *http.Request, title string
 			current = n
 		}
 	}
-	fmt.Fprint(w, `<div class=ts-contextbar><div class=ts-actions><input type=hidden id=admin-instance-choice value=""><button type=button data-chooser-kind=instances data-chooser-target=admin-instance-choice data-chooser-navigate>Choose administration instance</button></div>`)
-	fmt.Fprintf(w, `<form method=get action=/find-setting class=ts-search role=search><input type=search name=q placeholder="Find a setting…" aria-label="Find a setting across administration"></form></div><div class=ts-layout><aside class=ts-sidebar><nav aria-label="%s navigation"><div class=ts-treeowner>Network</div><ul class=ts-instance-tree>`, esc(adminRoleName(c.Role)))
+	fmt.Fprintf(w, `<div class=ts-layout><aside class=ts-sidebar><nav aria-label="%s navigation"><form method=get action=/find-setting class=ts-search role=search><input type=search name=q placeholder="Find a setting…" aria-label="Find a setting across administration"></form><div class=ts-treeowner>Network</div><ul class=ts-instance-tree>`, esc(adminRoleName(c.Role)))
+
 	nodes = adminVisibleInstances(nodes)
 
 	depth := 0
@@ -290,7 +321,7 @@ func (s *Service) webHeader(w http.ResponseWriter, r *http.Request, title string
 		depth = n.Level
 		fmt.Fprint(w, `<li class=ts-treeitem>`)
 		if n.URL == "" {
-			fmt.Fprintf(w, `<span class=ts-unavailable>%s<span>%s</span></span>`, adminIcon(n.Icon), esc(adminTier(n.Role)+": "+n.Name))
+			fmt.Fprintf(w, `<span class=ts-unavailable>%s<span>%s</span></span>`, adminIcon(n.Icon), esc(adminInstanceLabel(n)))
 		} else {
 			selected := ""
 			if n.Current {
@@ -300,7 +331,7 @@ func (s *Service) webHeader(w http.ResponseWriter, r *http.Request, title string
 			if !n.Current {
 				outside = adminPortalIcon()
 			}
-			fmt.Fprintf(w, `<a href="%s"%s>%s<span>%s</span>%s</a>`, esc(n.URL), selected, adminIcon(n.Icon), esc(adminTier(n.Role)+": "+n.Name), outside)
+			fmt.Fprintf(w, `<a href="%s"%s>%s<span>%s</span>%s</a>`, esc(n.URL), selected, adminIcon(n.Icon), esc(adminInstanceLabel(n)), outside)
 		}
 	}
 	fmt.Fprint(w, `</li>`)
@@ -308,8 +339,12 @@ func (s *Service) webHeader(w http.ResponseWriter, r *http.Request, title string
 		fmt.Fprint(w, `</ul></li>`)
 		depth--
 	}
-	fmt.Fprint(w, `</ul>`)
-	fmt.Fprintf(w, `<div class=ts-navgroup>%s</div>`, esc(current.Name))
+	fmt.Fprint(w, `</ul><input type=hidden id=admin-instance-choice value=""><button type=button data-chooser-kind=instances data-chooser-target=admin-instance-choice data-chooser-navigate>Choose controller</button>`)
+	navName := current.Name
+	if c.Role == RoleSite && !strings.HasSuffix(strings.ToLower(navName), "site") {
+		navName += " Site"
+	}
+	fmt.Fprintf(w, `<div class=ts-navgroup>%s</div>`, esc(navName))
 	nav := func(link adminLink) {
 		selected := ""
 		if base == link.Path || (base == "" && link.Path == "dashboard") {
@@ -319,52 +354,33 @@ func (s *Service) webHeader(w http.ResponseWriter, r *http.Request, title string
 		if link.Path == "dashboard" {
 			icon = "layout-dashboard"
 		}
-		fmt.Fprintf(w, `<a href="/%s"%s>%s<span>%s</span></a>`, esc(link.Path), selected, adminIcon(icon), esc(link.Label))
+		address := "/" + link.Path
+		outside := ""
+		if link.Path == "history" && c.Role != RoleSystem {
+			address = adminURL(s.adminTopology(s.webKnownZone()).SystemURL)
+			if address == "" {
+				fmt.Fprintf(w, `<span class=ts-muted>%s<span>%s · Address unavailable</span></span>`, adminIcon(icon), esc(link.Label))
+				return
+			}
+			address += "history"
+			outside = adminPortalIcon()
+		}
+		fmt.Fprintf(w, `<a href="%s"%s>%s<span>%s</span>%s</a>`, esc(address), selected, adminIcon(icon), esc(link.Label), outside)
 	}
 	nav(adminLink{"dashboard", "Overview"})
-	for _, section := range []string{"configuration", "status", "notifications", "operations", "reference"} {
-		folded := section != "configuration"
-		if folded {
-			open := ""
-			if group == section {
-				open = " open"
-			}
-			label := map[string]string{"status": "Status & troubleshooting", "notifications": "Alarms & email", "operations": "Operations", "reference": "Reference"}[section]
-			fmt.Fprintf(w, `<details class=ts-navbranch%s><summary>%s%s</summary>`, open, adminIcon("chevron-down"), esc(label))
-		} else {
-			fmt.Fprint(w, `<div class=ts-navgroup>Configuration</div>`)
-			for _, path := range adminPrimaryPages[c.Role] {
-				nav(adminLink{path, adminLabel(c.Role, path, path)})
-			}
+	for _, section := range []string{"status", "configuration", "operations", "notifications", "reference"} {
+		open := ""
+		if group == section || (group == "dashboard" && section == "status") {
+			open = " open"
 		}
+		label := map[string]string{"status": "Status & troubleshooting", "configuration": "Configuration", "notifications": "Email", "operations": "Operations", "reference": "Reference"}[section]
+		fmt.Fprintf(w, `<details class=ts-navbranch%s><summary>%s%s</summary>`, open, adminIcon("chevron-down"), esc(label))
 		for _, category := range adminCategories(c.Role, section) {
-			if folded {
-				for _, link := range category.Links {
-					nav(link)
-				}
-			} else {
-				remaining := []adminLink{}
-				open := ""
-				for _, link := range category.Links {
-					if !slices.Contains(adminPrimaryPages[c.Role], link.Path) {
-						remaining = append(remaining, link)
-						if base == link.Path {
-							open = " open"
-						}
-					}
-				}
-				if len(remaining) > 0 {
-					fmt.Fprintf(w, `<details class=ts-navbranch%s><summary>%s%s</summary>`, open, adminIcon("chevron-down"), esc(category.Label))
-					for _, link := range remaining {
-						nav(link)
-					}
-					fmt.Fprint(w, `</details>`)
-				}
+			for _, link := range category.Links {
+				nav(link)
 			}
 		}
-		if folded {
-			fmt.Fprint(w, `</details>`)
-		}
+		fmt.Fprint(w, `</details>`)
 	}
 	fmt.Fprint(w, `</nav></aside><main id=admin-content class=ts-main><header class=ts-pageheader><nav class=ts-breadcrumb aria-label=Breadcrumb>`)
 	first := true
@@ -376,7 +392,7 @@ func (s *Service) webHeader(w http.ResponseWriter, r *http.Request, title string
 			fmt.Fprint(w, `<span aria-hidden=true>/</span>`)
 		}
 		first = false
-		label := adminTier(n.Role) + ": " + n.Name
+		label := adminInstanceLabel(n)
 		if n.Current || n.URL == "" {
 			fmt.Fprintf(w, `<span>%s</span>`, esc(label))
 		} else {
@@ -393,6 +409,12 @@ func (s *Service) webHeader(w http.ResponseWriter, r *http.Request, title string
 	fmt.Fprintf(w, `<h1>%s</h1></div>`, esc(title))
 
 	fmt.Fprint(w, `<div class=ts-actions>`)
+	if group == "dashboard" {
+		fmt.Fprint(w, `<a class=ts-button href=/dashboard>Refresh</a>`)
+	}
+	if c.Role == RoleSite && (group == "dashboard" || base == "live-status" || base == "modem-status" || base == "history") {
+		fmt.Fprintf(w, `<a class=ts-button href=/radio-operation>%sChannel operation</a>`, adminIcon("power"))
+	}
 	collection := false
 	for _, section := range webSections() {
 		if section.Path == base && section.Collection != "" {
@@ -479,10 +501,19 @@ func webEditorFields(w io.Writer, kind string, fields []webField, record map[str
 				}
 			}
 		}
-		if len(selected) == 0 {
+		visible := false
+		for _, field := range selected {
+			visible = visible || field.Kind != "internal"
+		}
+		if !visible {
+			webFields(w, selected, record, submitted...)
 			continue
 		}
-		fmt.Fprintf(w, `<section class=ts-formsection id=section-%d><div class=ts-sectiontitle><h2>%s</h2></div>`, i, esc(g.Name))
+		sectionTitle := g.Name
+		if kind == "channels" && i == 0 {
+			sectionTitle = webRecordTitle(kind, record)
+		}
+		fmt.Fprintf(w, `<section class=ts-formsection id=section-%d><div class=ts-sectiontitle><h2>%s</h2></div>`, i, esc(sectionTitle))
 		webFields(w, selected, record, submitted...)
 		if kind == "talkgroups" && g.Name == "Encryption" {
 			fmt.Fprint(w, `<div class=ts-reference><div class=ts-itemline><strong>Receiving</strong></div>Permitted clear calls play with a clear indication. Encrypted calls use the loaded receive key identified by the call.</div>`)

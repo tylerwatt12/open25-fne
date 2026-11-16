@@ -21,6 +21,18 @@ Each service owns its configuration and SQLite databases. The executable
 includes the web interfaces. Site RF and native vocoding require a compatible
 [DVM runtime](patches/dvmhost/README.md). The Dispatch and PTT pages are development and testing interfaces.
 
+The current source includes Site-owned digital BSI and control-channel policy,
+optional Site startup, managed neighbor announcements, requested-Site routing,
+and the shared System history archive with durable source outboxes. Saved radio
+programming remains separate from explicit operating actions. Station
+identification uses digital BSI; CWID/Morse scheduling is retired.
+
+The public runtime is synchronized with the running lab's application and native
+feature baseline, retaining the later licensing corrections and the explicit
+BEE00–BEEFF operating restriction. Private operational state, configurations,
+build output, captures and research material are not part of this source release.
+Publishing source does not update an existing installation or qualify RF use.
+
 Open25's public native modifications are maintained in the separate
 [DVMHost fork](https://github.com/tylerwatt12/dvmhost), retaining DVMProject's
 upstream history. The [native integration instructions](patches/dvmhost/README.md)

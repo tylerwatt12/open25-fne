@@ -50,7 +50,7 @@ func applicationEnrollmentSite(t *testing.T, root string, receipt InitReceipt, i
 		err = json.Unmarshal(raw, &zone)
 	}
 	if err == nil {
-		zone.Sites = append(zone.Sites, SiteIdentity{ID: id, Name: id, SiteID: number, NAC: 0x293 + number})
+		zone.Sites = append(zone.Sites, SiteIdentity{ID: id, Name: id, SiteID: number})
 		err = store.SaveConfig(storeDoc(t, zone))
 	}
 	closeErr := store.Close()

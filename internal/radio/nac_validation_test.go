@@ -20,7 +20,7 @@ func TestRendererPreservesFixedTwelveBitNACAndRejectsSpecialValues(t *testing.T)
 	}{{0, true}, {0xF7D, true}, {0xF7E, false}, {0xF7F, false}, {0xF80, true}, {0xFFF, true}, {0x1000, false}, {-1, false}} {
 		t.Run(fmt.Sprintf("%X", test.nac), func(t *testing.T) {
 			profile := fixtureProfile()
-			profile.Zone.Sites[0].NAC = test.nac
+			profile.Site.NAC = test.nac
 			files, err := RenderChannel(profile, profile.Site.Channels[0], network, 41000, 41001, "null")
 			if (err == nil) != test.valid {
 				t.Fatalf("fixed NAC %X accepted=%v, expected=%v: %v", test.nac, err == nil, test.valid, err)

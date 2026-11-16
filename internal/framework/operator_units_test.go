@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"open25.local/open25-fne/internal/activity"
 	"open25.local/open25-fne/internal/radio"
 )
 
@@ -127,16 +126,6 @@ func TestOperatorUnitsFollowNewestOwnershipWithoutRevivingOldSites(t *testing.T)
 		t.Fatal("lost latest Site revived retained old affiliation", units, err)
 	}
 	v.Reports[1].ReceivedAt = now
-	v.Presence = []activity.Radio{{RID: 10001, SiteID: "site-2", Kind: "rf", Registered: false, LastSeen: now}}
-	units, err = s.operatorUnits(desk, 1001)
-	if err != nil || len(units) != 1 || units[0].SiteID != "site-2" {
-		t.Fatal("history upload changed accepted physical ownership", units, err)
-	}
-	v.Presence = []activity.Radio{{RID: 10001, SiteID: "site-2", Kind: "application", Registered: false, LastSeen: now}}
-	units, err = s.operatorUnits(desk, 1001)
-	if err != nil || len(units) != 1 || units[0].SiteID != "site-2" {
-		t.Fatal("application evidence changed physical ownership", units, err)
-	}
 	terminalAt := time.Now().UTC()
 	update := rfAuthorityUpdate{SiteID: "site-2", NativeStartedAt: s.rfAuthority.value.Load().document.NativeRuns["site-2"], ObservedAt: terminalAt, Terminals: []radio.Registration{{RID: 10001, At: terminalAt}}}
 	if err := s.rfAuthority.apply(context.Background(), update, s.rfAuthorityScope()); err != nil {
@@ -146,7 +135,6 @@ func TestOperatorUnitsFollowNewestOwnershipWithoutRevivingOldSites(t *testing.T)
 	if err != nil || len(units) != 0 {
 		t.Fatal("accepted control deregistration left subscriber current", units, err)
 	}
-	v.Presence = nil
 	v.Reports[1].Radio.Affiliations[0].At = time.Now().UTC()
 	publishFixtureRFState(t, s, "site-2", *v.Reports[1].Radio)
 	units, err = s.operatorUnits(desk, 1001)
@@ -213,7 +201,6 @@ func TestDispatchUnitsUseAuthenticatedControllerScopeAndRejectForgedQueries(t *t
 	now := time.Now().UTC()
 	view := *c.zone.service.view()
 	view.Reports = []SiteReport{{ID: "site-1", ReceivedAt: now, Radio: &radio.Status{SiteID: "site-1", State: "running", Affiliations: []radio.Affiliation{{RID: 10001, TGID: 1001, At: now}}}}, {ID: "site-2", ReceivedAt: now, Radio: &radio.Status{SiteID: "site-2", State: "running", Affiliations: []radio.Affiliation{{RID: 10003, TGID: 1002, At: now}}}}}
-	view.Presence = nil
 	c.zone.service.directory.value.Store(&view)
 	for _, report := range view.Reports {
 		publishFixtureRFState(t, c.zone.service, report.ID, *report.Radio)
