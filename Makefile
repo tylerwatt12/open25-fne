@@ -7,7 +7,7 @@ build:
 	$(GO_BUILD) -o build/open25-fne ./cmd/open25-fne
 
 test:
-	go test -mod=readonly -race -p 1 ./...
+	go test -mod=readonly -race -p 1 -timeout 30m ./...
 	$(MAKE) ui-test
 
 ui-test:

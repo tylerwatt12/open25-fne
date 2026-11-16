@@ -6,7 +6,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,7 +31,8 @@ func TestRelayNeedsOnlySystemArchiveAndPreservesSourceObservation(t *testing.T) 
 	event := activity.Event{ID: "original-application-observation", At: at, ReceivedAt: at.Add(time.Second), Origin: "application-1", Type: "status", SourceKind: "application", Message: "original message"}
 	delegate := c.system.server.Config.Handler
 	var relayed []activity.Event
-	c.system.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var relayedMu sync.Mutex
+	system := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/internal/events" {
 			raw, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -42,11 +46,19 @@ func TestRelayNeedsOnlySystemArchiveAndPreservesSourceObservation(t *testing.T) 
 			if err := json.Unmarshal(raw, &input); err != nil {
 				t.Error(err)
 			}
+			relayedMu.Lock()
 			relayed = input.Events
+			relayedMu.Unlock()
 			r.Body = io.NopCloser(strings.NewReader(string(raw)))
 		}
 		delegate.ServeHTTP(w, r)
-	})
+	}))
+	t.Cleanup(system.Close)
+	settings = c.zone.service.Config().Settings()
+	settings.UpstreamURL = system.URL
+	if err := c.zone.service.SaveSettings(settings); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	var reply struct {
@@ -55,6 +67,8 @@ func TestRelayNeedsOnlySystemArchiveAndPreservesSourceObservation(t *testing.T) 
 	if err := c.dispatch.service.requestAt(ctx, c.site.server.URL, "POST", "/internal/events", map[string]any{"events": []activity.Event{event}}, &reply, nil); err != nil {
 		t.Fatal(err)
 	}
+	relayedMu.Lock()
+	defer relayedMu.Unlock()
 	if len(relayed) != 1 || !relayed[0].At.Equal(at) || !relayed[0].ReceivedAt.Equal(event.ReceivedAt) || relayed[0].Origin != event.Origin || relayed[0].ID != event.ID || relayed[0].Message != event.Message || relayed[0].SiteID != "site-1" {
 		t.Fatal("relay rewrote source observation", relayed)
 	}
@@ -88,8 +102,9 @@ func TestSourceRetainsWholeBatchUntilCompleteSystemACK(t *testing.T) {
 				t.Fatal(err)
 			}
 			delegate := c.system.server.Config.Handler
-			c.system.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/internal/events" {
+			var acknowledge atomic.Bool
+			system := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/internal/events" || acknowledge.Load() {
 					delegate.ServeHTTP(w, r)
 					return
 				}
@@ -108,14 +123,20 @@ func TestSourceRetainsWholeBatchUntilCompleteSystemACK(t *testing.T) {
 					delegate.ServeHTTP(recorder, r)
 					w.WriteHeader(503)
 				}
-			})
+			}))
+			t.Cleanup(system.Close)
+			settings := c.zone.service.Config().Settings()
+			settings.UpstreamURL = system.URL
+			if err := c.zone.service.SaveSettings(settings); err != nil {
+				t.Fatal(err)
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			c.site.service.uploadActivity(ctx)
 			if health := source.IngestionHealth(); health.OutboxPending != 2 {
 				t.Fatal("incomplete receipt deleted source events", health.OutboxPending)
 			}
-			c.system.server.Config.Handler = delegate
+			acknowledge.Store(true)
 			c.site.service.uploadActivity(ctx)
 			if health := source.IngestionHealth(); health.OutboxPending != 0 {
 				t.Fatal("valid durable receipt failed to drain", health.OutboxPending)

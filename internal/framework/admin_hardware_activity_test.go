@@ -102,9 +102,11 @@ func TestHardwareActivityBrowser(t *testing.T) {
 	for _, pair := range []*integrationService{c.system, c.zone, c.site, c.otherSite} {
 		pair.service.assets = frameworkui.Assets()
 	}
-	fixture["system"], fixture["zone"], fixture["site"], fixture["other_site"] = c.system.web.URL, c.zone.web.URL, c.site.web.URL, c.otherSite.web.URL
 	for _, pair := range []*integrationService{c.site, c.otherSite} {
 		s := pair.service
+		// Join supervision before installing the browser's observation double.
+		s.operationCancel()
+		s.operationWG.Wait()
 		var site SiteConfig
 		_ = s.owned(&site)
 		site.Modems = nil
@@ -160,7 +162,8 @@ func TestHardwareActivityBrowser(t *testing.T) {
 		// Only inventory descriptors are fixture data. The shell, table, detail,
 		// assets, authentication and live endpoint use the production renderers.
 		base := s.Handler()
-		pair.web.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pair.web.Close()
+		pair.web = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/hardware" || r.URL.Query().Get("fragment") == "activity" {
 				base.ServeHTTP(w, r)
 				return
@@ -183,7 +186,12 @@ func TestHardwareActivityBrowser(t *testing.T) {
 			} else {
 				s.webHardwarePage(w, r, session, inventory, report, zone, now)
 			}
-		})
+		}))
+		settings := s.Config().Settings()
+		settings.PublicURL = pair.web.URL
+		if err := s.SaveSettings(settings); err != nil {
+			t.Fatal(err)
+		}
 		ctx, cancel := context.WithCancel(t.Context())
 		t.Cleanup(cancel)
 		go func() {
@@ -205,6 +213,7 @@ func TestHardwareActivityBrowser(t *testing.T) {
 			}
 		}()
 	}
+	fixture["system"], fixture["zone"], fixture["site"], fixture["other_site"] = c.system.web.URL, c.zone.web.URL, c.site.web.URL, c.otherSite.web.URL
 	file := filepath.Join(evidence, "fixture.private.json")
 	if err := WritePrivateJSON(file, fixture); err != nil {
 		t.Fatal(err)

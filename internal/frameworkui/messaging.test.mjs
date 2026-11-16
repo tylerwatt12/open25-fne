@@ -5,6 +5,7 @@ import http from 'node:http';
 
 const source = await fs.readFile(new URL('./messaging.js', import.meta.url), 'utf8');
 const testing = await fs.readFile(new URL('./testing.js', import.meta.url), 'utf8');
+const timestamps = await fs.readFile(new URL('./timestamps.js', import.meta.url), 'utf8');
 
 // Only local browser/HTTP fixtures are contacted; no radio, microphone or server
 // installation participates in these messaging checks.
@@ -23,8 +24,9 @@ test('PTT and Dispatch share personal conversations while audio is unavailable w
   const server = http.createServer(async (req,res) => {
     const url = new URL(req.url,'http://localhost'), user = /fixture-user=([^;]+)/.exec(req.headers.cookie||'')?.[1]||'alice';
     res.setHeader('Cache-Control','no-store');
-    if(url.pathname==='/') { res.setHeader('Content-Type','text/html');res.end('<!doctype html><meta charset="utf-8"><main id="audio-test" data-kind="'+(url.searchParams.get('kind')==='ptt'?'ptt':'dispatch')+'"></main><section id="messages" aria-label="Messages"></section><script src="/messaging.js"></script><script src="/testing.js"></script>');return; }
-    if(url.pathname==='/messaging.js'||url.pathname==='/testing.js') { res.setHeader('Content-Type','application/javascript');res.end(url.pathname==='/messaging.js'?source:testing);return; }
+    if(url.pathname==='/') { res.setHeader('Content-Type','text/html');res.end('<!doctype html><meta charset="utf-8"><main id="audio-test" data-kind="'+(url.searchParams.get('kind')==='ptt'?'ptt':'dispatch')+'"></main><section id="messages" aria-label="Messages"></section><script src="/timestamps.js"></script><script src="/messaging.js"></script><script src="/testing.js"></script>');return; }
+    const script = {'/timestamps.js': timestamps, '/messaging.js': source, '/testing.js': testing}[url.pathname];
+    if(script) { res.setHeader('Content-Type','application/javascript');res.end(script);return; }
     let raw='';for await(const chunk of req)raw+=chunk;
     const body=raw?JSON.parse(raw):null;
     requests.push({user,path:url.pathname,query:url.search,method:req.method,body,csrf:req.headers['x-csrf-token']});
@@ -102,6 +104,10 @@ test('PTT and Dispatch share personal conversations while audio is unavailable w
     await t.test('only displayed history is marked read and older pages remain ordered',async()=>{
       await open(ptt);
       await ptt.waitForFunction(()=>document.querySelectorAll('#messages ol li').length===50);
+      const sent = ptt.locator('#messages ol li time').first();
+      assert.equal(await sent.getAttribute('datetime'), '2026-11-04T12:00:00Z');
+      assert.match(await sent.getAttribute('title'), /Nov 4, 2026.*12:00:00 UTC/);
+      assert.match(await sent.textContent(), /ago|just now|^in /);
       await ptt.waitForFunction(()=>document.querySelector('#messages strong').textContent==='0 unread messages');
       assert.equal(requests.filter(request=>request.path.endsWith('/read')&&request.user==='alice').at(-1).body.message_id,55);
       assert.equal(await ptt.locator('#messages img').count(),0);assert.equal(await ptt.evaluate(()=>window.injected),undefined);
@@ -261,6 +267,7 @@ test('a delayed initial detail cannot restore bodies after an observed rejoin cu
   try {
     const page=await browser.newPage();
     await page.setContent('<section id="messages"></section>');
+    await page.addScriptTag({content:timestamps});
     await page.addScriptTag({content:source});
     await page.evaluate(() => {
       const initial={id:'group',kind:'group',name:'Private group',members:['alice','bob'],created_by:'alice',history_after_id:0,unread_count:1,read_through_id:0};

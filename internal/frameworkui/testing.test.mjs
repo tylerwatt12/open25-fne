@@ -58,7 +58,7 @@ test('plain Dispatch/PTT pages preserve actual audio and bounded call ownership'
   let chromium;
   try { ({chromium}=await import(process.env.TRUNKSYSTEM_PLAYWRIGHT||'playwright')); }
   catch(error){throw new Error('Set TRUNKSYSTEM_PLAYWRIGHT to the installed Playwright module: '+error.message);}
-  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'trunksystem-plain-audio-'));
+  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'open25-ui-audio-'));
   const microphone=path.join(directory,'microphone.wav');await fs.writeFile(microphone,wave());
   const requests=[];
   let controllerSnapshot={call_delivery:[],emergencies:[],patches:[]}, patchFailure="", profileReceive=[], historyPage={calls:[]}, holdAnnouncements=false;
@@ -325,7 +325,7 @@ test('plain Dispatch/PTT pages preserve actual audio and bounded call ownership'
         const page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));const before=requests.length;
         try{
           await page.goto(origin+'/?kind='+kind);await page.waitForFunction(()=>document.getElementById('test-connection').textContent==='Audio unavailable');
-          assert.ok((await page.locator('#test-identity').textContent()).includes('10002'));assert.equal(await page.locator('#test-group').inputValue(),'1001');assert.equal(await page.locator('#test-receive tr').count(),2);
+          assert.ok((await page.locator('#test-identity').textContent()).includes('10002'));assert.equal(await page.locator('#test-group').inputValue(),'01001');assert.equal(await page.locator('#test-receive tr').count(),2);
           assert.equal(await page.locator('#test-connect').isVisible(),false,'unsupported capture cannot be fixed by an enable click');
           await page.waitForTimeout(1200);assert.equal(requests.slice(before).filter(request=>request.path==='/api/state').length,1);assert.equal(requests.slice(before).filter(request=>request.path==='/api/dispatch/session').length,0);
           assert.equal(await page.evaluate(()=>fixture.microphoneOptions.length),0);assert.deepEqual(errors,[]);
@@ -402,7 +402,7 @@ test('plain Dispatch/PTT pages preserve actual audio and bounded call ownership'
         assert.deepEqual(receive.filter(value=>value.talkgroup_id===9009),hidden,'unrendered rows retain order, duplicates and entered values');
         assert.deepEqual(profile,submitted);await idle();const lastSaved=structuredClone(profile);
         await page.reload();await page.waitForSelector('#listen-1001');
-        assert.equal(await page.locator('#test-group').inputValue(),'1002');
+        assert.equal(await page.locator('#test-group').inputValue(),'01002');
         assert.equal(await page.locator('#volume-1001').inputValue(),'37.25');assert.equal(await page.locator('#volume-1002').inputValue(),'62.5');
         assert.equal(await page.locator('#listen-1001').isChecked(),false);assert.equal(await page.locator('#listen-1002').isChecked(),true);
         assert.equal(await page.locator('#pan-1001').inputValue(),'1');assert.equal(await page.locator('#pan-1002').inputValue(),'-1');
@@ -415,7 +415,7 @@ test('plain Dispatch/PTT pages preserve actual audio and bounded call ownership'
         assert.equal(await page.locator('#listen-1002').isChecked(),false);assert.equal(await page.locator('#pan-1001').inputValue(),'0');
         assert.deepEqual(profile,lastSaved,'failure leaves the retained profile unchanged');await idle();
         await page.reload();await page.waitForSelector('#listen-1001');
-        assert.equal(await page.locator('#test-group').inputValue(),'1002');assert.equal(await page.locator('#volume-1001').inputValue(),'37.25');await idle();
+        assert.equal(await page.locator('#test-group').inputValue(),'01002');assert.equal(await page.locator('#volume-1001').inputValue(),'37.25');await idle();
         await page.goto(origin+'/?kind=dispatch');await page.waitForSelector('#listen-1001');
         assert.equal(await page.locator('#test-save-preferences').count(),0,'Dispatch has no new Save control');await idle();
         assert.deepEqual(requests.slice(before).filter(value=>value.path.startsWith('/api/')&&value.path!=='/api/dispatch/session').map(value=>[value.path,value.method]),[['/api/state','GET'],['/api/profile','PUT'],['/api/state','GET'],['/api/profile','PUT'],['/api/state','GET'],['/api/state','GET']],'only explicit Saves write; load never polls or preflights profiles');
@@ -437,10 +437,9 @@ test('plain Dispatch/PTT pages preserve actual audio and bounded call ownership'
             for(const id of ['test-mic-level','test-rx-level']){assert.equal(await page.locator('#'+id).getAttribute('max'),'100');assert.ok((await page.locator('#'+id).locator('..').textContent()).includes('% full scale'));}
             await page.locator('#test-read-results').click();await page.waitForFunction(()=>document.getElementById('test-controller-results').textContent.includes('Transmit frequency (MHz)'));
             const shown=JSON.parse(await page.locator('#test-controller-results').textContent()).measurements;
-            assert.deepEqual(shown,{id:'443450001',radio_id:10001,talkgroup_id:1001,channel_number:81,attempts:2,'Transmit frequency (MHz)':443.450001,'Receive frequency (MHz)':448.45,'Base frequency (MHz)':443.43750025,'Uplink offset (MHz)':5,'Channel spacing (kHz)':12.5,'Bandwidth (kHz)':12.5,'Receive calibration (Hz)':.25,'Transmit calibration (Hz)':-.125,'Call lifetime (seconds)':1.501,'Allocated time (seconds)':1.2,'Speech time (seconds)':null,'Latency (ms)':17.250004,'Jitter (ms)':.0004,message:'Stored report: duration 1501 ms, RF 443450001 Hz'});
+            assert.deepEqual(shown,{id:'443450001',radio_id:'00010001',talkgroup_id:'01001',channel_number:81,attempts:2,'Transmit frequency (MHz)':'443.450001','Receive frequency (MHz)':'448.450000','Base frequency (MHz)':'443.43750025','Uplink offset (MHz)':'+5.000000','Channel spacing (kHz)':12.5,'Bandwidth (kHz)':12.5,'Receive calibration (Hz)':.25,'Transmit calibration (Hz)':-.125,'Call lifetime (seconds)':1.501,'Allocated time (seconds)':1.2,'Speech time (seconds)':null,'Latency (ms)':17.250004,'Jitter (ms)':.0004,message:'Stored report: duration 1501 ms, RF 443450001 Hz'});
             if(process.env.TRUNKSYSTEM_AUDIO_EVIDENCE){await fs.mkdir(process.env.TRUNKSYSTEM_AUDIO_EVIDENCE,{recursive:true});await page.locator('#test-controller-results').screenshot({path:path.join(process.env.TRUNKSYSTEM_AUDIO_EVIDENCE,kind+'-measurements.png')});}
-            await page.locator('#test-history').click();await page.waitForFunction(()=>document.getElementById('test-controller-results').textContent.includes('call-1'));
-            const history=JSON.parse(await page.locator('#test-controller-results').textContent()).calls[0];assert.equal(history['Call lifetime (seconds)'],1.501);assert.equal(history['Speech time (seconds)'],null);assert.equal(history.destinations[0]['Allocated time (seconds)'],1.2);
+            assert.equal(await page.locator('#test-history').count(),0,'operator testing has no retired local-history panel');
             assert.equal(controllerSnapshot.measurements.tx_frequency_hz,443450001);assert.equal(historyPage.calls[0].lifetime_ms,1501);assert.equal(profileReceive[0].volume,.25,'presentation does not mutate received API/profile values');
             await page.waitForFunction(()=>document.getElementById('test-connection').textContent==='connected');
             await page.evaluate(()=>fixture.call(1001,true));await page.waitForFunction(()=>Number(document.getElementById('test-rx-level').value)>1);
@@ -455,7 +454,7 @@ test('plain Dispatch/PTT pages preserve actual audio and bounded call ownership'
             assert.ok(!JSON.stringify(stats).includes('Round-trip'),'no absent round-trip measurement is invented');assert.ok(!JSON.stringify(stats).includes('bitrate'),'byte counts do not invent a bitrate');
             await page.evaluate(()=>RTCPeerConnection.prototype.getStats=fixture.realGetStats);
             const api=requests.slice(before).filter(value=>value.path.startsWith('/api/'));
-            assert.deepEqual(api.map(value=>[value.path,value.method]),[['/api/state','GET'],['/api/dispatch/session','POST'],['/api/operator/state','GET'],['/api/history/calls','GET'],['/api/state','GET']],'units create no extra queries or mutation');
+            assert.deepEqual(api.map(value=>[value.path,value.method]),[['/api/state','GET'],['/api/dispatch/session','POST'],['/api/operator/state','GET'],['/api/state','GET']],'units create no extra queries, retired history reads or mutation');
             assert.equal(await page.evaluate(()=>fixture.messages.filter(message=>message.type==='ptt_start').length),0,'display/volume/statistics never replay PTT');assert.deepEqual(errors,[]);assert.deepEqual(await page.evaluate(()=>fixture.failures),[]);
             if(process.env.TRUNKSYSTEM_AUDIO_EVIDENCE)await page.screenshot({path:path.join(process.env.TRUNKSYSTEM_AUDIO_EVIDENCE,kind+'-stats-percent.png'),fullPage:true});
           }finally{await page.evaluate(()=>fixture.finish()).catch(()=>{});await context.close();}

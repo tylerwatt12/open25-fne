@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -53,7 +54,7 @@ func TestControllerSyncAndReportDoNotWaitForHistoryUploadOrWriter(t *testing.T) 
 	started, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	delegate := c.zone.server.Config.Handler
-	c.zone.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	zone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/internal/events" {
 			once.Do(func() { close(started) })
 			select {
@@ -63,7 +64,13 @@ func TestControllerSyncAndReportDoNotWaitForHistoryUploadOrWriter(t *testing.T) 
 			}
 		}
 		delegate.ServeHTTP(w, r)
-	})
+	}))
+	t.Cleanup(zone.Close)
+	settings := s.Config().Settings()
+	settings.UpstreamURL = zone.URL
+	if err := s.SaveSettings(settings); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); s.runActivityHistory(ctx) }()
@@ -156,12 +163,18 @@ func TestHistoryTransferBudgetDoesNotWidenControlTimeout(t *testing.T) {
 	s := c.site.service
 	s.client.Timeout = 20 * time.Millisecond
 	delegate := c.zone.server.Config.Handler
-	c.zone.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	zone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/internal/events" {
 			time.Sleep(60 * time.Millisecond)
 		}
 		delegate.ServeHTTP(w, r)
-	})
+	}))
+	t.Cleanup(zone.Close)
+	settings := s.Config().Settings()
+	settings.UpstreamURL = zone.URL
+	if err := s.SaveSettings(settings); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := s.upstreamRequest(ctx, http.MethodPost, "/internal/events", map[string]any{"events": []activity.Event{}}, nil); err != nil {

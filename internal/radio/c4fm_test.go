@@ -362,6 +362,14 @@ func TestC4FMUnconfirmedAdmissionResumeRemainsFaultedUntilExplicitRestart(t *tes
 	if err := c.StopChannel(context.Background(), "voice-1"); err != nil {
 		t.Fatal(err)
 	}
+	// Supervision may have queued a retry while the admission fault was visible.
+	// Stop cancels it; join its retirement before requesting the explicit restart.
+	waitRadio(t, "canceled voice recovery did not retire after explicit Stop", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		recovery := c.recovery["voice-1"]
+		return recovery != nil && !recovery.wanted && recovery.attempt == nil
+	})
 	if err := c.StartChannel(context.Background(), "voice-1"); err != nil {
 		t.Fatal(err)
 	}
